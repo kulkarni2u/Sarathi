@@ -1,0 +1,27 @@
+{
+  "name": "@sarathi/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "api": "cd .. && python3 -m src.service --db .sarathi/sarathi.db --token dev --port 8765",
+    "desktop": "cd .. && python3 -m src.service.desktop",
+    "dev": "vite --host 127.0.0.1",
+    "dev:connected": "VITE_SARATHI_API_BASE_URL=http://127.0.0.1:8765 VITE_SARATHI_API_TOKEN=dev vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "@radix-ui/react-icons": "^1.3.2",
+    "@radix-ui/themes": "^3.3.0",
+    "lucide-react": "^1.14.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.9.3",
+    "vite": "^4.5.14"
+  }
+}

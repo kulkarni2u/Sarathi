@@ -1,12 +1,26 @@
 [project]
 name = "sarathi"
-version = "0.1.0"
+version = "0.2.0"
+description = "Policy-backed workflow orchestration for AI-assisted delivery (CLI + portable agent skill)."
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Sarathi contributors" }]
+dependencies = [
+    "PyYAML>=6.0.1",
+]
+
+[project.scripts]
+sarathi = "src.cli:main"
+sarathi-desktop = "src.service.desktop:main"
+
+[project.urls]
+Homepage = "https://github.com/kulkarni2u/Sarathi"
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
-    "pytest-asyncio",
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
     "black",
     "mypy",
 ]
@@ -17,3 +31,7 @@ testpaths = ["tests"]
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

@@ -92,12 +92,21 @@ Hybrid propagation model:
 - Agent provides evidence from each category:
 
 ```
-Evidence types (example weights):
-  - alternative_approaches_considered: 0.3
-  - risks_identified: 0.3
-  - success_criteria_defined: 0.2
-  - reversibility_assessed: 0.2
+Evidence types (updated weights for quality):
+  - problem_understanding: 0.25 (clear problem statement + context)
+  - alternative_approaches_considered: 0.25 (3+ approaches with pros/cons)
+  - technical_feasibility: 0.15 (constraints, dependencies assessment)
+  - risks_identified: 0.15 (impact/severity + mitigation strategies)
+  - success_criteria_defined: 0.10 (measurable acceptance criteria)
+  - reversibility_assessed: 0.10 (rollback plan + impact assessment)
 ```
+
+**Quality Controls:**
+- 10-point quality checklist covering scope, stakeholders, constraints, alternatives, risks
+- Anti-pattern detection: solution jumping, feature creep, over-engineering, groupthink
+- Structured 6-section template for comprehensive analysis
+- Model selection: Claude 3.5 Sonnet for Medium/High complexity (was Haiku)
+- Extended time budget: 15 minutes (was 10) for deeper analysis
 
 **Outputs:**
 - Confidence score

@@ -95,21 +95,14 @@ import {
   type Tone,
 } from "./mockData";
 
-type Route =
-  | "workspace"
-  | "orchestrator"
-  | "inbox"
-  | "tasks"
-  | "views"
-  | "task"
-  | "agents"
-  | "lifecycle"
-  | "history"
-  | "diagrams"
-  | "usage"
-  | "settings"
-  | "templates"
-  | "workflows";
+import WorkspacesHome from "./pages/WorkspacesHome";
+import Dashboard from "./pages/Dashboard";
+import InboxPage from "./pages/Inbox";
+import AgentsPage from "./pages/Agents";
+import SettingsPage from "./pages/Settings";
+import ProjectDetail from "./pages/ProjectDetail";
+
+export type AppRoute = "home" | "dashboard" | "inbox" | "agents" | "settings" | "project";
 
 type TaskTab = "messages" | "evidence" | "review" | "history" | "handoff";
 
@@ -131,71 +124,42 @@ type StudioUnit = {
   y: number;
 };
 
-const routeIcons: Record<Route, ReactNode> = {
-  workspace:    <DashboardIcon />,
-  orchestrator: <MixIcon />,
-  inbox:        <ArchiveIcon />,
-  tasks:        <CheckboxIcon />,
-  views:        <BarChartIcon />,
-  task:         <LayersIcon />,
-  agents:       <PersonIcon />,
-  lifecycle:    <LoopIcon />,
-  history:      <ClockIcon />,
-  diagrams:     <Share2Icon />,
-  usage:        <ActivityLogIcon />,
-  settings:     <GearIcon />,
-  templates:    <ArchiveIcon />,
-  workflows:    <BarChartIcon />,
+const routeIcons: Record<AppRoute, ReactNode> = {
+  home:        <DashboardIcon />,
+  dashboard:   <MixIcon />,
+  inbox:       <ArchiveIcon />,
+  agents:      <PersonIcon />,
+  settings:    <GearIcon />,
+  project:     <LayersIcon />,
 };
 
-const routes: Record<Route, string> = {
-  workspace: "Workspace",
-  orchestrator: "Orchestrator",
+const routes: Record<AppRoute, string> = {
+  home: "Workspaces",
+  dashboard: "Dashboard",
   inbox: "Inbox",
-  tasks: "Tasks",
-  views: "Views",
-  task: "Task Studio",
   agents: "Agents",
-  lifecycle: "Lifecycle",
-  history: "History",
-  diagrams: "Diagrams",
-  usage: "Usage Stats",
   settings: "Settings",
-  templates: "Templates",
-  workflows: "Workflows",
+  project: "Project",
 };
 
-const navGroups: Array<{ label: string; items: Array<{ id: Route; count?: string }> }> = [
+const navGroups: Array<{ label: string; items: Array<{ id: AppRoute; count?: string }> }> = [
   {
-    label: "Workspace",
+    label: "Main",
     items: [
-      { id: "workspace", count: "live" },
-      { id: "orchestrator", count: "1" },
-      { id: "inbox", count: "3" },
-      { id: "tasks", count: "2" },
-      { id: "views", count: "7" },
+      { id: "home", count: "live" },
+      { id: "dashboard", count: "3" },
+      { id: "inbox", count: "5" },
     ],
   },
   {
     label: "Library",
     items: [
-      { id: "templates" },
-      { id: "workflows" },
-    ],
-  },
-  {
-    label: "Agents",
-    items: [
       { id: "agents", count: "10" },
-      { id: "lifecycle", count: "12" },
     ],
   },
   {
     label: "Operate",
     items: [
-      { id: "history", count: "48" },
-      { id: "diagrams", count: "2" },
-      { id: "usage", count: "MVP" },
       { id: "settings" },
     ],
   },
@@ -203,7 +167,8 @@ const navGroups: Array<{ label: string; items: Array<{ id: Route; count?: string
 
 export function App() {
   const apiConfigured = getSarathiApiConfig() !== null;
-  const [route, setRoute] = useState<Route>("workspace");
+  const [route, setRoute] = useState<AppRoute>("home");
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<TaskDashboardItem | null>(null);
   const [selectedUnitId, setSelectedUnitId] = useState("ST-02");
   const [taskTab, setTaskTab] = useState<TaskTab>("messages");
@@ -292,7 +257,7 @@ export function App() {
     function handleKeyDown(event: KeyboardEvent) {
       if ((event.metaKey || event.ctrlKey) && event.key === "k") {
         event.preventDefault();
-        setRoute("orchestrator");
+        setRoute("dashboard");
       }
     }
     window.addEventListener("keydown", handleKeyDown);
@@ -310,7 +275,7 @@ export function App() {
     >
     <div className={dark ? "app dark" : "app"}>
       <aside className="sidebar">
-        <button className="brand" onClick={() => setRoute("workspace")}>
+        <button className="brand" onClick={() => setRoute("home")}>
           <div className="brand-mark">S</div>
           <div>
             <strong>Sarathi</strong>
@@ -318,7 +283,7 @@ export function App() {
           </div>
         </button>
 
-        <button className="workspace-switch" onClick={() => setRoute("workspace")}>
+        <button className="workspace-switch" onClick={() => setRoute("home")}>
           <span className="dot live" />
           <span style={{ flex: 1 }}>
             <strong>{workspace.id}</strong>
@@ -359,7 +324,7 @@ export function App() {
             <span className="crumb">Workspace / {workspace.id}</span>
             <h1>{routes[route]}</h1>
           </div>
-          <button className="command" onClick={() => setRoute("orchestrator")}>
+          <button className="command" onClick={() => setRoute("dashboard")}>
             <MagnifyingGlassIcon />
             Ask Sarathi to plan, split, dispatch, review...
             <kbd>⌘K</kbd>
@@ -367,7 +332,7 @@ export function App() {
           <button className="icon-action" title="Toggle dark mode" onClick={() => setDark((value) => !value)}>
             {dark ? <SunIcon /> : <MoonIcon />}
           </button>
-          <button className="primary" onClick={() => setRoute("orchestrator")}>
+          <button className="primary" onClick={() => setRoute("dashboard")}>
             <PlusIcon />
             New task
           </button>
@@ -382,32 +347,12 @@ export function App() {
             <Pill tone="blocked">Claude offline</Pill>
           </section>
 
-          {route === "workspace" && <WorkspaceOverview setRoute={setRoute} liveTick={liveTick} />}
-          {route === "orchestrator" && <Orchestrator setRoute={setRoute} />}
-          {route === "inbox" && <Inbox />}
-          {route === "tasks" && <TaskDashboard liveTick={liveTick} setRoute={setRoute} setSelectedTask={setSelectedTask} />}
-          {route === "views" && <SavedViews setRoute={setRoute} />}
-          {route === "task" && (
-            <TaskStudio
-              selectedUnit={selectedUnit}
-              selectedTask={selectedTask}
-              selectedUnitId={selectedUnitId}
-              setSelectedUnitId={setSelectedUnitId}
-              taskTab={taskTab}
-              setTaskTab={setTaskTab}
-              showList={showList}
-              setShowList={setShowList}
-              liveTick={liveTick}
-            />
-          )}
-          {route === "agents" && <Agents liveTick={liveTick} />}
-          {route === "lifecycle" && <Lifecycle liveTick={liveTick} />}
-          {route === "history" && <History liveTick={liveTick} />}
-          {route === "diagrams" && <Diagrams liveTick={liveTick} setRoute={setRoute} />}
-          {route === "usage" && <Usage liveTick={liveTick} />}
-          {route === "settings" && <Settings />}
-          {route === "templates" && <TemplatesPage />}
-          {route === "workflows" && <WorkflowsPage />}
+          {route === "home" && <WorkspacesHome setRoute={(r) => setRoute(r as AppRoute)} setSelectedWorkspaceId={setSelectedProjectId} />}
+          {route === "dashboard" && <Dashboard />}
+          {route === "inbox" && <InboxPage />}
+          {route === "agents" && <AgentsPage />}
+          {route === "settings" && <SettingsPage />}
+          {route === "project" && <ProjectDetail />}
         </div>
       </main>
     </div>
@@ -420,7 +365,7 @@ function WorkspaceOverview({
   setRoute,
 }: {
   liveTick: number;
-  setRoute: (route: Route) => void;
+  setRoute: (route: AppRoute) => void;
 }) {
   const apiConfigured = getSarathiApiConfig() !== null;
   const [attachedRepos, setAttachedRepos] = useState<WorkspaceRepo[]>(workspace.repos);
@@ -613,8 +558,8 @@ function WorkspaceOverview({
           product: PRD, plan, graph, evidence, review, handoff, and learnings.
         </p>
         <div className="actions">
-          <button className="primary" onClick={() => setRoute("orchestrator")}>Start with Sarathi</button>
-          <button onClick={() => setRoute("task")}>Open Task Studio</button>
+          <button className="primary" onClick={() => setRoute("dashboard")}>Start with Sarathi</button>
+          <button onClick={() => setRoute("project")}>Open Project</button>
         </div>
       </section>
 
@@ -788,7 +733,7 @@ function createDemoPreview(path: string): RepositoryIntakePreview {
   };
 }
 
-function Orchestrator({ setRoute }: { setRoute: (route: Route) => void }) {
+function Orchestrator({ setRoute }: { setRoute: (route: AppRoute) => void }) {
   const apiConfigured = getSarathiApiConfig() !== null;
   const [prompt, setPrompt] = useState("Build Sarathi UI through Sarathi dogfood workflow.");
   const [draft, setDraft] = useState<TaskDraftResult | null>(null);
@@ -912,7 +857,7 @@ function Orchestrator({ setRoute }: { setRoute: (route: Route) => void }) {
         <button className="full" onClick={approvePrdAndGenerateGraph} disabled={!draft || isCreating}>
           Approve PRD/AC and generate graph
         </button>
-        <button className="primary full" onClick={() => setRoute("task")}>Open Task Studio</button>
+        <button className="primary full" onClick={() => setRoute("project")}>Open Task Studio</button>
       </section>
     </div>
   );
@@ -1071,7 +1016,7 @@ function TaskDashboard({
   setSelectedTask,
 }: {
   liveTick: number;
-  setRoute: (route: Route) => void;
+  setRoute: (route: AppRoute) => void;
   setSelectedTask: (task: TaskDashboardItem | null) => void;
 }) {
   const apiConfigured = getSarathiApiConfig() !== null;
@@ -1149,7 +1094,7 @@ function TaskDashboard({
           </thead>
           <tbody>
             {filteredTasks.map((task) => (
-              <tr key={task.id} onClick={() => { setSelectedTask(task); setRoute("task"); }}>
+              <tr key={task.id} onClick={() => { setSelectedTask(task); setRoute("project"); }}>
                 <td style={{ fontFamily: "monospace", fontSize: "0.75rem", color: "var(--muted)" }}>{task.id}</td>
                 <td style={{ fontWeight: 500 }}>{task.title}</td>
                 <td><Pill tone={stateTone(task.status)}>{task.status}</Pill></td>
@@ -1168,7 +1113,7 @@ function TaskDashboard({
           key={task.id}
           onClick={() => {
             setSelectedTask(task);
-            setRoute("task");
+            setRoute("project");
           }}
         >
           <PanelTitle title={task.id} badge={task.status} />
@@ -1255,7 +1200,7 @@ function formatRole(role: string): string {
     .join(" ");
 }
 
-function SavedViews({ setRoute }: { setRoute: (route: Route) => void }) {
+function SavedViews({ setRoute }: { setRoute: (route: AppRoute) => void }) {
   return (
     <section className="panel">
       <PanelTitle title="Built-in saved views" badge="MVP" />
@@ -1268,7 +1213,7 @@ function SavedViews({ setRoute }: { setRoute: (route: Route) => void }) {
           { id: "ready-pr", label: "Ready for PR", target: "history" },
           { id: "provider-failures", label: "Provider failures", target: "settings" },
         ].map((view) => (
-          <button className="card" key={view.id} onClick={() => setRoute(view.target as Route)}>
+          <button className="card" key={view.id} onClick={() => setRoute(view.target as AppRoute)}>
             <strong>{view.label}</strong>
             <p>Workspace-scoped filter for Tasks and History.</p>
           </button>
@@ -2390,7 +2335,7 @@ function History({ compact = false, liveTick = 0 }: { compact?: boolean; liveTic
   );
 }
 
-function Diagrams({ liveTick, setRoute }: { liveTick: number; setRoute: (route: Route) => void }) {
+function Diagrams({ liveTick, setRoute }: { liveTick: number; setRoute: (route: AppRoute) => void }) {
   const { snapshot, status } = useWorkspaceOperationalViews(liveTick);
   const liveDiagrams = snapshot?.diagrams;
   return (
@@ -2408,14 +2353,14 @@ function Diagrams({ liveTick, setRoute }: { liveTick: number; setRoute: (route: 
             ) : (
               <small>{diagram.task_id ?? diagram.updated_at ?? "workspace artifact"}</small>
             )}
-            <button onClick={() => setRoute(diagram.kind === "agent_lifecycle" ? "lifecycle" : "task")}>
+            <button onClick={() => setRoute(diagram.kind === "agent_lifecycle" ? "home" : "project")}>
               Open {diagram.kind === "agent_lifecycle" ? "Lifecycle" : "Task Studio"}
             </button>
           </Card>
         )) : (
           <>
-            <Card><strong>Dependency graph</strong><p>Task graph artifact generated from real subtask state.</p><button onClick={() => setRoute("task")}>Open Task Studio</button></Card>
-            <Card><strong>Agent lifecycle</strong><p>Role flow, review loop, and handoff state.</p><button onClick={() => setRoute("lifecycle")}>Open Lifecycle</button></Card>
+            <Card><strong>Dependency graph</strong><p>Task graph artifact generated from real subtask state.</p><button onClick={() => setRoute("project")}>Open Task Studio</button></Card>
+            <Card><strong>Agent lifecycle</strong><p>Role flow, review loop, and handoff state.</p><button onClick={() => setRoute("home")}>Open Lifecycle</button></Card>
           </>
         )}
       </div>

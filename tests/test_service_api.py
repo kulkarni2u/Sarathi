@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import pytest
 
 from src.service import create_app, create_http_server
+from src.storage import Storage, connect, run_migrations
 
 
 def request(app, method, path, body=None, correlation_id="corr-test"):
@@ -71,6 +72,42 @@ def test_workspace_lifecycle_is_persisted_without_touching_repo_paths(tmp_path):
     assert data["workspaces"][0]["name"] == "Pravaha UI"
 
 
+def test_workspace_repository_action_preference_can_be_saved(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "PATCH",
+            f"/api/workspaces/{workspace_id}",
+            {
+                "metadata": {
+                    "repository_action_preference": {
+                        "scope": "workspace",
+                        "mode": "draft_pr",
+                    }
+                }
+            },
+        )
+    )
+
+    assert status == 200
+    assert data["workspace"]["metadata"]["repository_action_preference"]["scope"] == "workspace"
+    assert data["workspace"]["metadata"]["repository_action_preference"]["mode"] == "draft_pr"
+
+    _, workspace_again = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}"))
+    assert workspace_again["workspace"]["metadata"]["repository_action_preference"]["mode"] == "draft_pr"
+
+
 def test_task_lifecycle_for_workspace(tmp_path):
     app = create_app(tmp_path / "sarathi.db")
     _, workspace_data = assert_ok(
@@ -109,6 +146,54 @@ def test_task_lifecycle_for_workspace(tmp_path):
     assert list_data["tasks"] == [task]
 
 
+def test_task_handoff_creates_checkpoint_capsule(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(app, "POST", "/api/workspaces", {"name": "QA", "root_path": "/tmp/qa"})
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+    _, task_data = assert_ok(
+        request(app, "POST", f"/api/workspaces/{workspace_id}/tasks", {"title": "Checkpoint task"})
+    )
+    task_id = task_data["task"]["id"]
+    storage = Storage(connect(tmp_path / "sarathi.db"))
+    storage.create_review_run(workspace_id=workspace_id, task_id=task_id, status="approved", summary="OK")
+    status, handoff_data = assert_ok(request(app, "POST", f"/api/tasks/{task_id}/handoff", {}))
+    assert status == 201
+    checkpoint = handoff_data["checkpoint"]
+    assert checkpoint["source_task_id"] == task_id
+    assert checkpoint["status"] == "ready"
+
+
+def test_task_checkpoint_can_be_retrieved_and_restarted(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(app, "POST", "/api/workspaces", {"name": "QA", "root_path": "/tmp/qa"})
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+    _, task_data = assert_ok(
+        request(app, "POST", f"/api/workspaces/{workspace_id}/tasks", {"title": "Checkpoint task"})
+    )
+    task_id = task_data["task"]["id"]
+    storage = Storage(connect(tmp_path / "sarathi.db"))
+    storage.create_review_run(workspace_id=workspace_id, task_id=task_id, status="approved", summary="OK")
+    assert_ok(request(app, "POST", f"/api/tasks/{task_id}/handoff", {}))
+
+    status, checkpoint_data = assert_ok(request(app, "GET", f"/api/tasks/{task_id}/checkpoint"))
+    assert status == 200
+    checkpoint = checkpoint_data["checkpoint"]
+    assert checkpoint["source_task_id"] == task_id
+    assert checkpoint["status"] == "ready"
+
+    status, restart_data = assert_ok(request(app, "POST", f"/api/tasks/{task_id}/checkpoint/restart", {}))
+    assert status == 201
+    restarted_task = restart_data["task"]
+    assert restarted_task["workspace_id"] == workspace_id
+    assert restarted_task["status"] == "prd_pending"
+    assert restarted_task["metadata"]["source_checkpoint_id"] == checkpoint["id"]
+    assert restarted_task["metadata"]["repository_action_preference"] == checkpoint["repository_action_preference"]
+
+
 def test_workspace_and_placeholder_task_resources(tmp_path):
     app = create_app(tmp_path / "sarathi.db")
     _, workspace_data = assert_ok(
@@ -137,6 +222,50 @@ def test_workspace_and_placeholder_task_resources(tmp_path):
     assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/handoff"))
     assert_ok(request(app, "GET", f"/api/providers?workspace_id={workspace['id']}"))
     assert_ok(request(app, "GET", f"/api/events?workspace_id={workspace['id']}"))
+
+
+def test_task_panel_snapshot_endpoint_merges_timeline_entries(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task_id = create_task_with_panel_entries(app, tmp_path)
+
+    status, data = assert_ok(request(app, "GET", f"/api/tasks/{task_id}/panel"))
+
+    assert status == 200
+    assert data["task_id"] == task_id
+    assert [entry["kind"] for entry in data["entries"]] == [
+        "human_message",
+        "blocked",
+        "review",
+        "claimed",
+        "evidence",
+        "review",
+        "handoff",
+    ]
+    assert data["entries"][0]["summary"] == "Start the panel flow."
+    assert data["entries"][1]["summary"] == "Task blocked: waiting_user"
+    assert data["entries"][3]["target"] == "subtask-1"
+
+
+def test_dispatch_persists_usage_metadata_for_operational_views(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+
+    _, studio_before = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    first_node = studio_before["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{first_node['id']}/dispatch",
+            {"provider": "local"},
+        )
+    )
+
+    assert status == 201
+    assert data["dispatch"]["metadata"]["usage"]["total_tokens"] > 0
+    assert data["dispatch"]["metadata"]["usage"]["budget_state"] in {"ok", "warning", "near_limit", "exhausted", "unknown"}
+    assert data["dispatch"]["metadata"]["usage"]["usage_source"] in {"reported", "estimated", "mixed"}
 
 
 def test_approval_endpoint_persists_gate_and_event(tmp_path):
@@ -181,6 +310,51 @@ def test_approval_endpoint_persists_gate_and_event(tmp_path):
     assert events_data["events"][-1]["object_id"] == approval["id"]
 
 
+def test_chat_and_task_draft_persist_project_context(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+    project_id = "project-123"
+
+    status, draft_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {
+                "prompt": "Build a project-scoped task draft.",
+                "title": "Project-scoped draft",
+                "context": {"projectId": project_id},
+            },
+        )
+    )
+    assert status == 201
+    draft_task = draft_data["task"]
+    assert draft_task["metadata"]["project_id"] == project_id
+
+    status, chat_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/chat",
+            {
+                "message": "Plan the workspace onboarding flow.",
+                "context": {"workspaceId": workspace_id, "projectId": project_id},
+            },
+        )
+    )
+    assert status == 201
+    _, task_data = assert_ok(request(app, "GET", f"/api/tasks/{chat_data['taskId']}"))
+    assert task_data["task"]["metadata"]["project_id"] == project_id
+
+
 def test_http_sse_stream_returns_persisted_events(tmp_path):
     with running_server(tmp_path / "sarathi.db", token="secret") as base_url:
         _, workspace_data = http_json(
@@ -191,7 +365,7 @@ def test_http_sse_stream_returns_persisted_events(tmp_path):
         )
         workspace_id = workspace_data["data"]["workspace"]["id"]
 
-        status, headers, body = http_raw(
+        status, headers, body = http_sse(
             "GET",
             f"{base_url}/api/events/stream?workspace_id={workspace_id}",
             token="secret",
@@ -199,8 +373,66 @@ def test_http_sse_stream_returns_persisted_events(tmp_path):
 
         assert status == 200
         assert headers["content-type"].startswith("text/event-stream")
+        assert headers.get("content-length") is None
         assert "event: snapshot" in body
         assert "workspace.created" in body
+
+
+def test_http_sse_stream_filters_by_task_id(tmp_path):
+    with running_server(tmp_path / "sarathi.db", token="secret") as base_url:
+        _, workspace_data = http_json(
+            "POST",
+            f"{base_url}/api/workspaces",
+            token="secret",
+            body={"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+        workspace_id = workspace_data["data"]["workspace"]["id"]
+
+        _, task_one = http_json(
+            "POST",
+            f"{base_url}/api/workspaces/{workspace_id}/tasks",
+            token="secret",
+            body={"title": "Task one"},
+        )
+        task_one_id = task_one["data"]["task"]["id"]
+
+        _, task_two = http_json(
+            "POST",
+            f"{base_url}/api/workspaces/{workspace_id}/tasks",
+            token="secret",
+            body={"title": "Task two"},
+        )
+        task_two_id = task_two["data"]["task"]["id"]
+
+        db_path = tmp_path / "sarathi.db"
+        with connect(db_path) as conn:
+            run_migrations(conn)
+            storage = Storage(conn)
+            storage.create_lifecycle_event(
+                workspace_id=workspace_id,
+                task_id=task_one_id,
+                event_type="task.blocked",
+                payload={"reason": "waiting_task_one"},
+            )
+            storage.create_lifecycle_event(
+                workspace_id=workspace_id,
+                task_id=task_two_id,
+                event_type="task.blocked",
+                payload={"reason": "waiting_task_two"},
+            )
+
+        status, headers, body = http_sse(
+            "GET",
+            f"{base_url}/api/events/stream?workspace_id={workspace_id}&task_id={task_one_id}&token=secret",
+            token="secret",
+        )
+
+        assert status == 200
+        assert headers["content-type"].startswith("text/event-stream")
+        assert headers.get("content-length") is None
+        assert "event: snapshot" in body
+        assert "waiting_task_one" in body
+        assert "waiting_task_two" not in body
 
 
 def test_http_sse_stream_accepts_query_token_for_browser_eventsource(tmp_path):
@@ -213,13 +445,14 @@ def test_http_sse_stream_accepts_query_token_for_browser_eventsource(tmp_path):
         )
         workspace_id = workspace_data["data"]["workspace"]["id"]
 
-        status, headers, body = http_raw(
+        status, headers, body = http_sse(
             "GET",
             f"{base_url}/api/events/stream?workspace_id={workspace_id}&token=secret",
         )
 
         assert status == 200
         assert headers["content-type"].startswith("text/event-stream")
+        assert headers.get("content-length") is None
         assert "event: snapshot" in body
         assert "workspace.created" in body
 
@@ -451,3 +684,157 @@ def http_raw(
         return response.status, dict(response.getheaders()), response.read().decode("utf-8")
     finally:
         connection.close()
+
+
+def http_sse(
+    method,
+    url,
+    *,
+    token=None,
+    body=None,
+    raw_body=None,
+    correlation_id="corr-http",
+    extra_headers=None,
+):
+    parsed = urlparse(url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=2)
+    data = raw_body if raw_body is not None else None
+    if data is None and body is not None:
+        data = json.dumps(body).encode("utf-8")
+    headers = {"x-correlation-id": correlation_id}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    if body is not None or raw_body is not None:
+        headers["content-type"] = "application/json"
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        path = parsed.path
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        connection.request(method, path, body=data, headers=headers)
+        response = connection.getresponse()
+        chunks: list[str] = []
+        while True:
+            line = response.readline().decode("utf-8")
+            if not line:
+                break
+            chunks.append(line)
+            if line in {"\n", "\r\n"}:
+                break
+        return response.status, dict(response.getheaders()), "".join(chunks)
+    finally:
+        connection.close()
+
+
+def create_task_with_panel_entries(app, tmp_path):
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+    db_path = tmp_path / "sarathi.db"
+    with connect(db_path) as conn:
+        run_migrations(conn)
+        storage = Storage(conn)
+        task = storage.create_task(
+            workspace_id=workspace_id,
+            title="Service-backed task panel",
+            description="Panel snapshot fixture.",
+            status="in_progress",
+        )
+        task_id = task["id"]
+        storage.create_message(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            role="user",
+            content="Start the panel flow.",
+            metadata={"target": "Sarathi"},
+        )
+        storage.create_lifecycle_event(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            event_type="task.blocked",
+            payload={"reason": "waiting_user"},
+        )
+        storage.create_approval_gate(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            name="PRD/AC",
+            status="pending",
+            metadata={"requires_human": True},
+        )
+        storage.create_dispatch(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            agent_name="Pravaha",
+            status="queued",
+            metadata={"subtask_id": "subtask-1"},
+        )
+        storage.create_evidence_artifact(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            artifact_type="doc",
+            uri="sarathi://evidence/doc-1",
+            metadata={"note": "panel evidence"},
+        )
+        storage.create_review_run(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            status="approved",
+            summary="Review approved.",
+            metadata={"review_type": "code"},
+        )
+        storage.create_handoff(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            summary="Handoff to Disha for implementation.",
+            from_agent="Pravaha",
+            to_agent="Disha",
+            metadata={"handoff_type": "panel"},
+        )
+    return task_id
+
+
+def create_task_with_ready_graph(app, tmp_path):
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+    _, draft_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {"prompt": "Dispatch ready work unit.", "title": "Service dispatch"},
+        )
+    )
+    task = draft_data["task"]
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task['id']}/approve",
+            {"name": "PRD/AC", "status": "approved"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/graph-draft"))
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task['id']}/approve",
+            {"name": "Task graph", "status": "approved"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    return task

@@ -9,6 +9,7 @@ import socketserver
 import sys
 import tempfile
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from src.dispatch import LocalDispatcher
 from src.init import InitWorkflow
 from src.policy import compile_policy_pack
-from src.runtime import DispatchRequest, GraphExecutionPolicy, list_agent_roles
+from src.runtime import DispatchRequest, GraphExecutionPolicy, UsageRecord, list_agent_roles
 from src.storage import Storage, connect, run_migrations
 
 MAX_BODY_BYTES = 64 * 1024
@@ -103,7 +104,13 @@ class ServiceApp:
         conn, storage = self._storage()
 
         if method == "GET" and parts == ["workspaces"]:
-            return 200, {"workspaces": storage.list_workspaces()}
+            workspaces = storage.list_workspaces()
+            for ws in workspaces:
+                stats = storage.get_workspace_stats(ws["id"])
+                ws["task_count"] = stats["task_count"]
+                ws["active_count"] = stats["active_count"]
+                ws["last_activity"] = stats["last_activity"]
+            return 200, {"workspaces": workspaces}
 
         if method == "POST" and parts == ["workspaces"]:
             workspace = storage.create_workspace(
@@ -123,6 +130,32 @@ class ServiceApp:
             if workspace is None:
                 raise ServiceError("not_found", "Workspace not found.", 404)
             return 200, {"workspace": workspace}
+
+        if method == "PATCH" and len(parts) == 2 and parts[0] == "workspaces":
+            workspace = storage.get_workspace(parts[1])
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            raw_metadata = _optional_dict(body, "metadata")
+            if raw_metadata is None or "repository_action_preference" not in raw_metadata:
+                raise ServiceError(
+                    "invalid_request",
+                    "Field 'metadata.repository_action_preference' is required.",
+                    400,
+                )
+            preference = _normalize_repository_action_preference(
+                raw_metadata["repository_action_preference"],
+                fallback_scope="workspace",
+            )
+            if preference is None:
+                raise ServiceError(
+                    "invalid_request",
+                    "Unsupported repository action preference.",
+                    400,
+                )
+            next_metadata = dict(workspace["metadata"])
+            next_metadata["repository_action_preference"] = preference
+            updated_workspace = storage.update_workspace(parts[1], metadata=next_metadata)
+            return 200, {"workspace": updated_workspace}
 
         if (
             method == "GET"
@@ -283,7 +316,7 @@ class ServiceApp:
                 workspace_id=workspace_id,
                 title=_required_text(body, "title"),
                 description=_optional_text(body, "description"),
-                metadata=_optional_dict(body, "metadata"),
+                metadata=_merge_task_defaults(_optional_dict(body, "metadata")),
             )
             storage.create_lifecycle_event(
                 workspace_id=workspace_id,
@@ -304,7 +337,11 @@ class ServiceApp:
                 raise ServiceError("not_found", "Workspace not found.", 404)
             prompt = _required_text(body, "prompt")
             title = _optional_text(body, "title") or _derive_task_title(prompt)
-            metadata = _task_draft_metadata(prompt)
+            context = _optional_dict(body, "context") or {}
+            metadata = _task_draft_metadata(
+                prompt,
+                project_id=_task_context_project_id(context),
+            )
             task = storage.create_task(
                 workspace_id=workspace_id,
                 title=title,
@@ -358,6 +395,96 @@ class ServiceApp:
                 "messages": [user_message, sarathi_message],
             }
 
+        if (
+            method == "POST"
+            and len(parts) == 5
+            and parts[0] == "workspaces"
+            and parts[2] == "github"
+            and parts[3] == "issues"
+            and parts[4] == "import"
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            context = _optional_dict(body, "context") or {}
+            project_id = _task_context_project_id(context)
+            issue, repository = _build_github_issue_reference(storage, workspace_id, body)
+            task_title = _optional_text(body, "title") or f"GitHub issue #{issue['number']}"
+            task_metadata = _task_draft_metadata(
+                issue["url"] or f"GitHub issue #{issue['number']}",
+                project_id=project_id,
+            )
+            task_metadata["source"] = "github_issue"
+            task_metadata["github_issue"] = issue
+            repository_metadata: dict[str, Any] = {}
+            if issue["full_name"]:
+                repository_metadata["github"] = {
+                    "host": issue["host"],
+                    "owner": issue["owner"],
+                    "name": issue["name"],
+                    "full_name": issue["full_name"],
+                    "repository_url": issue["repository_url"],
+                }
+            if repository is not None:
+                repository_metadata.update(_github_repository_metadata(repository))
+                if repository.get("remote_url"):
+                    repository_metadata["remote_url"] = repository["remote_url"]
+            if repository_metadata:
+                task_metadata["repository"] = repository_metadata
+            task = storage.create_task(
+                workspace_id=workspace_id,
+                title=task_title,
+                status="prd_pending",
+                description=issue["url"] or f"Imported GitHub issue #{issue['number']}.",
+                metadata=task_metadata,
+            )
+            user_message = storage.create_message(
+                workspace_id=workspace_id,
+                task_id=task["id"],
+                role="user",
+                content=issue["url"] or f"GitHub issue #{issue['number']}",
+                metadata={"target": "Sarathi", "source": "github_issue_import"},
+            )
+            sarathi_message = storage.create_message(
+                workspace_id=workspace_id,
+                task_id=task["id"],
+                role="sarathi",
+                content=(
+                    "I drafted the PRD/AC shell from the GitHub issue reference and opened "
+                    "the PRD/AC approval gate before graph generation."
+                ),
+                metadata={"draft_task_id": task["id"], "gate": "PRD/AC", "source": "github_issue_import"},
+            )
+            gate = storage.create_approval_gate(
+                workspace_id=workspace_id,
+                task_id=task["id"],
+                name="PRD/AC",
+                status="pending",
+                metadata={
+                    "requires_human": True,
+                    "source_issue": issue["url"] or f"GitHub issue #{issue['number']}",
+                    "acceptance_criteria": task_metadata["acceptance_criteria"],
+                },
+            )
+            storage.create_lifecycle_event(
+                workspace_id=workspace_id,
+                task_id=task["id"],
+                event_type="task.draft_created",
+                payload={"object_id": task["id"], "gate": gate["id"]},
+            )
+            storage.create_lifecycle_event(
+                workspace_id=workspace_id,
+                task_id=task["id"],
+                event_type="approval.requested",
+                payload={"object_id": gate["id"], "name": gate["name"]},
+            )
+            return 201, {
+                "task": task,
+                "approval_gate": gate,
+                "messages": [user_message, sarathi_message],
+            }
+
         if method == "GET" and len(parts) == 2 and parts[0] == "tasks":
             task = storage.get_task(parts[1])
             if task is None:
@@ -371,6 +498,11 @@ class ServiceApp:
             resource = parts[2]
             if resource == "studio":
                 return 200, _task_studio_snapshot(storage, task)
+            if resource == "panel":
+                return 200, {
+                    "task_id": task["id"],
+                    "entries": storage.list_task_panel_entries(task["id"]),
+                }
             if resource == "graph":
                 return 200, _graph_for_task(storage, task)
             if resource == "evidence":
@@ -388,12 +520,30 @@ class ServiceApp:
                     "task_id": parts[1],
                     "handoff": _latest_or_none(storage.list_handoffs_for_task(parts[1])),
                 }
+            if resource == "checkpoint":
+                return 200, {
+                    "task_id": parts[1],
+                    "checkpoint": _latest_or_none(
+                        storage.list_checkpoint_capsules_for_task(parts[1])
+                    ),
+                }
             if resource == "messages":
                 return 200, {"messages": storage.list_messages(task_id=parts[1])}
             if resource == "approvals":
                 return 200, {
                     "approval_gates": storage.list_approval_gates_for_task(parts[1])
                 }
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "tasks"
+            and parts[2] == "dispatches"
+        ):
+            task = storage.get_task(parts[1])
+            if task is None:
+                raise ServiceError("not_found", "Task not found.", 404)
+            return 200, {"dispatches": storage.list_dispatches_for_task(parts[1])}
 
         if (
             method == "POST"
@@ -573,6 +723,42 @@ class ServiceApp:
 
         if (
             method == "POST"
+            and len(parts) == 4
+            and parts[0] == "tasks"
+            and parts[2] == "checkpoint"
+            and parts[3] == "restart"
+        ):
+            task = storage.get_task(parts[1])
+            if task is None:
+                raise ServiceError("not_found", "Task not found.", 404)
+            checkpoint = _latest_or_none(storage.list_checkpoint_capsules_for_task(task["id"]))
+            if checkpoint is None:
+                raise ServiceError("not_found", "Checkpoint not found.", 404)
+            new_task = storage.create_task(
+                workspace_id=checkpoint["workspace_id"],
+                title=f"Resume: {checkpoint['summary'][:80]}",
+                description=checkpoint["summary"],
+                status="prd_pending",
+                metadata={
+                    "source_checkpoint_id": checkpoint["id"],
+                    "source_task_id": checkpoint["source_task_id"],
+                    "project_id": checkpoint["project_id"],
+                    "repository_action_preference": checkpoint["repository_action_preference"],
+                },
+            )
+            storage.create_lifecycle_event(
+                workspace_id=checkpoint["workspace_id"],
+                task_id=new_task["id"],
+                event_type="task.checkpoint_restarted",
+                payload={
+                    "object_id": checkpoint["id"],
+                    "source_task_id": checkpoint["source_task_id"],
+                },
+            )
+            return 201, {"task": new_task, "checkpoint": checkpoint}
+
+        if (
+            method == "POST"
             and len(parts) == 3
             and parts[0] == "tasks"
             and parts[2] == "repository-action"
@@ -621,6 +807,29 @@ class ServiceApp:
             return 200, {
                 "events": storage.list_events(workspace_id=workspace_id, task_id=task_id)
             }
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
+            and parts[2] == "policy-pack"
+        ):
+            workspace_id = parts[1]
+            if storage.get_workspace(workspace_id) is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, _get_policy_pack(storage, workspace_id)
+
+        if (
+            method == "PUT"
+            and len(parts) == 4
+            and parts[0] == "workspaces"
+            and parts[2] == "policy-pack"
+        ):
+            workspace_id = parts[1]
+            if storage.get_workspace(workspace_id) is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            filename = parts[3]
+            return 200, _put_policy_pack_file(storage, workspace_id, filename, body)
 
         raise ServiceError("not_found", "Endpoint not found.", 404)
 
@@ -714,18 +923,38 @@ def create_http_server(
                 app._authorize_stream(dict(self.headers.items()), _query(self.path))
                 status, data = app._route("GET", ["api", "events"], _query(self.path), {})
                 payload = json.dumps(data, sort_keys=True)
-                encoded = f"event: snapshot\ndata: {payload}\n\n".encode("utf-8")
                 self.send_response(status, HTTPStatus(status).phrase)
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("cache-control", "no-cache")
-                self.send_header("content-length", str(len(encoded)))
-                self.send_header("connection", "close")
+                self.send_header("connection", "keep-alive")
+                self.send_header("x-accel-buffering", "no")
                 self._write_cors_headers()
                 self.end_headers()
-                self.wfile.write(encoded)
-                self.close_connection = True
+                last_payload = payload
+                try:
+                    self._write_sse_snapshot(payload)
+                    while True:
+                        time.sleep(2.0)
+                        try:
+                            _, next_data = app._route("GET", ["api", "events"], _query(self.path), {})
+                        except ServiceError:
+                            break
+                        next_payload = json.dumps(next_data, sort_keys=True)
+                        if next_payload != last_payload:
+                            self._write_sse_snapshot(next_payload)
+                            last_payload = next_payload
+                        else:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
             except ServiceError as error:
                 self._write_json(error.status, _error(error, correlation_id))
+
+        def _write_sse_snapshot(self, payload: str) -> None:
+            encoded = f"event: snapshot\ndata: {payload}\n\n".encode("utf-8")
+            self.wfile.write(encoded)
+            self.wfile.flush()
 
         def _read_json_body(self) -> tuple[dict[str, Any] | None, ServiceError | None]:
             try:
@@ -846,6 +1075,179 @@ def _optional_dict(body: Mapping[str, Any], key: str) -> dict[str, Any] | None:
     return value
 
 
+_REPOSITORY_ACTION_MODES = ["no_action", "prepare_patch", "commit", "draft_pr", "ready_pr"]
+
+
+def _default_repository_action_preference() -> dict[str, Any]:
+    return {
+        "scope": "default",
+        "mode": "no_action",
+        "allowed_modes": list(_REPOSITORY_ACTION_MODES),
+    }
+
+
+def _normalize_repository_action_preference(
+    preference: Any,
+    *,
+    fallback_scope: str,
+) -> dict[str, Any] | None:
+    if not isinstance(preference, Mapping):
+        return None
+    mode = preference.get("mode")
+    if mode not in _REPOSITORY_ACTION_MODES:
+        return None
+    scope = preference.get("scope")
+    if scope not in {"task", "project", "workspace", "default"}:
+        scope = fallback_scope
+    normalized = {
+        "scope": scope,
+        "mode": mode,
+        "allowed_modes": list(_REPOSITORY_ACTION_MODES),
+    }
+    if "source" in preference and isinstance(preference.get("source"), str):
+        normalized["source"] = preference["source"]
+    return normalized
+
+
+def _effective_repository_action_preference(
+    task: Mapping[str, Any],
+    workspace: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    task_metadata = task.get("metadata") or {}
+    task_preference = _normalize_repository_action_preference(
+        task_metadata.get("repository_action_preference"),
+        fallback_scope="task",
+    )
+    if task_preference is not None and task_preference["scope"] != "default":
+        return task_preference
+
+    project_preference = _normalize_repository_action_preference(
+        task_metadata.get("project_repository_action_preference"),
+        fallback_scope="project",
+    )
+    if project_preference is not None:
+        return project_preference
+
+    if workspace is not None:
+        workspace_metadata = workspace.get("metadata") or {}
+        workspace_preference = _normalize_repository_action_preference(
+            workspace_metadata.get("repository_action_preference"),
+            fallback_scope="workspace",
+        )
+        if workspace_preference is not None:
+            return workspace_preference
+
+    return task_preference or _default_repository_action_preference()
+
+
+def _merge_task_defaults(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    next_metadata = dict(metadata or {})
+    next_metadata.setdefault("repository_action_preference", _default_repository_action_preference())
+    return next_metadata
+
+
+def _parse_github_issue_url(issue_url: str) -> dict[str, Any]:
+    parsed = urlparse(issue_url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 4 or parts[2] != "issues":
+        raise ServiceError(
+            "invalid_request",
+            "GitHub issue URLs must look like https://github.com/<owner>/<repo>/issues/<number>.",
+            400,
+        )
+    owner, repo, _, number_text = parts[:4]
+    try:
+        issue_number = int(number_text)
+    except ValueError as exc:
+        raise ServiceError("invalid_request", "GitHub issue number must be an integer.", 400) from exc
+    return {
+        "url": issue_url,
+        "host": parsed.netloc,
+        "owner": owner,
+        "name": repo,
+        "full_name": f"{owner}/{repo}",
+        "number": issue_number,
+        "repository_url": f"{parsed.scheme}://{parsed.netloc}/{owner}/{repo}",
+    }
+
+
+def _github_repository_metadata(repository: dict[str, Any]) -> dict[str, Any]:
+    metadata = {
+        "workspace_repository_id": repository["id"],
+        "workspace_repository_name": repository["name"],
+        "workspace_repository_path": repository["path"],
+        "workspace_repository_remote_url": repository["remote_url"],
+    }
+    return metadata
+
+
+def _resolve_issue_repository(
+    storage: Storage,
+    workspace_id: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    repository_id = _optional_text(body, "repository_id")
+    if repository_id is not None:
+        repository = storage.get_workspace_repository(repository_id)
+        if repository is None or repository["workspace_id"] != workspace_id:
+            raise ServiceError("not_found", "Repository not found.", 404)
+        return repository
+
+    repositories = storage.list_workspace_repositories(workspace_id)
+    if len(repositories) == 1 and body.get("issue_number") is not None:
+        return repositories[0]
+    return None
+
+
+def _build_github_issue_reference(
+    storage: Storage,
+    workspace_id: str,
+    body: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    issue_url = _optional_text(body, "issue_url")
+    if issue_url:
+        issue = _parse_github_issue_url(issue_url)
+        repository = _resolve_issue_repository(storage, workspace_id, body)
+        issue["repository"] = {
+            "host": issue["host"],
+            "owner": issue["owner"],
+            "name": issue["name"],
+            "full_name": issue["full_name"],
+            "repository_url": issue["repository_url"],
+        }
+        if repository is not None:
+            issue["repository"].update(_github_repository_metadata(repository))
+            if repository.get("remote_url"):
+                issue["repository"]["remote_url"] = repository["remote_url"]
+        return issue, repository
+
+    issue_number_value = body.get("issue_number")
+    if issue_number_value is None:
+        raise ServiceError("invalid_request", "Field 'issue_url' or 'issue_number' is required.", 400)
+    if not isinstance(issue_number_value, int):
+        raise ServiceError("invalid_request", "Field 'issue_number' must be an integer.", 400)
+    repository = _resolve_issue_repository(storage, workspace_id, body)
+    if repository is None:
+        raise ServiceError(
+            "invalid_request",
+            "Provide repository_id when importing a GitHub issue by number.",
+            400,
+        )
+    issue = {
+        "url": None,
+        "host": None,
+        "owner": None,
+        "name": None,
+        "full_name": None,
+        "number": issue_number_value,
+        "repository_url": None,
+    }
+    issue["repository"] = _github_repository_metadata(repository)
+    if repository.get("remote_url"):
+        issue["repository"]["remote_url"] = repository["remote_url"]
+    return issue, repository
+
+
 def _derive_task_title(prompt: str) -> str:
     words = prompt.strip().split()
     if not words:
@@ -854,8 +1256,12 @@ def _derive_task_title(prompt: str) -> str:
     return title[:80] or "Untitled orchestrated task"
 
 
-def _task_draft_metadata(prompt: str) -> dict[str, Any]:
-    return {
+def _task_draft_metadata(
+    prompt: str,
+    *,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
         "source_prompt": prompt,
         "complexity": "high",
         "phase": "prd_ac_draft",
@@ -873,7 +1279,29 @@ def _task_draft_metadata(prompt: str) -> dict[str, Any]:
             "The source prompt is preserved as a task-scoped user message.",
             "Sarathi creates a PRD/AC approval gate before task graph generation.",
         ],
+        "repository_action_preference": _default_repository_action_preference(),
     }
+    if project_id:
+        metadata["project_id"] = project_id
+    return metadata
+
+
+def _task_context_project_id(context: Any) -> str | None:
+    if not isinstance(context, Mapping):
+        return None
+    value = context.get("projectId")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _task_context_workspace_id(context: Any) -> str | None:
+    if not isinstance(context, Mapping):
+        return None
+    value = context.get("workspaceId")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 def _has_approved_gate(storage: Storage, task_id: str, name: str) -> bool:
@@ -1058,6 +1486,7 @@ def _workspace_operational_views(storage: Storage, workspace_id: str) -> dict[st
             "messages": {"total": len(messages), "by_role": _count_by(messages, "role")},
             "repositories": {"total": len(repositories)},
             "dispatches": {"total": len(all_dispatches), "by_status": _count_by(all_dispatches, "status")},
+            "budget": _workspace_budget_summary(all_dispatches),
             "evidence": {"total": len(all_evidence), "by_type": _count_by(all_evidence, "artifact_type")},
             "reviews": {"total": len(all_reviews), "by_status": _count_by(all_reviews, "status")},
             "handoffs": {"total": len(all_handoffs)},
@@ -1113,6 +1542,71 @@ def _count_by(items: list[dict[str, Any]], key: str) -> dict[str, int]:
         value = str(item.get(key) or "unknown")
         counts[value] = counts.get(value, 0) + 1
     return counts
+
+
+def _workspace_budget_summary(dispatches: list[dict[str, Any]]) -> dict[str, Any] | None:
+    records = _dispatch_usage_records(dispatches)
+    if not records:
+        return None
+
+    total_tokens = sum(record.total_tokens for record in records)
+    budget_limits = [record.budget_limit for record in records if record.budget_limit is not None]
+    budget_limit = sum(budget_limits) if budget_limits else None
+
+    budget_remaining = None
+    records_with_limit = [record for record in records if record.budget_limit is not None]
+    if budget_limit is not None:
+        remaining_values = [record.budget_remaining for record in records_with_limit if record.budget_remaining is not None]
+        if remaining_values and len(remaining_values) == len(records_with_limit):
+            budget_remaining = sum(remaining_values)
+        else:
+            budget_remaining = max(budget_limit - total_tokens, 0)
+
+    budget_state = _worst_budget_state(records)
+    if budget_state == "unknown" and budget_limit is not None:
+        ratio = total_tokens / budget_limit if budget_limit > 0 else 1.0
+        if ratio >= 1.0:
+            budget_state = "exhausted"
+        elif ratio >= 0.9:
+            budget_state = "near_limit"
+        elif ratio >= 0.75:
+            budget_state = "warning"
+        else:
+            budget_state = "ok"
+
+    usage_sources = {record.usage_source for record in records}
+    usage_source = usage_sources.pop() if len(usage_sources) == 1 else "mixed"
+
+    return {
+        "total_tokens": total_tokens,
+        "budget_limit": budget_limit,
+        "budget_remaining": budget_remaining,
+        "budget_state": budget_state,
+        "usage_source": usage_source,
+    }
+
+
+def _dispatch_usage_records(dispatches: list[dict[str, Any]]) -> list[UsageRecord]:
+    records: list[UsageRecord] = []
+    for dispatch in dispatches:
+        metadata = dispatch.get("metadata")
+        if not isinstance(metadata, Mapping):
+            continue
+        usage = metadata.get("usage")
+        if not isinstance(usage, Mapping):
+            continue
+        record = UsageRecord.from_mapping(usage)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def _worst_budget_state(records: list[UsageRecord]) -> str:
+    severity = {"unknown": 0, "ok": 1, "warning": 2, "near_limit": 3, "exhausted": 4}
+    active_states = [record.budget_state for record in records if record.budget_state != "unknown"]
+    if not active_states:
+        return "unknown"
+    return max(active_states, key=lambda state: severity[state])
 
 
 def _dogfood_acceptance(storage: Storage, workspace: dict[str, Any]) -> dict[str, Any]:
@@ -1311,12 +1805,14 @@ def _create_task_handoff(storage: Storage, task: dict[str, Any]) -> dict[str, An
             "approval_required",
             "An approved review is required before final handoff.",
             409,
-        )
+    )
     graph = _graph_for_task(storage, task)
     evidence = storage.list_evidence_artifacts_for_task(task["id"])
     dispatches = storage.list_dispatches_for_task(task["id"])
     latest_review = approved_reviews[-1]
     ac_coverage = latest_review["metadata"].get("ac_coverage", [])
+    workspace = storage.get_workspace(task["workspace_id"])
+    repository_action_preference = _effective_repository_action_preference(task, workspace)
     summary = (
         f"Sarathi handoff for {task['title']}: "
         f"{len([node for node in graph['nodes'] if node['status'] == 'complete'])}/"
@@ -1337,7 +1833,12 @@ def _create_task_handoff(storage: Storage, task: dict[str, Any]) -> dict[str, An
             "dispatch_ids": [item["id"] for item in dispatches],
             "review_ids": [item["id"] for item in approved_reviews],
             "ac_coverage": ac_coverage,
-            "repository_action": {"status": "pending", "action": None},
+            "repository_action_preference": repository_action_preference,
+            "repository_action": {
+                "status": "pending",
+                "action": None,
+                "mode": repository_action_preference["mode"],
+            },
         },
     )
     gate = storage.create_approval_gate(
@@ -1348,7 +1849,8 @@ def _create_task_handoff(storage: Storage, task: dict[str, Any]) -> dict[str, An
         metadata={
             "requires_human": True,
             "handoff_id": handoff["id"],
-            "allowed_actions": ["no_action", "prepare_patch", "commit", "draft_pr"],
+            "allowed_actions": list(_REPOSITORY_ACTION_MODES),
+            "default_action": repository_action_preference["mode"],
         },
     )
     task_metadata = dict(task["metadata"])
@@ -1360,7 +1862,14 @@ def _create_task_handoff(storage: Storage, task: dict[str, Any]) -> dict[str, An
         event_type="handoff.created",
         payload={"object_id": handoff["id"], "repository_action_gate": gate["id"]},
     )
-    return {"handoff": handoff, "repository_action_gate": gate}
+    checkpoint = _create_task_checkpoint(
+        storage,
+        task,
+        handoff,
+        approved_reviews,
+        next_start_point="Start from the handoff summary and approved review context.",
+    )
+    return {"handoff": handoff, "repository_action_gate": gate, "checkpoint": checkpoint}
 
 
 def _record_repository_action(
@@ -1374,16 +1883,22 @@ def _record_repository_action(
             "Repository actions require explicit approval.",
             409,
         )
-    action = _required_text(body, "action")
-    if action not in {"no_action", "prepare_patch", "commit", "draft_pr"}:
+    action = _optional_text(body, "action") or "no_action"
+    if action not in _REPOSITORY_ACTION_MODES:
         raise ServiceError("invalid_request", "Unsupported repository action.", 400)
     handoff = _latest_or_none(storage.list_handoffs_for_task(task["id"]))
     if handoff is None:
         raise ServiceError("not_found", "Create handoff before repository action.", 404)
+    approved_reviews = [
+        review
+        for review in storage.list_review_runs_for_task(task["id"])
+        if review["status"] == "approved"
+    ]
     metadata = dict(handoff["metadata"])
     repository_action = {
         "status": "approved",
         "action": action,
+        "mode": action,
         "note": _optional_text(body, "note"),
     }
     metadata["repository_action"] = repository_action
@@ -1415,11 +1930,57 @@ def _record_repository_action(
         event_type="repository_action.approved",
         payload={"object_id": updated_handoff["id"], "action": action, "approval_gate": gate["id"]},
     )
+    checkpoint = _create_task_checkpoint(
+        storage,
+        task,
+        updated_handoff,
+        approved_reviews,
+        next_start_point="Start from the completed handoff summary and repository-action result.",
+    )
     return {
         "handoff": updated_handoff,
         "repository_action": repository_action,
         "approval_gate": gate,
+        "checkpoint": checkpoint,
     }
+
+
+def _create_task_checkpoint(
+    storage: Storage,
+    task: dict[str, Any],
+    handoff: dict[str, Any],
+    approved_reviews: list[dict[str, Any]],
+    *,
+    next_start_point: str,
+) -> dict[str, Any]:
+    workspace = storage.get_workspace(task["workspace_id"])
+    if workspace is None:
+        raise ServiceError("not_found", "Workspace not found.", 404)
+    handoff_metadata = handoff.get("metadata") or {}
+    repository_action_preference = handoff_metadata.get("repository_action_preference")
+    if repository_action_preference is None:
+        repository_action_preference = _effective_repository_action_preference(task, workspace)
+    evidence_refs = handoff_metadata.get("evidence_ids")
+    if not isinstance(evidence_refs, list):
+        evidence_refs = [item["id"] for item in storage.list_evidence_artifacts_for_task(task["id"])]
+    key_decisions = [
+        review["summary"]
+        for review in approved_reviews
+        if review.get("summary")
+    ][:3]
+    if not key_decisions and handoff["summary"]:
+        key_decisions = [handoff["summary"]]
+    return storage.create_checkpoint_capsule(
+        workspace_id=task["workspace_id"],
+        task_id=task["id"],
+        project_id=task["metadata"].get("project_id"),
+        summary=handoff["summary"],
+        key_decisions=key_decisions,
+        evidence_refs=evidence_refs,
+        repository_action_preference=repository_action_preference,
+        next_start_point=next_start_point,
+        created_by="Sarathi",
+    )
 
 
 def _run_task_review(
@@ -2099,6 +2660,7 @@ def _dispatch_subtask(
             "outputs": response.outputs,
             "evidence": response.evidence,
             "artifacts": response.artifacts,
+            **({"usage": response.usage.to_artifact()} if response.usage else {}),
             **({"error": response.error} if response.error else {}),
         },
     )
@@ -2319,7 +2881,7 @@ def _provider_health(storage: Storage, workspace_id: str | None = None) -> list[
 def _handle_chat(storage: Storage, body: Mapping[str, Any]) -> dict[str, Any]:
     message = _required_text(body, "message")
     context = body.get("context") or {}
-    workspace_id = (context.get("workspaceId") if isinstance(context, dict) else None)
+    workspace_id = _task_context_workspace_id(context)
     if not workspace_id:
         workspace_id = _optional_text(body, "workspace_id")
     if not workspace_id:
@@ -2339,7 +2901,10 @@ def _handle_chat(storage: Storage, body: Mapping[str, Any]) -> dict[str, Any]:
         title=message[:100],
         status="prd_pending",
         description=message,
-        metadata=_task_draft_metadata(message),
+        metadata=_task_draft_metadata(
+            message,
+            project_id=_task_context_project_id(context),
+        ),
     )
     storage.create_lifecycle_event(
         workspace_id=workspace_id,
@@ -2567,6 +3132,12 @@ def _transition_subtask(
         lifecycle["reason"] = reason
     metadata["lifecycle"] = lifecycle
     updated = storage.update_subtask(subtask["id"], status=next_status, metadata=metadata)
+    storage.create_message(
+        workspace_id=updated["workspace_id"],
+        task_id=updated["task_id"],
+        role="assistant",
+        content=_sarathi_transition_message(updated, next_status),
+    )
     storage.create_lifecycle_event(
         workspace_id=updated["workspace_id"],
         task_id=updated["task_id"],
@@ -2885,6 +3456,70 @@ def _task_tracking_status_from_graph(graph: dict[str, Any]) -> tuple[str, str]:
     if "queued" in statuses:
         return "queued", "TaskTracking"
     return "pending", "TaskTracking"
+
+
+def _find_policy_pack_dir(storage: Storage, workspace_id: str) -> Path | None:
+    repos = storage.list_workspace_repositories(workspace_id)
+    for repo in repos:
+        candidate = Path(repo["path"]).expanduser() / "policy-pack"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _get_policy_pack(storage: Storage, workspace_id: str) -> dict[str, Any]:
+    policy_dir = _find_policy_pack_dir(storage, workspace_id)
+    if policy_dir is None:
+        return {"files": [], "error": "No policy pack found for this workspace"}
+    files = []
+    for md_file in sorted(policy_dir.glob("*.md")):
+        try:
+            content = md_file.read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        files.append({"name": md_file.name, "content": content, "size": len(content)})
+    return {"files": files}
+
+
+def _put_policy_pack_file(
+    storage: Storage,
+    workspace_id: str,
+    filename: str,
+    body: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not filename.endswith(".md"):
+        raise ServiceError("invalid_request", "Filename must end in .md.", 400)
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise ServiceError("invalid_request", "Filename must not contain path traversal characters.", 400)
+    policy_dir = _find_policy_pack_dir(storage, workspace_id)
+    if policy_dir is None:
+        raise ServiceError("not_found", "No policy pack found for this workspace.", 404)
+    content = body.get("content")
+    if not isinstance(content, str):
+        raise ServiceError("invalid_request", "Field 'content' must be a string.", 400)
+    target = policy_dir / filename
+    try:
+        target.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        raise ServiceError("internal_error", f"Failed to write policy file: {exc}", 500)
+    return {"ok": True, "filename": filename}
+
+
+def _sarathi_transition_message(subtask: dict[str, Any], new_status: str) -> str:
+    title = subtask.get("title", "Unit")
+    metadata = subtask.get("metadata", {})
+    provider = (
+        metadata.get("provider", "agent")
+        if isinstance(metadata, dict)
+        else "agent"
+    )
+    msgs = {
+        "in_progress": f"Starting: {title}",
+        "review": f"Unit complete: {title}. Ready for review.",
+        "completed": f"Done: {title}.",
+        "failed": f"Unit failed: {title}. Check dispatch log for details.",
+    }
+    return msgs.get(new_status, f"Unit {title} → {new_status}")
 
 
 def _preview_repository_intake(path: str) -> dict[str, Any]:

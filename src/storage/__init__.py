@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 
-LATEST_SCHEMA_VERSION = 2
+LATEST_SCHEMA_VERSION = 3
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -51,6 +51,13 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             (2, _utc_now()),
         )
         conn.commit()
+    if current_schema_version(conn) < 3:
+        conn.executescript(_MIGRATION_003)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (3, _utc_now()),
+        )
+        conn.commit()
 
 
 class Storage:
@@ -74,6 +81,30 @@ class Storage:
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (workspace_id, name, root_path, _dump_json(metadata), now, now),
+        )
+        self.conn.commit()
+        workspace = self.get_workspace(workspace_id)
+        assert workspace is not None
+        return workspace
+
+    def update_workspace(
+        self,
+        workspace_id: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_workspace(workspace_id)
+        if existing is None:
+            raise KeyError(workspace_id)
+        now = _utc_now()
+        next_metadata = metadata if metadata is not None else existing["metadata"]
+        self.conn.execute(
+            """
+            UPDATE workspaces
+            SET metadata = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (_dump_json(next_metadata), now, workspace_id),
         )
         self.conn.commit()
         workspace = self.get_workspace(workspace_id)
@@ -689,6 +720,107 @@ class Storage:
         assert handoff is not None
         return handoff
 
+    def create_checkpoint_capsule(
+        self,
+        *,
+        workspace_id: str,
+        task_id: str,
+        summary: str,
+        key_decisions: list[str],
+        evidence_refs: list[str],
+        repository_action_preference: dict[str, Any],
+        next_start_point: str,
+        created_by: str,
+        project_id: str | None = None,
+        status: str = "ready",
+    ) -> dict[str, Any]:
+        checkpoint_id = _new_id()
+        now = _utc_now()
+        self.conn.execute(
+            """
+            INSERT INTO checkpoint_capsules (
+                id,
+                workspace_id,
+                project_id,
+                source_task_id,
+                status,
+                summary,
+                key_decisions,
+                evidence_refs,
+                repository_action_preference,
+                next_start_point,
+                created_at,
+                created_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                checkpoint_id,
+                workspace_id,
+                project_id,
+                task_id,
+                status,
+                summary,
+                _dump_json(key_decisions),
+                _dump_json(evidence_refs),
+                _dump_json(repository_action_preference),
+                next_start_point,
+                now,
+                created_by,
+            ),
+        )
+        self.conn.commit()
+        checkpoint = self.get_checkpoint_capsule(checkpoint_id)
+        assert checkpoint is not None
+        return checkpoint
+
+    def get_checkpoint_capsule(self, checkpoint_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT
+                id,
+                workspace_id,
+                project_id,
+                source_task_id,
+                status,
+                summary,
+                key_decisions,
+                evidence_refs,
+                repository_action_preference,
+                next_start_point,
+                created_at,
+                created_by
+            FROM checkpoint_capsules
+            WHERE id = ?
+            """,
+            (checkpoint_id,),
+        ).fetchone()
+        return _checkpoint_capsule_from_row(row) if row is not None else None
+
+    def list_checkpoint_capsules_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT
+                id,
+                workspace_id,
+                project_id,
+                source_task_id,
+                status,
+                summary,
+                key_decisions,
+                evidence_refs,
+                repository_action_preference,
+                next_start_point,
+                created_at,
+                created_by
+            FROM checkpoint_capsules
+            WHERE source_task_id = ?
+            ORDER BY created_at, id
+            """,
+            (task_id,),
+        ).fetchall()
+        return [_checkpoint_capsule_from_row(row) for row in rows]
+
     def get_handoff(self, handoff_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             """
@@ -711,6 +843,122 @@ class Storage:
             (task_id,),
         ).fetchall()
         return [_handoff_from_row(row) for row in rows]
+
+    def list_task_panel_entries(self, task_id: str) -> list[dict[str, Any]]:
+        task = self.get_task(task_id)
+        if task is None:
+            return []
+
+        entries: list[dict[str, Any]] = []
+        for message in self.list_messages(task_id=task_id):
+            role = str(message["role"])
+            kind = "human_message" if role == "user" else "agent_update"
+            entries.append(
+                _task_panel_entry(
+                    id=message["id"],
+                    kind=kind,
+                    source=role,
+                    target=_text_or_none(message["metadata"].get("target")),
+                    summary=_task_panel_summary(message["content"]),
+                    created_at=message["created_at"],
+                    task_id=task_id,
+                    workspace_id=task["workspace_id"],
+                    metadata=message["metadata"],
+                )
+            )
+
+        for event in self.list_events(task_id=task_id):
+            entries.append(
+                _task_panel_entry(
+                    id=event["id"],
+                    kind=_task_panel_kind_for_event(event["event_type"], event["payload"]),
+                    source=_task_panel_event_source(event),
+                    target=_task_panel_event_target(event),
+                    summary=_task_panel_event_summary(event),
+                    created_at=event["created_at"],
+                    task_id=task_id,
+                    workspace_id=task["workspace_id"],
+                    metadata=event["payload"],
+                )
+            )
+
+        for gate in self.list_approval_gates_for_task(task_id):
+            entries.append(
+                _task_panel_entry(
+                    id=gate["id"],
+                    kind="review",
+                    source=gate["name"],
+                    target=gate["status"],
+                    summary=f"{gate['name']} gate {gate['status']}",
+                    created_at=gate["created_at"],
+                    task_id=task_id,
+                    workspace_id=task["workspace_id"],
+                    metadata=gate["metadata"],
+                )
+            )
+
+        for dispatch in self.list_dispatches_for_task(task_id):
+            entries.append(
+                _task_panel_entry(
+                    id=dispatch["id"],
+                    kind=_task_panel_kind_for_dispatch(dispatch["status"]),
+                    source=dispatch["agent_name"],
+                    target=_text_or_none(dispatch["metadata"].get("subtask_id")),
+                    summary=f"{dispatch['agent_name']} dispatch {dispatch['status']}",
+                    created_at=dispatch["created_at"],
+                    task_id=task_id,
+                    workspace_id=task["workspace_id"],
+                    metadata=dispatch["metadata"],
+                )
+            )
+
+        for evidence in self.list_evidence_artifacts_for_task(task_id):
+            entries.append(
+                _task_panel_entry(
+                    id=evidence["id"],
+                    kind="evidence",
+                    source=evidence["artifact_type"],
+                    target=_text_or_none(evidence["uri"]),
+                    summary=f"{evidence['artifact_type']} evidence attached",
+                    created_at=evidence["created_at"],
+                    task_id=task_id,
+                    workspace_id=task["workspace_id"],
+                    metadata=evidence["metadata"],
+                )
+            )
+
+        for review in self.list_review_runs_for_task(task_id):
+            entries.append(
+                _task_panel_entry(
+                    id=review["id"],
+                    kind="review",
+                    source="review",
+                    target=review["status"],
+                    summary=review["summary"] or f"Review {review['status']}",
+                    created_at=review["created_at"],
+                    task_id=task_id,
+                    workspace_id=task["workspace_id"],
+                    metadata=review["metadata"],
+                )
+            )
+
+        for handoff in self.list_handoffs_for_task(task_id):
+            entries.append(
+                _task_panel_entry(
+                    id=handoff["id"],
+                    kind="handoff",
+                    source=handoff["from_agent"] or "handoff",
+                    target=handoff["to_agent"],
+                    summary=handoff["summary"],
+                    created_at=handoff["created_at"],
+                    task_id=task_id,
+                    workspace_id=task["workspace_id"],
+                    metadata=handoff["metadata"],
+                )
+            )
+
+        entries.sort(key=lambda entry: (entry["created_at"], entry["id"]))
+        return entries
 
     def upsert_provider(
         self,
@@ -749,6 +997,26 @@ class Storage:
             (workspace_id, provider_id),
         ).fetchone()
         return _provider_from_row(row) if row is not None else None
+
+    def get_workspace_stats(self, workspace_id: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS task_count,
+                SUM(CASE WHEN status NOT IN ('done', 'skipped') THEN 1 ELSE 0 END) AS active_count,
+                MAX(updated_at) AS last_activity
+            FROM tasks
+            WHERE workspace_id = ?
+            """,
+            (workspace_id,),
+        ).fetchone()
+        if row is None:
+            return {"task_count": 0, "active_count": 0, "last_activity": None}
+        return {
+            "task_count": int(row["task_count"] or 0),
+            "active_count": int(row["active_count"] or 0),
+            "last_activity": row["last_activity"],
+        }
 
     def list_providers_for_workspace(self, workspace_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -902,6 +1170,163 @@ def _handoff_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _checkpoint_capsule_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "workspace_id": row["workspace_id"],
+        "project_id": row["project_id"],
+        "source_task_id": row["source_task_id"],
+        "status": row["status"],
+        "summary": row["summary"],
+        "key_decisions": _load_json_list(row["key_decisions"]),
+        "evidence_refs": _load_json_list(row["evidence_refs"]),
+        "repository_action_preference": _load_json(row["repository_action_preference"]),
+        "next_start_point": row["next_start_point"],
+        "created_at": row["created_at"],
+        "created_by": row["created_by"],
+    }
+
+
+def _task_panel_entry(
+    *,
+    id: str,
+    kind: str,
+    source: str,
+    target: str | None,
+    summary: str,
+    created_at: str,
+    task_id: str,
+    workspace_id: str,
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "id": id,
+        "kind": kind,
+        "source": source,
+        "target": target,
+        "summary": summary,
+        "created_at": created_at,
+        "metadata": metadata or {},
+        "task_id": task_id,
+        "workspace_id": workspace_id,
+    }
+
+
+def _task_panel_summary(text: str, *, limit: int = 120) -> str:
+    summary = " ".join(text.strip().split())
+    if len(summary) <= limit:
+        return summary
+    return summary[: limit - 1].rstrip() + "…"
+
+
+def _task_panel_kind_for_event(event_type: str, payload: dict[str, Any]) -> str:
+    if event_type == "task.blocked":
+        return "blocked"
+    if event_type == "task.unblocked":
+        return "unblocked"
+    if event_type in {"task.completed", "task.complete"}:
+        return "completion"
+    if event_type in {"approval.requested", "approval.recorded"}:
+        return "review"
+    if event_type in {"review.completed", "review.rejected"}:
+        return "review"
+    if event_type == "task.draft_created":
+        return "system_note"
+    if event_type == "task.chat_created":
+        return "system_note"
+    if event_type == "subtask.dispatched":
+        return "claimed"
+    if event_type == "subtask.scheduled":
+        return "claimed"
+    if event_type == "subtask.unblocked":
+        return "unblocked"
+    if event_type == "subtask.transitioned":
+        status = str(payload.get("status") or "")
+        if status == "blocked":
+            return "blocked"
+        if status in {"waiting_human", "review"}:
+            return "review"
+        if status == "complete":
+            return "completion"
+        if status == "in_progress":
+            return "claimed"
+    return "system_note"
+
+
+def _task_panel_event_source(event: dict[str, Any]) -> str:
+    payload = event["payload"]
+    for key in ("actor", "agent", "provider", "source", "name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return event["event_type"]
+
+
+def _task_panel_event_target(event: dict[str, Any]) -> str | None:
+    payload = event["payload"]
+    for key in ("object_id", "subtask_id", "dispatch_id", "status", "name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _task_panel_event_summary(event: dict[str, Any]) -> str:
+    payload = event["payload"]
+    event_type = event["event_type"]
+    if event_type == "task.blocked":
+        reason = payload.get("reason") or payload.get("message") or "blocked"
+        return f"Task blocked: {reason}"
+    if event_type == "task.unblocked":
+        return "Task unblocked"
+    if event_type == "task.completed":
+        return "Task completed"
+    if event_type == "approval.requested":
+        return f"Approval requested for {payload.get('name') or 'gate'}"
+    if event_type == "approval.recorded":
+        return f"Approval recorded: {payload.get('status') or 'updated'}"
+    if event_type == "subtask.scheduled":
+        role = payload.get("role") or payload.get("provider") or "subtask"
+        return f"{role} scheduled"
+    if event_type == "subtask.dispatched":
+        return f"Dispatch recorded for {payload.get('object_id') or 'subtask'}"
+    if event_type == "subtask.unblocked":
+        return f"Unblocked {payload.get('object_id') or 'subtask'}"
+    if event_type == "subtask.transitioned":
+        status = payload.get("status") or "updated"
+        actor = payload.get("actor") or "Subtask"
+        return f"{actor} → {status}"
+    if event_type == "task.draft_created":
+        return "Task draft created"
+    if event_type == "task.chat_created":
+        return "Task inception chat created a draft"
+    if event_type == "review.completed":
+        return "Review completed"
+    if event_type == "review.rejected":
+        return "Review rejected"
+    return event_type.replace(".", " ")
+
+
+def _task_panel_kind_for_dispatch(status: str) -> str:
+    if status in {"queued", "claimed", "pending"}:
+        return "claimed"
+    if status in {"in_progress", "running"}:
+        return "in_progress"
+    if status == "review":
+        return "review"
+    if status == "complete":
+        return "completion"
+    if status == "failed":
+        return "blocked"
+    return "system_note"
+
+
+def _text_or_none(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
 def _provider_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -914,8 +1339,17 @@ def _provider_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _dump_json(value: dict[str, Any] | None) -> str:
-    return json.dumps(value or {}, sort_keys=True)
+def _dump_json(value: Any | None) -> str:
+    return json.dumps({} if value is None else value, sort_keys=True)
+
+
+def _load_json_list(value: str | None) -> list[Any]:
+    if not value:
+        return []
+    loaded = json.loads(value)
+    if not isinstance(loaded, list):
+        return []
+    return loaded
 
 
 def _load_json(value: str | None) -> dict[str, Any]:
@@ -1168,4 +1602,28 @@ ALTER TABLE providers_v2 RENAME TO providers;
 
 CREATE INDEX IF NOT EXISTS idx_providers_workspace
     ON providers(workspace_id);
+"""
+
+
+_MIGRATION_003 = """
+CREATE TABLE IF NOT EXISTS checkpoint_capsules (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    project_id TEXT,
+    source_task_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    key_decisions TEXT NOT NULL DEFAULT '[]',
+    evidence_refs TEXT NOT NULL DEFAULT '[]',
+    repository_action_preference TEXT NOT NULL DEFAULT '{}',
+    next_start_point TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_task_id, workspace_id) REFERENCES tasks(id, workspace_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoint_capsules_task
+    ON checkpoint_capsules(workspace_id, source_task_id);
 """

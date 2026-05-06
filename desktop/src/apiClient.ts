@@ -30,11 +30,49 @@ export type WorkspaceRepositoryRecord = {
   updated_at: string;
 };
 
+export type RepositoryActionPreferenceRecord = {
+  scope: "default" | "workspace" | "project" | "task" | string;
+  mode: "no_action" | "prepare_patch" | "commit" | "draft_pr" | "ready_pr" | string;
+  allowed_modes: Array<"no_action" | "prepare_patch" | "commit" | "draft_pr" | "ready_pr" | string>;
+  source?: string;
+};
+
+export type TaskMetadata = {
+  source_prompt?: string;
+  complexity?: string;
+  phase?: string;
+  source?: string;
+  prd?: {
+    problem?: string;
+    goal?: string;
+    scope?: string[];
+  };
+  acceptance_criteria?: string[];
+  repository_action_preference?: RepositoryActionPreferenceRecord;
+  project_repository_action_preference?: RepositoryActionPreferenceRecord;
+  github_issue?: {
+    url?: string | null;
+    host?: string | null;
+    owner?: string | null;
+    name?: string | null;
+    full_name?: string | null;
+    number?: number | null;
+    repository_url?: string | null;
+    reference?: string | null;
+    repository?: Record<string, unknown>;
+  };
+  repository?: Record<string, unknown>;
+} & Record<string, unknown>;
+
+export type WorkspaceMetadata = {
+  repository_action_preference?: RepositoryActionPreferenceRecord;
+} & Record<string, unknown>;
+
 export type WorkspaceRecord = {
   id: string;
   name: string;
   root_path: string;
-  metadata: Record<string, unknown>;
+  metadata: WorkspaceMetadata;
   created_at: string;
   updated_at: string;
 };
@@ -52,19 +90,24 @@ export type TaskRecord = {
   title: string;
   description: string | null;
   status: string;
-  metadata: {
-    source_prompt?: string;
-    complexity?: string;
-    phase?: string;
-    prd?: {
-      problem?: string;
-      goal?: string;
-      scope?: string[];
-    };
-    acceptance_criteria?: string[];
-  };
+  metadata: TaskMetadata;
   created_at: string;
   updated_at: string;
+};
+
+export type CheckpointCapsuleRecord = {
+  id: string;
+  workspace_id: string;
+  project_id: string | null;
+  source_task_id: string;
+  status: string;
+  summary: string;
+  key_decisions: string[];
+  evidence_refs: string[];
+  repository_action_preference: RepositoryActionPreferenceRecord;
+  next_start_point: string;
+  created_at: string;
+  created_by: string;
 };
 
 export type ApprovalGateRecord = {
@@ -200,6 +243,34 @@ export type TaskStudioSnapshot = {
   handoff: HandoffRecord | null;
 };
 
+export type TaskPanelEntry = {
+  id: string;
+  kind:
+    | "human_message"
+    | "agent_update"
+    | "blocked"
+    | "unblocked"
+    | "claimed"
+    | "in_progress"
+    | "review"
+    | "handoff"
+    | "completion"
+    | "evidence"
+    | "system_note";
+  source: string;
+  target: string | null;
+  summary: string;
+  created_at: string;
+  metadata: Record<string, unknown>;
+  task_id: string;
+  workspace_id: string;
+};
+
+export type TaskPanelSnapshot = {
+  task_id: string;
+  entries: TaskPanelEntry[];
+};
+
 export type TaskScheduleResult = {
   task: TaskRecord;
   scheduled: Array<{
@@ -268,6 +339,14 @@ export type OperationalDiagram = {
   updated_at?: string;
 };
 
+export type TokenBudgetSummary = {
+  total_tokens: number;
+  budget_limit: number | null;
+  budget_remaining: number | null;
+  budget_state: string;
+  usage_source: string;
+};
+
 export type OperationalViewsSnapshot = {
   workspace_id: string;
   history: LifecycleEventRecord[];
@@ -280,6 +359,7 @@ export type OperationalViewsSnapshot = {
     messages: { total: number; by_role: Record<string, number> };
     repositories: { total: number };
     dispatches: { total: number; by_status: Record<string, number> };
+    budget?: TokenBudgetSummary | null;
     evidence: { total: number; by_type: Record<string, number> };
     reviews: { total: number; by_status: Record<string, number> };
     handoffs: { total: number };
@@ -419,6 +499,24 @@ export async function createWorkspace(
   return data.workspace;
 }
 
+export async function getWorkspace(workspaceId: string): Promise<WorkspaceRecord> {
+  const data = await getJson<{ workspace: WorkspaceRecord }>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}`,
+  );
+  return data.workspace;
+}
+
+export async function updateWorkspace(
+  workspaceId: string,
+  metadata: WorkspaceMetadata,
+): Promise<WorkspaceRecord> {
+  const data = await patchJson<{ workspace: WorkspaceRecord }>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}`,
+    { metadata },
+  );
+  return data.workspace;
+}
+
 export async function ensureWorkspace(
   name: string,
   rootPath: string,
@@ -436,12 +534,14 @@ export async function createTaskDraft(
   workspaceId: string,
   prompt: string,
   title?: string,
+  context?: { projectId?: string; workspaceId?: string },
 ): Promise<TaskDraftResult> {
   return postJson<TaskDraftResult>(
     `/api/workspaces/${encodeURIComponent(workspaceId)}/task-drafts`,
     {
       prompt,
       ...(title ? { title } : {}),
+      ...(context ? { context } : {}),
     },
   );
 }
@@ -501,6 +601,26 @@ export async function getTaskStudio(taskId: string): Promise<TaskStudioSnapshot>
   return getJson<TaskStudioSnapshot>(`/api/tasks/${encodeURIComponent(taskId)}/studio`);
 }
 
+export async function getTaskPanel(taskId: string): Promise<TaskPanelSnapshot> {
+  return getJson<TaskPanelSnapshot>(`/api/tasks/${encodeURIComponent(taskId)}/panel`);
+}
+
+export async function getTaskCheckpoint(taskId: string): Promise<CheckpointCapsuleRecord | null> {
+  const data = await getJson<{ checkpoint: CheckpointCapsuleRecord | null }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/checkpoint`,
+  );
+  return data.checkpoint;
+}
+
+export async function restartTaskFromCheckpoint(
+  taskId: string,
+): Promise<{ task: TaskRecord; checkpoint: CheckpointCapsuleRecord }> {
+  return postJson<{ task: TaskRecord; checkpoint: CheckpointCapsuleRecord }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/checkpoint/restart`,
+    {},
+  );
+}
+
 export async function sendTaskMessage(
   taskId: string,
   content: string,
@@ -515,7 +635,7 @@ export async function sendTaskMessage(
 
 export async function sendChatMessage(
   message: string,
-  context?: { taskId?: string; workspaceId?: string },
+  context?: { taskId?: string; workspaceId?: string; projectId?: string },
 ): Promise<{ taskId: string; agent: string; status: string }> {
   return postJson<{ taskId: string; agent: string; status: string }>("/api/chat", {
     message,
@@ -676,6 +796,26 @@ async function postJson<T>(path: string, body: Record<string, unknown>): Promise
   }
   const response = await fetch(`${config.baseUrl}${path}`, {
     method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(config.token ? { authorization: `Bearer ${config.token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  const envelope = (await response.json()) as ApiEnvelope<T>;
+  if (!envelope.ok) {
+    throw new Error(envelope.error.message);
+  }
+  return envelope.data;
+}
+
+async function patchJson<T>(path: string, body: Record<string, unknown>): Promise<T> {
+  const config = getSarathiApiConfig();
+  if (!config) {
+    throw new Error("Sarathi local service is not configured for this desktop build.");
+  }
+  const response = await fetch(`${config.baseUrl}${path}`, {
+    method: "PATCH",
     headers: {
       "content-type": "application/json",
       ...(config.token ? { authorization: `Bearer ${config.token}` } : {}),

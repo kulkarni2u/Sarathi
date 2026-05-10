@@ -8,6 +8,7 @@ import {
   getTaskStudio,
   getWorkspaceOperationalViews,
   listTaskDashboard,
+  listTaskCheckpoints,
   restartTaskFromCheckpoint,
   runTaskReview,
   scheduleTask,
@@ -530,6 +531,57 @@ function githubIssueReference(metadata: TaskMetadata): string | null {
   return null;
 }
 
+function nextPendingGate(approvalItems: TaskStudioSnapshot["approval_gates"]) {
+  return approvalItems.find((gate) => gate.status === "waiting_human")
+    ?? approvalItems.find((gate) => gate.status === "pending")
+    ?? null;
+}
+
+function deriveNextAction(
+  task: TaskDashboardItem | null,
+  approvalItems: TaskStudioSnapshot["approval_gates"],
+  latestReview: ReviewRunRecord | null,
+  handoffReady: boolean,
+): { label: string; tone: string; detail: string } {
+  const pendingGate = nextPendingGate(approvalItems);
+  if (task?.blocked_count) {
+    return {
+      label: "Unblock execution",
+      tone: "blocked",
+      detail: `${task.blocked_count} unit${task.blocked_count === 1 ? "" : "s"} are blocked. Review dependencies or provider posture before dispatch continues.`,
+    };
+  }
+  if (pendingGate) {
+    const requiresHuman = pendingGate.metadata?.requires_human === true || pendingGate.status === "waiting_human";
+    return {
+      label: `Approve ${pendingGate.name}`,
+      tone: requiresHuman ? "warning" : "active",
+      detail: requiresHuman
+        ? `${pendingGate.name} is waiting on a human decision before Sarathi can continue.`
+        : `${pendingGate.name} is the next workflow gate.`,
+    };
+  }
+  if (latestReview && latestReview.status === "approved" && !handoffReady) {
+    return {
+      label: "Create handoff",
+      tone: "active",
+      detail: "Execution and review are in a good state. Capture the governed handoff next.",
+    };
+  }
+  if (task?.status === "in_progress") {
+    return {
+      label: "Monitor execution",
+      tone: "active",
+      detail: "Units are in flight. Watch the task panel and evidence feed for failures or review triggers.",
+    };
+  }
+  return {
+    label: "Schedule ready units",
+    tone: "warning",
+    detail: "Sarathi is ready for the next dispatch cycle.",
+  };
+}
+
 export default function ProjectDetail({
   workspaceId,
   projectId,
@@ -548,11 +600,13 @@ export default function ProjectDetail({
   const [snapshot, setSnapshot] = useState<TaskStudioSnapshot | null>(null);
   const [panelSnapshot, setPanelSnapshot] = useState<TaskPanelSnapshot | null>(null);
   const [taskCheckpoint, setTaskCheckpoint] = useState<CheckpointCapsuleRecord | null>(null);
+  const [taskCheckpointHistory, setTaskCheckpointHistory] = useState<CheckpointCapsuleRecord[]>([]);
   const [operations, setOperations] = useState<OperationalViewsSnapshot | null>(null);
   const [taskLoadStatus, setTaskLoadStatus] = useState(apiConfigured ? "Loading task studio." : "Demo task studio.");
   const [panelLoadStatus, setPanelLoadStatus] = useState(apiConfigured ? "Loading task panel." : "Demo task panel.");
   const [opsLoadStatus, setOpsLoadStatus] = useState(apiConfigured ? "Loading lifecycle views." : "Demo lifecycle views.");
   const [actionStatus, setActionStatus] = useState("");
+  const [checkpointExpanded, setCheckpointExpanded] = useState(false);
 
   useEffect(() => {
     if (workspaceId) {
@@ -596,13 +650,14 @@ export default function ProjectDetail({
       return { items: mockTasksToDashboardItems(), fallbackReason: "demo", fromApi: false };
     }
     try {
-      const list = await listTaskDashboard(workspaceKey);
-      if (list.length > 0) {
-        return { items: list, fallbackReason: null, fromApi: true };
-      }
-      return { items: mockTasksToDashboardItems(), fallbackReason: "empty", fromApi: true };
+      const list = await listTaskDashboard(workspaceKey, { projectId });
+      return {
+        items: list,
+        fallbackReason: list.length === 0 ? "empty" : null,
+        fromApi: true,
+      };
     } catch {
-      return { items: mockTasksToDashboardItems(), fallbackReason: "error", fromApi: true };
+      return { items: [], fallbackReason: "error", fromApi: true };
     }
   }
 
@@ -612,9 +667,9 @@ export default function ProjectDetail({
     if (!next.fromApi || next.fallbackReason === "demo") {
       setTaskLoadStatus("Demo task studio.");
     } else if (next.fallbackReason === "empty") {
-      setTaskLoadStatus("No persisted tasks yet. Using demo data.");
+      setTaskLoadStatus("No persisted tasks yet.");
     } else if (next.fallbackReason === "error") {
-      setTaskLoadStatus("Task load failed. Using demo data.");
+      setTaskLoadStatus("Task load failed.");
     } else {
       setTaskLoadStatus(`${next.items.length} persisted tasks loaded.`);
     }
@@ -632,9 +687,9 @@ export default function ProjectDetail({
         if (!next.fromApi || next.fallbackReason === "demo") {
           setTaskLoadStatus("Demo task studio.");
         } else if (next.fallbackReason === "empty") {
-          setTaskLoadStatus("No persisted tasks yet. Using demo data.");
+          setTaskLoadStatus("No persisted tasks yet.");
         } else if (next.fallbackReason === "error") {
-          setTaskLoadStatus("Task load failed. Using demo data.");
+          setTaskLoadStatus("Task load failed.");
         } else {
           setTaskLoadStatus(`${next.items.length} persisted tasks loaded.`);
         }
@@ -644,12 +699,14 @@ export default function ProjectDetail({
     return () => {
       cancelled = true;
     };
-  }, [apiConfigured, resolvedWorkspaceId, liveTick]);
+  }, [apiConfigured, projectId, resolvedWorkspaceId, liveTick, selectedTaskId]);
 
   const selectedTask = useMemo(() => {
     if (!taskItems.length) return null;
     if (selectedTaskIdState) {
-      return taskItems.find((item) => item.id === selectedTaskIdState) ?? taskItems[0];
+      const found = taskItems.find((item) => item.id === selectedTaskIdState);
+      if (found) return found;
+      return null;
     }
     return taskItems[0];
   }, [selectedTaskIdState, taskItems]);
@@ -732,23 +789,34 @@ export default function ProjectDetail({
     const workspaceKey = resolvedWorkspaceId ?? workspace.id;
     if (!task || !workspaceKey) {
       setTaskCheckpoint(null);
+      setTaskCheckpointHistory([]);
       return;
     }
     if (!apiConfigured) {
-      setTaskCheckpoint(task.status === "done" ? createDemoCheckpoint(task, selectedTask?.title ?? "Task studio", workspaceKey, projectId ?? null) : null);
+      const demoCheckpoint = task.status === "done"
+        ? createDemoCheckpoint(task, selectedTask?.title ?? "Task studio", workspaceKey, projectId ?? null)
+        : null;
+      setTaskCheckpoint(demoCheckpoint);
+      setTaskCheckpointHistory(demoCheckpoint ? [demoCheckpoint] : []);
       return;
     }
     let cancelled = false;
     setTaskCheckpoint(null);
+    setTaskCheckpointHistory([]);
     async function loadCheckpoint() {
       try {
-        const next = await getTaskCheckpoint(task.id);
+        const [next, history] = await Promise.all([
+          getTaskCheckpoint(task.id),
+          listTaskCheckpoints(task.id),
+        ]);
         if (!cancelled) {
           setTaskCheckpoint(next);
+          setTaskCheckpointHistory(history);
         }
       } catch {
         if (!cancelled) {
           setTaskCheckpoint(null);
+          setTaskCheckpointHistory([]);
         }
       }
     }
@@ -796,6 +864,7 @@ export default function ProjectDetail({
   const approvalItems = liveSnapshot?.approval_gates ?? [];
   const taskReviews = liveSnapshot?.reviews ?? [];
   const taskHandoff = liveSnapshot?.handoff ?? null;
+  const latestReview = taskReviews.length > 0 ? taskReviews[taskReviews.length - 1] : null;
   const taskMetadata = (liveSnapshot?.task.metadata ?? {}) as TaskMetadata;
   const repositoryPreference = taskMetadata.repository_action_preference ?? {
     scope: "default",
@@ -808,6 +877,8 @@ export default function ProjectDetail({
     : []);
   const selectedPhase = liveSnapshot?.task.metadata.phase ?? selectedTask?.phase ?? "Build";
   const selectedTaskTitle = liveSnapshot?.task.title ?? selectedTask?.title ?? "Task studio";
+  const pendingGate = nextPendingGate(approvalItems);
+  const nextAction = deriveNextAction(selectedTask ?? null, approvalItems, latestReview, Boolean(taskHandoff));
 
   async function reloadStudio() {
     if (!selectedTask) return;
@@ -979,16 +1050,62 @@ export default function ProjectDetail({
         </div>
         <div style={styles.headerActions}>
           <button style={styles.secondaryButton} onClick={() => setRoute?.("dashboard")}>Back to Dashboard</button>
-          <button style={styles.primaryButton} onClick={() => setRoute?.("home")}>Workspaces</button>
+          <button style={styles.primaryButton} onClick={() => setRoute?.("workspace")}>Workspaces</button>
         </div>
       </div>
+
+      <section style={styles.cockpitStrip}>
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Task</div>
+          <div style={styles.cockpitValue}>{selectedTask?.status ?? "pending"}</div>
+        </div>
+        <div style={styles.cockpitDivider} />
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Phase</div>
+          <div style={styles.cockpitValue}>{selectedPhase}</div>
+        </div>
+        <div style={styles.cockpitDivider} />
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Next Action</div>
+          <Pill tone={nextAction.tone}>{nextAction.label}</Pill>
+        </div>
+        <div style={styles.cockpitDivider} />
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Blocked</div>
+          <Pill tone={selectedTask?.blocked_count ? "blocked" : "healthy"}>{selectedTask?.blocked_count ?? 0}</Pill>
+        </div>
+        <div style={styles.cockpitDivider} />
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Checkpoint</div>
+          <Pill tone={taskCheckpoint ? "healthy" : "draft"}>{taskCheckpoint ? "Ready" : "None"}</Pill>
+        </div>
+        <div style={styles.cockpitDivider} />
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Units</div>
+          <div style={styles.cockpitValue}>{graphNodes.length}</div>
+        </div>
+        <div style={styles.cockpitDivider} />
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Messages</div>
+          <div style={styles.cockpitValue}>{taskMessages.length}</div>
+        </div>
+        <div style={styles.cockpitDivider} />
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Gates</div>
+          <div style={styles.cockpitValue}>{approvalItems.length}</div>
+        </div>
+        <div style={styles.cockpitDivider} />
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Budget</div>
+          <Pill tone={budgetTone(budget?.budget_state)}>{budgetLabel}</Pill>
+        </div>
+      </section>
 
       <section style={styles.statusStrip}>
         <Pill tone={apiConfigured ? "healthy" : "warning"}>Workspace {apiConfigured ? "live" : "demo"}</Pill>
         <Pill tone={snapshot ? "healthy" : "warning"}>{taskLoadStatus}</Pill>
         <Pill tone={panelSnapshot ? "healthy" : "warning"}>{panelLoadStatus}</Pill>
         <Pill tone={operations ? "healthy" : "warning"}>{opsLoadStatus}</Pill>
-        <Pill tone={budgetTone(budget?.budget_state)}>{`Budget ${budgetLabel}`}</Pill>
         <Pill tone="active">{taskItems.length} tasks</Pill>
         <Pill tone={selectedTask?.status === "done" ? "healthy" : "warning"}>{selectedTask?.status ?? "pending"}</Pill>
       </section>
@@ -1004,15 +1121,15 @@ export default function ProjectDetail({
               setSelectedTab("studio");
             }}
           >
-            <div style={styles.taskCardHeader}>
-              <strong>{task.id}</strong>
+            <div style={styles.taskCardRow}>
+              <span style={styles.taskCardId}>{task.id.split("-")[0]}</span>
               <Pill tone={task.status === "done" ? "healthy" : task.status === "in_progress" ? "active" : "warning"}>{task.status}</Pill>
             </div>
-            <div style={styles.taskCardTitle}>{task.title}</div>
-            <div style={styles.taskCardMeta}>
-              <span>{task.phase}</span>
-              <span>{task.node_count} units</span>
-              <span>{task.providers.join(" · ") || "No provider"}</span>
+            <div style={styles.taskCardTitleRow}>
+              <span style={styles.taskCardTitle}>{task.title.length > 32 ? task.title.slice(0, 32) + "…" : task.title}</span>
+            </div>
+            <div style={styles.taskCardMetaRow}>
+              <span style={styles.taskCardMeta}>{task.phase} · {task.node_count} units</span>
             </div>
           </button>
         ))}
@@ -1053,18 +1170,30 @@ export default function ProjectDetail({
 
             <div style={styles.panel}>
               <PanelTitle title="Task actions" badge="Sutra" />
+              <Card style={styles.summaryCard}>
+                <strong>Current posture</strong>
+                <Pill tone={nextAction.tone}>{nextAction.label}</Pill>
+                <p>{nextAction.detail}</p>
+                <small>
+                  Phase: {selectedPhase}
+                  {" / "}
+                  Gate: {pendingGate?.name ?? "clear"}
+                  {" / "}
+                  Review: {latestReview?.status ?? "not run"}
+                </small>
+              </Card>
               <div style={styles.actionRow}>
                 <button style={styles.secondaryButton} onClick={() => void handleSchedule()} disabled={!selectedTask || !apiConfigured}>Schedule ready units</button>
                 <button style={styles.secondaryButton} onClick={() => void handleReview()} disabled={!selectedTask || !apiConfigured}>Run review</button>
                 <button style={styles.secondaryButton} onClick={() => void handleHandoff()} disabled={!selectedTask || !apiConfigured}>Create handoff</button>
               </div>
               <p style={styles.helperText}>{actionStatus || "Use Sarathi's lifecycle actions to move the selected task forward."}</p>
-              {taskReviews[0] ? (
+              {latestReview ? (
                 <Card style={styles.summaryCard}>
                   <strong>Latest review</strong>
-                  <Pill tone={stateTone(taskReviews[0].status)}>{taskReviews[0].status}</Pill>
-                  <p>{taskReviews[0].summary ?? "Review result captured from SQLite."}</p>
-                  <small>{taskReviews[0].created_at}</small>
+                  <Pill tone={stateTone(latestReview.status)}>{latestReview.status}</Pill>
+                  <p>{latestReview.summary ?? "Review result captured from SQLite."}</p>
+                  <small>{latestReview.created_at}</small>
                 </Card>
               ) : (
                 <Card style={styles.summaryCard}>
@@ -1088,21 +1217,58 @@ export default function ProjectDetail({
               {taskCheckpoint ? (
                 <Card style={styles.summaryCard}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-                    <strong>Checkpoint ready</strong>
-                    <Pill tone="healthy">checkpoint</Pill>
-                  </div>
-                  <p>{taskCheckpoint.summary}</p>
-                  <small>{taskCheckpoint.next_start_point}</small>
-                  <div style={{ ...styles.actionRow, marginTop: 12 }}>
-                    <button style={styles.primaryButton} onClick={() => void handleStartNewSession()} disabled={!selectedTask || !taskCheckpoint}>
-                      Start new session
-                    </button>
-                    <button style={styles.secondaryButton} onClick={() => handleOpenSourceTask()} disabled={!taskCheckpoint}>
-                      Open source task
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <strong>Checkpoint</strong>
+                      <Pill tone="healthy">Ready</Pill>
+                    </div>
+                    <button
+                      style={{ padding: "4px 8px", height: "auto", fontSize: "0.7rem" }}
+                      onClick={() => setCheckpointExpanded(!checkpointExpanded)}
+                    >
+                      {checkpointExpanded ? "Hide" : "Show"}
                     </button>
                   </div>
+                  {checkpointExpanded && (
+                    <>
+                      <p>{taskCheckpoint.summary}</p>
+                      <small>{taskCheckpoint.next_start_point}</small>
+                      <div style={{ ...styles.actionRow, marginTop: 12 }}>
+                        <button style={styles.primaryButton} onClick={() => void handleStartNewSession()} disabled={!selectedTask || !taskCheckpoint}>
+                          Start new session
+                        </button>
+                        <button style={styles.secondaryButton} onClick={() => handleOpenSourceTask()} disabled={!taskCheckpoint}>
+                          Open source
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </Card>
               ) : null}
+              {taskCheckpointHistory.length > 1 && checkpointExpanded && (
+                <Card style={styles.summaryCard}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                    <strong>Checkpoint history</strong>
+                    <Pill tone="active">{taskCheckpointHistory.length}</Pill>
+                  </div>
+                  <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
+                    {taskCheckpointHistory.slice(1).map((checkpoint, index) => {
+                      return (
+                        <div key={checkpoint.id} style={styles.checkpointHistoryItem}>
+                          <div style={styles.checkpointHistoryHeader}>
+                            <strong>Checkpoint {taskCheckpointHistory.length - index}</strong>
+                            <Pill tone="draft">{checkpoint.status}</Pill>
+                          </div>
+                          <p style={styles.checkpointSummary}>{checkpoint.summary}</p>
+                          <div style={styles.checkpointMetaRow}>
+                            <span>{new Date(checkpoint.created_at).toLocaleString()}</span>
+                            <span>{checkpoint.created_by}</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </Card>
+              )}
               <Card style={styles.summaryCard}>
                 <strong>Repository actions</strong>
                 <Pill tone={repositoryPreference.mode === "no_action" ? "draft" : "warning"}>
@@ -1266,41 +1432,105 @@ const styles: Record<string, CSSProperties> = {
     flexWrap: "wrap",
     gap: 8,
   },
+  cockpitStrip: {
+    display: "flex",
+    alignItems: "center",
+    gap: 0,
+    padding: "12px 16px",
+    borderRadius: "var(--radius-lg)",
+    border: "1px solid var(--border)",
+    background: "var(--surface)",
+    overflowX: "auto",
+  },
+  cockpitSection: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 4,
+    padding: "4px 12px",
+    minWidth: 70,
+  },
+  cockpitLabel: {
+    fontSize: "0.65rem",
+    fontWeight: 600,
+    letterSpacing: "0.05em",
+    textTransform: "uppercase",
+    color: "var(--muted)",
+  },
+  cockpitValue: {
+    fontSize: "1.1rem",
+    fontWeight: 700,
+    color: "var(--ink)",
+    letterSpacing: "-0.02em",
+  },
+  cockpitDivider: {
+    width: 1,
+    height: 32,
+    background: "var(--border)",
+  },
   taskRail: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+    display: "flex",
+    flexDirection: "row",
     gap: 10,
+    overflowX: "auto",
+    paddingBottom: 8,
+    maxWidth: "100%",
   },
   taskCard: {
     textAlign: "left",
-    padding: 14,
-    borderRadius: 16,
+    padding: "10px 14px",
+    borderRadius: 14,
     border: "1px solid var(--border)",
     background: "var(--panel)",
     boxShadow: "var(--shadow-sm)",
+    minWidth: 200,
+    maxWidth: 260,
+    flexShrink: 0,
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+    height: "auto",
+    whiteSpace: "normal",
+    lineHeight: "inherit",
   },
   taskCardActive: {
-    borderColor: "var(--indigo-a8)",
+    borderColor: "var(--accent)",
     background: "var(--active)",
+    boxShadow: "0 0 0 1px var(--accent)",
   },
-  taskCardHeader: {
+  taskCardRow: {
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
     gap: 8,
-    marginBottom: 8,
+  },
+  taskCardId: {
+    fontWeight: 700,
+    fontSize: "0.78rem",
+    color: "var(--ink)",
+    fontFamily: "var(--mono)",
+    letterSpacing: "0.02em",
+  },
+  taskCardStatus: {
+    fontSize: "0.66rem",
+    padding: "2px 6px",
+  },
+  taskCardTitleRow: {
+    minWidth: 0,
   },
   taskCardTitle: {
     fontWeight: 600,
     color: "var(--ink)",
-    marginBottom: 8,
+    fontSize: "0.86rem",
+    lineHeight: 1.3,
+  },
+  taskCardMetaRow: {
+    marginTop: 2,
   },
   taskCardMeta: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: 8,
     color: "var(--muted)",
-    fontSize: "0.78rem",
+    fontSize: "0.72rem",
+    lineHeight: 1.3,
   },
   tabBar: {
     display: "inline-flex",
@@ -1367,6 +1597,47 @@ const styles: Record<string, CSSProperties> = {
   summaryCard: {
     padding: 14,
     marginTop: 12,
+  },
+  checkpointHistoryItem: {
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: 10,
+    background: "var(--canvas)",
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  checkpointHistoryHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  checkpointSummary: {
+    margin: 0,
+  },
+  checkpointMetaRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    color: "var(--muted)",
+    fontSize: "0.75rem",
+  },
+  checkpointDecisions: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  checkpointDecisionPill: {
+    display: "inline-flex",
+    alignItems: "center",
+    padding: "3px 8px",
+    borderRadius: 999,
+    background: "var(--surface-2)",
+    color: "var(--ink)",
+    fontSize: "0.75rem",
+    border: "1px solid var(--border)",
   },
   ledgerGrid: {
     display: "grid",

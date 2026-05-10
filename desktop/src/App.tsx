@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { Badge, Theme } from "@radix-ui/themes";
 if (typeof globalThis !== "undefined" && !(globalThis as Record<string, unknown>).__SARATHI_RUNTIME_CONFIG__) {
   const env = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
@@ -35,6 +35,7 @@ import {
   approveRepositoryAction,
   approveTaskGate,
   createWorkspace,
+  createWorkspaceProject,
   createTaskHandoff,
   createTaskGraphDraft,
   createTaskDraft,
@@ -49,6 +50,7 @@ import {
   listEvents,
   listProviders,
   listTaskDashboard,
+  listWorkspaceProjects,
   listWorkspaceRepositories,
   listWorkspaces,
   previewWorkspaceRepository,
@@ -74,6 +76,7 @@ import {
   type TaskGraphDraftResult,
   type TaskGraphNode,
   type TaskStudioSnapshot,
+  type WorkspaceProjectRecord,
   type WorkspaceRecord,
 } from "./apiClient";
 import {
@@ -96,13 +99,14 @@ import {
 } from "./mockData";
 
 import WorkspacesHome from "./pages/WorkspacesHome";
+import WorkspaceDashboard from "./pages/WorkspaceDashboard";
 import Dashboard from "./pages/Dashboard";
 import InboxPage from "./pages/Inbox";
 import AgentsPage from "./pages/Agents";
 import SettingsPage from "./pages/Settings";
 import ProjectDetail from "./pages/ProjectDetail";
 
-export type AppRoute = "home" | "dashboard" | "inbox" | "agents" | "settings" | "project";
+export type AppRoute = "workspace" | "dashboard" | "inbox" | "agents" | "settings" | "project";
 
 type TaskTab = "messages" | "evidence" | "review" | "history" | "handoff";
 
@@ -125,7 +129,7 @@ type StudioUnit = {
 };
 
 const routeIcons: Record<AppRoute, ReactNode> = {
-  home:        <DashboardIcon />,
+  workspace:   <MixIcon />,
   dashboard:   <MixIcon />,
   inbox:       <ArchiveIcon />,
   agents:      <PersonIcon />,
@@ -134,7 +138,7 @@ const routeIcons: Record<AppRoute, ReactNode> = {
 };
 
 const routes: Record<AppRoute, string> = {
-  home: "Workspaces",
+  workspace: "Workspace",
   dashboard: "Dashboard",
   inbox: "Inbox",
   agents: "Agents",
@@ -146,7 +150,7 @@ const navGroups: Array<{ label: string; items: Array<{ id: AppRoute; count?: str
   {
     label: "Main",
     items: [
-      { id: "home", count: "live" },
+      { id: "workspace", count: "live" },
       { id: "dashboard", count: "3" },
       { id: "inbox", count: "5" },
     ],
@@ -165,10 +169,65 @@ const navGroups: Array<{ label: string; items: Array<{ id: AppRoute; count?: str
   },
 ];
 
+const WORKSPACE_SELECTION_KEY = "sarathi.desktop.workspace.selection.v1";
+
+function mockProjectTasks(): TaskDashboardItem[] {
+  return tasks.map((task) => ({
+    id: task.id,
+    workspace_id: workspace.id,
+    title: task.title,
+    status: task.status === "in_progress"
+      ? "in_progress"
+      : task.status === "complete"
+        ? "done"
+        : "prd_pending",
+    phase: task.phase,
+    approval_state: task.reviewState,
+    graph_state: "ready",
+    next_gate: task.status === "waiting_human" ? "approval required" : null,
+    node_count: task.progress > 0 ? Math.ceil(task.progress / 25) : 1,
+    blocked_count: 0,
+    roles: ["Pravaha"],
+    providers: ["Codex"],
+    updated_at: new Date(Date.now() - 5 * 60000).toISOString(),
+  }));
+}
+
+function readSelectedWorkspaceId(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(WORKSPACE_SELECTION_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function saveSelectedWorkspaceId(workspaceId: string | null) {
+  if (typeof window === "undefined") return;
+  try {
+    if (workspaceId) {
+      window.localStorage.setItem(WORKSPACE_SELECTION_KEY, workspaceId);
+    } else {
+      window.localStorage.removeItem(WORKSPACE_SELECTION_KEY);
+    }
+  } catch {
+    // Ignore persistence failures in the desktop shell.
+  }
+}
+
 export function App() {
   const apiConfigured = getSarathiApiConfig() !== null;
-  const [route, setRoute] = useState<AppRoute>("home");
+  const [route, setRoute] = useState<AppRoute>("workspace");
+  const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
+  const [workspaceLoading, setWorkspaceLoading] = useState(apiConfigured);
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(apiConfigured ? readSelectedWorkspaceId() : null);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [projectsByWorkspace, setProjectsByWorkspace] = useState<Record<string, WorkspaceProjectRecord[]>>({});
+  const [showWorkspaceCreate, setShowWorkspaceCreate] = useState(false);
+const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
+  const [projectCreateRequest, setProjectCreateRequest] = useState(0);
+  const [taskCreateRequest, setTaskCreateRequest] = useState(0);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<TaskDashboardItem | null>(null);
   const [selectedUnitId, setSelectedUnitId] = useState("ST-02");
   const [taskTab, setTaskTab] = useState<TaskTab>("messages");
@@ -183,10 +242,112 @@ export function App() {
     [selectedUnitId],
   );
 
+  const selectedWorkspace = useMemo(() => {
+    return workspaces.find((candidate) => candidate.id === selectedWorkspaceId) ?? null;
+  }, [workspaces, selectedWorkspaceId]);
+
+  const selectedProjects = useMemo(
+    () => (selectedWorkspaceId ? projectsByWorkspace[selectedWorkspaceId] ?? [] : []),
+    [projectsByWorkspace, selectedWorkspaceId],
+  );
+
+  const selectedProject = useMemo(
+    () => selectedProjects.find((project) => project.id === selectedProjectId) ?? null,
+    [selectedProjects, selectedProjectId],
+  );
+
+  useEffect(() => {
+    saveSelectedWorkspaceId(selectedWorkspaceId);
+  }, [selectedWorkspaceId]);
+
   useEffect(() => {
     if (!apiConfigured) {
+      setWorkspaces([]);
+      setWorkspaceLoading(false);
+      setSelectedWorkspaceId(null);
+      setSelectedProjectId(null);
+      setRoute("workspace");
       return;
     }
+
+    let cancelled = false;
+    async function loadWorkspaces() {
+      setWorkspaceLoading(true);
+      try {
+        const list = await listWorkspaces();
+        if (cancelled) return;
+        setWorkspaces(list);
+        const preferred = readSelectedWorkspaceId();
+        const nextWorkspace = list.find((candidate) => candidate.id === preferred) ?? list[0] ?? null;
+        setSelectedWorkspaceId(nextWorkspace?.id ?? null);
+        if (nextWorkspace) {
+          const nextProjects = projectsByWorkspace[nextWorkspace.id] ?? [];
+          setSelectedProjectId(nextProjects[0]?.id ?? null);
+          if (nextProjects.length > 0) {
+            setRoute("workspace");
+          }
+        } else {
+          setSelectedProjectId(null);
+          setRoute("workspace");
+        }
+      } catch {
+        if (!cancelled) {
+          setWorkspaces([]);
+          setSelectedWorkspaceId(null);
+          setSelectedProjectId(null);
+          setRoute("workspace");
+        }
+      } finally {
+        if (!cancelled) {
+          setWorkspaceLoading(false);
+        }
+      }
+    }
+    void loadWorkspaces();
+    return () => {
+      cancelled = true;
+    };
+  }, [apiConfigured]);
+
+  useEffect(() => {
+    if (!apiConfigured || !selectedWorkspaceId) return;
+    const workspaceId = selectedWorkspaceId;
+    let cancelled = false;
+    async function loadProjects() {
+      try {
+        const projects = await listWorkspaceProjects(workspaceId);
+        if (cancelled) return;
+        setProjectsByWorkspace((current) => ({
+          ...current,
+          [workspaceId]: projects,
+        }));
+        if (projects.length > 0) {
+          setSelectedProjectId((prev) => {
+            const hasCurrent = projects.some((p) => p.id === prev);
+            return hasCurrent && prev ? prev : projects[0].id;
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setProjectsByWorkspace((current) => ({
+            ...current,
+            [workspaceId]: [],
+          }));
+        }
+      }
+    }
+    void loadProjects();
+    return () => {
+      cancelled = true;
+    };
+  }, [apiConfigured, selectedWorkspaceId]);
+
+  useEffect(() => {
+    if (!apiConfigured || !selectedWorkspace) {
+      return;
+    }
+    const workspaceId = selectedWorkspace.id;
+    const taskId = route === "project" ? selectedTaskId ?? undefined : undefined;
     let cancelled = false;
     let source: EventSource | null = null;
     let pollInterval: number | undefined;
@@ -194,14 +355,9 @@ export function App() {
 
     async function startLiveUpdates() {
       try {
-        const selectedWorkspace = await ensureWorkspace(
-          workspace.name,
-          "/Users/sweethome/Work/Skills/Sarathi",
-          { source: "desktop-ui", display_id: workspace.id },
-        );
-        const streamUrl = getEventsStreamUrl(selectedWorkspace.id);
+        const streamUrl = getEventsStreamUrl(workspaceId, taskId);
         if (!streamUrl || typeof EventSource === "undefined") {
-          startPolling(selectedWorkspace.id);
+          startPolling(workspaceId, taskId);
           return;
         }
         source = new EventSource(streamUrl);
@@ -218,7 +374,7 @@ export function App() {
           setStreamState("polling");
           setStreamDetail("SSE reconnecting; polling fallback active");
           source?.close();
-          startPolling(selectedWorkspace.id);
+          startPolling(workspaceId, taskId);
         };
       } catch (error) {
         if (!cancelled) {
@@ -228,10 +384,10 @@ export function App() {
       }
     }
 
-    function startPolling(workspaceId: string) {
+    function startPolling(workspaceId: string, taskId?: string) {
       if (pollInterval !== undefined) return;
       pollInterval = window.setInterval(() => {
-        void listEvents(workspaceId).then((nextEvents) => {
+        void listEvents(workspaceId, taskId).then((nextEvents) => {
           if (cancelled) return;
           if (nextEvents.length !== observedEventCount) {
             observedEventCount = nextEvents.length;
@@ -251,7 +407,7 @@ export function App() {
         window.clearInterval(pollInterval);
       }
     };
-  }, [apiConfigured]);
+  }, [apiConfigured, selectedWorkspace, route, selectedTaskId]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -264,6 +420,134 @@ export function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [setRoute]);
 
+  async function handleCreateWorkspace(name: string, rootPath: string): Promise<WorkspaceRecord> {
+    if (!apiConfigured) {
+      const created: WorkspaceRecord = {
+        id: name.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-+|-+$/g, "") || `ws-${Date.now()}`,
+        name: name.trim(),
+        root_path: rootPath,
+        metadata: {
+          repo_count: 0,
+          status: "live",
+        },
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      setWorkspaces((current) => [created, ...current.filter((candidate) => candidate.id !== created.id)]);
+      setSelectedWorkspaceId(created.id);
+      setSelectedProjectId(null);
+      setShowWorkspaceCreate(false);
+      setRoute("workspace");
+      return created;
+    }
+    const created = await createWorkspace(name, rootPath, { source: "desktop-ui", display_id: workspace.id });
+    setWorkspaces((current) => [created, ...current.filter((candidate) => candidate.id !== created.id)]);
+    setSelectedWorkspaceId(created.id);
+    setSelectedProjectId(null);
+    setShowWorkspaceCreate(false);
+    setRoute("workspace");
+    return created;
+  }
+
+  function handleWorkspaceSelection(workspaceId: string) {
+    const nextWorkspace = workspaces.find((candidate) => candidate.id === workspaceId);
+    if (!nextWorkspace) return;
+    setShowWorkspaceCreate(false);
+    setSelectedWorkspaceId(workspaceId);
+    setSelectedTaskId(null);
+    const nextProjects = projectsByWorkspace[workspaceId] ?? [];
+    if (nextProjects.length > 0) {
+      setSelectedProjectId(nextProjects[0].id);
+    } else {
+      setSelectedProjectId(null);
+    }
+    setRoute("workspace");
+  }
+
+  async function handleCreateProject(name: string, description: string) {
+    const workspaceId = selectedWorkspace?.id;
+    if (!workspaceId) {
+      throw new Error("Select a workspace first.");
+    }
+    const project = await createWorkspaceProject(workspaceId, { name, description });
+    setProjectsByWorkspace((current) => ({
+      ...current,
+      [workspaceId]: [...(current[workspaceId] ?? []), project],
+    }));
+    setSelectedProjectId(project.id);
+    setShowWorkspaceCreate(false);
+    setRoute("dashboard");
+  }
+
+  function handleOpenProject(projectId: string) {
+    setSelectedProjectId(projectId);
+    setRoute("dashboard");
+  }
+
+  useEffect(() => {
+    if (!selectedWorkspaceId) return;
+    const nextProjects = projectsByWorkspace[selectedWorkspaceId] ?? [];
+    if (nextProjects.length === 0) {
+      if (selectedProjectId !== null) {
+        setSelectedProjectId(null);
+      }
+      return;
+    }
+    const hasCurrent = nextProjects.some((project) => project.id === selectedProjectId);
+    if (!hasCurrent) {
+      setSelectedProjectId(nextProjects[0].id);
+    }
+  }, [projectsByWorkspace, selectedProjectId, selectedWorkspaceId]);
+
+  const workspaceLabel = selectedWorkspace?.name ?? "No workspace yet";
+  const workspaceMeta = selectedWorkspace ? `${selectedWorkspace.id} / ${selectedWorkspace.root_path || "no path"}` : "Create a workspace to continue";
+  const currentProjects = selectedWorkspaceId ? projectsByWorkspace[selectedWorkspaceId] ?? [] : [];
+  const showWorkspaceEmpty = !selectedWorkspace || workspaces.length === 0;
+  const showProjectEmpty = !!selectedWorkspace && currentProjects.length === 0;
+  const showCommandBar = route !== "workspace";
+  const showStatusStrip = ["dashboard", "project"].includes(route);
+  const primaryActionLabel =
+    !selectedWorkspace
+      ? "New workspace"
+      : route === "workspace"
+        ? "New project"
+        : showProjectEmpty
+          ? "New project"
+          : "New task";
+  const secondaryActionLabel = route === "dashboard" && selectedWorkspace
+    ? "Workspace home"
+    : null;
+
+  function openWorkspaceCreate() {
+    setShowWorkspaceCreate(true);
+  }
+
+  function closeWorkspaceCreate() {
+    setShowWorkspaceCreate(false);
+  }
+
+  function openProjectCreate() {
+    if (!selectedWorkspace) {
+      openWorkspaceCreate();
+      return;
+    }
+    setProjectCreateRequest((current) => current + 1);
+    setRoute("workspace");
+  }
+
+  function openTaskCreate() {
+    if (!selectedWorkspace) {
+      openWorkspaceCreate();
+      return;
+    }
+    if (showProjectEmpty) {
+      openProjectCreate();
+      return;
+    }
+    setTaskCreateRequest((current) => current + 1);
+    setRoute("dashboard");
+  }
+
   return (
     <Theme
       accentColor="indigo"
@@ -274,25 +558,74 @@ export function App() {
       panelBackground="translucent"
     >
     <div className={dark ? "app dark" : "app"}>
-      <aside className="sidebar">
-        <button className="brand" onClick={() => setRoute("home")}>
-          <div className="brand-mark">S</div>
-          <div>
-            <strong>Sarathi</strong>
-            <span>Charioteer for AI Agents</span>
-          </div>
-        </button>
+      <aside className="sidebar hybrid-sidebar">
+        <div className="workspace-context">
+          <button className="brand" onClick={() => setRoute("workspace")}>
+            <div className="brand-mark">S</div>
+            <div className="brand-text">
+              <strong>Sarathi</strong>
+            </div>
+          </button>
 
-        <button className="workspace-switch" onClick={() => setRoute("home")}>
-          <span className="dot live" />
-          <span style={{ flex: 1 }}>
-            <strong>{workspace.id}</strong>
-            <small>{workspace.repos.length} repos linked</small>
-          </span>
-          <ChevronRightIcon style={{ color: "var(--faint)", flexShrink: 0 }} />
-        </button>
+          <button
+            className="workspace-chip hybrid-workspace-chip"
+            onClick={() => setWorkspaceSwitcherOpen((open) => !open)}
+            aria-expanded={workspaceSwitcherOpen}
+            aria-haspopup="menu"
+          >
+            <span className="chip-status dot live" />
+            <span className="chip-label">
+              <span className="chip-name">{workspaceLabel}</span>
+              {selectedWorkspace && <span className="chip-meta">{selectedWorkspace.id}</span>}
+            </span>
+            <ChevronRightIcon
+              style={{
+                color: "var(--h-faint)",
+                flexShrink: 0,
+                transform: workspaceSwitcherOpen ? "rotate(90deg)" : "none",
+                transition: "transform 150ms ease",
+              }}
+            />
+          </button>
 
-        <nav aria-label="Primary">
+          {workspaceSwitcherOpen && (
+            <div className="workspace-switcher-popover">
+              <div className="ws-popover-header">Switch workspace</div>
+              <div className="ws-popover-list">
+                {workspaces.map((ws) => {
+                  const isCurrent = ws.id === selectedWorkspaceId;
+                  return (
+                    <button
+                      key={ws.id}
+                      className={`ws-popover-item${isCurrent ? " current" : ""}`}
+                      onClick={() => {
+                        handleWorkspaceSelection(ws.id);
+                        setWorkspaceSwitcherOpen(false);
+                      }}
+                    >
+                      <span className={`ws-popover-dot ${ws.metadata?.status === "live" ? "live" : ""}`} />
+                      <span className="ws-popover-name">{ws.name}</span>
+                      {isCurrent && <span className="ws-popover-check">✓</span>}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="ws-popover-divider" />
+              <button
+                className="ws-popover-item ws-popover-create"
+                onClick={() => {
+                  setWorkspaceSwitcherOpen(false);
+                  openWorkspaceCreate();
+                }}
+              >
+                <PlusIcon style={{ width: 14, height: 14, flexShrink: 0 }} />
+                <span>New workspace</span>
+              </button>
+            </div>
+          )}
+        </div>
+
+        <nav aria-label="Primary" className="hybrid-nav">
           {navGroups.map((group) => (
             <section className="nav-group" key={group.label}>
               <span className="nav-label">{group.label}</span>
@@ -310,427 +643,146 @@ export function App() {
           ))}
         </nav>
 
-        <section className="sidebar-card">
-          <span className="eyebrow">Environment</span>
+        <section className="sidebar-card hybrid-status">
           <StatusLine tone="live" label="Sessions" value="3 active" />
-          <StatusLine tone="live" label="SQLite" value="ready" />
-          <StatusLine tone={streamTone(streamState)} label="Streams" value={streamDetail} />
+          <StatusLine tone={streamTone(streamState)} label="Stream" value={streamState} />
         </section>
       </aside>
 
       <main className="main">
-        <header className="topbar">
-          <div>
-            <span className="crumb">Workspace / {workspace.id}</span>
-            <h1>{routes[route]}</h1>
+        <header
+          className="topbar hybrid-topbar"
+        >
+          <div className="topbar-title">
+            <span className="crumb">
+              {selectedWorkspace ? `Workspace / ${selectedWorkspace.id}` : "Workspace / none"}
+            </span>
+            <h1>
+              {route === "workspace"
+                ? workspaceLabel
+                : route === "dashboard" && selectedProject
+                  ? selectedProject.name
+                  : routes[route]}
+            </h1>
           </div>
-          <button className="command" onClick={() => setRoute("dashboard")}>
-            <MagnifyingGlassIcon />
-            Ask Sarathi to plan, split, dispatch, review...
-            <kbd>⌘K</kbd>
-          </button>
+          {secondaryActionLabel && (
+            <button
+              className="secondary-action"
+              onClick={() => {
+                if (!selectedWorkspace) {
+                  openWorkspaceCreate();
+                  return;
+                }
+                setRoute("workspace");
+              }}
+            >
+              {secondaryActionLabel}
+            </button>
+          )}
           <button className="icon-action" title="Toggle dark mode" onClick={() => setDark((value) => !value)}>
             {dark ? <SunIcon /> : <MoonIcon />}
           </button>
-          <button className="primary" onClick={() => setRoute("dashboard")}>
+          <button
+            className="primary"
+            onClick={() => {
+              if (!selectedWorkspace) {
+                openWorkspaceCreate();
+                return;
+              }
+              if (route === "workspace" || showProjectEmpty) {
+                openProjectCreate();
+                return;
+              }
+              openTaskCreate();
+            }}
+          >
             <PlusIcon />
-            New task
+            {primaryActionLabel}
           </button>
         </header>
 
         <div className="page-body">
-          <section className="status-strip" style={{ marginBottom: 16 }}>
-            <Pill tone="active">Workspace {workspace.status}</Pill>
-            <Pill tone="healthy">SQLite ready</Pill>
-            <Pill tone={streamState === "connected" ? "healthy" : "warning"}>{streamDetail}</Pill>
-            <Pill tone="warning">Dirty worktree</Pill>
-            <Pill tone="blocked">Claude offline</Pill>
-          </section>
+          {showStatusStrip ? (
+            <section className="status-strip" style={{ marginBottom: 18 }}>
+              <Pill tone="active">Workspace {workspace.status}</Pill>
+              <Pill tone="healthy">SQLite ready</Pill>
+              <Pill tone={streamState === "connected" ? "healthy" : "warning"}>{streamDetail}</Pill>
+              <Pill tone="warning">Dirty worktree</Pill>
+            </section>
+          ) : null}
 
-          {route === "home" && <WorkspacesHome setRoute={(r) => setRoute(r as AppRoute)} setSelectedWorkspaceId={setSelectedProjectId} />}
-          {route === "dashboard" && <Dashboard />}
-          {route === "inbox" && <InboxPage />}
-          {route === "agents" && <AgentsPage />}
-          {route === "settings" && <SettingsPage />}
-          {route === "project" && <ProjectDetail />}
+          {!selectedWorkspace && (
+            <WorkspacesHome
+              workspaces={workspaces}
+              loading={workspaceLoading}
+              showCreate={showWorkspaceCreate}
+              onCreateWorkspace={handleCreateWorkspace}
+              onCloseCreate={closeWorkspaceCreate}
+              onOpenCreate={openWorkspaceCreate}
+              onSelectWorkspace={(selected) => handleWorkspaceSelection(selected.id)}
+              selectedWorkspaceId={selectedWorkspaceId}
+            />
+          )}
+          {route === "workspace" && selectedWorkspace && (
+            <WorkspaceDashboard
+              workspace={selectedWorkspace}
+              projects={currentProjects}
+              createRequestedAt={projectCreateRequest}
+              onCreateProject={handleCreateProject}
+              onOpenProject={handleOpenProject}
+            />
+          )}
+          {route === "dashboard" && (
+            !selectedWorkspace ? (
+              <WorkspacesHome
+                workspaces={workspaces}
+                loading={workspaceLoading}
+                showCreate={showWorkspaceCreate}
+                onCreateWorkspace={handleCreateWorkspace}
+                onCloseCreate={closeWorkspaceCreate}
+                onOpenCreate={openWorkspaceCreate}
+                onSelectWorkspace={(selected) => handleWorkspaceSelection(selected.id)}
+                selectedWorkspaceId={selectedWorkspaceId}
+              />
+            ) : showProjectEmpty ? (
+              <WorkspaceDashboard
+                workspace={selectedWorkspace}
+                projects={currentProjects}
+                createRequestedAt={projectCreateRequest}
+                onCreateProject={handleCreateProject}
+                onOpenProject={handleOpenProject}
+              />
+            ) : (
+<Dashboard
+                workspaceId={selectedWorkspaceId ?? selectedWorkspace?.id ?? workspace.id}
+                projectId={selectedProjectId ?? null}
+                projectName={selectedProject?.name ?? workspaceLabel}
+                tasks={null}
+                setRoute={setRoute as unknown as (route: string) => void}
+                liveTick={liveTick}
+                createRequestedAt={taskCreateRequest}
+                setSelectedTaskId={setSelectedTaskId}
+              />
+            )
+          )}
+          {route === "inbox" && <InboxPage workspaceId={selectedWorkspaceId ?? selectedWorkspace?.id ?? workspace.id} projectId={selectedProject?.id ?? null} setRoute={setRoute as unknown as (route: string) => void} liveTick={liveTick} setSelectedTaskId={setSelectedTaskId} />}
+          {route === "agents" && <AgentsPage workspaceId={selectedWorkspaceId ?? selectedWorkspace?.id ?? workspace.id} liveTick={liveTick} />}
+          {route === "settings" && <SettingsPage workspaceId={selectedWorkspaceId ?? selectedWorkspace?.id ?? null} />}
+          {route === "project" && (
+            <ProjectDetail
+              workspaceId={selectedWorkspaceId ?? selectedWorkspace?.id ?? workspace.id}
+              projectId={selectedProject?.id ?? null}
+              selectedTaskId={selectedTaskId}
+              setSelectedTaskId={setSelectedTaskId}
+              setRoute={setRoute as unknown as (route: string) => void}
+              liveTick={liveTick}
+            />
+          )}
         </div>
       </main>
     </div>
     </Theme>
   );
-}
-
-function WorkspaceOverview({
-  liveTick,
-  setRoute,
-}: {
-  liveTick: number;
-  setRoute: (route: AppRoute) => void;
-}) {
-  const apiConfigured = getSarathiApiConfig() !== null;
-  const [attachedRepos, setAttachedRepos] = useState<WorkspaceRepo[]>(workspace.repos);
-  const [repoDraftPath, setRepoDraftPath] = useState("/Users/sweethome/Work/Skills/Sarathi");
-  const [repoPreview, setRepoPreview] = useState<RepositoryIntakePreview | null>(null);
-  const [serviceWorkspace, setServiceWorkspace] = useState<WorkspaceRecord | null>(null);
-  const [serviceWorkspaces, setServiceWorkspaces] = useState<WorkspaceRecord[]>([]);
-  const [workspaceDraftName, setWorkspaceDraftName] = useState(workspace.name);
-  const [interviewDraft, setInterviewDraft] = useState({
-    project_name: "Sarathi workspace repo",
-    purpose: "A repository managed through Sarathi orchestration.",
-    primary_language: "Unknown",
-  });
-  const [repoStatus, setRepoStatus] = useState(
-    apiConfigured ? "Connected to local service." : "Demo preview mode. Configure local service to persist attach.",
-  );
-  const [isPreviewing, setIsPreviewing] = useState(false);
-
-  useEffect(() => {
-    if (!apiConfigured) {
-      return;
-    }
-    let cancelled = false;
-    async function initializeWorkspace() {
-      try {
-        const workspaces = await listWorkspaces();
-        const existing =
-          workspaces.find((candidate) => candidate.name === workspace.name)
-          ?? workspaces[0]
-          ?? await createWorkspace(workspace.name, "/Users/sweethome/Work/Skills/Sarathi", {
-            source: "desktop-ui",
-            display_id: workspace.id,
-          });
-        if (!cancelled) {
-          setServiceWorkspaces(workspaces.includes(existing) ? workspaces : [existing, ...workspaces]);
-          setServiceWorkspace(existing);
-          setRepoStatus(`Connected to local service workspace ${existing.id}.`);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setRepoStatus(error instanceof Error ? error.message : "Workspace initialization failed.");
-        }
-      }
-    }
-    void initializeWorkspace();
-    return () => {
-      cancelled = true;
-    };
-  }, [apiConfigured]);
-
-  useEffect(() => {
-    if (!apiConfigured || !serviceWorkspace) {
-      return;
-    }
-    const workspaceId = serviceWorkspace.id;
-    let cancelled = false;
-    async function loadRepositories() {
-      try {
-        const repositories = await listWorkspaceRepositories(workspaceId);
-        if (!cancelled) {
-          setAttachedRepos(repositories.map(repositoryRecordToRepo));
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setRepoStatus(error instanceof Error ? error.message : "Repository list refresh failed.");
-        }
-      }
-    }
-    void loadRepositories();
-    return () => {
-      cancelled = true;
-    };
-  }, [apiConfigured, serviceWorkspace, liveTick]);
-
-
-  async function createServiceWorkspace() {
-    if (!apiConfigured) {
-      setRepoStatus("Workspace creation requires the local service.");
-      return;
-    }
-    setIsPreviewing(true);
-    try {
-      const created = await createWorkspace(
-        workspaceDraftName.trim() || workspace.name,
-        "/Users/sweethome/Work/Skills/Sarathi",
-        { source: "desktop-ui", display_id: workspace.id },
-      );
-      setServiceWorkspaces((current) => [created, ...current]);
-      setServiceWorkspace(created);
-      setRepoStatus(`Created and selected workspace ${created.id}.`);
-    } catch (error) {
-      setRepoStatus(error instanceof Error ? error.message : "Workspace creation failed.");
-    } finally {
-      setIsPreviewing(false);
-    }
-  }
-
-  async function previewRepository() {
-    const trimmedPath = repoDraftPath.trim();
-    if (!trimmedPath) {
-      setRepoStatus("Enter a repository path before preview.");
-      return;
-    }
-    setIsPreviewing(true);
-    try {
-      const preview = apiConfigured
-        ? await previewWorkspaceRepository(requireServiceWorkspaceId(serviceWorkspace), trimmedPath)
-        : createDemoPreview(trimmedPath);
-      setRepoPreview(preview);
-      setRepoStatus(
-        apiConfigured
-          ? "Live preview returned from local service. No files were mutated."
-          : "Demo preview only. Start the local service to persist repository attach.",
-      );
-    } catch (error) {
-      setRepoStatus(error instanceof Error ? error.message : "Repository preview failed.");
-    } finally {
-      setIsPreviewing(false);
-    }
-  }
-
-  async function attachRepository() {
-    if (!repoPreview) {
-      setRepoStatus("Preview a repository before attaching it.");
-      return;
-    }
-    if (!apiConfigured) {
-      setRepoStatus("Attach requires the local service. Preview remains safe and non-mutating.");
-      return;
-    }
-    setIsPreviewing(true);
-    try {
-      const repository = await attachWorkspaceRepository(
-        requireServiceWorkspaceId(serviceWorkspace),
-        repoPreview.path,
-      );
-      setAttachedRepos((current) => [
-        ...current,
-        {
-          id: repository.id,
-          name: repository.name ?? repoPreview.name,
-          path: repository.path,
-          branch: repository.metadata.intake?.branch ?? "unknown",
-          gitState: repository.metadata.intake?.dirty ? "dirty" : "clean",
-          permission: "write",
-        },
-      ]);
-      setRepoStatus("Repository attached after approval. Sarathi recorded a lifecycle event.");
-    } catch (error) {
-      setRepoStatus(error instanceof Error ? error.message : "Repository attach failed.");
-    } finally {
-      setIsPreviewing(false);
-    }
-  }
-
-  async function initializeRepository(repo: WorkspaceRepo) {
-    if (!apiConfigured) {
-      setRepoStatus("Repository initialization requires the local service.");
-      return;
-    }
-    setIsPreviewing(true);
-    try {
-      const result = await initializeWorkspaceRepository(
-        requireServiceWorkspaceId(serviceWorkspace),
-        repo.id,
-        repoPreview?.requires_interview ? interviewDraft : {},
-      );
-      setAttachedRepos((current) => current.map((candidate) =>
-        candidate.id === repo.id ? repositoryRecordToRepo(result.repository) : candidate,
-      ));
-      setRepoStatus(
-        `Sarathi initialized ${repo.name}: ${result.initialization.created_files.length} files created.`,
-      );
-    } catch (error) {
-      setRepoStatus(error instanceof Error ? error.message : "Repository initialization failed.");
-    } finally {
-      setIsPreviewing(false);
-    }
-  }
-
-  return (
-    <div className="grid two">
-      <MetricsStrip />
-      <div style={{ display: "flex", flexDirection: "column", gap: 12, gridColumn: "1 / -1" }}>
-      <section className="panel hero">
-        <span className="eyebrow">Sarathi builds Sarathi</span>
-        <h2>Dogfood cockpit for turning intent into verified, reviewable work.</h2>
-        <p>
-          This workspace proves the app is being developed through the same CLI/Skill model baked into the
-          product: PRD, plan, graph, evidence, review, handoff, and learnings.
-        </p>
-        <div className="actions">
-          <button className="primary" onClick={() => setRoute("dashboard")}>Start with Sarathi</button>
-          <button onClick={() => setRoute("project")}>Open Project</button>
-        </div>
-      </section>
-
-      <section className="panel">
-        <PanelTitle title="Workspace readiness" badge="M0" />
-        {workspace.docs.map((doc) => (
-          <Card key={doc.name}>
-            <strong>{doc.name}</strong>
-            <Pill tone={doc.state === "valid" || doc.state === "active" ? "healthy" : "warning"}>
-              {doc.state}
-            </Pill>
-            <p>{doc.note}</p>
-          </Card>
-        ))}
-      </section>
-
-      <section className="panel">
-        <PanelTitle title="Repository intake preview" badge="UI-04" />
-        <p>
-          Attach one or more repos to this workspace. Sarathi previews Git state, policy-pack readiness,
-          and what it would create before any file mutation.
-        </p>
-        <Pill tone={apiConfigured ? "healthy" : "warning"}>
-          {apiConfigured ? "local service" : "demo mode"}
-        </Pill>
-        {serviceWorkspace ? (
-          <div className="stacked-field">
-            <label htmlFor="service-workspace">Service workspace</label>
-            <select
-              id="service-workspace"
-              value={serviceWorkspace.id}
-              onChange={(event) => {
-                const next = serviceWorkspaces.find((candidate) => candidate.id === event.target.value);
-                if (next) {
-                  setServiceWorkspace(next);
-                  setRepoStatus(`Selected workspace ${next.id}.`);
-                }
-              }}
-            >
-              {serviceWorkspaces.map((candidate) => (
-                <option key={candidate.id} value={candidate.id}>
-                  {candidate.name} / {candidate.id.slice(0, 8)}
-                </option>
-              ))}
-            </select>
-          </div>
-        ) : null}
-        <div className="inline-form">
-          <input
-            aria-label="Workspace name"
-            value={workspaceDraftName}
-            onChange={(event) => setWorkspaceDraftName(event.target.value)}
-          />
-          <button onClick={createServiceWorkspace} disabled={isPreviewing}>
-            Create workspace
-          </button>
-        </div>
-        <div className="inline-form">
-          <input
-            aria-label="Repository path"
-            value={repoDraftPath}
-            onChange={(event) => setRepoDraftPath(event.target.value)}
-          />
-          <button className="primary" onClick={previewRepository} disabled={isPreviewing}>
-            {isPreviewing ? "Checking" : "Preview"}
-          </button>
-        </div>
-        {repoPreview ? (
-          <Card>
-            <strong>{repoPreview.name}</strong>
-            <Pill tone={repoPreview.dirty ? "warning" : "healthy"}>{repoPreview.recommended_mode}</Pill>
-            <Field label="Branch" value={repoPreview.branch ?? "unknown"} />
-            <Field label="Git state" value={repoPreview.dirty ? "dirty" : "clean"} />
-            <Field label="Sarathi docs" value={repoPreview.sarathi_initialized ? "ready" : "needs setup"} />
-            {repoPreview.warnings.map((warning) => <p key={warning}>{warning}</p>)}
-            {repoPreview.requires_interview ? (
-              <div className="mini-list">
-                <input
-                  aria-label="Project name"
-                  value={interviewDraft.project_name}
-                  onChange={(event) => setInterviewDraft({ ...interviewDraft, project_name: event.target.value })}
-                />
-                <input
-                  aria-label="Project purpose"
-                  value={interviewDraft.purpose}
-                  onChange={(event) => setInterviewDraft({ ...interviewDraft, purpose: event.target.value })}
-                />
-                <input
-                  aria-label="Primary language"
-                  value={interviewDraft.primary_language}
-                  onChange={(event) => setInterviewDraft({ ...interviewDraft, primary_language: event.target.value })}
-                />
-              </div>
-            ) : null}
-            <button className="full" onClick={attachRepository} disabled={isPreviewing}>
-              Approve and attach repo
-            </button>
-          </Card>
-        ) : (
-          <Card>
-            <strong>No preview yet</strong>
-            <p>Run a preview to see branch, dirty-state, Sarathi docs, and approval requirements.</p>
-          </Card>
-        )}
-        <small>{repoStatus}</small>
-      </section>
-
-      {attachedRepos.map((repo) => (
-        <section className="panel" key={repo.id}>
-          <PanelTitle title={repo.name} badge={repo.gitState} />
-          <Field label="Branch" value={repo.branch} />
-          <Field label="Permission" value={repo.permission} />
-          <Field label="Path" value={repo.path} />
-          <Field label="Sarathi init" value={repo.initializationStatus ?? "not initialized"} />
-          <button className="full" onClick={() => void initializeRepository(repo)} disabled={isPreviewing}>
-            Approve Sarathi init
-          </button>
-        </section>
-      ))}
-      </div>
-      </div>
-  );
-}
-
-function requireServiceWorkspaceId(workspaceRecord: WorkspaceRecord | null): string {
-  if (!workspaceRecord) {
-    throw new Error("Local service workspace is still initializing.");
-  }
-  return workspaceRecord.id;
-}
-
-function repositoryRecordToRepo(repository: {
-  id: string;
-  name: string | null;
-  path: string;
-  metadata: { intake?: RepositoryIntakePreview; sarathi_initialization?: { status?: string } };
-}): WorkspaceRepo {
-  return {
-    id: repository.id,
-    name: repository.name ?? repository.metadata.intake?.name ?? "Repository",
-    path: repository.path,
-    branch: repository.metadata.intake?.branch ?? "unknown",
-    gitState: repository.metadata.intake?.dirty ? "dirty" : "clean",
-    permission: "write",
-    initializationStatus: repository.metadata.sarathi_initialization?.status ?? (
-      repository.metadata.intake?.sarathi_initialized ? "completed" : "not initialized"
-    ),
-  };
-}
-
-function createDemoPreview(path: string): RepositoryIntakePreview {
-  const name = path.split("/").filter(Boolean).at(-1) ?? "workspace-repo";
-  const looksLikeSarathi = path.toLowerCase().includes("sarathi");
-  return {
-    path,
-    name,
-    exists: Boolean(path),
-    is_directory: Boolean(path),
-    is_git_repo: looksLikeSarathi,
-    branch: looksLikeSarathi ? "main" : null,
-    remote_url: null,
-    dirty: looksLikeSarathi,
-    changes: looksLikeSarathi ? ["mock: dirty worktree warning"] : [],
-    sarathi_initialized: looksLikeSarathi,
-    recommended_mode: looksLikeSarathi ? "sarathi_enabled_repo" : "directory",
-    requires_interview: !looksLikeSarathi,
-    warnings: looksLikeSarathi
-      ? ["Demo warning: verify dirty worktree before initialization."]
-      : ["Demo warning: policy pack not detected; interview required."],
-    would_create: looksLikeSarathi ? [] : ["policy-pack/", "wiki/", "coding-standards.md", "learnings.md"],
-  };
 }
 
 function Orchestrator({ setRoute }: { setRoute: (route: AppRoute) => void }) {
@@ -1226,6 +1278,7 @@ function SavedViews({ setRoute }: { setRoute: (route: AppRoute) => void }) {
 function TaskStudio({
   selectedUnit,
   selectedTask,
+  projectId,
   selectedUnitId,
   setSelectedUnitId,
   taskTab,
@@ -1236,6 +1289,7 @@ function TaskStudio({
 }: {
   selectedUnit: StudioUnit;
   selectedTask: TaskDashboardItem | null;
+  projectId?: string | null;
   selectedUnitId: string;
   setSelectedUnitId: (id: string) => void;
   taskTab: TaskTab;
@@ -1265,7 +1319,11 @@ function TaskStudio({
       if (!config) { setChatStatus("Connect service to use chat."); return; }
       const ws = await ensureWorkspace(workspace.name, "/Users/sweethome/Work/Skills/Sarathi");
       console.log("[Chat] Workspace:", ws.id);
-      const result = await sendChatMessage(message, { workspaceId: ws.id, taskId: selectedTask?.id });
+      const result = await sendChatMessage(message, {
+        workspaceId: ws.id,
+        taskId: selectedTask?.id,
+        projectId: projectId ?? undefined,
+      });
       console.log("[Chat] Result:", result);
       setChatStatus(`Task ${result.taskId.slice(0, 8)} → ${result.agent}`);
     } catch (err) {
@@ -1963,6 +2021,9 @@ function TaskTabPanel({
   const repositoryAction = handoff?.metadata.repository_action as
     | { status?: string; action?: string; note?: string | null }
     | undefined;
+  const repositoryActionPreference = handoff?.metadata.repository_action_preference as
+    | { scope?: string; mode?: string; allowed_modes?: string[] }
+    | undefined;
   const acCoverage = handoff?.metadata.ac_coverage as
     | Array<{ id?: string; criterion?: string; covered?: boolean }>
     | undefined;
@@ -2020,12 +2081,16 @@ function TaskTabPanel({
         <p style={{ marginBottom: 12, fontSize: "0.83rem", color: "var(--muted)" }}>
           Choose the safest next action for this task before Sarathi touches Git.
         </p>
+        <p style={{ marginBottom: 12, fontSize: "0.8rem", color: "var(--muted)" }}>
+          Default posture: <strong>{repositoryActionPreference?.mode?.replace(/_/g, " ") ?? "no action"}</strong>. Commit and PR remain off until you opt in from Settings.
+        </p>
         <div className="actions" style={{ gap: 8 }}>
           {[
             { id: "no_action", label: "No action", tone: "default" },
             { id: "prepare_patch", label: "Prepare patch", tone: "warning" },
-            { id: "commit", label: "Commit", tone: "active" },
-            { id: "draft_pr", label: "Draft PR", tone: "healthy" },
+            { id: "commit", label: "Commit (opt-in)", tone: "active" },
+            { id: "draft_pr", label: "Draft PR (opt-in)", tone: "healthy" },
+            { id: "ready_pr", label: "Ready PR (opt-in)", tone: "healthy" },
           ].map((action) => (
             <button
               disabled={!taskId || !handoff || repositoryAction?.status === "approved"}
@@ -2353,14 +2418,14 @@ function Diagrams({ liveTick, setRoute }: { liveTick: number; setRoute: (route: 
             ) : (
               <small>{diagram.task_id ?? diagram.updated_at ?? "workspace artifact"}</small>
             )}
-            <button onClick={() => setRoute(diagram.kind === "agent_lifecycle" ? "home" : "project")}>
+            <button onClick={() => setRoute(diagram.kind === "agent_lifecycle" ? "workspace" : "project")}>
               Open {diagram.kind === "agent_lifecycle" ? "Lifecycle" : "Task Studio"}
             </button>
           </Card>
         )) : (
           <>
             <Card><strong>Dependency graph</strong><p>Task graph artifact generated from real subtask state.</p><button onClick={() => setRoute("project")}>Open Task Studio</button></Card>
-            <Card><strong>Agent lifecycle</strong><p>Role flow, review loop, and handoff state.</p><button onClick={() => setRoute("home")}>Open Lifecycle</button></Card>
+            <Card><strong>Agent lifecycle</strong><p>Role flow, review loop, and handoff state.</p><button onClick={() => setRoute("workspace")}>Open Lifecycle</button></Card>
           </>
         )}
       </div>
@@ -2376,6 +2441,7 @@ function Usage({ liveTick }: { liveTick: number }) {
     approveLearning,
   } = useDogfoodAcceptance(liveTick);
   const usage = snapshot?.usage;
+  const budget = usage?.budget ?? null;
   return (
     <>
       <section className="panel">
@@ -2385,6 +2451,11 @@ function Usage({ liveTick }: { liveTick: number }) {
       <div className="grid four">
         <Metric label="Tasks complete" value={String(usage?.tasks.done ?? 1)} note={`${usage?.tasks.total ?? 1} total tasks`} />
         <Metric label="Units active" value={String(usage?.subtasks.by_status.in_progress ?? 4)} note={`${usage?.subtasks.total ?? 4} graph units`} />
+        <Metric
+          label="Token budget"
+          value={budget ? (budget.budget_limit != null ? `${formatTokenCount(budget.total_tokens)} / ${formatTokenCount(budget.budget_limit)}` : formatTokenCount(budget.total_tokens)) : "n/a"}
+          note={budget ? `${budget.budget_state} · ${budget.usage_source}` : "no usage data yet"}
+        />
         <Metric label="Reviews" value={String(usage?.reviews.total ?? 1)} note={`${usage?.evidence.total ?? 0} evidence artifacts`} />
         <Metric label="Provider health" value={`${usage?.providers.online ?? 2}/${usage?.providers.total ?? 4}`} note="online" />
         <Metric label="Events" value={String(usage?.events.total ?? events.length)} note="persisted lifecycle signals" />
@@ -2530,178 +2601,6 @@ function useDogfoodAcceptance(liveTick: number) {
   }
 
   return { acceptance, status, approveLearning };
-}
-
-function Settings() {
-  const apiConfigured = getSarathiApiConfig() !== null;
-  const [providerHealth, setProviderHealth] = useState<ProviderHealthRecord[]>([]);
-  const [providerDrafts, setProviderDrafts] = useState<Record<string, { path: string; auth: string }>>({});
-  const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
-  const [settingsStatus, setSettingsStatus] = useState(
-    apiConfigured ? "Loading provider settings." : "Demo provider settings.",
-  );
-  const [providerPriority, setProviderPriority] = useState<string[]>(() => {
-    try {
-      return JSON.parse(localStorage.getItem("sarathi_provider_priority") || "null") || ["claude", "codex", "copilot", "opencode"];
-    } catch {
-      return ["claude", "codex", "copilot", "opencode"];
-    }
-  });
-
-  useEffect(() => {
-    if (!apiConfigured) return;
-    let cancelled = false;
-    async function loadSettingsProviders() {
-      try {
-        const selectedWorkspace = await ensureWorkspace(
-          workspace.name,
-          "/Users/sweethome/Work/Skills/Sarathi",
-          { source: "desktop-ui", display_id: workspace.id },
-        );
-        const nextProviders = await listProviders(selectedWorkspace.id);
-        if (!cancelled) {
-          setProviderHealth(nextProviders);
-          setProviderDrafts(Object.fromEntries(nextProviders.map((provider) => [
-            provider.id,
-            { path: provider.path, auth: provider.auth },
-          ])));
-          setSettingsStatus(`${nextProviders.length} providers loaded from workspace settings.`);
-        }
-      } catch (error) {
-        if (!cancelled) {
-          setSettingsStatus(error instanceof Error ? error.message : "Provider settings load failed.");
-        }
-      }
-    }
-    void loadSettingsProviders();
-    return () => {
-      cancelled = true;
-    };
-  }, [apiConfigured]);
-
-  async function testProvider(provider: ProviderHealthRecord) {
-    if (!apiConfigured) {
-      setSettingsStatus("Testing providers requires the local service.");
-      return;
-    }
-    setTestingProviderId(provider.id);
-    try {
-      setSettingsStatus(`Testing ${provider.name}...`);
-      const selectedWorkspace = await ensureWorkspace(
-        workspace.name,
-        "/Users/sweethome/Work/Skills/Sarathi",
-        { source: "desktop-ui", display_id: workspace.id },
-      );
-      const draft = providerDrafts[provider.id] ?? { path: provider.path, auth: provider.auth };
-      const updated = await testProviderConnection(selectedWorkspace.id, provider.id, draft.path, draft.auth);
-      setProviderHealth((current) => current.map((candidate) => candidate.id === updated.id ? updated : candidate));
-      setProviderDrafts((current) => ({ ...current, [updated.id]: { path: updated.path, auth: updated.auth } }));
-      setSettingsStatus(`${updated.name} is ${updated.health}${updated.last_error ? `: ${updated.last_error}` : "."}`);
-    } catch (error) {
-      setSettingsStatus(error instanceof Error ? error.message : "Provider test failed.");
-    } finally {
-      setTestingProviderId(null);
-    }
-  }
-
-  const visibleProviders: ProviderHealthRecord[] = providerHealth.length ? providerHealth : providers.map((provider) => ({
-    id: provider.id,
-    name: provider.name,
-    provider_type: provider.type,
-    health: provider.health,
-    auth: provider.auth,
-    path: provider.path,
-    capabilities: provider.capabilities,
-    last_checked_at: null,
-    last_error: null,
-  }));
-
-  return (
-    <div className="grid two">
-      <section className="panel">
-        <PanelTitle title="Setup checklist" badge="M0" />
-        <Field label="CLI validation" value="ready" />
-        <Field label="Provider setup" value={providerHealth.some((provider) => provider.health === "online") ? "ready" : "warning"} />
-        <Field label="Policy pack" value={workspace.policyPack} />
-        <Field label="SQLite" value={workspace.sqlite} />
-        <small>{settingsStatus}</small>
-      </section>
-      <section className="panel">
-        <PanelTitle title="Provider health" badge={apiConfigured ? "workspace" : "demo"} />
-        {visibleProviders.map((provider) => {
-          const draft = providerDrafts[provider.id] ?? { path: provider.path, auth: provider.auth };
-          return (
-            <Card key={provider.id}>
-              <strong>{provider.name}</strong>
-              <Pill tone={stateTone(provider.health)}>{provider.health}</Pill>
-              <div className="mini-list">
-                <input
-                  aria-label={`${provider.name} CLI path`}
-                  value={draft.path}
-                  onChange={(event) => setProviderDrafts({
-                    ...providerDrafts,
-                    [provider.id]: { ...draft, path: event.target.value },
-                  })}
-                />
-                <select
-                  aria-label={`${provider.name} auth`}
-                  value={draft.auth}
-                  onChange={(event) => setProviderDrafts({
-                    ...providerDrafts,
-                    [provider.id]: { ...draft, auth: event.target.value },
-                  })}
-                >
-                  <option value="connected">connected</option>
-                  <option value="missing">missing</option>
-                  <option value="not_required">not_required</option>
-                  <option value="workspace_setting">workspace_setting</option>
-                  <option value="github_auth">github_auth</option>
-                </select>
-              </div>
-              <small>{provider.last_checked_at ?? "not checked"} {provider.last_error ? `/ ${provider.last_error}` : ""}</small>
-              <div className="actions">
-                <button onClick={() => void testProvider(provider)} disabled={testingProviderId !== null}>
-                  {testingProviderId === provider.id ? "Testing..." : "Test connection"}
-                </button>
-              </div>
-            </Card>
-          );
-        })}
-      </section>
-      <section className="panel">
-        <PanelTitle title="Dispatch priority" badge="drag to reorder" />
-        <div className="mini-list">
-          {providerPriority.map((pid, index) => (
-            <div key={pid} style={{ display: "flex", alignItems: "center", gap: "0.5rem", padding: "0.25rem 0" }}>
-              <span style={{ flex: 1 }}>{pid}</span>
-              <button
-                disabled={index === 0}
-                onClick={() => {
-                  const newOrder = [...providerPriority];
-                  [newOrder[index - 1], newOrder[index]] = [newOrder[index], newOrder[index - 1]];
-                  setProviderPriority(newOrder);
-                  localStorage.setItem("sarathi_provider_priority", JSON.stringify(newOrder));
-                }}
-              >
-                Up
-              </button>
-              <button
-                disabled={index === providerPriority.length - 1}
-                onClick={() => {
-                  const newOrder = [...providerPriority];
-                  [newOrder[index], newOrder[index + 1]] = [newOrder[index + 1], newOrder[index]];
-                  setProviderPriority(newOrder);
-                  localStorage.setItem("sarathi_provider_priority", JSON.stringify(newOrder));
-                }}
-              >
-                Down
-              </button>
-            </div>
-          ))}
-        </div>
-      </section>
-    </div>
-  );
 }
 
 function WorkflowsPage() {
@@ -2923,6 +2822,16 @@ function MetricsStrip() {
       ))}
     </div>
   );
+}
+
+function formatTokenCount(value: number): string {
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 1)}m`;
+  }
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(value % 1000 === 0 ? 0 : 1)}k`;
+  }
+  return String(value);
 }
 
 function Metric({ label, value, note }: { label: string; value: string; note: string }) {

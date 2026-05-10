@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   getSarathiApiConfig,
   listTaskDashboard,
@@ -15,6 +15,18 @@ function relativeTime(iso: string): string {
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h ago`;
   return `${Math.floor(hrs / 24)}d ago`;
+}
+
+function getStatusPillClass(status: string): string {
+  if (status === "in_progress") return "status-pill active";
+  if (status === "done") return "status-pill done";
+  return "status-pill pending";
+}
+
+function getStatusLabel(status: string): string {
+  if (status === "in_progress") return "Active";
+  if (status === "done") return "Done";
+  return "Pending";
 }
 
 function mockTasksToDashboardItems(): TaskDashboardItem[] {
@@ -41,20 +53,33 @@ type FilterTab = "all" | "active" | "blocked" | "done";
 
 interface DashboardProps {
   workspaceId?: string | null;
+  projectId?: string | null;
+  projectName?: string | null;
+  tasks?: TaskDashboardItem[] | null;
+  createRequestedAt?: number;
   setSelectedTaskId?: (id: string) => void;
   setRoute?: (r: string) => void;
   liveTick?: number;
+  onTasksLoaded?: (items: TaskDashboardItem[]) => void;
+  onTaskCreated?: (item: TaskDashboardItem) => void;
 }
 
 export default function Dashboard({
   workspaceId,
+  projectId,
+  projectName,
+  tasks: controlledTasks,
+  createRequestedAt = 0,
   setSelectedTaskId,
   setRoute,
   liveTick = 0,
+  onTasksLoaded,
+  onTaskCreated,
 }: DashboardProps) {
   const apiConfigured = getSarathiApiConfig() !== null;
-  const [items, setItems] = useState<TaskDashboardItem[]>([]);
-  const [loading, setLoading] = useState(false);
+  const controlled = Array.isArray(controlledTasks);
+  const [items, setItems] = useState<TaskDashboardItem[]>(controlled ? controlledTasks : []);
+  const [loading, setLoading] = useState(!controlled);
   const [filter, setFilter] = useState<FilterTab>("all");
   const [search, setSearch] = useState("");
   const [showNew, setShowNew] = useState(false);
@@ -62,25 +87,58 @@ export default function Dashboard({
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
+  const guidanceCopy = apiConfigured
+    ? "Describe what you want to build. Sarathi will ask what it needs, then create the task."
+    : "Describe what you want to build. When the service is offline, Sarathi will fall back to a local draft.";
+
   const loadTasks = useCallback(async () => {
+    if (controlled) {
+      setItems(controlledTasks ?? []);
+      setLoading(false);
+      onTasksLoaded?.(controlledTasks ?? []);
+      return;
+    }
     if (!apiConfigured || !workspaceId) {
-      setItems(mockTasksToDashboardItems());
+      const fallback = mockTasksToDashboardItems();
+      setItems(fallback);
+      setLoading(false);
+      onTasksLoaded?.(fallback);
       return;
     }
     setLoading(true);
     try {
-      const list = await listTaskDashboard(workspaceId);
-      setItems(list.length > 0 ? list : mockTasksToDashboardItems());
+      const list = await listTaskDashboard(workspaceId, { projectId });
+      setItems(list);
+      onTasksLoaded?.(list);
     } catch {
-      setItems(mockTasksToDashboardItems());
+      setItems([]);
+      onTasksLoaded?.([]);
     } finally {
       setLoading(false);
     }
-  }, [apiConfigured, workspaceId]);
+  }, [apiConfigured, workspaceId, projectId, controlled, controlledTasks, onTasksLoaded]);
 
   useEffect(() => {
     void loadTasks();
   }, [loadTasks, liveTick]);
+
+  useEffect(() => {
+    if (createRequestedAt > 0) {
+      setShowNew(true);
+    }
+  }, [createRequestedAt]);
+
+  const insertCreatedItem = useCallback(
+    (item: TaskDashboardItem) => {
+      const nextItems = [item, ...items.filter((candidate) => candidate.id !== item.id)];
+      setItems(nextItems);
+      onTasksLoaded?.(nextItems);
+      onTaskCreated?.(item);
+      if (setSelectedTaskId) setSelectedTaskId(item.id);
+      if (setRoute) setRoute("project");
+    },
+    [items, onTaskCreated, onTasksLoaded, setRoute, setSelectedTaskId],
+  );
 
   async function handleCreateTask(e: React.FormEvent) {
     e.preventDefault();
@@ -92,7 +150,10 @@ export default function Dashboard({
     setCreating(true);
     setCreateError(null);
     try {
-      const result = await createTaskDraft(workspaceId, newPrompt.trim());
+      const result = await createTaskDraft(workspaceId, newPrompt.trim(), undefined, {
+        workspaceId,
+        projectId: projectId ?? undefined,
+      });
       const task = result.task;
       const newItem: TaskDashboardItem = {
         id: task.id,
@@ -109,11 +170,9 @@ export default function Dashboard({
         providers: [],
         updated_at: task.updated_at,
       };
-      setItems((prev) => [newItem, ...prev]);
+      insertCreatedItem(newItem);
       setShowNew(false);
       setNewPrompt("");
-      if (setSelectedTaskId) setSelectedTaskId(task.id);
-      if (setRoute) setRoute("project");
     } catch (err) {
       setCreateError(err instanceof Error ? err.message : "Failed to create task");
     } finally {
@@ -121,8 +180,8 @@ export default function Dashboard({
     }
   }
 
-  function applyFilter(list: TaskDashboardItem[]): TaskDashboardItem[] {
-    let filtered = list;
+  const visible = useMemo(() => {
+    let filtered = items;
     if (filter === "active") filtered = filtered.filter((t) => t.status === "in_progress");
     else if (filter === "blocked") filtered = filtered.filter((t) => t.blocked_count > 0);
     else if (filter === "done") filtered = filtered.filter((t) => t.status === "done");
@@ -131,85 +190,104 @@ export default function Dashboard({
       filtered = filtered.filter((t) => t.title.toLowerCase().includes(q));
     }
     return filtered;
-  }
+  }, [items, filter, search]);
 
-  const visible = applyFilter(items);
+  const hasProject = Boolean(projectId);
+  const emptyMessage = hasProject
+    ? "No tasks yet."
+    : "No projects yet.";
+  const emptyAction = hasProject
+    ? "Create one"
+    : "Create one";
 
   return (
-    <div style={styles.page}>
-      {/* Header */}
-      <div style={styles.header}>
-        <h2 style={styles.title}>Dashboard</h2>
-        <button
-          style={styles.newBtn}
-          onClick={() => setShowNew((v) => !v)}
-        >
-          + New project
-        </button>
+    <div className="dashboard-page">
+      <div className="dashboard-header">
+        {projectName && (
+          <span className="dashboard-eyebrow">{projectName}</span>
+        )}
+        <h2 className="dashboard-title">Dashboard</h2>
+        <p className="dashboard-subtitle">
+          {apiConfigured
+            ? "Describe what you want to build. Sarathi will ask what it needs, then create the task."
+            : "Describe what you want to build. When the service is offline, Sarathi will fall back to a local draft."}
+        </p>
       </div>
 
-      {/* New project form */}
-      {showNew && (
-        <form onSubmit={(e) => { void handleCreateTask(e); }} style={styles.newForm}>
-          <input
-            style={styles.input}
-            type="text"
-            placeholder="Describe the task or feature…"
-            value={newPrompt}
-            onChange={(e) => setNewPrompt(e.target.value)}
-            autoFocus
-            disabled={creating}
-          />
-          {createError && (
-            <div style={styles.errorText}>{createError}</div>
-          )}
-          <div style={styles.formActions}>
-            <button
-              type="submit"
-              style={{ ...styles.btn, ...styles.btnPrimary }}
-              disabled={creating || !newPrompt.trim()}
-            >
-              {creating ? "Creating…" : "Create"}
-            </button>
-            <button
-              type="button"
-              style={styles.btn}
-              onClick={() => {
-                setShowNew(false);
-                setCreateError(null);
-                setNewPrompt("");
-              }}
+      <div className="task-composer">
+        <div className="composer-guidance">
+          <span className="guidance-main">
+            Describe what you want to build
+          </span>
+          <span className="guidance-hint">
+            Sarathi will ask questions if needed, then create the task
+          </span>
+        </div>
+        {showNew && (
+          <form className="composer-form" onSubmit={(e) => { void handleCreateTask(e); }}>
+            <textarea
+              className="composer-input"
+              placeholder="Describe the task or feature…"
+              value={newPrompt}
+              onChange={(e) => setNewPrompt(e.target.value)}
+              autoFocus
               disabled={creating}
+              rows={2}
+            />
+            {createError && (
+              <div className="composer-error">{createError}</div>
+            )}
+            <div className="composer-actions">
+              <button
+                type="submit"
+                className="btn-primary"
+                disabled={creating || !newPrompt.trim()}
+              >
+                {creating ? "Creating…" : "Create"}
+              </button>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => {
+                  setShowNew(false);
+                  setCreateError(null);
+                  setNewPrompt("");
+                }}
+                disabled={creating}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        )}
+        {!showNew && (
+          <div className="prompt-chips">
+            <button
+              className="prompt-chip"
+              onClick={() => setShowNew(true)}
             >
-              Cancel
+              + New task
             </button>
           </div>
-        </form>
-      )}
+        )}
+      </div>
 
-      {/* Divider */}
-      <div style={styles.divider} />
-
-      {/* Filter bar */}
-      <div style={styles.filterBar}>
-        <div style={styles.tabs}>
+      <div className="filter-bar">
+        <div className="filter-tabs">
           {(["all", "active", "blocked", "done"] as FilterTab[]).map((tab) => (
             <button
               key={tab}
-              style={{
-                ...styles.tab,
-                ...(filter === tab ? styles.tabActive : {}),
-              }}
+              className={`filter-tab ${filter === tab ? "active" : ""}`}
               onClick={() => setFilter(tab)}
             >
               {tab.charAt(0).toUpperCase() + tab.slice(1)}
             </button>
           ))}
         </div>
-        <div style={styles.searchWrapper}>
-          <span style={styles.searchIcon}>&#128269;</span>
+        <div className="search-wrapper">
+          <span className="search-icon">&#128269;</span>
           <input
-            style={styles.searchInput}
+            className="search-input"
             type="text"
             placeholder="Search…"
             value={search}
@@ -218,19 +296,18 @@ export default function Dashboard({
         </div>
       </div>
 
-      {/* Task list */}
-      <div style={styles.list}>
+      <div className="task-list">
         {loading && (
-          <p style={styles.loadingText}>Loading tasks…</p>
+          <p className="loading-text">Loading tasks…</p>
         )}
         {!loading && visible.length === 0 && (
-          <div style={styles.emptyState}>
-            No projects yet.{" "}
+          <div className="empty-state">
+            {emptyMessage}{" "}
             <button
-              style={styles.inlineLink}
+              className="inline-link"
               onClick={() => setShowNew(true)}
             >
-              Create one
+              {emptyAction}
             </button>
           </div>
         )}
@@ -250,10 +327,10 @@ export default function Dashboard({
 }
 
 function statusDot(status: string, blockedCount: number): { symbol: string; color: string } {
-  if (blockedCount > 0) return { symbol: "⏸", color: "var(--s-amber)" };
-  if (status === "in_progress") return { symbol: "●", color: "var(--s-green)" };
-  if (status === "done") return { symbol: "✓", color: "var(--s-accent)" };
-  return { symbol: "○", color: "var(--s-faint)" };
+  if (blockedCount > 0) return { symbol: "⏸", color: "var(--amber)" };
+  if (status === "in_progress") return { symbol: "●", color: "var(--green)" };
+  if (status === "done") return { symbol: "✓", color: "var(--accent)" };
+  return { symbol: "○", color: "var(--faint)" };
 }
 
 function TaskCard({
@@ -264,276 +341,42 @@ function TaskCard({
   onClick: () => void;
 }) {
   const [hovered, setHovered] = useState(false);
-  const dot = statusDot(task.status, task.blocked_count);
-  const providerLine = task.providers.length > 0 ? task.providers.join(" · ") : null;
   const phaseLine = task.phase ? `${task.phase} phase` : null;
+  const providerLine = task.providers.length > 0 ? task.providers.join(" · ") : null;
+  const isBlocked = task.blocked_count > 0;
 
   return (
     <button
-      style={{
-        ...styles.taskCard,
-        ...(hovered ? styles.taskCardHover : {}),
-      }}
+      className={`task-card ${hovered ? "hovered" : ""} ${isBlocked ? "blocked" : ""}`}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       onClick={onClick}
     >
-      <div style={styles.taskRow}>
-        <span style={{ ...styles.statusDot, color: dot.color }}>{dot.symbol}</span>
-        <span style={styles.taskTitle}>{task.title}</span>
+      <div className="task-header">
+        {isBlocked && <span className="blocked-badge">Blocked</span>}
+        <span className={getStatusPillClass(task.status)}>
+          {getStatusLabel(task.status)}
+        </span>
+        {phaseLine && <span className="phase-pill">{phaseLine}</span>}
+        <span className="task-timestamp">{relativeTime(task.updated_at)}</span>
       </div>
 
-      {(providerLine || phaseLine) && (
-        <div style={styles.taskSub}>
-          {providerLine && <span>{providerLine}</span>}
-          {providerLine && phaseLine && <span style={styles.sep}>·</span>}
-          {phaseLine && <span>{phaseLine}</span>}
-        </div>
-      )}
+      <span className="task-title">{task.title}</span>
 
-      <div style={styles.taskMeta}>
+      <div className="task-meta">
         {task.node_count > 0 && (
-          <span>
+          <span className="meta-item">
             {task.node_count} unit{task.node_count !== 1 ? "s" : ""}
             {task.blocked_count > 0 && (
-              <span style={styles.blockedBadge}> · {task.blocked_count} blocked</span>
+              <span className="meta-item blocked"> · {task.blocked_count} blocked</span>
             )}
           </span>
         )}
         {task.next_gate && (
-          <span style={styles.gateBadge}>&#9888; gate pending</span>
+          <span className="meta-item gate">&#9888; gate pending</span>
         )}
-        <span style={styles.timestamp}>{relativeTime(task.updated_at)}</span>
+        {providerLine && <span className="meta-item">{providerLine}</span>}
       </div>
     </button>
   );
 }
-
-const styles: Record<string, React.CSSProperties> = {
-  page: {
-    display: "flex",
-    flexDirection: "column",
-    height: "100%",
-    padding: "20px 24px",
-    boxSizing: "border-box",
-    overflow: "auto",
-  },
-  header: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 12,
-  },
-  title: {
-    fontSize: 16,
-    fontWeight: 700,
-    color: "var(--s-ink)",
-    margin: 0,
-  },
-  newBtn: {
-    background: "var(--s-accent)",
-    color: "#fff",
-    border: "none",
-    borderRadius: "var(--s-radius-sm)",
-    padding: "6px 12px",
-    fontSize: 13,
-    fontWeight: 500,
-    cursor: "pointer",
-    font: "inherit",
-  },
-  newForm: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-    marginBottom: 12,
-    padding: "12px",
-    background: "var(--s-surface)",
-    border: "1px solid var(--s-border)",
-    borderRadius: "var(--s-radius)",
-  },
-  input: {
-    border: "1px solid var(--s-border)",
-    borderRadius: "var(--s-radius-sm)",
-    padding: "7px 10px",
-    fontSize: 13,
-    color: "var(--s-ink)",
-    background: "var(--s-canvas)",
-    outline: "none",
-    width: "100%",
-    boxSizing: "border-box",
-    font: "inherit",
-  },
-  errorText: {
-    color: "var(--s-red)",
-    fontSize: 12,
-  },
-  formActions: {
-    display: "flex",
-    gap: 6,
-  },
-  btn: {
-    border: "1px solid var(--s-border)",
-    borderRadius: "var(--s-radius-sm)",
-    padding: "5px 12px",
-    fontSize: 12,
-    fontWeight: 500,
-    cursor: "pointer",
-    background: "var(--s-surface)",
-    color: "var(--s-ink)",
-    font: "inherit",
-  },
-  btnPrimary: {
-    background: "var(--s-accent)",
-    color: "#fff",
-    border: "none",
-  },
-  divider: {
-    height: 1,
-    background: "var(--s-border)",
-    marginBottom: 12,
-  },
-  filterBar: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 12,
-    gap: 8,
-  },
-  tabs: {
-    display: "flex",
-    gap: 4,
-  },
-  tab: {
-    border: "none",
-    background: "none",
-    borderRadius: "var(--s-radius-sm)",
-    padding: "5px 10px",
-    fontSize: 13,
-    fontWeight: 500,
-    cursor: "pointer",
-    color: "var(--s-muted)",
-    font: "inherit",
-  },
-  tabActive: {
-    background: "var(--s-accent-bg)",
-    color: "var(--s-accent)",
-  },
-  searchWrapper: {
-    display: "flex",
-    alignItems: "center",
-    gap: 6,
-    border: "1px solid var(--s-border)",
-    borderRadius: "var(--s-radius-sm)",
-    padding: "4px 8px",
-    background: "var(--s-surface)",
-  },
-  searchIcon: {
-    fontSize: 13,
-    color: "var(--s-faint)",
-  },
-  searchInput: {
-    border: "none",
-    outline: "none",
-    fontSize: 13,
-    color: "var(--s-ink)",
-    background: "transparent",
-    width: 140,
-    font: "inherit",
-  },
-  list: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 8,
-  },
-  loadingText: {
-    fontSize: 13,
-    color: "var(--s-muted)",
-  },
-  emptyState: {
-    fontSize: 13,
-    color: "var(--s-muted)",
-    padding: "24px 0",
-    textAlign: "center",
-  },
-  inlineLink: {
-    background: "none",
-    border: "none",
-    color: "var(--s-accent)",
-    cursor: "pointer",
-    fontSize: "inherit",
-    padding: 0,
-    textDecoration: "underline",
-    font: "inherit",
-  },
-  taskCard: {
-    display: "flex",
-    flexDirection: "column",
-    gap: 6,
-    padding: "12px 16px",
-    background: "var(--s-surface)",
-    border: "1px solid var(--s-border)",
-    borderRadius: "var(--s-radius)",
-    cursor: "pointer",
-    textAlign: "left",
-    width: "100%",
-    boxSizing: "border-box",
-    transition: "box-shadow 0.15s ease",
-    font: "inherit",
-    color: "inherit",
-    outline: "none",
-  },
-  taskCardHover: {
-    boxShadow: "var(--s-shadow)",
-  },
-  taskRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-  },
-  statusDot: {
-    fontSize: 14,
-    lineHeight: 1,
-    flexShrink: 0,
-  },
-  taskTitle: {
-    fontWeight: 600,
-    fontSize: 14,
-    color: "var(--s-ink)",
-  },
-  taskSub: {
-    fontSize: 12,
-    color: "var(--s-muted)",
-    paddingLeft: 22,
-    display: "flex",
-    gap: 6,
-    alignItems: "center",
-  },
-  sep: {
-    color: "var(--s-faint)",
-  },
-  taskMeta: {
-    fontSize: 12,
-    color: "var(--s-muted)",
-    paddingLeft: 22,
-    display: "flex",
-    gap: 8,
-    alignItems: "center",
-    flexWrap: "wrap",
-  },
-  blockedBadge: {
-    color: "var(--s-amber)",
-    fontWeight: 500,
-  },
-  gateBadge: {
-    background: "var(--s-amber-bg)",
-    color: "var(--s-amber)",
-    fontSize: 11,
-    fontWeight: 600,
-    borderRadius: 4,
-    padding: "2px 6px",
-  },
-  timestamp: {
-    color: "var(--s-faint)",
-    marginLeft: "auto",
-  },
-};

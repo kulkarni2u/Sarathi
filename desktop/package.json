@@ -8,6 +8,7 @@
     "desktop": "cd .. && python3 -m src.service.desktop",
     "dev": "vite --host 127.0.0.1",
     "dev:connected": "VITE_SARATHI_API_BASE_URL=http://127.0.0.1:8765 VITE_SARATHI_API_TOKEN=dev vite --host 127.0.0.1",
+    "validate:task-panel": "npx -y @playwright/test@1.52.0 install chromium && node scripts/validate-task-panel.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1"
   },

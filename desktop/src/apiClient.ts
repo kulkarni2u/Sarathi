@@ -37,6 +37,17 @@ export type RepositoryActionPreferenceRecord = {
   source?: string;
 };
 
+export type AutoApprovePreferenceRecord = {
+  scope: "default" | "workspace" | "project" | "task" | string;
+  mode: "manual_only" | "below_threshold" | string;
+  allowed_modes: Array<"manual_only" | "below_threshold" | string>;
+  threshold?: {
+    complexity?: string;
+    max_node_count?: number;
+  };
+  source?: string;
+};
+
 export type TaskMetadata = {
   source_prompt?: string;
   complexity?: string;
@@ -66,6 +77,7 @@ export type TaskMetadata = {
 
 export type WorkspaceMetadata = {
   repository_action_preference?: RepositoryActionPreferenceRecord;
+  auto_approve_preference?: AutoApprovePreferenceRecord;
 } & Record<string, unknown>;
 
 export type WorkspaceRecord = {
@@ -449,6 +461,15 @@ type RuntimeConfig = {
 };
 
 export function getSarathiApiConfig(): ApiConfig | null {
+  const env = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
+  const baseUrl = env?.VITE_SARATHI_API_BASE_URL?.replace(/\/$/, "");
+  if (baseUrl) {
+    return {
+      baseUrl,
+      token: env?.VITE_SARATHI_API_TOKEN ?? null,
+    };
+  }
+
   const runtime = (globalThis as typeof globalThis & {
     __SARATHI_RUNTIME_CONFIG__?: RuntimeConfig;
   }).__SARATHI_RUNTIME_CONFIG__;
@@ -459,15 +480,37 @@ export function getSarathiApiConfig(): ApiConfig | null {
       token: runtime?.token ?? null,
     };
   }
-  const env = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
-  const baseUrl = env?.VITE_SARATHI_API_BASE_URL?.replace(/\/$/, "");
-  if (!baseUrl) {
-    return null;
-  }
-  return {
-    baseUrl,
-    token: env?.VITE_SARATHI_API_TOKEN ?? null,
-  };
+  return null;
+}
+
+export type WorkspaceProjectRecord = {
+  id: string;
+  workspace_id: string;
+  name: string;
+  description: string | null;
+  status: string;
+  task_count: number;
+  blocked_count: number;
+  updated_at: string;
+  created_at: string;
+};
+
+export async function listWorkspaceProjects(workspaceId: string): Promise<WorkspaceProjectRecord[]> {
+  const data = await getJson<{ projects: WorkspaceProjectRecord[] }>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/projects`,
+  );
+  return data.projects;
+}
+
+export async function createWorkspaceProject(
+  workspaceId: string,
+  payload: { name: string; description?: string },
+): Promise<WorkspaceProjectRecord> {
+  const data = await postJson<{ project: WorkspaceProjectRecord }>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/projects`,
+    payload,
+  );
+  return data.project;
 }
 
 export async function previewWorkspaceRepository(
@@ -565,9 +608,16 @@ export async function createTaskGraphDraft(taskId: string): Promise<TaskGraphDra
   );
 }
 
-export async function listTaskDashboard(workspaceId: string): Promise<TaskDashboardItem[]> {
+export async function listTaskDashboard(
+  workspaceId: string,
+  options: { projectId?: string | null } = {},
+): Promise<TaskDashboardItem[]> {
+  const params = new URLSearchParams();
+  if (options.projectId) {
+    params.set("project_id", options.projectId);
+  }
   const data = await getJson<{ tasks: TaskDashboardItem[] }>(
-    `/api/workspaces/${encodeURIComponent(workspaceId)}/task-dashboard`,
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/task-dashboard${params.size > 0 ? `?${params.toString()}` : ""}`,
   );
   return data.tasks;
 }
@@ -610,6 +660,13 @@ export async function getTaskCheckpoint(taskId: string): Promise<CheckpointCapsu
     `/api/tasks/${encodeURIComponent(taskId)}/checkpoint`,
   );
   return data.checkpoint;
+}
+
+export async function listTaskCheckpoints(taskId: string): Promise<CheckpointCapsuleRecord[]> {
+  const data = await getJson<{ checkpoints: CheckpointCapsuleRecord[] }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/checkpoints`,
+  );
+  return data.checkpoints;
 }
 
 export async function restartTaskFromCheckpoint(
@@ -689,6 +746,29 @@ export async function approveRepositoryAction(
   return postJson<RepositoryActionResult>(
     `/api/tasks/${encodeURIComponent(taskId)}/repository-action`,
     { action, approved: true },
+  );
+}
+
+export type PolicyPackFile = {
+  name: string;
+  content: string;
+};
+
+export async function getWorkspacePolicyPack(workspaceId: string): Promise<PolicyPackFile[]> {
+  const data = await getJson<{ files: PolicyPackFile[] }>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/policy-pack`,
+  );
+  return data.files;
+}
+
+export async function putWorkspacePolicyPackFile(
+  workspaceId: string,
+  filename: string,
+  content: string,
+): Promise<void> {
+  await putJson<Record<string, unknown>>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/policy-pack/${encodeURIComponent(filename)}`,
+    { content },
   );
 }
 
@@ -816,6 +896,26 @@ async function patchJson<T>(path: string, body: Record<string, unknown>): Promis
   }
   const response = await fetch(`${config.baseUrl}${path}`, {
     method: "PATCH",
+    headers: {
+      "content-type": "application/json",
+      ...(config.token ? { authorization: `Bearer ${config.token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  const envelope = (await response.json()) as ApiEnvelope<T>;
+  if (!envelope.ok) {
+    throw new Error(envelope.error.message);
+  }
+  return envelope.data;
+}
+
+async function putJson<T>(path: string, body: Record<string, unknown>): Promise<T> {
+  const config = getSarathiApiConfig();
+  if (!config) {
+    throw new Error("Sarathi local service is not configured for this desktop build.");
+  }
+  const response = await fetch(`${config.baseUrl}${path}`, {
+    method: "PUT",
     headers: {
       "content-type": "application/json",
       ...(config.token ? { authorization: `Bearer ${config.token}` } : {}),

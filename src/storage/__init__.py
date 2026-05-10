@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 4
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -56,6 +56,13 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
             (3, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 4:
+        conn.executescript(_MIGRATION_004)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (4, _utc_now()),
         )
         conn.commit()
 
@@ -212,6 +219,124 @@ class Storage:
             (workspace_id,),
         ).fetchall()
         return [_workspace_repository_from_row(row) for row in rows]
+
+    def create_project(
+        self,
+        *,
+        workspace_id: str,
+        name: str,
+        description: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        project_id = _new_id()
+        now = _utc_now()
+        self.conn.execute(
+            """
+            INSERT INTO projects (id, workspace_id, name, description, status, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (project_id, workspace_id, name, description, "active", _dump_json(metadata), now, now),
+        )
+        self.conn.commit()
+        project = self.get_project(project_id)
+        assert project is not None
+        return project
+
+    def get_project(self, project_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, workspace_id, name, description, status, metadata, created_at, updated_at
+            FROM projects
+            WHERE id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+        return _project_from_row(row) if row is not None else None
+
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_project(project_id)
+        if existing is None:
+            raise KeyError(project_id)
+        now = _utc_now()
+        next_metadata = metadata if metadata is not None else existing["metadata"]
+        self.conn.execute(
+            """
+            UPDATE projects
+            SET metadata = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (_dump_json(next_metadata), now, project_id),
+        )
+        self.conn.commit()
+        project = self.get_project(project_id)
+        assert project is not None
+        return project
+
+    def list_projects(self, workspace_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, name, description, status, metadata, created_at, updated_at
+            FROM projects
+            WHERE workspace_id = ?
+            ORDER BY created_at, id
+            """,
+            (workspace_id,),
+        ).fetchall()
+        return [_project_from_row(row) for row in rows]
+
+    def get_project_stats(self, project_id: str) -> dict[str, Any]:
+        if self.get_project(project_id) is None:
+            return {
+                "task_count": 0,
+                "blocked_count": 0,
+                "review_needed_count": 0,
+                "last_activity": None,
+            }
+        rows = self.conn.execute(
+            """
+            SELECT
+                t.id,
+                MAX(t.updated_at) AS last_activity
+            FROM tasks t
+            WHERE json_extract(t.metadata, '$.project_id') = ?
+            GROUP BY t.id
+            """,
+            (project_id,),
+        ).fetchall()
+        task_ids = [row["id"] for row in rows]
+        task_count = len(task_ids)
+        last_activity = max((row["last_activity"] for row in rows), default=None)
+        blocked_count = 0
+        review_needed_count = 0
+        if task_ids:
+            placeholders = ",".join(["?" for _ in task_ids])
+            blocked_count = self.conn.execute(
+                f"""
+                SELECT COUNT(DISTINCT task_id)
+                FROM lifecycle_events
+                WHERE task_id IN ({placeholders}) AND event_type = 'task.blocked'
+                """,
+                task_ids,
+            ).fetchone()[0] or 0
+            review_needed_count = self.conn.execute(
+                f"""
+                SELECT COUNT(DISTINCT task_id)
+                FROM approval_gates
+                WHERE task_id IN ({placeholders}) AND status = 'pending' AND name != 'PRD/AC'
+                """,
+                task_ids,
+            ).fetchone()[0] or 0
+        return {
+            "task_count": task_count,
+            "blocked_count": int(blocked_count),
+            "review_needed_count": int(review_needed_count),
+            "last_activity": last_activity,
+        }
 
     def create_task(
         self,
@@ -1055,6 +1180,19 @@ def _workspace_repository_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _project_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "workspace_id": row["workspace_id"],
+        "name": row["name"],
+        "description": row["description"],
+        "status": row["status"],
+        "metadata": _load_json(row["metadata"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 def _task_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -1626,4 +1764,22 @@ CREATE TABLE IF NOT EXISTS checkpoint_capsules (
 
 CREATE INDEX IF NOT EXISTS idx_checkpoint_capsules_task
     ON checkpoint_capsules(workspace_id, source_task_id);
+"""
+
+
+_MIGRATION_004 = """
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_projects_workspace
+    ON projects(workspace_id);
 """

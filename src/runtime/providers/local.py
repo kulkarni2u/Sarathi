@@ -1,12 +1,13 @@
 """Deterministic local provider for early orchestration slices."""
 from __future__ import annotations
 
+import json
 import re
 
 try:
-    from ..contracts import DispatchRequest, DispatchResponse
+    from ..contracts import DispatchRequest, DispatchResponse, build_usage_record
 except ImportError:
-    from runtime.contracts import DispatchRequest, DispatchResponse
+    from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
 
 from .base import ProviderAdapter
 
@@ -73,6 +74,13 @@ class LocalProviderAdapter(ProviderAdapter):
             outputs=outputs,
             evidence=evidence,
             artifacts={"mode": "explore", "provider": self.name},
+            usage=build_usage_record(
+                provider_id=self.name,
+                provider_family=self.name,
+                dispatch_id=request.task_id,
+                prompt=request.prompt,
+                response_text=json.dumps({"outputs": outputs, "evidence": evidence}, sort_keys=True, default=str),
+            ),
         )
 
     def _dispatch_execute(self, request: DispatchRequest) -> DispatchResponse:
@@ -123,6 +131,17 @@ class LocalProviderAdapter(ProviderAdapter):
                     "recovery_class": recovery_class,
                     "target_provider": provider_name,
                 },
+                usage=build_usage_record(
+                    provider_id=self.name,
+                    provider_family=self.name,
+                    dispatch_id=request.task_id,
+                    prompt=request.prompt,
+                    response_text=json.dumps({"outputs": outputs, "evidence": {
+                        "provider_recovery_fix_prepared": True,
+                        "recovery_class": recovery_class,
+                        "provider_recovery_target": provider_name,
+                    }}, sort_keys=True, default=str),
+                ),
             )
 
         if request.constraints.get("purpose") == "child_task_execution":
@@ -146,6 +165,13 @@ class LocalProviderAdapter(ProviderAdapter):
                 outputs=outputs,
                 evidence=response_evidence,
                 artifacts={"mode": "execute", "provider": self.name, "purpose": "child_task_execution"},
+                usage=build_usage_record(
+                    provider_id=self.name,
+                    provider_family=self.name,
+                    dispatch_id=request.task_id,
+                    prompt=request.prompt,
+                    response_text=json.dumps({"outputs": outputs, "evidence": response_evidence}, sort_keys=True, default=str),
+                ),
             )
 
         description = request.inputs.get("task_description", request.prompt)
@@ -179,6 +205,17 @@ class LocalProviderAdapter(ProviderAdapter):
                 "rollback_plan": bool(risks),
             },
             artifacts={"mode": "execute", "provider": self.name},
+            usage=build_usage_record(
+                provider_id=self.name,
+                provider_family=self.name,
+                dispatch_id=request.task_id,
+                prompt=request.prompt,
+                response_text=json.dumps({"outputs": outputs, "evidence": {
+                    "checkpoint_list": len(plan["steps"]) > 0,
+                    "dependency_map": len(plan["dependencies"]) > 0,
+                    "rollback_plan": bool(risks),
+                }}, sort_keys=True, default=str),
+            ),
         )
 
     def _changed_files_for_node(self, node: dict) -> list[str]:

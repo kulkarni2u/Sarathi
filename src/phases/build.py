@@ -5,10 +5,20 @@ import os
 from typing import TYPE_CHECKING, Any
 
 try:
-    from src.task_graph import latest_failed_node, next_retryable_failed_node, require_human_for_graph_node
+    from src.task_graph import (
+        annotate_graph_for_supervision,
+        latest_failed_node,
+        next_retryable_failed_node,
+        require_human_for_graph_node,
+    )
     from src.runtime import EscalationBundleBuilder, GraphExecutionPolicy, TaskGraphExecutor
 except ImportError:
-    from task_graph import latest_failed_node, next_retryable_failed_node, require_human_for_graph_node
+    from task_graph import (
+        annotate_graph_for_supervision,
+        latest_failed_node,
+        next_retryable_failed_node,
+        require_human_for_graph_node,
+    )
     from runtime import EscalationBundleBuilder, GraphExecutionPolicy, TaskGraphExecutor
 
 if TYPE_CHECKING:
@@ -48,6 +58,8 @@ class BuildHandler:
                 if isinstance(graph, dict):
                     task_graph = graph
                     break
+        if task_graph:
+            task_graph = annotate_graph_for_supervision(task_graph, parent_task_id=task.task_id)
 
         evidence = {
             "plan_consumed": bool(plan),

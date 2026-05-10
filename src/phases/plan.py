@@ -62,6 +62,8 @@ class PlanHandler:
                 "task_graph": graph_from_plan(plan).to_artifact(),
                 "dispatch_artifacts": response.artifacts,
             }
+            if response.usage is not None:
+                artifacts["dispatch_usage"] = response.usage.to_artifact()
         else:
             plan = self._create_implementation_plan(task, prev_artifacts)
             effort_estimate = self._estimate_effort(plan)

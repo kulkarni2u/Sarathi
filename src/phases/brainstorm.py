@@ -49,6 +49,8 @@ class BrainstormHandler:
                 "success_criteria": success_criteria,
                 "dispatch_artifacts": response.artifacts,
             }
+            if response.usage is not None:
+                artifacts["dispatch_usage"] = response.usage.to_artifact()
         else:
             approaches = self._generate_approaches(task)
             risks = self._assess_risks(approaches)

@@ -1,7 +1,11 @@
+import sys
 from pathlib import Path
 import stat
 
 from src.service import _provider_dispatch_command, create_app
+from src.runtime import DispatchRequest
+from src.runtime.providers.configured import CommandProviderAdapter
+from src.runtime.providers.local import LocalProviderAdapter
 
 
 def request(app, method, path, body=None, correlation_id="corr-provider-dispatch"):
@@ -250,6 +254,73 @@ def test_configured_command_provider_dispatches_non_local_work_unit(tmp_path):
     assert data["subtask"]["status"] == "review"
     assert data["evidence"]["metadata"]["provider"] == "codex"
     assert data["evidence"]["metadata"]["response_evidence"]["command_provider"] is True
+
+
+def test_local_provider_dispatch_attaches_estimated_usage():
+    adapter = LocalProviderAdapter()
+    response = adapter.dispatch(
+        DispatchRequest(
+            mode="execute",
+            task_id="task-usage",
+            phase="Build",
+            prompt="Implement token tracking",
+        )
+    )
+
+    assert response.success is True
+    assert response.usage is not None
+    assert response.usage.provider_id == "local"
+    assert response.usage.provider_family == "local"
+    assert response.usage.estimated is True
+    assert response.usage.usage_source == "estimated"
+    assert response.usage.total_tokens > 0
+
+
+def test_command_provider_dispatch_uses_reported_usage_when_available(tmp_path):
+    script = tmp_path / "usage_provider.py"
+    script.write_text(
+        (
+            "import json,sys;"
+            "request=json.load(sys.stdin);"
+            "print(json.dumps({"
+            "'success': True,"
+            "'outputs': {'messages': ['done']},"
+            "'evidence': {'command_provider': True},"
+            "'artifacts': {'bridge': 'shim'},"
+            "'usage': {"
+            "'provider_id': 'demo',"
+            "'provider_family': 'command',"
+            "'dispatch_id': request['task_id'],"
+            "'input_tokens': 50,"
+            "'output_tokens': 25,"
+            "'total_tokens': 75,"
+            "'estimated': False,"
+            "'budget_limit': 100,"
+            "'budget_remaining': 25,"
+            "'budget_state': 'warning',"
+            "'usage_source': 'reported'"
+            "}"
+            "}))"
+        )
+    )
+    adapter = CommandProviderAdapter("demo", [sys.executable, str(script)])
+
+    response = adapter.dispatch(
+        DispatchRequest(
+            mode="execute",
+            task_id="task-reported",
+            phase="Build",
+            prompt="Implement token tracking",
+        )
+    )
+
+    assert response.success is True
+    assert response.usage is not None
+    assert response.usage.provider_id == "demo"
+    assert response.usage.provider_family == "command"
+    assert response.usage.estimated is False
+    assert response.usage.total_tokens == 75
+    assert response.usage.budget_state == "warning"
 
 
 def test_dispatch_rejects_offline_non_local_provider(tmp_path):

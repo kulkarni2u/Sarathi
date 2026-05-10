@@ -37,6 +37,7 @@ try:
         RecoveryRunner,
         phase_agent_role_artifact,
     )
+    from .task_graph import annotate_graph_for_supervision
 except ImportError:
     from dispatch import Dispatcher, LocalDispatcher
     from phases import (
@@ -62,6 +63,7 @@ except ImportError:
         RecoveryRunner,
         phase_agent_role_artifact,
     )
+    from task_graph import annotate_graph_for_supervision
 
 
 class Phase(Enum):
@@ -758,10 +760,10 @@ class Engine:
         """Promote selected phase artifacts into task-level state."""
         task_graph = result.artifacts.get("task_graph")
         if isinstance(task_graph, dict):
-            task.task_graph_state = task_graph
+            task.task_graph_state = annotate_graph_for_supervision(task_graph, parent_task_id=task.task_id)
         task_graph_state = result.artifacts.get("task_graph_state")
         if isinstance(task_graph_state, dict) and task_graph_state:
-            task.task_graph_state = task_graph_state
+            task.task_graph_state = annotate_graph_for_supervision(task_graph_state, parent_task_id=task.task_id)
 
         # Save updated task state
         self.persistence.save_task(task)

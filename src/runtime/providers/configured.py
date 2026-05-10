@@ -9,9 +9,9 @@ import subprocess
 from typing import Any
 
 try:
-    from ..contracts import DispatchRequest, DispatchResponse
+    from ..contracts import DispatchRequest, DispatchResponse, build_usage_record
 except ImportError:
-    from runtime.contracts import DispatchRequest, DispatchResponse
+    from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
 
 from .base import ProviderAdapter
 from .local import LocalProviderAdapter
@@ -143,6 +143,13 @@ class ExternalProviderAdapter(ProviderAdapter):
             outputs=outputs,
             evidence=evidence,
             artifacts=artifacts,
+            usage=build_usage_record(
+                provider_id=self.name,
+                provider_family="command",
+                dispatch_id=request.task_id,
+                prompt=request.prompt,
+                response_text=json.dumps({"outputs": outputs, "evidence": evidence}, sort_keys=True, default=str),
+            ),
         )
 
 
@@ -199,6 +206,14 @@ class CommandProviderAdapter(ProviderAdapter):
             )
         if not isinstance(parsed, dict):
             parsed = {}
+        usage = build_usage_record(
+            provider_id=self.name,
+            provider_family="command",
+            dispatch_id=request.task_id,
+            prompt=request.prompt,
+            response_text=completed.stdout or "",
+            reported_usage=parsed.get("usage") if isinstance(parsed.get("usage"), Mapping) else None,
+        )
         return DispatchResponse(
             success=bool(parsed.get("success", completed.returncode == 0)),
             outputs=parsed.get("outputs") if isinstance(parsed.get("outputs"), dict) else {},
@@ -209,6 +224,7 @@ class CommandProviderAdapter(ProviderAdapter):
                 **(parsed.get("artifacts") if isinstance(parsed.get("artifacts"), dict) else {}),
             },
             raw_transcript_ref=parsed.get("raw_transcript_ref") if isinstance(parsed.get("raw_transcript_ref"), str) else None,
+            usage=usage,
             error=parsed.get("error") if isinstance(parsed.get("error"), str) else (completed.stderr.strip() or None),
         )
 

@@ -1,6 +1,7 @@
 """Task graph execution helpers."""
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -24,7 +25,8 @@ _GRAPH_STATE_KEYS = (
 
 def _copy_graph_state(graph: dict) -> dict:
     """Copy graph state while preserving scheduler indexes."""
-    current = {"nodes": [dict(node) for node in graph.get("nodes", [])]}
+    current = deepcopy(graph)
+    current["nodes"] = [dict(node) for node in graph.get("nodes", [])]
     for key in _GRAPH_STATE_KEYS:
         current[key] = list(graph.get(key, []))
     return current
@@ -336,6 +338,8 @@ class TaskGraphExecutor:
             "evidence": response.evidence,
             "artifacts": response.artifacts,
         }
+        if response.usage:
+            result["usage"] = response.usage.to_artifact()
         if response.error:
             result["error"] = response.error
         if response.raw_transcript_ref:

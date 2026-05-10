@@ -1,6 +1,7 @@
 """Task graph helpers for dependency-aware execution planning."""
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -14,12 +15,17 @@ class TaskNode:
     title: str
     status: str = "pending"
     depends_on: list[str] = field(default_factory=list)
+    parent_task_id: str | None = None
+    child_task_ids: list[str] = field(default_factory=list)
+    needs_from: list[str] = field(default_factory=list)
+    block_reason: str | None = None
     attempts: int = 0
     started_at: str | None = None
     completed_at: str | None = None
     failed_at: str | None = None
     blocked_at: str | None = None
     last_error: str | None = None
+    last_touched_at: str | None = None
 
     def to_artifact(self) -> dict[str, Any]:
         return {
@@ -27,12 +33,17 @@ class TaskNode:
             "title": self.title,
             "status": self.status,
             "depends_on": self.depends_on,
+            "parent_task_id": self.parent_task_id,
+            "child_task_ids": self.child_task_ids,
+            "needs_from": self.needs_from,
+            "block_reason": self.block_reason,
             "attempts": self.attempts,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "failed_at": self.failed_at,
             "blocked_at": self.blocked_at,
             "last_error": self.last_error,
+            "last_touched_at": self.last_touched_at,
         }
 
 
@@ -43,10 +54,11 @@ class TaskGraph:
     nodes: list[TaskNode] = field(default_factory=list)
 
     def to_artifact(self) -> dict[str, Any]:
-        return {
+        graph = {
             "nodes": [node.to_artifact() for node in self.nodes],
             "ready_nodes": [node.id for node in self.nodes if not node.depends_on],
         }
+        return annotate_graph_for_supervision(graph)
 
 
 def graph_from_plan(plan: dict[str, Any]) -> TaskGraph:
@@ -57,8 +69,19 @@ def graph_from_plan(plan: dict[str, Any]) -> TaskGraph:
     for index, step in enumerate(steps, start=1):
         node_id = f"step-{index}"
         depends_on = [previous_id] if previous_id is not None else []
-        nodes.append(TaskNode(id=node_id, title=str(step), depends_on=depends_on))
+        nodes.append(
+            TaskNode(
+                id=node_id,
+                title=str(step),
+                depends_on=depends_on,
+                parent_task_id=plan.get("task_id"),
+                needs_from=list(depends_on),
+            )
+        )
         previous_id = node_id
+    for index, node in enumerate(nodes):
+        if index + 1 < len(nodes):
+            node.child_task_ids = [nodes[index + 1].id]
     return TaskGraph(nodes=nodes)
 
 
@@ -72,6 +95,9 @@ def graph_summary(graph: dict[str, Any]) -> dict[str, int]:
         "blocked": 0,
         "failed": 0,
         "waiting_human": 0,
+        "waiting_user": 0,
+        "stale": 0,
+        "done": 0,
     }
     for node in graph.get("nodes", []):
         status = node.get("status", "pending")
@@ -257,6 +283,9 @@ def _recompute_graph_state(graph: dict[str, Any]) -> dict[str, Any]:
     """Recompute graph indexes after a node state transition."""
     nodes = list(graph.get("nodes", []))
     updated_graph = {"nodes": nodes}
+    for key, value in graph.items():
+        if key != "nodes":
+            updated_graph[key] = deepcopy(value)
     completed = []
     failed = []
     blocked = []
@@ -291,4 +320,179 @@ def _recompute_graph_state(graph: dict[str, Any]) -> dict[str, Any]:
     latest_failed = latest_failed_node(updated_graph)
     if latest_failed is not None:
         updated_graph["last_failed_node"] = latest_failed["id"]
+    return annotate_graph_for_supervision(updated_graph)
+
+
+def annotate_graph_for_supervision(
+    graph: dict[str, Any],
+    *,
+    parent_task_id: str | None = None,
+    stale_after_seconds: int = 300,
+) -> dict[str, Any]:
+    """Attach compact supervision metadata to a task graph."""
+    updated_graph = deepcopy(graph)
+    nodes = [dict(node) for node in updated_graph.get("nodes", [])]
+    node_ids = {node.get("id") for node in nodes if node.get("id")}
+    dependents: dict[str, list[str]] = {node_id: [] for node_id in node_ids}
+    for node in nodes:
+        node_id = node.get("id")
+        if not node_id:
+            continue
+        blockers = _node_blockers(node)
+        for blocker in blockers:
+            dependents.setdefault(blocker, []).append(node_id)
+    for node in nodes:
+        node_id = node.get("id")
+        if not node_id:
+            continue
+        blockers = _node_blockers(node)
+        node["parent_task_id"] = node.get("parent_task_id") or parent_task_id
+        node["child_task_ids"] = list(node.get("child_task_ids") or dependents.get(node_id, []))
+        node["needs_from"] = list(node.get("needs_from") or blockers)
+        node["block_reason"] = _block_reason(node)
+        node["last_touched_at"] = _last_touched_at(node)
+        node["progress_state"] = compact_progress_state(
+            node,
+            stale_after_seconds=stale_after_seconds,
+        )
+    updated_graph["nodes"] = nodes
+    updated_graph["task_manifest"] = task_manifest_from_graph(
+        updated_graph,
+        parent_task_id=parent_task_id,
+        stale_after_seconds=stale_after_seconds,
+    )
+    updated_graph["supervision_summary"] = supervision_summary(
+        updated_graph,
+        stale_after_seconds=stale_after_seconds,
+    )
     return updated_graph
+
+
+def task_manifest_from_graph(
+    graph: dict[str, Any],
+    *,
+    parent_task_id: str | None = None,
+    stale_after_seconds: int = 300,
+) -> list[dict[str, Any]]:
+    """Return a compact manifest for live supervision of spawned subtasks."""
+    nodes = [dict(node) for node in graph.get("nodes", [])]
+    node_ids = {node.get("id") for node in nodes if node.get("id")}
+    dependents: dict[str, list[str]] = {node_id: [] for node_id in node_ids}
+    for node in nodes:
+        node_id = node.get("id")
+        if not node_id:
+            continue
+        for blocker in _node_blockers(node):
+            dependents.setdefault(blocker, []).append(node_id)
+
+    manifest: list[dict[str, Any]] = []
+    for node in nodes:
+        node_id = node.get("id")
+        if not node_id:
+            continue
+        blockers = _node_blockers(node)
+        manifest.append(
+            {
+                "task_id": parent_task_id or graph.get("parent_task_id"),
+                "node_id": node_id,
+                "title": node.get("title"),
+                "status": node.get("status", "pending"),
+                "progress_state": compact_progress_state(
+                    node,
+                    stale_after_seconds=stale_after_seconds,
+                ),
+                "parent_task_id": node.get("parent_task_id") or parent_task_id or graph.get("parent_task_id"),
+                "child_task_ids": list(node.get("child_task_ids") or dependents.get(node_id, [])),
+                "needs_from": list(node.get("needs_from") or blockers),
+                "block_reason": _block_reason(node),
+                "attempts": int(node.get("attempts", 0) or 0),
+                "updated_at": _last_touched_at(node),
+            }
+        )
+    return manifest
+
+
+def supervision_summary(graph: dict[str, Any], *, stale_after_seconds: int = 300) -> dict[str, int]:
+    """Summarize task graph nodes by compact supervision state."""
+    summary = {
+        "running": 0,
+        "blocked": 0,
+        "waiting_user": 0,
+        "stale": 0,
+        "done": 0,
+        "total": 0,
+    }
+    for node in graph.get("nodes", []):
+        summary["total"] += 1
+        summary[compact_progress_state(node, stale_after_seconds=stale_after_seconds)] += 1
+    return summary
+
+
+def compact_progress_state(node: dict[str, Any], *, stale_after_seconds: int = 300) -> str:
+    """Map a verbose graph node status to the compact supervision set."""
+    status = str(node.get("status", "pending")).strip().lower()
+    block_reason = _block_reason(node).lower()
+    if status in {"completed", "complete"}:
+        return "done"
+    if status in {"waiting_human", "waiting_user"} or "human" in block_reason or "user" in block_reason:
+        return "waiting_user"
+    if _is_stale(node, stale_after_seconds=stale_after_seconds):
+        return "stale"
+    if status in {"blocked", "failed"} or node.get("last_error"):
+        return "blocked"
+    if status in {"running", "in_progress"}:
+        return "running"
+    if status == "pending":
+        if _node_blockers(node):
+            return "blocked"
+        return "running"
+    return "running"
+
+
+def _node_blockers(node: dict[str, Any]) -> list[str]:
+    blockers = node.get("needs_from")
+    if isinstance(blockers, list) and blockers:
+        return [str(item) for item in blockers]
+    blockers = node.get("blocked_by")
+    if isinstance(blockers, list) and blockers:
+        return [str(item) for item in blockers]
+    blockers = node.get("depends_on")
+    if isinstance(blockers, list) and blockers:
+        return [str(item) for item in blockers]
+    return []
+
+
+def _block_reason(node: dict[str, Any]) -> str:
+    for key in ("block_reason", "last_error", "reason"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    blockers = _node_blockers(node)
+    if blockers:
+        return f"waiting on {', '.join(blockers)}"
+    return ""
+
+
+def _last_touched_at(node: dict[str, Any]) -> str | None:
+    for key in ("last_touched_at", "completed_at", "failed_at", "blocked_at", "started_at"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _is_stale(node: dict[str, Any], *, stale_after_seconds: int) -> bool:
+    timestamp = _last_touched_at(node)
+    if not timestamp:
+        return False
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    age = datetime.now(UTC) - parsed.astimezone(UTC)
+    return age.total_seconds() >= stale_after_seconds and str(node.get("status", "")).lower() in {
+        "running",
+        "in_progress",
+        "pending",
+        "blocked",
+    }

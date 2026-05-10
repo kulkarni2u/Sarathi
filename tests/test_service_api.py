@@ -108,6 +108,34 @@ def test_workspace_repository_action_preference_can_be_saved(tmp_path):
     assert workspace_again["workspace"]["metadata"]["repository_action_preference"]["mode"] == "draft_pr"
 
 
+def test_browser_cors_allows_loopback_vite_port(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    status, payload = app.handle(
+        "GET",
+        "/api/workspaces",
+        headers={
+            "origin": "http://127.0.0.1:5174",
+            "x-correlation-id": "cors-test",
+        },
+    )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["correlation_id"] == "cors-test"
+    assert payload["data"]["workspaces"][0]["id"] == workspace_id
+
+
 def test_task_lifecycle_for_workspace(tmp_path):
     app = create_app(tmp_path / "sarathi.db")
     _, workspace_data = assert_ok(
@@ -192,6 +220,44 @@ def test_task_checkpoint_can_be_retrieved_and_restarted(tmp_path):
     assert restarted_task["status"] == "prd_pending"
     assert restarted_task["metadata"]["source_checkpoint_id"] == checkpoint["id"]
     assert restarted_task["metadata"]["repository_action_preference"] == checkpoint["repository_action_preference"]
+
+
+def test_task_checkpoint_history_is_returned_latest_first(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(app, "POST", "/api/workspaces", {"name": "QA", "root_path": "/tmp/qa"})
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+    _, task_data = assert_ok(
+        request(app, "POST", f"/api/workspaces/{workspace_id}/tasks", {"title": "Checkpoint task"})
+    )
+    task_id = task_data["task"]["id"]
+    storage = Storage(connect(tmp_path / "sarathi.db"))
+    storage.create_checkpoint_capsule(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        summary="First checkpoint",
+        key_decisions=["A"],
+        evidence_refs=["e1"],
+        repository_action_preference={"mode": "no_action", "scope": "workspace", "allowed_modes": ["no_action"]},
+        next_start_point="Resume from first checkpoint",
+        created_by="test",
+    )
+    storage.create_checkpoint_capsule(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        summary="Second checkpoint",
+        key_decisions=["B"],
+        evidence_refs=["e2"],
+        repository_action_preference={"mode": "no_action", "scope": "workspace", "allowed_modes": ["no_action"]},
+        next_start_point="Resume from second checkpoint",
+        created_by="test",
+    )
+
+    status, checkpoints_data = assert_ok(request(app, "GET", f"/api/tasks/{task_id}/checkpoints"))
+    assert status == 200
+    checkpoints = checkpoints_data["checkpoints"]
+    assert [checkpoint["summary"] for checkpoint in checkpoints] == ["Second checkpoint", "First checkpoint"]
 
 
 def test_workspace_and_placeholder_task_resources(tmp_path):
@@ -353,6 +419,202 @@ def test_chat_and_task_draft_persist_project_context(tmp_path):
     assert status == 201
     _, task_data = assert_ok(request(app, "GET", f"/api/tasks/{chat_data['taskId']}"))
     assert task_data["task"]["metadata"]["project_id"] == project_id
+
+
+def test_workspace_projects_can_be_created_and_listed(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Orchestration Studio", "root_path": "/tmp/studio"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    status, created = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/projects",
+            {"name": "Desktop Hardening", "description": "Trustworthy orchestration surfaces"},
+        )
+    )
+    assert status == 201
+    assert created["project"]["workspace_id"] == workspace_id
+    assert created["project"]["name"] == "Desktop Hardening"
+    assert created["project"]["description"] == "Trustworthy orchestration surfaces"
+    assert created["project"]["status"] == "active"
+
+    status, listed = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/projects"))
+    assert status == 200
+    project_names = [p["name"] for p in listed["projects"]]
+    assert "Desktop Hardening" in project_names
+
+
+def test_workspace_projects_are_rejected_without_name(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Orchestration Studio", "root_path": "/tmp/studio"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    status, payload = request(
+        app,
+        "POST",
+        f"/api/workspaces/{workspace_id}/projects",
+        {"description": "Missing name field"},
+    )
+    assert status == 400
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "invalid_request"
+
+
+def test_workspace_project_list_requires_existing_workspace(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+
+    status, payload = request(app, "GET", "/api/workspaces/nonexistent/projects")
+    assert status == 404
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_found"
+
+
+def test_workspace_projects_order_by_created_at(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Orchestration Studio", "root_path": "/tmp/studio"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    assert_ok(request(app, "POST", f"/api/workspaces/{workspace_id}/projects", {"name": "Project Alpha"}))
+    assert_ok(request(app, "POST", f"/api/workspaces/{workspace_id}/projects", {"name": "Project Beta"}))
+
+    status, listed = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/projects"))
+    project_names = [p["name"] for p in listed["projects"]]
+    assert project_names == ["Project Alpha", "Project Beta"]
+
+
+def test_task_draft_preserves_project_id_when_context_provides_it(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, ws = assert_ok(
+        request(app, "POST", "/api/workspaces", {"name": "Sutra", "root_path": "/tmp/sutra"}),
+    )
+    workspace_id = ws["workspace"]["id"]
+    _, proj = assert_ok(
+        request(app, "POST", f"/api/workspaces/{workspace_id}/projects", {"name": "Task Studio"}),
+    )
+    project_id = proj["project"]["id"]
+
+    status, draft_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {
+                "prompt": "Build the task studio hardening.",
+                "context": {"projectId": project_id},
+            },
+        )
+    )
+    assert status == 201
+    assert draft_data["task"]["metadata"]["project_id"] == project_id
+
+
+def test_workspace_project_desktop_summary_includes_task_counts_and_last_activity(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, ws = assert_ok(
+        request(app, "POST", "/api/workspaces", {"name": "Sutra", "root_path": "/tmp/sutra"}),
+    )
+    workspace_id = ws["workspace"]["id"]
+    _, proj = assert_ok(
+        request(app, "POST", f"/api/workspaces/{workspace_id}/projects", {"name": "Desktop Summary"}),
+    )
+    project_id = proj["project"]["id"]
+
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {"prompt": "First task", "context": {"projectId": project_id}},
+        )
+    )
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {"prompt": "Second task", "context": {"projectId": project_id}},
+        )
+    )
+
+    status, listed = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/projects"))
+    summary = next(p for p in listed["projects"] if p["id"] == project_id)
+    assert summary["task_count"] == 2
+    assert summary["updated_at"] is not None
+
+
+def test_workspace_project_desktop_summary_includes_blocked_and_review_counts(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, ws = assert_ok(
+        request(app, "POST", "/api/workspaces", {"name": "Sutra", "root_path": "/tmp/sutra"}),
+    )
+    workspace_id = ws["workspace"]["id"]
+    _, proj = assert_ok(
+        request(app, "POST", f"/api/workspaces/{workspace_id}/projects", {"name": "Summary Counts"}),
+    )
+    project_id = proj["project"]["id"]
+
+    _, draft1 = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {"prompt": "Blocked task", "context": {"projectId": project_id}},
+        )
+    )
+    _, draft2 = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {"prompt": "Review task", "context": {"projectId": project_id}},
+        )
+    )
+
+    from src.storage import Storage, connect, run_migrations
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn)
+        storage.create_lifecycle_event(
+            workspace_id=workspace_id,
+            task_id=draft1["task"]["id"],
+            event_type="task.blocked",
+            payload={"reason": "waiting_user"},
+        )
+        storage.create_approval_gate(
+            workspace_id=workspace_id,
+            task_id=draft2["task"]["id"],
+            name="Review",
+            status="pending",
+            metadata={"requires_human": True},
+        )
+
+    status, listed = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/projects"))
+    summary = next(p for p in listed["projects"] if p["id"] == project_id)
+    assert summary["blocked_count"] == 1
+    assert summary["review_needed_count"] == 1
 
 
 def test_http_sse_stream_returns_persisted_events(tmp_path):
@@ -838,3 +1100,275 @@ def create_task_with_ready_graph(app, tmp_path):
     )
     assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
     return task
+
+
+def test_workspace_auto_approve_preference_can_be_saved(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "PATCH",
+            f"/api/workspaces/{workspace_id}",
+            {
+                "metadata": {
+                    "auto_approve_preference": {
+                        "scope": "workspace",
+                        "mode": "below_threshold",
+                        "threshold": {
+                            "complexity": "low",
+                            "max_node_count": 3,
+                        },
+                    }
+                }
+            },
+        )
+    )
+
+    assert status == 200
+    assert data["workspace"]["metadata"]["auto_approve_preference"]["scope"] == "workspace"
+    assert data["workspace"]["metadata"]["auto_approve_preference"]["mode"] == "below_threshold"
+
+    _, workspace_again = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}"))
+    assert workspace_again["workspace"]["metadata"]["auto_approve_preference"]["mode"] == "below_threshold"
+
+
+def test_auto_approve_blocked_when_mode_is_manual_only(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    assert_ok(
+        request(
+            app,
+            "PATCH",
+            f"/api/workspaces/{workspace_id}",
+            {
+                "metadata": {
+                    "auto_approve_preference": {
+                        "scope": "workspace",
+                        "mode": "manual_only",
+                    }
+                }
+            },
+        )
+    )
+
+    _, task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/tasks",
+            {"title": "Test task"},
+        )
+    )
+    task_id = task_data["task"]["id"]
+
+    from src.storage import Storage, connect, run_migrations
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn)
+        storage.create_approval_gate(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            name="Code review",
+            status="pending",
+            metadata={"complexity": "low", "node_count": 2},
+        )
+
+    assert_error(
+        request(app, "POST", f"/api/tasks/{task_id}/auto-approve"),
+        status=403,
+        code="auto_approve_disabled",
+    )
+
+
+def test_auto_approve_allowed_for_below_threshold_with_eligible_gates(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    assert_ok(
+        request(
+            app,
+            "PATCH",
+            f"/api/workspaces/{workspace_id}",
+            {
+                "metadata": {
+                    "auto_approve_preference": {
+                        "scope": "workspace",
+                        "mode": "below_threshold",
+                        "threshold": {
+                            "complexity": "low",
+                            "max_node_count": 3,
+                        },
+                    }
+                }
+            },
+        )
+    )
+
+    _, task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/tasks",
+            {"title": "Test task"},
+        )
+    )
+    task_id = task_data["task"]["id"]
+
+    from src.storage import Storage, connect, run_migrations
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn)
+        storage.create_approval_gate(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            name="Code review",
+            status="pending",
+            metadata={"complexity": "low", "node_count": 2},
+        )
+
+    _, result = assert_ok(request(app, "POST", f"/api/tasks/{task_id}/auto-approve"))
+    assert len(result["approved"]) == 1
+    assert result["approved"][0]["name"] == "Code review"
+    assert result["approved"][0]["metadata"]["auto_approved"] is True
+
+
+def test_auto_approve_denied_for_denylisted_gates(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    assert_ok(
+        request(
+            app,
+            "PATCH",
+            f"/api/workspaces/{workspace_id}",
+            {
+                "metadata": {
+                    "auto_approve_preference": {
+                        "scope": "workspace",
+                        "mode": "below_threshold",
+                        "threshold": {
+                            "complexity": "low",
+                            "max_node_count": 10,
+                        },
+                    }
+                }
+            },
+        )
+    )
+
+    _, draft_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {"prompt": "Create a feature"},
+        )
+    )
+    task_id = draft_data["task"]["id"]
+
+    assert_error(
+        request(app, "POST", f"/api/tasks/{task_id}/auto-approve"),
+        status=403,
+        code="auto_approve_denied",
+    )
+
+
+def test_auto_approve_ignores_gates_not_meeting_threshold(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    assert_ok(
+        request(
+            app,
+            "PATCH",
+            f"/api/workspaces/{workspace_id}",
+            {
+                "metadata": {
+                    "auto_approve_preference": {
+                        "scope": "workspace",
+                        "mode": "below_threshold",
+                        "threshold": {
+                            "complexity": "low",
+                            "max_node_count": 3,
+                        },
+                    }
+                }
+            },
+        )
+    )
+
+    _, task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/tasks",
+            {"title": "Test task"},
+        )
+    )
+    task_id = task_data["task"]["id"]
+
+    from src.storage import Storage, connect, run_migrations
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn)
+        storage.create_approval_gate(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            name="Code review",
+            status="pending",
+            metadata={"complexity": "low", "node_count": 2},
+        )
+        storage.create_approval_gate(
+            workspace_id=workspace_id,
+            task_id=task_id,
+            name="Security review",
+            status="pending",
+            metadata={"complexity": "high", "node_count": 10},
+        )
+
+    _, result = assert_ok(request(app, "POST", f"/api/tasks/{task_id}/auto-approve"))
+    assert len(result["approved"]) == 1
+    assert result["approved"][0]["name"] == "Code review"

@@ -1,5 +1,6 @@
 from src.task_graph import (
     block_graph_node,
+    annotate_graph_for_supervision,
     fail_graph_node,
     graph_from_plan,
     graph_summary,
@@ -10,7 +11,9 @@ from src.task_graph import (
     progress_graph,
     retry_graph_node,
     require_human_for_graph_node,
+    supervision_summary,
     start_graph_node,
+    task_manifest_from_graph,
 )
 from src.runtime import TaskGraphExecutor, TaskScheduler
 from src.runtime.contracts import DispatchResponse
@@ -245,3 +248,36 @@ def test_graph_summary_counts_scheduler_states():
     assert summary["failed"] == 1
     assert summary["waiting_human"] == 1
     assert summary["total"] == 6
+
+
+def test_supervision_manifest_includes_parent_child_links_and_block_reasons():
+    graph = {
+        "parent_task_id": "task-1",
+        "nodes": [
+            {
+                "id": "step-1",
+                "title": "Root",
+                "status": "completed",
+                "depends_on": [],
+                "child_task_ids": ["step-2"],
+            },
+            {
+                "id": "step-2",
+                "title": "Child",
+                "status": "blocked",
+                "depends_on": ["step-1"],
+                "last_error": "needs external input",
+            },
+        ],
+    }
+
+    annotated = annotate_graph_for_supervision(graph, parent_task_id="task-1")
+    manifest = task_manifest_from_graph(annotated, parent_task_id="task-1")
+
+    assert annotated["nodes"][0]["progress_state"] == "done"
+    assert annotated["nodes"][1]["progress_state"] == "blocked"
+    assert manifest[0]["parent_task_id"] == "task-1"
+    assert manifest[0]["child_task_ids"] == ["step-2"]
+    assert manifest[1]["needs_from"] == ["step-1"]
+    assert manifest[1]["block_reason"] == "needs external input"
+    assert supervision_summary(annotated)["done"] == 1

@@ -17,9 +17,9 @@ import tempfile
 from typing import Any
 
 try:
-    from ..contracts import DispatchRequest, DispatchResponse
+    from ..contracts import DispatchRequest, DispatchResponse, build_usage_record
 except ImportError:
-    from runtime.contracts import DispatchRequest, DispatchResponse
+    from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
 
 
 def dispatch_via_cli_bridge(
@@ -362,12 +362,21 @@ def _normalize_native_response(
             "workspace_root": workspace_root,
             **artifacts,
         }
+        usage = build_usage_record(
+            provider_id=provider,
+            provider_family=cli_family,
+            dispatch_id=request.task_id,
+            prompt=request.prompt,
+            response_text=message,
+            reported_usage=parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None,
+        )
         return DispatchResponse(
             success=success,
             outputs=outputs,
             evidence=evidence,
             artifacts=artifacts,
             raw_transcript_ref=raw_transcript_ref,
+            usage=usage,
             error=error,
         )
 
@@ -392,6 +401,13 @@ def _normalize_native_response(
         fallback_summary=summary,
         success=True,
     )
+    usage = build_usage_record(
+        provider_id=provider,
+        provider_family=cli_family,
+        dispatch_id=request.task_id,
+        prompt=request.prompt,
+        response_text=summary,
+    )
     return DispatchResponse(
         success=True,
         outputs=outputs,
@@ -410,6 +426,7 @@ def _normalize_native_response(
             "native_cli_family": cli_family,
             "workspace_root": workspace_root,
         },
+        usage=usage,
     )
 
 
@@ -556,6 +573,7 @@ def main(argv: list[str] | None = None) -> int:
                 "evidence": response.evidence,
                 "artifacts": response.artifacts,
                 "raw_transcript_ref": response.raw_transcript_ref,
+                "usage": response.usage.to_artifact() if response.usage else None,
                 "error": response.error,
             }
         )

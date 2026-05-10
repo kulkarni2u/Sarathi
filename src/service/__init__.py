@@ -25,10 +25,7 @@ from src.runtime import DispatchRequest, GraphExecutionPolicy, UsageRecord, list
 from src.storage import Storage, connect, run_migrations
 
 MAX_BODY_BYTES = 64 * 1024
-_ALLOWED_BROWSER_ORIGINS = {
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
-}
+_ALLOWED_BROWSER_HOSTS = {"127.0.0.1", "localhost"}
 
 
 @dataclass(frozen=True)
@@ -136,24 +133,48 @@ class ServiceApp:
             if workspace is None:
                 raise ServiceError("not_found", "Workspace not found.", 404)
             raw_metadata = _optional_dict(body, "metadata")
-            if raw_metadata is None or "repository_action_preference" not in raw_metadata:
+            if raw_metadata is None:
                 raise ServiceError(
                     "invalid_request",
-                    "Field 'metadata.repository_action_preference' is required.",
+                    "Field 'metadata' is required.",
                     400,
                 )
-            preference = _normalize_repository_action_preference(
-                raw_metadata["repository_action_preference"],
-                fallback_scope="workspace",
-            )
-            if preference is None:
+
+            next_metadata = dict(workspace.get("metadata") or {})
+
+            if "repository_action_preference" in raw_metadata:
+                preference = _normalize_repository_action_preference(
+                    raw_metadata["repository_action_preference"],
+                    fallback_scope="workspace",
+                )
+                if preference is None:
+                    raise ServiceError(
+                        "invalid_request",
+                        "Unsupported repository action preference.",
+                        400,
+                    )
+                next_metadata["repository_action_preference"] = preference
+
+            if "auto_approve_preference" in raw_metadata:
+                preference = _normalize_auto_approve_preference(
+                    raw_metadata["auto_approve_preference"],
+                    fallback_scope="workspace",
+                )
+                if preference is None:
+                    raise ServiceError(
+                        "invalid_request",
+                        "Unsupported auto-approve preference. Allowed modes: manual_only, below_threshold.",
+                        400,
+                    )
+                next_metadata["auto_approve_preference"] = preference
+
+            if "repository_action_preference" not in next_metadata and "auto_approve_preference" not in next_metadata:
                 raise ServiceError(
                     "invalid_request",
-                    "Unsupported repository action preference.",
+                    "At least one preference field is required: 'repository_action_preference' or 'auto_approve_preference'.",
                     400,
                 )
-            next_metadata = dict(workspace["metadata"])
-            next_metadata["repository_action_preference"] = preference
+
             updated_workspace = storage.update_workspace(parts[1], metadata=next_metadata)
             return 200, {"workspace": updated_workspace}
 
@@ -218,6 +239,41 @@ class ServiceApp:
             return 201, {"repository": repository}
 
         if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
+            and parts[2] == "projects"
+        ):
+            workspace_id = parts[1]
+            if storage.get_workspace(workspace_id) is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            projects = storage.list_projects(workspace_id)
+            for proj in projects:
+                stats = storage.get_project_stats(proj["id"])
+                proj["task_count"] = stats["task_count"]
+                proj["blocked_count"] = stats["blocked_count"]
+                proj["review_needed_count"] = stats["review_needed_count"]
+                proj["updated_at"] = stats["last_activity"] or proj["updated_at"]
+            return 200, {"projects": projects}
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
+            and parts[2] == "projects"
+        ):
+            workspace_id = parts[1]
+            if storage.get_workspace(workspace_id) is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            project = storage.create_project(
+                workspace_id=workspace_id,
+                name=_required_text(body, "name"),
+                description=_optional_text(body, "description"),
+                metadata=_optional_dict(body, "metadata"),
+            )
+            return 201, {"project": project}
+
+        if (
             method == "POST"
             and len(parts) == 5
             and parts[0] == "workspaces"
@@ -266,7 +322,13 @@ class ServiceApp:
             workspace_id = parts[1]
             if storage.get_workspace(workspace_id) is None:
                 raise ServiceError("not_found", "Workspace not found.", 404)
-            return 200, {"tasks": _task_dashboard(storage, workspace_id)}
+            return 200, {
+                "tasks": _task_dashboard(
+                    storage,
+                    workspace_id,
+                    project_id=_first_query(query, "project_id"),
+                )
+            }
 
         if (
             method == "GET"
@@ -527,6 +589,13 @@ class ServiceApp:
                         storage.list_checkpoint_capsules_for_task(parts[1])
                     ),
                 }
+            if resource == "checkpoints":
+                checkpoints = storage.list_checkpoint_capsules_for_task(parts[1])
+                checkpoints.reverse()
+                return 200, {
+                    "task_id": parts[1],
+                    "checkpoints": checkpoints,
+                }
             if resource == "messages":
                 return 200, {"messages": storage.list_messages(task_id=parts[1])}
             if resource == "approvals":
@@ -654,12 +723,39 @@ class ServiceApp:
             task = storage.get_task(parts[1])
             if task is None:
                 raise ServiceError("not_found", "Task not found.", 404)
+
+            workspace = storage.get_workspace(task["workspace_id"])
+            preference = _effective_auto_approve_preference(task, workspace)
+            policy_defaults = _get_policy_pack_approval_defaults()
+
+            if preference["mode"] == "manual_only":
+                raise ServiceError(
+                    "auto_approve_disabled",
+                    "Auto-approve is disabled. Policy requires manual approval for all gates.",
+                    403,
+                )
+
+            denylist = policy_defaults["never_auto_approve_gates"]
             pending_gates = [
                 g for g in storage.list_approval_gates_for_task(task["id"])
                 if g["status"] == "pending"
             ]
+
+            denylisted_gates = [g for g in pending_gates if _is_gate_denylisted(g["name"], denylist)]
+            if denylisted_gates:
+                denylisted_names = ", ".join(g["name"] for g in denylisted_gates)
+                raise ServiceError(
+                    "auto_approve_denied",
+                    f"Auto-approve is not permitted for the following gates: {denylisted_names}. These gates require manual approval.",
+                    403,
+                )
+
             approved = []
             for pending_gate in pending_gates:
+                if preference["mode"] == "below_threshold":
+                    if not _evaluate_threshold(preference, pending_gate.get("metadata")):
+                        continue
+
                 approved_gate = storage.create_approval_gate(
                     workspace_id=task["workspace_id"],
                     task_id=task["id"],
@@ -668,6 +764,9 @@ class ServiceApp:
                     metadata={
                         **(pending_gate.get("metadata") or {}),
                         "auto_approved": True,
+                        "preference_scope": preference["scope"],
+                        "preference_mode": preference["mode"],
+                        "policy_source": "policy-pack/approval.md",
                         "approved_by": _optional_text(body, "approved_by") or "auto",
                     },
                 )
@@ -675,9 +774,23 @@ class ServiceApp:
                     workspace_id=task["workspace_id"],
                     task_id=task["id"],
                     event_type="approval.recorded",
-                    payload={"object_id": approved_gate["id"], "status": "approved", "auto_approved": True},
+                    payload={
+                        "object_id": approved_gate["id"],
+                        "status": "approved",
+                        "auto_approved": True,
+                        "preference_scope": preference["scope"],
+                        "preference_mode": preference["mode"],
+                    },
                 )
                 approved.append(approved_gate)
+
+            if not approved:
+                raise ServiceError(
+                    "auto_approve_no_eligible_gates",
+                    "No gates were eligible for auto-approve under the current policy.",
+                    403,
+                )
+
             auto_schedule = _maybe_auto_schedule_ready_subtasks(storage, task, reason="auto_approve")
             return 200, {"approved": approved, "auto_schedule": auto_schedule}
 
@@ -987,7 +1100,7 @@ def create_http_server(
 
         def _write_cors_headers(self) -> None:
             origin = self.headers.get("origin")
-            allowed_origin = origin if origin in _ALLOWED_BROWSER_ORIGINS else "http://127.0.0.1:5173"
+            allowed_origin = origin if _browser_origin_allowed(origin) else "http://127.0.0.1:5173"
             self.send_header("access-control-allow-origin", allowed_origin)
             self.send_header("vary", "Origin")
             self.send_header("access-control-allow-methods", "GET, POST, DELETE, PATCH, PUT, OPTIONS")
@@ -1144,6 +1257,122 @@ def _merge_task_defaults(metadata: dict[str, Any] | None) -> dict[str, Any]:
     next_metadata = dict(metadata or {})
     next_metadata.setdefault("repository_action_preference", _default_repository_action_preference())
     return next_metadata
+
+
+_AUTO_APPROVE_MODES = ["manual_only", "below_threshold"]
+
+
+def _default_auto_approve_preference() -> dict[str, Any]:
+    return {
+        "scope": "default",
+        "mode": "manual_only",
+        "allowed_modes": list(_AUTO_APPROVE_MODES),
+    }
+
+
+def _normalize_auto_approve_preference(
+    preference: Any,
+    *,
+    fallback_scope: str,
+) -> dict[str, Any] | None:
+    if not isinstance(preference, Mapping):
+        return None
+    mode = preference.get("mode")
+    if mode not in _AUTO_APPROVE_MODES:
+        return None
+    scope = preference.get("scope")
+    if scope not in {"task", "project", "workspace", "default"}:
+        scope = fallback_scope
+    normalized = {
+        "scope": scope,
+        "mode": mode,
+        "allowed_modes": list(_AUTO_APPROVE_MODES),
+    }
+    if "threshold" in preference and isinstance(preference.get("threshold"), Mapping):
+        normalized["threshold"] = preference["threshold"]
+    if "source" in preference and isinstance(preference.get("source"), str):
+        normalized["source"] = preference["source"]
+    return normalized
+
+
+def _effective_auto_approve_preference(
+    task: Mapping[str, Any],
+    workspace: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    task_metadata = task.get("metadata") or {}
+    task_preference = _normalize_auto_approve_preference(
+        task_metadata.get("auto_approve_preference"),
+        fallback_scope="task",
+    )
+    if task_preference is not None and task_preference["scope"] != "default":
+        return task_preference
+
+    project_preference = _normalize_auto_approve_preference(
+        task_metadata.get("project_auto_approve_preference"),
+        fallback_scope="project",
+    )
+    if project_preference is not None:
+        return project_preference
+
+    if workspace is not None:
+        workspace_metadata = workspace.get("metadata") or {}
+        workspace_preference = _normalize_auto_approve_preference(
+            workspace_metadata.get("auto_approve_preference"),
+            fallback_scope="workspace",
+        )
+        if workspace_preference is not None:
+            return workspace_preference
+
+    return task_preference or _default_auto_approve_preference()
+
+
+def _get_policy_pack_approval_defaults() -> dict[str, Any]:
+    return {
+        "default_mode": "manual_only",
+        "allowed_modes": list(_AUTO_APPROVE_MODES),
+        "max_threshold": {
+            "complexity": "low",
+            "max_node_count": 3,
+        },
+        "never_auto_approve_gates": [
+            "PRD/AC",
+            "Repository action",
+            "Final handoff",
+            "Task graph",
+        ],
+    }
+
+
+def _evaluate_threshold(
+    preference: dict[str, Any],
+    gate_metadata: dict[str, Any] | None,
+) -> bool:
+    if preference.get("mode") != "below_threshold":
+        return False
+
+    threshold = preference.get("threshold")
+    if not threshold:
+        return False
+
+    complexity = threshold.get("complexity", "high")
+    max_nodes = threshold.get("max_node_count", 0)
+
+    gate_complexity = (gate_metadata or {}).get("complexity", "high")
+    gate_node_count = (gate_metadata or {}).get("node_count", 999)
+
+    if complexity == "low" and gate_complexity != "low":
+        return False
+    if complexity == "medium" and gate_complexity == "high":
+        return False
+
+    if max_nodes > 0 and gate_node_count > max_nodes:
+        return False
+
+    return True
+
+
+def _is_gate_denylisted(gate_name: str, denylist: list[str]) -> bool:
+    return gate_name in denylist
 
 
 def _parse_github_issue_url(issue_url: str) -> dict[str, Any]:
@@ -1387,6 +1616,7 @@ def _task_studio_snapshot(storage: Storage, task: dict[str, Any]) -> dict[str, A
 
 def _workspace_operational_views(storage: Storage, workspace_id: str) -> dict[str, Any]:
     tasks = storage.list_tasks_for_workspace(workspace_id)
+    projects = storage.list_projects(workspace_id)
     repositories = storage.list_workspace_repositories(workspace_id)
     history = storage.list_events(workspace_id=workspace_id)
     messages = storage.list_messages(workspace_id=workspace_id)
@@ -1466,8 +1696,22 @@ def _workspace_operational_views(storage: Storage, workspace_id: str) -> dict[st
         }
     )
 
+    project_summaries: list[dict[str, Any]] = []
+    for project in projects:
+        stats = storage.get_project_stats(project["id"])
+        project_summaries.append(
+            {
+                **project,
+                "task_count": stats["task_count"],
+                "blocked_count": stats["blocked_count"],
+                "review_needed_count": stats["review_needed_count"],
+                "updated_at": stats["last_activity"] or project["updated_at"],
+            }
+        )
+
     return {
         "workspace_id": workspace_id,
+        "projects": project_summaries,
         "history": history,
         "lifecycle": lifecycle,
         "diagrams": diagrams,
@@ -3045,6 +3289,13 @@ def _service_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _browser_origin_allowed(origin: str | None) -> bool:
+    if not origin:
+        return False
+    parsed = urlparse(origin)
+    return parsed.scheme == "http" and parsed.hostname in _ALLOWED_BROWSER_HOSTS
+
+
 def _schedule_ready_subtasks(
     storage: Storage,
     task: dict[str, Any],
@@ -3304,9 +3555,16 @@ def _workspace_graph_execution_policy(
     )
 
 
-def _task_dashboard(storage: Storage, workspace_id: str) -> list[dict[str, Any]]:
+def _task_dashboard(
+    storage: Storage,
+    workspace_id: str,
+    *,
+    project_id: str | None = None,
+) -> list[dict[str, Any]]:
     summaries = []
     for task in storage.list_tasks_for_workspace(workspace_id):
+        if project_id is not None and task["metadata"].get("project_id") != project_id:
+            continue
         approvals = storage.list_approval_gates_for_task(task["id"])
         graph = _graph_for_task(storage, task)
         next_gate = _next_pending_gate(approvals)

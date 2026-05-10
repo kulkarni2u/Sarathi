@@ -10,7 +10,7 @@ from .agent_roles import (
 )
 from .artifacts import ArtifactStore
 from .commands import CommandResult, CommandRunner
-from .contracts import DispatchRequest, DispatchResponse, GateResult
+from .contracts import DispatchRequest, DispatchResponse, GateResult, UsageRecord, build_usage_record
 from .escalation import EscalationBundle, EscalationBundleBuilder
 from .graph_executor import GraphExecutionEvent, GraphExecutionResult, TaskGraphExecutor
 from .graph_policy import GraphExecutionPolicy, validate_graph_execution_config
@@ -37,6 +37,8 @@ __all__ = [
     "CommandRunner",
     "DispatchRequest",
     "DispatchResponse",
+    "UsageRecord",
+    "build_usage_record",
     "EscalationBundle",
     "EscalationBundleBuilder",
     "GateResult",

@@ -3,17 +3,20 @@ import argparse
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 try:
     from .evolve import Evolver, ProposalReviewStore
     from .init import InitWorkflow
-    from .runtime import list_agent_roles, list_phase_agent_roles
+    from .runtime import UsageRecord, list_agent_roles, list_phase_agent_roles
     from .task_graph import (
         graph_summary,
         latest_completed_node,
         latest_failed_node,
         next_ready_node,
         next_retryable_failed_node,
+        supervision_summary,
+        task_manifest_from_graph,
     )
     from .validate import PolicyValidator
     from .engine import Engine, TaskContext, Phase, Complexity, PHASE_TRANSITIONS, PhaseResult
@@ -21,16 +24,19 @@ except ImportError:
     # Support direct execution via sarathi.py, which prepends src/ to sys.path.
     from evolve import Evolver, ProposalReviewStore
     from init import InitWorkflow
-    from runtime import list_agent_roles, list_phase_agent_roles
+    from runtime import UsageRecord, list_agent_roles, list_phase_agent_roles
     from task_graph import (
         graph_summary,
         latest_completed_node,
         latest_failed_node,
         next_ready_node,
         next_retryable_failed_node,
+        supervision_summary,
+        task_manifest_from_graph,
     )
     from validate import PolicyValidator
     from engine import Engine, TaskContext, Phase, Complexity, PHASE_TRANSITIONS, PhaseResult
+import time
 
 
 # ============================================================================
@@ -188,16 +194,131 @@ def phase_agent_name(result: PhaseResult) -> str:
     return "-"
 
 
+def _task_usage_records(task: TaskContext) -> list[UsageRecord]:
+    records: list[UsageRecord] = []
+    for phase_result in task.phase_results:
+        records.extend(_usage_records_from_value(phase_result.artifacts))
+        records.extend(_usage_records_from_value(phase_result.evidence))
+    return records
+
+
+def _usage_records_from_value(value: Any) -> list[UsageRecord]:
+    record = UsageRecord.from_mapping(value if isinstance(value, dict) else None)
+    if record is not None:
+        return [record]
+    if isinstance(value, dict):
+        records: list[UsageRecord] = []
+        usage_value = value.get("usage")
+        if isinstance(usage_value, dict):
+            usage_record = UsageRecord.from_mapping(usage_value)
+            if usage_record is not None:
+                records.append(usage_record)
+        for key, nested in value.items():
+            if key == "usage":
+                continue
+            records.extend(_usage_records_from_value(nested))
+        return records
+    if isinstance(value, list):
+        records: list[UsageRecord] = []
+        for item in value:
+            records.extend(_usage_records_from_value(item))
+        return records
+    return []
+
+
+def _usage_summary_line(task: TaskContext) -> str | None:
+    records = _task_usage_records(task)
+    if not records:
+        return None
+
+    total_tokens = sum(record.total_tokens for record in records)
+    budget_limit = next((record.budget_limit for record in records if record.budget_limit is not None), None)
+    budget_remaining = None
+    budget_state = "unknown"
+    if budget_limit is not None:
+        budget_remaining = max(budget_limit - total_tokens, 0)
+        ratio = total_tokens / budget_limit if budget_limit > 0 else 1.0
+        if ratio >= 1.0:
+            budget_state = "exhausted"
+        elif ratio >= 0.9:
+            budget_state = "near_limit"
+        elif ratio >= 0.75:
+            budget_state = "warning"
+        else:
+            budget_state = "ok"
+    else:
+        severity = {"unknown": 0, "ok": 1, "warning": 2, "near_limit": 3, "exhausted": 4}
+        budget_state = max((record.budget_state for record in records), key=lambda state: severity.get(state, 0))
+
+    usage_source = _usage_source_summary(records)
+    tokens_text = _format_token_count(total_tokens)
+    if budget_limit is not None:
+        return (
+            "Token Budget:"
+            f" {tokens_text} / {_format_token_count(budget_limit)}"
+            f" | remaining: {_format_token_count(budget_remaining or 0)}"
+            f" | budget: {budget_state}"
+            f" | usage source: {usage_source}"
+        )
+    return (
+        "Token Budget:"
+        f" {tokens_text}"
+        f" | budget: {budget_state}"
+        f" | usage source: {usage_source}"
+    )
+
+
+def _usage_source_summary(records: list[UsageRecord]) -> str:
+    sources = {record.usage_source for record in records}
+    if sources == {"reported"}:
+        return "reported"
+    if sources == {"estimated"}:
+        return "estimated"
+    return "mixed"
+
+
+def _format_token_count(value: int) -> str:
+    if value >= 1_000_000:
+        scaled = value / 1_000_000
+        return f"{scaled:.1f}".rstrip("0").rstrip(".") + "m"
+    if value >= 1000:
+        scaled = value / 1000
+        return f"{scaled:.1f}".rstrip("0").rstrip(".") + "k"
+    return str(value)
+
+
 # ============================================================================
 # CLI handlers
 # ============================================================================
+
+def handle_home() -> None:
+    """Render the default calm home for bare CLI launch."""
+    print("Sarathi")
+    print("Workspace: no workspace selected")
+    print("Actions:")
+    print("  chat         start brainstorming or create a task")
+    print("  run          execute a task through Sarathi")
+    print("  status       inspect task progress")
+    print("  resume       continue a saved task")
+    print("  new workspace create or select a workspace")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="sarathi",
         description="Sarathi - Workflow orchestration framework"
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "-m", "--message",
+        default=None,
+        help="Initial message to send to the TUI"
+    )
+    parser.add_argument(
+        "-x", "--exit",
+        action="store_true",
+        help="Exit after processing initial message (for testing)"
+    )
+    subparsers = parser.add_subparsers(dest="command")
 
     # Init command
     init_parser = subparsers.add_parser("init", help="Initialize a new Sarathi policy pack")
@@ -225,6 +346,9 @@ def main() -> None:
         action="store_true",
         help="Show detailed validation results",
     )
+
+    # Chat command (launches TUI)
+    chat_parser = subparsers.add_parser("chat", help="Start interactive chat mode")
 
     # Run command
     run_parser = subparsers.add_parser("run", help="Run a task through the lifecycle")
@@ -262,6 +386,29 @@ def main() -> None:
         help="Task ID to show status for",
     )
 
+    watch_parser = subparsers.add_parser("watch", help="Watch task status live")
+    watch_parser.add_argument(
+        "task_id",
+        help="Task ID to watch",
+    )
+    watch_parser.add_argument(
+        "--interval",
+        type=float,
+        default=2.0,
+        help="Seconds between refreshes (default: 2.0)",
+    )
+    watch_parser.add_argument(
+        "--stale-after",
+        type=int,
+        default=300,
+        help="Mark nodes stale after this many seconds without activity",
+    )
+    watch_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Render a single snapshot and exit",
+    )
+
     resume_parser = subparsers.add_parser("resume", help="Resume a saved task")
     resume_parser.add_argument(
         "task_id",
@@ -294,6 +441,22 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # Check for stdin input or message argument
+    initial_message = None
+    if args.message:
+        initial_message = args.message
+    elif not sys.stdin.isatty():
+        # Read from stdin if piped
+        initial_message = sys.stdin.read().strip()
+
+    if args.command is None:
+        from src.tui import launch_sarathi_tui
+        launch_sarathi_tui(initial_message, exit_after=args.exit)
+        return
+    if args.command == "chat":
+        from src.tui import launch_sarathi_tui
+        launch_sarathi_tui(initial_message, exit_after=args.exit)
+        return
     if args.command == "init":
         handle_init(args)
     elif args.command == "validate":
@@ -304,6 +467,8 @@ def main() -> None:
         handle_log(args)
     elif args.command == "status":
         handle_status(args)
+    elif args.command == "watch":
+        handle_watch(args)
     elif args.command == "resume":
         handle_resume(args)
     elif args.command == "list":
@@ -662,6 +827,11 @@ def handle_status(args: argparse.Namespace) -> None:
         print(f"Task {args.task_id} not found. Available tasks: {persistence.list_tasks()}")
         return
 
+    _print_task_status(task, stale_after_seconds=300)
+
+
+def _print_task_status(task: TaskContext, *, stale_after_seconds: int = 300) -> None:
+    """Print a compact supervision snapshot for a persisted task."""
     print(f"Task: {task.task_id}")
     print(f"Description: {task.description}")
     print(f"Complexity: {task.complexity.value}")
@@ -674,6 +844,9 @@ def handle_status(args: argparse.Namespace) -> None:
             f" {task.preflight_validation.get('todo', 0)} TODO"
         )
     print(f"Phases Recorded: {len(task.phase_results)}")
+    usage_line = _usage_summary_line(task)
+    if usage_line is not None:
+        print(usage_line)
     if task.task_graph_state:
         summary = graph_summary(task.task_graph_state)
         print(
@@ -702,6 +875,36 @@ def handle_status(args: argparse.Namespace) -> None:
         retryable_node = next_retryable_failed_node(task.task_graph_state)
         if retryable_node is not None:
             print(f"Retryable Node: {retryable_node.get('id')} - {retryable_node.get('title')}")
+        compact_summary = supervision_summary(task.task_graph_state, stale_after_seconds=stale_after_seconds)
+        print(
+            "Supervision:"
+            f" {compact_summary.get('running', 0)} running,"
+            f" {compact_summary.get('blocked', 0)} blocked,"
+            f" {compact_summary.get('waiting_user', 0)} waiting_user,"
+            f" {compact_summary.get('stale', 0)} stale,"
+            f" {compact_summary.get('done', 0)} done"
+        )
+        manifest = task_manifest_from_graph(
+            task.task_graph_state,
+            parent_task_id=task.task_id,
+            stale_after_seconds=stale_after_seconds,
+        )
+        if manifest:
+            print("Task Manifest:")
+            for item in manifest:
+                line = (
+                    f"  - {item['node_id']}: {item['title']}"
+                    f" [{item['progress_state']}]"
+                )
+                if item.get("parent_task_id"):
+                    line += f" parent={item['parent_task_id']}"
+                if item.get("child_task_ids"):
+                    line += f" child={','.join(item['child_task_ids'])}"
+                if item.get("needs_from"):
+                    line += f" needs_from={','.join(item['needs_from'])}"
+                if item.get("block_reason"):
+                    line += f" reason={item['block_reason']}"
+                print(line)
     if task.phase_results:
         last = task.phase_results[-1]
         print(f"Last Outcome: {last.phase.value} -> {last.outcome}")
@@ -709,6 +912,36 @@ def handle_status(args: argparse.Namespace) -> None:
     bundle = latest_escalation_bundle(task)
     if bundle is not None:
         print_escalation_summary(bundle)
+
+
+def handle_watch(args: argparse.Namespace) -> None:
+    """Watch a persisted task and refresh the compact supervision view."""
+    persistence_cls = globals().get("PersistenceManager")
+    if persistence_cls is None:
+        try:
+            from .engine import PersistenceManager as persistence_cls
+        except ImportError:
+            from engine import PersistenceManager as persistence_cls
+
+    persistence = persistence_cls()
+    iterations = 1 if getattr(args, "once", False) else None
+    count = 0
+    try:
+        while iterations is None or count < iterations:
+            task = persistence.load_task(args.task_id)
+            if task is None:
+                print(f"Task {args.task_id} not found. Available tasks: {persistence.list_tasks()}")
+                return
+            if count > 0:
+                print("\n" + "=" * 94 + "\n")
+            print(f"Watch: {task.task_id}")
+            print(f"Refreshed: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            _print_task_status(task, stale_after_seconds=getattr(args, "stale_after", 300))
+            count += 1
+            if iterations is None:
+                time.sleep(max(getattr(args, "interval", 2.0), 0.1))
+    except KeyboardInterrupt:
+        print("\nWatch stopped.")
 
 
 def handle_resume(args: argparse.Namespace) -> None:

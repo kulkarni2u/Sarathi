@@ -8,6 +8,8 @@ license = { text = "MIT" }
 authors = [{ name = "Sarathi contributors" }]
 dependencies = [
     "PyYAML>=6.0.1",
+    "textual>=0.90.0",
+    "rich>=13.0.0",
 ]
 
 [project.scripts]

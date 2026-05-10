@@ -57,6 +57,54 @@ def test_task_dashboard_summarizes_workspace_tasks_and_graph_state(tmp_path):
     assert graph_summary["providers"] == ["Codex", "Claude"]
 
 
+def test_task_dashboard_can_be_filtered_to_a_project(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    workspace_id = create_workspace(app, tmp_path)
+
+    _, project_one = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/projects",
+            {"name": "Project One"},
+        )
+    )
+    _, project_two = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/projects",
+            {"name": "Project Two"},
+        )
+    )
+
+    create_task_draft(
+        app,
+        workspace_id,
+        "Project one task",
+        "Project one task",
+        project_id=project_one["project"]["id"],
+    )
+    create_task_draft(
+        app,
+        workspace_id,
+        "Project two task",
+        "Project two task",
+        project_id=project_two["project"]["id"],
+    )
+
+    status, data = assert_ok(
+        request(
+            app,
+            "GET",
+            f"/api/workspaces/{workspace_id}/task-dashboard?project_id={project_one['project']['id']}",
+        )
+    )
+
+    assert status == 200
+    assert [summary["title"] for summary in data["tasks"]] == ["Project one task"]
+
+
 def create_workspace(app, tmp_path):
     _, workspace_data = assert_ok(
         request(
@@ -69,13 +117,17 @@ def create_workspace(app, tmp_path):
     return workspace_data["workspace"]["id"]
 
 
-def create_task_draft(app, workspace_id, prompt, title):
+def create_task_draft(app, workspace_id, prompt, title, project_id=None):
     _, draft_data = assert_ok(
         request(
             app,
             "POST",
             f"/api/workspaces/{workspace_id}/task-drafts",
-            {"prompt": prompt, "title": title},
+            {
+                "prompt": prompt,
+                "title": title,
+                **({"context": {"projectId": project_id}} if project_id else {}),
+            },
         )
     )
     return draft_data["task"]

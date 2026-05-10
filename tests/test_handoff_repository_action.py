@@ -93,6 +93,55 @@ def test_repository_action_requires_explicit_approval_and_records_decision(tmp_p
     assert "repository_action.approved" in {event["event_type"] for event in studio_data["events"]}
 
 
+def test_handoff_defaults_repository_action_to_no_action_with_all_opt_in_modes(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_reviewed_task(app, tmp_path)
+
+    status, data = assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/handoff"))
+
+    assert status == 201
+    handoff = data["handoff"]
+    assert handoff["metadata"]["repository_action_preference"]["mode"] == "no_action"
+    assert handoff["metadata"]["repository_action_preference"]["scope"] == "default"
+    assert handoff["metadata"]["repository_action"]["mode"] == "no_action"
+    assert handoff["metadata"]["repository_action"]["status"] == "pending"
+    assert data["repository_action_gate"]["metadata"]["allowed_actions"] == [
+        "no_action",
+        "prepare_patch",
+        "commit",
+        "draft_pr",
+        "ready_pr",
+    ]
+
+
+def test_handoff_uses_workspace_repository_action_preference(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_reviewed_task(app, tmp_path)
+
+    assert_ok(
+        request(
+            app,
+            "PATCH",
+            f"/api/workspaces/{task['workspace_id']}",
+            {
+                "metadata": {
+                    "repository_action_preference": {
+                        "scope": "workspace",
+                        "mode": "draft_pr",
+                    }
+                }
+            },
+        )
+    )
+
+    status, data = assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/handoff"))
+
+    assert status == 201
+    assert data["handoff"]["metadata"]["repository_action_preference"]["mode"] == "draft_pr"
+    assert data["handoff"]["metadata"]["repository_action_preference"]["scope"] == "workspace"
+    assert data["repository_action_gate"]["metadata"]["default_action"] == "draft_pr"
+
+
 def create_reviewed_task(app, tmp_path):
     task = create_task_with_approved_graph(app, tmp_path)
     assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))

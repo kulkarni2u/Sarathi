@@ -146,6 +146,8 @@ class RecoveryRunner:
             "evidence": response.evidence,
             "artifacts": response.artifacts,
         }
+        if response.usage:
+            details["usage"] = response.usage.to_artifact()
         if provider_context is not None:
             details["provider_context"] = provider_context
         if response.raw_transcript_ref:

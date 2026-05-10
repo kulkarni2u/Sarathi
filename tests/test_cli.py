@@ -188,9 +188,22 @@ def test_handle_status_prints_summary(tmp_path, capsys):
                         "recommended_action": "Inspect step-2 and resume",
                         "graph_node": {"id": "step-2", "title": "B", "status": "failed"},
                         "artifact_refs": ["/tmp/evidence.json"],
+                    },
+                    "dispatch_usage": {
+                        "provider_id": "codex",
+                        "provider_family": "codex",
+                        "dispatch_id": "task-1",
+                        "input_tokens": 1200,
+                        "output_tokens": 600,
+                        "total_tokens": 1800,
+                        "estimated": False,
+                        "budget_limit": 2000,
+                        "budget_remaining": 200,
+                        "budget_state": "near_limit",
+                        "usage_source": "reported",
                     }
                 },
-            )
+            ),
         ],
     )
     persistence.save_task(task)
@@ -209,6 +222,7 @@ def test_handle_status_prints_summary(tmp_path, capsys):
     assert "Task: task-1" in output
     assert "Preflight: 2 PASS, 1 WARN, 0 TODO" in output
     assert "Task Graph: 1 completed, 0 pending, 2 total" in output
+    assert "Token Budget: 1.8k / 2k | remaining: 200 | budget: near_limit | usage source: reported" in output
     assert "Last Completed Node: step-1 - A (attempts: 1)" in output
     assert "Failed Node: step-2 - B (attempts: 1)" in output
     assert "Retryable Node: step-2 - B" in output
@@ -216,6 +230,89 @@ def test_handle_status_prints_summary(tmp_path, capsys):
     assert "Escalation: Graph node step-2 failed" in output
     assert "Evidence Ref: /tmp/evidence.json" in output
     assert "Recommended Action: Inspect step-2 and resume" in output
+
+
+def test_handle_status_prints_compact_supervision_manifest(tmp_path, capsys):
+    persistence = PersistenceManager(str(tmp_path / "tasks"))
+    task = TaskContext(
+        task_id="task-supervision",
+        description="Supervise subtasks",
+        complexity=Complexity.MEDIUM,
+        task_graph_state={
+            "parent_task_id": "task-supervision",
+            "nodes": [
+                {
+                    "id": "step-1",
+                    "title": "Start",
+                    "status": "completed",
+                    "depends_on": [],
+                    "child_task_ids": ["step-2"],
+                },
+                {
+                    "id": "step-2",
+                    "title": "Waiting",
+                    "status": "waiting_human",
+                    "depends_on": ["step-1"],
+                    "last_error": "needs user input",
+                },
+            ],
+        },
+    )
+    persistence.save_task(task)
+
+    original = cli.PersistenceManager if hasattr(cli, "PersistenceManager") else None
+    cli.PersistenceManager = lambda: persistence
+    try:
+        cli.handle_status(Namespace(task_id="task-supervision"))
+    finally:
+        if original is None:
+            delattr(cli, "PersistenceManager")
+        else:
+            cli.PersistenceManager = original
+
+    output = capsys.readouterr().out
+    assert "Supervision: 0 running, 0 blocked, 1 waiting_user, 0 stale, 1 done" in output
+    assert "Task Manifest:" in output
+    assert "step-1: Start [done]" in output
+    assert "step-2: Waiting [waiting_user]" in output
+    assert "parent=task-supervision" in output
+    assert "needs_from=step-1" in output
+
+
+def test_handle_watch_once_prints_refresh_snapshot(tmp_path, capsys):
+    persistence = PersistenceManager(str(tmp_path / "tasks"))
+    task = TaskContext(
+        task_id="task-watch",
+        description="Watch subtasks",
+        complexity=Complexity.MEDIUM,
+        task_graph_state={
+            "parent_task_id": "task-watch",
+            "nodes": [
+                {
+                    "id": "step-1",
+                    "title": "Root",
+                    "status": "running",
+                    "started_at": "2026-04-23T10:00:00Z",
+                }
+            ],
+        },
+    )
+    persistence.save_task(task)
+
+    original = cli.PersistenceManager if hasattr(cli, "PersistenceManager") else None
+    cli.PersistenceManager = lambda: persistence
+    try:
+        cli.handle_watch(Namespace(task_id="task-watch", once=True, interval=0.01, stale_after=1))
+    finally:
+        if original is None:
+            delattr(cli, "PersistenceManager")
+        else:
+            cli.PersistenceManager = original
+
+    output = capsys.readouterr().out
+    assert "Watch: task-watch" in output
+    assert "Refreshed:" in output
+    assert "Supervision:" in output
 
 
 def test_handle_log_prints_escalation_summary(tmp_path, capsys):

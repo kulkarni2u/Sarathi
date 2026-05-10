@@ -1,6 +1,7 @@
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   approveTaskGate,
+  getWorkspaceOperationalViews,
   listTaskDashboard,
   getSarathiApiConfig,
   type TaskDashboardItem,
@@ -8,7 +9,7 @@ import {
 import { approvalGates } from "../mockData";
 import { Pill } from "../components/ui";
 
-type InboxItemType = "gate" | "blocked" | "rate_limited";
+type InboxItemType = "gate" | "blocked";
 
 interface InboxEntry {
   id: string;
@@ -16,7 +17,10 @@ interface InboxEntry {
   type: InboxItemType;
   title: string;
   description: string;
+  detail: string;
   gateName?: string;
+  phase: string;
+  providerSummary: string;
   updatedAt: string;
 }
 
@@ -34,28 +38,58 @@ function relativeTime(iso: string): string {
 function buildEntries(tasks: TaskDashboardItem[]): InboxEntry[] {
   const entries: InboxEntry[] = [];
   for (const task of tasks) {
-    if (task.approval_state.includes("pending")) {
+    const providerSummary = task.providers.length > 0 ? task.providers.join(", ") : "Provider pending";
+    if (task.approval_state === "prd_pending") {
       entries.push({
         id: `gate-${task.id}`,
         taskId: task.id,
         type: "gate",
         title: task.title,
-        description: `Task graph: ${task.node_count} unit${task.node_count !== 1 ? "s" : ""}. Approve to dispatch.`,
-        gateName: task.next_gate ?? "Task graph",
+        description: "Scope approval is required before Sarathi can lock planning and execution.",
+        detail: "PRD/acceptance gate is waiting on a human decision.",
+        gateName: task.next_gate ?? "PRD/AC",
+        phase: task.phase,
+        providerSummary,
         updatedAt: task.updated_at,
       });
-    } else if (task.blocked_count > 0) {
+      continue;
+    }
+    if (task.approval_state === "graph_pending" || task.approval_state === "approval_pending") {
+      const gateName = task.next_gate ?? "Task graph";
+      entries.push({
+        id: `gate-${task.id}`,
+        taskId: task.id,
+        type: "gate",
+        title: task.title,
+        description: `${gateName} needs approval before execution can continue.`,
+        detail: `${task.node_count} unit${task.node_count !== 1 ? "s" : ""} prepared for dispatch.`,
+        gateName,
+        phase: task.phase,
+        providerSummary,
+        updatedAt: task.updated_at,
+      });
+      continue;
+    }
+    if (task.blocked_count > 0) {
       entries.push({
         id: `blocked-${task.id}`,
         taskId: task.id,
         type: "blocked",
         title: task.title,
-        description: `${task.blocked_count} unit${task.blocked_count !== 1 ? "s" : ""} blocked. Provider may be offline.`,
+        description: `${task.blocked_count} unit${task.blocked_count !== 1 ? "s" : ""} blocked. Execution needs intervention or an upstream recovery.`,
+        detail: task.next_gate ? `Next gate: ${task.next_gate}.` : "Waiting on dependency or provider progress.",
+        phase: task.phase,
+        providerSummary,
         updatedAt: task.updated_at,
       });
     }
   }
-  return entries;
+  return entries.sort((left, right) => {
+    const severity = (entry: InboxEntry) => (entry.type === "gate" ? 0 : 1);
+    const severityDiff = severity(left) - severity(right);
+    if (severityDiff !== 0) return severityDiff;
+    return new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime();
+  });
 }
 
 function mockEntries(): InboxEntry[] {
@@ -65,42 +99,63 @@ function mockEntries(): InboxEntry[] {
     taskId: "SA-001",
     type: "gate" as const,
     title: "Implement Chat Orchestrator",
-    description: "Task graph: 4 units. Approve to dispatch.",
+    description: "Task graph approval is waiting on a human decision.",
+    detail: "4 units prepared for dispatch.",
     gateName: g.name,
+    phase: "Plan",
+    providerSummary: "Codex, Claude",
     updatedAt: new Date(Date.now() - 2 * 60 * 1000).toISOString(),
   }));
 }
 
 interface Props {
   workspaceId?: string | null;
+  projectId?: string | null;
   liveTick?: number;
   setRoute?: (r: string) => void;
   setSelectedTaskId?: (id: string) => void;
 }
 
-export default function Inbox({ workspaceId, liveTick, setRoute, setSelectedTaskId }: Props) {
+export default function Inbox({ workspaceId, projectId, liveTick, setRoute, setSelectedTaskId }: Props) {
   const [entries, setEntries] = useState<InboxEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [approvingId, setApprovingId] = useState<string | null>(null);
+  const [status, setStatus] = useState("Loading attention queue.");
 
   const load = useCallback(async () => {
     const config = getSarathiApiConfig();
-    if (!config || !workspaceId) {
+    if (!config) {
       setEntries(mockEntries());
+      setStatus("Demo attention queue. Connect the local service for persisted workflow state.");
       setLoading(false);
       return;
     }
+    if (!workspaceId) {
+      setEntries([]);
+      setStatus("Select a workspace to load approvals, blockers, and restart-ready work.");
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
     try {
-      const tasks = await listTaskDashboard(workspaceId);
+      const [tasks, operations] = await Promise.all([
+        listTaskDashboard(workspaceId, { projectId }),
+        getWorkspaceOperationalViews(workspaceId),
+      ]);
       const built = buildEntries(tasks);
-      // Also add a demo rate-limit item if nothing else is present
       setEntries(built);
+      const blocked = built.filter((entry) => entry.type === "blocked").length;
+      const decisions = built.filter((entry) => entry.type === "gate").length;
+      setStatus(
+        `${decisions} decisions, ${blocked} blocked tasks, ${operations.usage.tasks.active} active task${operations.usage.tasks.active === 1 ? "" : "s"} in scope.`,
+      );
     } catch {
       setEntries(mockEntries());
+      setStatus("Attention queue load failed. Showing fallback queue.");
     } finally {
       setLoading(false);
     }
-  }, [workspaceId]);
+  }, [workspaceId, projectId]);
 
   useEffect(() => {
     void load();
@@ -133,7 +188,7 @@ export default function Inbox({ workspaceId, liveTick, setRoute, setSelectedTask
   const typeLabel = (type: InboxItemType) => {
     if (type === "gate") return "GATE";
     if (type === "blocked") return "BLOCKED";
-    return "RATE LIMIT";
+    return "BLOCKED";
   };
 
   const dotColor = (type: InboxItemType) => {
@@ -142,18 +197,64 @@ export default function Inbox({ workspaceId, liveTick, setRoute, setSelectedTask
     return "var(--status-red-fg)";
   };
 
+  const summary = useMemo(() => {
+    const decisions = entries.filter((entry) => entry.type === "gate").length;
+    const blocked = entries.filter((entry) => entry.type === "blocked").length;
+    return {
+      decisions,
+      blocked,
+      total: entries.length,
+    };
+  }, [entries]);
+
   return (
     <div style={{ padding: "24px 28px", maxWidth: 760 }}>
-      {/* Header */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
-        <h1 style={{ margin: 0 }}>Inbox</h1>
+        <div>
+          <h1 style={{ margin: 0 }}>Inbox</h1>
+          <p style={{ margin: "6px 0 0", fontSize: "0.83rem", color: "var(--muted)" }}>
+            Human attention queue for approvals, blockers, and execution interrupts.
+          </p>
+        </div>
         {entries.length > 0 && (
           <Pill tone="warning">{entries.length} item{entries.length !== 1 ? "s" : ""}</Pill>
         )}
       </div>
 
-      {/* Divider */}
       <div style={{ borderBottom: "1px solid var(--border)", marginBottom: 8 }} />
+      <p style={{ margin: "12px 0 18px", fontSize: "0.78rem", color: "var(--faint)" }}>{status}</p>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+          gap: 12,
+          marginBottom: 20,
+        }}
+      >
+        {[
+          { label: "Needs decision", value: summary.decisions, tone: "active" as const },
+          { label: "Blocked now", value: summary.blocked, tone: "warning" as const },
+          { label: projectId ? "Project scope" : "Workspace scope", value: summary.total, tone: "default" as const },
+        ].map((item) => (
+          <div
+            key={item.label}
+            style={{
+              border: "1px solid var(--border)",
+              borderRadius: "var(--radius-md)",
+              padding: "12px 14px",
+              background: "var(--surface)",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <span style={{ fontSize: "0.73rem", letterSpacing: "0.04em", textTransform: "uppercase", color: "var(--muted)" }}>
+                {item.label}
+              </span>
+              <Pill tone={item.tone}>{item.value}</Pill>
+            </div>
+          </div>
+        ))}
+      </div>
 
       {loading ? (
         <div className="loading-overlay">
@@ -163,9 +264,13 @@ export default function Inbox({ workspaceId, liveTick, setRoute, setSelectedTask
       ) : entries.length === 0 ? (
         <div className="empty-state" style={{ paddingTop: 64 }}>
           <div style={{ fontSize: "2rem", marginBottom: 12, color: "var(--faint)" }}>&#10003;</div>
-          <p style={{ fontWeight: 500, color: "var(--muted)" }}>Sarathi has no decisions waiting for you.</p>
+          <p style={{ fontWeight: 500, color: "var(--muted)" }}>
+            {workspaceId ? "Sarathi has no decisions waiting for you." : "No workspace selected."}
+          </p>
           <p style={{ fontSize: "0.78rem", color: "var(--faint)", marginTop: 4 }}>
-            When tasks need approval or are blocked, they will appear here.
+            {workspaceId
+              ? "When tasks need approval or are blocked, they will appear here."
+              : "Choose a workspace to load its operational queue."}
           </p>
         </div>
       ) : (
@@ -195,8 +300,11 @@ export default function Inbox({ workspaceId, liveTick, setRoute, setSelectedTask
 
               {/* Body */}
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
                   <Pill tone={typeBadgeTone(entry.type)}>{typeLabel(entry.type)}</Pill>
+                  <span style={{ fontSize: "0.72rem", color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                    {entry.phase}
+                  </span>
                   <span
                     style={{
                       fontSize: "0.855rem",
@@ -223,6 +331,9 @@ export default function Inbox({ workspaceId, liveTick, setRoute, setSelectedTask
                   }}
                 >
                   {entry.description}
+                </p>
+                <p style={{ margin: "0 0 10px", fontSize: "0.76rem", color: "var(--faint)" }}>
+                  {entry.detail} Providers: {entry.providerSummary}.
                 </p>
 
                 <div className="actions">

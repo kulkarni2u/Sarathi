@@ -9,3 +9,15 @@ __pycache__/
 # Local Sarathi task store
 .sarathi/
 .gstack/
+.superpowers/
+
+# Runtime data
+data/
+
+# Build artifacts
+sarathi.egg-info/
+desktop/tsconfig.tsbuildinfo
+desktop/dist/
+
+# Local desktop config (contains dev tokens + localhost URLs)
+desktop/public/sarathi-runtime.js

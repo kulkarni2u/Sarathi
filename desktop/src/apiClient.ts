@@ -749,6 +749,102 @@ export async function approveRepositoryAction(
   );
 }
 
+export type BrainstormTurn = {
+  role: "sarathi" | "user";
+  content: string;
+  options?: string[];
+  selected?: string | null;
+  spec_update?: string | null;
+  timestamp: string;
+};
+
+export type BrainstormResearchFinding = {
+  agent: string;
+  type: "codebase" | "risk" | "pattern" | "reference";
+  summary: string;
+  refs?: string[];
+  timestamp: string;
+};
+
+export type BrainstormSession = {
+  id: string;
+  workspace_id: string;
+  project_id: string | null;
+  task_id: string | null;
+  status: "active" | "approved" | "abandoned";
+  title: string;
+  provider: string | null;
+  spec_path: string | null;
+  spec_content: string | null;
+  output_format: string;
+  dialogue_turns: BrainstormTurn[];
+  research_findings: BrainstormResearchFinding[];
+  visual_options: unknown[];
+  approved_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export async function createBrainstormSession(
+  workspaceId: string,
+  title: string,
+  options: { projectId?: string; provider?: string; outputFormat?: string } = {},
+): Promise<BrainstormSession> {
+  const data = await postJson<{ session: BrainstormSession }>(
+    "/api/brainstorm/sessions",
+    {
+      workspace_id: workspaceId,
+      title,
+      ...(options.projectId ? { project_id: options.projectId } : {}),
+      ...(options.provider ? { provider: options.provider } : {}),
+      ...(options.outputFormat ? { output_format: options.outputFormat } : {}),
+    },
+  );
+  return data.session;
+}
+
+export async function getBrainstormSession(sessionId: string): Promise<BrainstormSession> {
+  const data = await getJson<{ session: BrainstormSession }>(
+    `/api/brainstorm/${encodeURIComponent(sessionId)}`,
+  );
+  return data.session;
+}
+
+export async function addBrainstormTurn(
+  sessionId: string,
+  turn: Omit<BrainstormTurn, "timestamp">,
+): Promise<BrainstormSession> {
+  const data = await postJson<{ session: BrainstormSession }>(
+    `/api/brainstorm/${encodeURIComponent(sessionId)}/turns`,
+    turn as Record<string, unknown>,
+  );
+  return data.session;
+}
+
+export async function addBrainstormResearch(
+  sessionId: string,
+  finding: Omit<BrainstormResearchFinding, "timestamp">,
+): Promise<BrainstormSession> {
+  const data = await postJson<{ session: BrainstormSession }>(
+    `/api/brainstorm/${encodeURIComponent(sessionId)}/research`,
+    finding as Record<string, unknown>,
+  );
+  return data.session;
+}
+
+export async function approveBrainstormSession(
+  sessionId: string,
+  options: { exportPath?: string; outputFormat?: string } = {},
+): Promise<{ session: BrainstormSession; task: TaskRecord }> {
+  return postJson<{ session: BrainstormSession; task: TaskRecord }>(
+    `/api/brainstorm/${encodeURIComponent(sessionId)}/approve`,
+    {
+      ...(options.exportPath ? { export_path: options.exportPath } : {}),
+      ...(options.outputFormat ? { output_format: options.outputFormat } : {}),
+    },
+  );
+}
+
 export type PolicyPackFile = {
   name: string;
   content: string;

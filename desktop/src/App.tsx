@@ -38,6 +38,7 @@ import {
   createWorkspaceProject,
   createTaskHandoff,
   createTaskGraphDraft,
+  createBrainstormSession,
   createTaskDraft,
   dispatchSubtask,
   ensureWorkspace,
@@ -105,8 +106,9 @@ import InboxPage from "./pages/Inbox";
 import AgentsPage from "./pages/Agents";
 import SettingsPage from "./pages/Settings";
 import ProjectDetail from "./pages/ProjectDetail";
+import BrainstormPage from "./pages/Brainstorm";
 
-export type AppRoute = "workspace" | "dashboard" | "inbox" | "agents" | "settings" | "project";
+export type AppRoute = "workspace" | "dashboard" | "inbox" | "agents" | "settings" | "project" | "brainstorm";
 
 type TaskTab = "messages" | "evidence" | "review" | "history" | "handoff";
 
@@ -135,6 +137,7 @@ const routeIcons: Record<AppRoute, ReactNode> = {
   agents:      <PersonIcon />,
   settings:    <GearIcon />,
   project:     <LayersIcon />,
+  brainstorm:  <MixIcon />,
 };
 
 const routes: Record<AppRoute, string> = {
@@ -144,6 +147,7 @@ const routes: Record<AppRoute, string> = {
   agents: "Agents",
   settings: "Settings",
   project: "Project",
+  brainstorm: "Brainstorm",
 };
 
 const navGroups: Array<{ label: string; items: Array<{ id: AppRoute; count?: string }> }> = [
@@ -228,6 +232,7 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
   const [projectCreateRequest, setProjectCreateRequest] = useState(0);
   const [taskCreateRequest, setTaskCreateRequest] = useState(0);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [brainstormSessionId, setBrainstormSessionId] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<TaskDashboardItem | null>(null);
   const [selectedUnitId, setSelectedUnitId] = useState("ST-02");
   const [taskTab, setTaskTab] = useState<TaskTab>("messages");
@@ -482,6 +487,20 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
   function handleOpenProject(projectId: string) {
     setSelectedProjectId(projectId);
     setRoute("dashboard");
+  }
+
+  async function handleStartBrainstorm(title: string) {
+    const workspaceId = selectedWorkspace?.id;
+    if (!workspaceId || !getSarathiApiConfig()) return;
+    try {
+      const session = await createBrainstormSession(workspaceId, title, {
+        projectId: selectedProjectId ?? undefined,
+      });
+      setBrainstormSessionId(session.id);
+      setRoute("brainstorm");
+    } catch {
+      // fall back silently — no regression on brainstorm failure
+    }
   }
 
   useEffect(() => {
@@ -776,6 +795,17 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
               setSelectedTaskId={setSelectedTaskId}
               setRoute={setRoute as unknown as (route: string) => void}
               liveTick={liveTick}
+            />
+          )}
+          {route === "brainstorm" && brainstormSessionId && (
+            <BrainstormPage
+              sessionId={brainstormSessionId}
+              workspaceId={selectedWorkspaceId ?? selectedWorkspace?.id ?? workspace.id}
+              onApproved={(taskId) => {
+                setSelectedTaskId(taskId);
+                setBrainstormSessionId(null);
+                setRoute("project");
+              }}
             />
           )}
         </div>

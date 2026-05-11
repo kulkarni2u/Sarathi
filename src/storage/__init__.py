@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 5
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -63,6 +63,13 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
             (4, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 5:
+        conn.executescript(_MIGRATION_005)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (5, _utc_now()),
         )
         conn.commit()
 
@@ -337,6 +344,146 @@ class Storage:
             "review_needed_count": int(review_needed_count),
             "last_activity": last_activity,
         }
+
+    def create_brainstorm_session(
+        self,
+        *,
+        workspace_id: str,
+        title: str,
+        project_id: str | None = None,
+        provider: str | None = None,
+        output_format: str = "markdown",
+    ) -> dict[str, Any]:
+        session_id = _new_id()
+        now = _utc_now()
+        self.conn.execute(
+            """
+            INSERT INTO brainstorm_sessions (
+                id, workspace_id, project_id, title, provider, output_format,
+                dialogue_turns, research_findings, visual_options,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, workspace_id, project_id, title, provider, output_format,
+             "[]", "[]", "[]", now, now),
+        )
+        self.conn.commit()
+        session = self.get_brainstorm_session(session_id)
+        assert session is not None
+        return session
+
+    def get_brainstorm_session(self, session_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, workspace_id, project_id, task_id, status, title, provider,
+                   spec_path, spec_content, output_format, dialogue_turns,
+                   research_findings, visual_options, approved_at, created_at, updated_at
+            FROM brainstorm_sessions WHERE id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        return _brainstorm_session_from_row(row) if row is not None else None
+
+    def list_brainstorm_sessions(
+        self, workspace_id: str, *, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        if status:
+            rows = self.conn.execute(
+                """
+                SELECT id, workspace_id, project_id, task_id, status, title, provider,
+                       spec_path, spec_content, output_format, dialogue_turns,
+                       research_findings, visual_options, approved_at, created_at, updated_at
+                FROM brainstorm_sessions
+                WHERE workspace_id = ? AND status = ?
+                ORDER BY created_at DESC
+                """,
+                (workspace_id, status),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                """
+                SELECT id, workspace_id, project_id, task_id, status, title, provider,
+                       spec_path, spec_content, output_format, dialogue_turns,
+                       research_findings, visual_options, approved_at, created_at, updated_at
+                FROM brainstorm_sessions
+                WHERE workspace_id = ?
+                ORDER BY created_at DESC
+                """,
+                (workspace_id,),
+            ).fetchall()
+        return [_brainstorm_session_from_row(row) for row in rows]
+
+    def append_brainstorm_turn(self, session_id: str, turn: dict[str, Any]) -> dict[str, Any]:
+        session = self.get_brainstorm_session(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        turns = session["dialogue_turns"]
+        turns.append(turn)
+        now = _utc_now()
+        self.conn.execute(
+            "UPDATE brainstorm_sessions SET dialogue_turns = ?, updated_at = ? WHERE id = ?",
+            (_dump_json(turns), now, session_id),
+        )
+        self.conn.commit()
+        updated = self.get_brainstorm_session(session_id)
+        assert updated is not None
+        return updated
+
+    def append_brainstorm_research(self, session_id: str, finding: dict[str, Any]) -> dict[str, Any]:
+        session = self.get_brainstorm_session(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        findings = session["research_findings"]
+        findings.append(finding)
+        now = _utc_now()
+        self.conn.execute(
+            "UPDATE brainstorm_sessions SET research_findings = ?, updated_at = ? WHERE id = ?",
+            (_dump_json(findings), now, session_id),
+        )
+        self.conn.commit()
+        updated = self.get_brainstorm_session(session_id)
+        assert updated is not None
+        return updated
+
+    def update_brainstorm_spec(
+        self, session_id: str, spec_content: str, spec_path: str | None = None
+    ) -> dict[str, Any]:
+        session = self.get_brainstorm_session(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        now = _utc_now()
+        self.conn.execute(
+            """
+            UPDATE brainstorm_sessions
+            SET spec_content = ?, spec_path = COALESCE(?, spec_path), updated_at = ?
+            WHERE id = ?
+            """,
+            (spec_content, spec_path, now, session_id),
+        )
+        self.conn.commit()
+        updated = self.get_brainstorm_session(session_id)
+        assert updated is not None
+        return updated
+
+    def approve_brainstorm_session(
+        self, session_id: str, *, task_id: str | None = None
+    ) -> dict[str, Any]:
+        session = self.get_brainstorm_session(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        now = _utc_now()
+        self.conn.execute(
+            """
+            UPDATE brainstorm_sessions
+            SET status = 'approved', approved_at = ?, task_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (now, task_id, now, session_id),
+        )
+        self.conn.commit()
+        updated = self.get_brainstorm_session(session_id)
+        assert updated is not None
+        return updated
 
     def create_task(
         self,
@@ -1325,6 +1472,27 @@ def _checkpoint_capsule_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _brainstorm_session_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "workspace_id": row["workspace_id"],
+        "project_id": row["project_id"],
+        "task_id": row["task_id"],
+        "status": row["status"],
+        "title": row["title"],
+        "provider": row["provider"],
+        "spec_path": row["spec_path"],
+        "spec_content": row["spec_content"],
+        "output_format": row["output_format"],
+        "dialogue_turns": _load_json_list(row["dialogue_turns"]),
+        "research_findings": _load_json_list(row["research_findings"]),
+        "visual_options": _load_json_list(row["visual_options"]),
+        "approved_at": row["approved_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 def _task_panel_entry(
     *,
     id: str,
@@ -1782,4 +1950,33 @@ CREATE TABLE IF NOT EXISTS projects (
 
 CREATE INDEX IF NOT EXISTS idx_projects_workspace
     ON projects(workspace_id);
+"""
+
+_MIGRATION_005 = """
+CREATE TABLE IF NOT EXISTS brainstorm_sessions (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    project_id TEXT,
+    task_id TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    title TEXT NOT NULL,
+    provider TEXT,
+    spec_path TEXT,
+    spec_content TEXT,
+    output_format TEXT NOT NULL DEFAULT 'markdown',
+    dialogue_turns TEXT NOT NULL DEFAULT '[]',
+    research_findings TEXT NOT NULL DEFAULT '[]',
+    visual_options TEXT NOT NULL DEFAULT '[]',
+    approved_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_brainstorm_sessions_workspace
+    ON brainstorm_sessions(workspace_id);
+
+CREATE INDEX IF NOT EXISTS idx_brainstorm_sessions_status
+    ON brainstorm_sessions(workspace_id, status);
 """

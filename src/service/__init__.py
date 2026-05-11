@@ -944,6 +944,98 @@ class ServiceApp:
             filename = parts[3]
             return 200, _put_policy_pack_file(storage, workspace_id, filename, body)
 
+        # ── Brainstorm sessions ──────────────────────────────────────────────
+        if method == "POST" and len(parts) == 2 and parts[0] == "brainstorm" and parts[1] == "sessions":
+            workspace_id = _required_text(body, "workspace_id")
+            if storage.get_workspace(workspace_id) is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            title = _required_text(body, "title")
+            project_id = _optional_text(body, "project_id")
+            provider = _optional_text(body, "provider")
+            output_format = _optional_text(body, "output_format") or "markdown"
+            session = storage.create_brainstorm_session(
+                workspace_id=workspace_id,
+                title=title,
+                project_id=project_id,
+                provider=provider,
+                output_format=output_format,
+            )
+            _emit_brainstorm_event(storage, "brainstorm.session_started", {
+                "session_id": session["id"], "workspace_id": workspace_id, "title": title,
+            }, workspace_id=workspace_id)
+            return 200, {"session": session}
+
+        if method == "GET" and len(parts) == 2 and parts[0] == "brainstorm":
+            session = storage.get_brainstorm_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Brainstorm session not found.", 404)
+            return 200, {"session": session}
+
+        if method == "POST" and len(parts) == 3 and parts[0] == "brainstorm" and parts[2] == "turns":
+            session = storage.get_brainstorm_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Brainstorm session not found.", 404)
+            turn: dict[str, Any] = {
+                "role": _required_text(body, "role"),
+                "content": _required_text(body, "content"),
+                "options": body.get("options", []),
+                "selected": body.get("selected"),
+                "timestamp": _service_now(),
+            }
+            updated = storage.append_brainstorm_turn(session["id"], turn)
+            spec_update = _optional_text(body, "spec_update")
+            if spec_update:
+                updated = storage.update_brainstorm_spec(session["id"], spec_update)
+                _emit_brainstorm_event(storage, "brainstorm.spec_updated",
+                    {"session_id": session["id"]}, workspace_id=updated["workspace_id"])
+            _emit_brainstorm_event(storage, "brainstorm.turn_added",
+                {"session_id": session["id"], "role": turn["role"]},
+                workspace_id=updated["workspace_id"])
+            return 200, {"session": updated}
+
+        if method == "POST" and len(parts) == 3 and parts[0] == "brainstorm" and parts[2] == "research":
+            session = storage.get_brainstorm_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Brainstorm session not found.", 404)
+            finding: dict[str, Any] = {
+                "agent": _required_text(body, "agent"),
+                "type": _optional_text(body, "type") or "codebase",
+                "summary": _required_text(body, "summary"),
+                "refs": body.get("refs", []),
+                "timestamp": _service_now(),
+            }
+            updated = storage.append_brainstorm_research(session["id"], finding)
+            _emit_brainstorm_event(storage, "brainstorm.research_added",
+                {"session_id": session["id"], "agent": finding["agent"]},
+                workspace_id=updated["workspace_id"])
+            return 200, {"session": updated}
+
+        if method == "POST" and len(parts) == 3 and parts[0] == "brainstorm" and parts[2] == "approve":
+            session = storage.get_brainstorm_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Brainstorm session not found.", 404)
+            if session["status"] == "approved":
+                raise ServiceError("conflict", "Session already approved.", 409)
+            spec_content = session["spec_content"] or f"# {session['title']}\n"
+            task = storage.create_task(
+                workspace_id=session["workspace_id"],
+                title=session["title"],
+                description=spec_content,
+                metadata={
+                    "source": "brainstorm",
+                    "brainstorm_session_id": session["id"],
+                    "project_id": session["project_id"],
+                },
+            )
+            approved = storage.approve_brainstorm_session(session["id"], task_id=task["id"])
+            spec_path = _write_brainstorm_spec(approved)
+            if spec_path:
+                approved = storage.update_brainstorm_spec(session["id"], spec_content, spec_path=spec_path)
+            _emit_brainstorm_event(storage, "brainstorm.approved",
+                {"session_id": session["id"], "task_id": task["id"]},
+                workspace_id=session["workspace_id"])
+            return 200, {"session": approved, "task": task}
+
         raise ServiceError("not_found", "Endpoint not found.", 404)
 
     def _authorize(self, headers: Mapping[str, str] | None) -> None:
@@ -3723,6 +3815,36 @@ def _find_policy_pack_dir(storage: Storage, workspace_id: str) -> Path | None:
         if candidate.is_dir():
             return candidate
     return None
+
+
+def _emit_brainstorm_event(
+    storage: Storage,
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    workspace_id: str | None = None,
+) -> None:
+    try:
+        storage.create_lifecycle_event(
+            workspace_id=workspace_id,
+            task_id=None,
+            event_type=event_type,
+            payload=payload,
+        )
+    except Exception:
+        pass
+
+
+def _write_brainstorm_spec(session: dict[str, Any]) -> str | None:
+    try:
+        sarathi_dir = Path(".sarathi") / "brainstorm" / session["id"]
+        sarathi_dir.mkdir(parents=True, exist_ok=True)
+        spec_path = sarathi_dir / "spec.md"
+        content = session["spec_content"] or f"# {session['title']}\n"
+        spec_path.write_text(content, encoding="utf-8")
+        return str(spec_path)
+    except Exception:
+        return None
 
 
 def _get_policy_pack(storage: Storage, workspace_id: str) -> dict[str, Any]:

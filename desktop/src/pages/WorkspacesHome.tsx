@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { type WorkspaceRecord } from "../apiClient";
+import { useEffect, useState } from "react";
+import { listProviders, getWorkspaceOperationalViews, type WorkspaceRecord } from "../apiClient";
 
 interface WorkspacesHomeProps {
   workspaces: WorkspaceRecord[];
@@ -26,6 +26,31 @@ export default function WorkspacesHome({
   const [createPath, setCreatePath] = useState("");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [providerHealth, setProviderHealth] = useState<Record<string, { total: number; online: number }>>({});
+  const [attentionCount, setAttentionCount] = useState<Record<string, number>>({});
+
+  useEffect(() => {
+    workspaces.forEach((ws) => {
+      void (async () => {
+        try {
+          const [providers, views] = await Promise.all([
+            listProviders(ws.id).catch(() => null),
+            getWorkspaceOperationalViews(ws.id).catch(() => null),
+          ]);
+          if (providers) {
+            const online = providers.filter((p) => p.health === "online" || p.health === "healthy").length;
+            setProviderHealth((prev) => ({ ...prev, [ws.id]: { total: providers.length, online } }));
+          }
+          if (views) {
+            const active = views.usage?.tasks?.active ?? 0;
+            setAttentionCount((prev) => ({ ...prev, [ws.id]: active }));
+          }
+        } catch {
+          // silently ignore — health strip shows "?" on failure
+        }
+      })();
+    });
+  }, [workspaces]);
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -137,6 +162,8 @@ export default function WorkspacesHome({
             const tasks = taskCount(ws as WorkspaceRecord & { task_count?: number });
             const active_ = activeCount(ws as WorkspaceRecord & { active_count?: number });
             const isSelected = ws.id === selectedWorkspaceId;
+            const health = providerHealth[ws.id];
+            const attention = attentionCount[ws.id] ?? 0;
             return (
               <WorkspaceRow
                 key={ws.id}
@@ -148,6 +175,9 @@ export default function WorkspacesHome({
                 lastActivity={lastActivity(ws)}
                 isSelected={isSelected}
                 onClick={() => handleSelectWorkspace(ws)}
+                providerOnline={health?.online}
+                providerTotal={health?.total}
+                attentionCount={attention}
               />
             );
           })}
@@ -216,6 +246,9 @@ interface WorkspaceRowProps {
   onClick: () => void;
   lastActivity?: string;
   isSelected?: boolean;
+  providerOnline?: number;
+  providerTotal?: number;
+  attentionCount?: number;
 }
 
 function WorkspaceRow({
@@ -227,7 +260,20 @@ function WorkspaceRow({
   onClick,
   lastActivity,
   isSelected,
+  providerOnline,
+  providerTotal,
+  attentionCount,
 }: WorkspaceRowProps) {
+  const providerLabel =
+    providerTotal === undefined
+      ? "? providers"
+      : providerOnline !== undefined
+        ? `${providerOnline}/${providerTotal} online`
+        : `${providerTotal} providers`;
+  const attentionLabel = attentionCount !== undefined && attentionCount > 0
+    ? `${attentionCount} active`
+    : null;
+
   return (
     <button
       className={`workspace-row${isSelected ? " selected" : ""}`}
@@ -236,6 +282,10 @@ function WorkspaceRow({
       <span className="ws-list-col-name">
         <span className={`status-dot ${isActive ? "active" : ""}`} />
         <span className="ws-name-text">{name}</span>
+        <span className="ws-health-strip">
+          <span className="ws-health-pill">{providerLabel}</span>
+          {attentionLabel && <span className="ws-health-pill attention">{attentionLabel}</span>}
+        </span>
       </span>
       <span className="ws-list-col-tasks">
         <span className="ws-meta-pill">{taskCount} task{taskCount !== 1 ? "s" : ""}</span>

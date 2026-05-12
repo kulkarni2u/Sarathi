@@ -747,6 +747,7 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
               createRequestedAt={projectCreateRequest}
               onCreateProject={handleCreateProject}
               onOpenProject={handleOpenProject}
+              onStartBrainstorm={handleStartBrainstorm}
             />
           )}
           {route === "dashboard" && (
@@ -768,6 +769,7 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
                 createRequestedAt={projectCreateRequest}
                 onCreateProject={handleCreateProject}
                 onOpenProject={handleOpenProject}
+                onStartBrainstorm={handleStartBrainstorm}
               />
             ) : (
 <Dashboard

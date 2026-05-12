@@ -7,6 +7,14 @@ interface WorkspaceDashboardProps {
   createRequestedAt?: number;
   onCreateProject: (name: string, description: string) => Promise<void> | void;
   onOpenProject: (projectId: string) => void;
+  onStartBrainstorm?: (title: string) => void;
+}
+
+function isSarathiConfigured(): boolean {
+  return (
+    !!(globalThis as { __SARATHI_RUNTIME_CONFIG__?: unknown }).__SARATHI_RUNTIME_CONFIG__ ||
+    !!(import.meta as { env?: Record<string, string | undefined> }).env?.VITE_SARATHI_API_BASE_URL
+  );
 }
 
 export default function WorkspaceDashboard({
@@ -15,6 +23,7 @@ export default function WorkspaceDashboard({
   createRequestedAt = 0,
   onCreateProject,
   onOpenProject,
+  onStartBrainstorm,
 }: WorkspaceDashboardProps) {
   const [showCreate, setShowCreate] = useState(projects.length === 0);
   const [name, setName] = useState("");
@@ -61,6 +70,13 @@ export default function WorkspaceDashboard({
     setCreating(true);
     setError(null);
     try {
+      if (isSarathiConfigured() && onStartBrainstorm) {
+        await onStartBrainstorm(trimmedName);
+        setName("");
+        setDescription("");
+        setShowCreate(false);
+        return;
+      }
       await onCreateProject(trimmedName, trimmedDescription);
       setName("");
       setDescription("");

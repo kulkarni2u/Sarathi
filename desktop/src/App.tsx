@@ -1094,37 +1094,6 @@ function createDemoTaskDraft(prompt: string): TaskDraftResult {
   };
 }
 
-const inboxItems = [
-  { title: "User request: start Sarathi UI", tag: "classified", desc: "Preserve source context before converting into task or evidence.", time: "09:10" },
-  { title: "External review feedback", tag: "classified", desc: "Review comments from external stakeholder on UI foundation.", time: "09:18" },
-  { title: "Mission Control comparison", tag: "classified", desc: "Reference screenshots for dashboard layout decisions.", time: "09:24" },
-];
-
-function Inbox() {
-  return (
-    <section className="panel">
-      <PanelTitle title="Inbox" badge="capture" />
-      <div>
-        {inboxItems.map((item) => (
-          <div className="inbox-item" key={item.title}>
-            <span className="inbox-dot" />
-            <div className="inbox-body">
-              <div style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "space-between" }}>
-                <span className="inbox-title">{item.title}</span>
-                <span style={{ fontSize: "0.72rem", color: "var(--faint)", fontFamily: "monospace", flexShrink: 0 }}>{item.time}</span>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 4 }}>
-                <Pill tone="warning">{item.tag}</Pill>
-                <span className="inbox-desc">{item.desc}</span>
-              </div>
-            </div>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
 function TaskDashboard({
   liveTick,
   setRoute,

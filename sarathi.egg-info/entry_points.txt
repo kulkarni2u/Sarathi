@@ -1,2 +1,3 @@
 [console_scripts]
 sarathi = src.cli:main
+sarathi-desktop = src.service.desktop:main

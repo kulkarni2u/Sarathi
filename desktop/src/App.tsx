@@ -150,28 +150,33 @@ const routes: Record<AppRoute, string> = {
   brainstorm: "Brainstorm",
 };
 
-const navGroups: Array<{ label: string; items: Array<{ id: AppRoute; count?: string }> }> = [
-  {
-    label: "Main",
-    items: [
-      { id: "workspace", count: "live" },
-      { id: "dashboard", count: "3" },
-      { id: "inbox", count: "5" },
-    ],
-  },
-  {
-    label: "Library",
-    items: [
-      { id: "agents", count: "10" },
-    ],
-  },
-  {
-    label: "Operate",
-    items: [
-      { id: "settings" },
-    ],
-  },
-];
+type NavItem = { id: AppRoute; count?: string };
+type NavGroup = { label: string; items: NavItem[] };
+
+function buildNavGroups(counts: { inbox: string; dashboard: string; agents: string }): NavGroup[] {
+  return [
+    {
+      label: "Main",
+      items: [
+        { id: "workspace", count: "live" },
+        { id: "dashboard", count: counts.dashboard || undefined },
+        { id: "inbox", count: counts.inbox || undefined },
+      ],
+    },
+    {
+      label: "Library",
+      items: [
+        { id: "agents", count: counts.agents || undefined },
+      ],
+    },
+    {
+      label: "Operate",
+      items: [
+        { id: "settings" },
+      ],
+    },
+  ];
+}
 
 const WORKSPACE_SELECTION_KEY = "sarathi.desktop.workspace.selection.v1";
 
@@ -241,6 +246,7 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
   const [liveTick, setLiveTick] = useState(0);
   const [streamState, setStreamState] = useState(apiConfigured ? "connecting" : "demo");
   const [streamDetail, setStreamDetail] = useState(apiConfigured ? "SSE connecting" : "Demo mode");
+  const [navCounts, setNavCounts] = useState({ inbox: "0", dashboard: "0", agents: "0" });
 
   const selectedUnit = useMemo(
     () => subtasks.find((unit) => unit.id === selectedUnitId) ?? subtasks[0],
@@ -344,6 +350,33 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
       cancelled = true;
     };
   }, [apiConfigured, selectedWorkspaceId]);
+
+  useEffect(() => {
+    if (!apiConfigured || !selectedWorkspaceId) return;
+    const workspaceId = selectedWorkspaceId;
+    let cancelled = false;
+    async function refreshNavCounts() {
+      try {
+        const [tasks, providers] = await Promise.all([
+          listTaskDashboard(workspaceId),
+          listProviders(workspaceId).catch(() => [] as { id: string }[]),
+        ]);
+        if (cancelled) return;
+        const inboxCount = tasks.filter(
+          (t) => ["prd_pending", "graph_pending", "approval_pending"].includes(t.approval_state) || t.blocked_count > 0
+        ).length;
+        setNavCounts({
+          inbox: inboxCount > 0 ? String(inboxCount) : "",
+          dashboard: tasks.length > 0 ? String(tasks.length) : "",
+          agents: providers.length > 0 ? String(providers.length) : "",
+        });
+      } catch {
+        // fail silently — badges degrade to empty
+      }
+    }
+    void refreshNavCounts();
+    return () => { cancelled = true; };
+  }, [apiConfigured, selectedWorkspaceId, liveTick]);
 
   useEffect(() => {
     if (!apiConfigured || !selectedWorkspace) {
@@ -643,7 +676,7 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
         </div>
 
         <nav aria-label="Primary" className="hybrid-nav">
-          {navGroups.map((group) => (
+          {buildNavGroups(navCounts).map((group) => (
             <section className="nav-group" key={group.label}>
               <span className="nav-label">{group.label}</span>
               {group.items.map((item) => (

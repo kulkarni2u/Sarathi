@@ -28,6 +28,23 @@ export default function BrainstormChat({ turns, onUserTurn, disabled }: Brainsto
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", gap: 12 }}>
       <div style={{ flex: 1, overflow: "auto", display: "flex", flexDirection: "column", gap: 8 }}>
+        {turns.length === 0 && !disabled && (
+          <div
+            style={{
+              padding: "8px 12px",
+              borderRadius: "var(--radius-sm)",
+              background: "var(--canvas)",
+              alignSelf: "flex-start",
+              maxWidth: "85%",
+              fontSize: "0.82rem",
+              color: "var(--ink)",
+              border: "1px solid var(--border)",
+            }}
+          >
+            <div style={{ fontSize: "0.68rem", color: "var(--muted)", marginBottom: 4, fontWeight: 600 }}>Sarathi</div>
+            <div>Describe what you want to build. What problem does it solve, and who is it for? I'll help you clarify the scope before we start.</div>
+          </div>
+        )}
         {turns.map((turn, idx) => (
           <div
             key={idx}

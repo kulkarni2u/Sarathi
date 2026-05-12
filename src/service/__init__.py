@@ -71,10 +71,12 @@ class ServiceApp:
         *,
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        skip_auth: bool = False,
     ) -> tuple[int, dict[str, Any]]:
         correlation_id = _correlation_id(headers)
         try:
-            self._authorize(headers)
+            if not skip_auth:
+                self._authorize(headers)
             status, data = self._route(
                 method.upper(),
                 _path_parts(path),
@@ -1104,8 +1106,10 @@ def create_http_server(
             return
 
         def _handle(self) -> None:
+            is_loopback = self.client_address[0] in ("127.0.0.1", "::1", "localhost")
+
             if self.command == "GET" and _path_parts(self.path) == ["api", "events", "stream"]:
-                self._handle_sse()
+                self._handle_sse(skip_auth=is_loopback)
                 return
 
             body, error = self._read_json_body()
@@ -1119,13 +1123,15 @@ def create_http_server(
                 self.path,
                 body=body,
                 headers=dict(self.headers.items()),
+                skip_auth=is_loopback,
             )
             self._write_json(status, payload)
 
-        def _handle_sse(self) -> None:
+        def _handle_sse(self, skip_auth: bool = False) -> None:
             correlation_id = _correlation_id(self.headers)
             try:
-                app._authorize_stream(dict(self.headers.items()), _query(self.path))
+                if not skip_auth:
+                    app._authorize_stream(dict(self.headers.items()), _query(self.path))
                 status, data = app._route("GET", ["api", "events"], _query(self.path), {})
                 payload = json.dumps(data, sort_keys=True)
                 self.send_response(status, HTTPStatus(status).phrase)
@@ -1212,6 +1218,11 @@ def create_http_server(
             host, bound_port = self.server_address[:2]
             self.server_name = str(host)
             self.server_port = int(bound_port)
+            _write_service_discovery(str(host), int(bound_port))
+
+        def server_close(self) -> None:
+            super().server_close()
+            _delete_service_discovery()
 
     return LocalThreadingHTTPServer((host, port), Handler)
 
@@ -3815,6 +3826,29 @@ def _find_policy_pack_dir(storage: Storage, workspace_id: str) -> Path | None:
         if candidate.is_dir():
             return candidate
     return None
+
+
+def _service_discovery_path() -> Path:
+    return Path.home() / ".sarathi" / "service.json"
+
+
+def _write_service_discovery(host: str, port: int) -> None:
+    try:
+        discovery = _service_discovery_path()
+        discovery.parent.mkdir(parents=True, exist_ok=True)
+        discovery.write_text(
+            json.dumps({"url": f"http://{host}:{port}", "host": host, "port": port}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _delete_service_discovery() -> None:
+    try:
+        _service_discovery_path().unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _emit_brainstorm_event(

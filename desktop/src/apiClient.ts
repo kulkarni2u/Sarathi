@@ -460,6 +460,9 @@ type RuntimeConfig = {
   token?: string | null;
 };
 
+// Default port when no explicit config is provided
+const SARATHI_DEFAULT_BASE_URL = "http://127.0.0.1:8765";
+
 export function getSarathiApiConfig(): ApiConfig | null {
   const env = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
   const baseUrl = env?.VITE_SARATHI_API_BASE_URL?.replace(/\/$/, "");
@@ -477,10 +480,14 @@ export function getSarathiApiConfig(): ApiConfig | null {
   if (runtimeBaseUrl) {
     return {
       baseUrl: runtimeBaseUrl,
+      // Loopback connections don't require a token — service bypasses auth for 127.0.0.1
       token: runtime?.token ?? null,
     };
   }
-  return null;
+
+  // Auto-discover: default to localhost. Service bypasses token auth for loopback connections,
+  // so no token is needed here. If the service isn't running, requests will fail gracefully.
+  return { baseUrl: SARATHI_DEFAULT_BASE_URL, token: null };
 }
 
 export type WorkspaceProjectRecord = {

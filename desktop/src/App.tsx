@@ -266,15 +266,6 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
   }, [selectedWorkspaceId]);
 
   useEffect(() => {
-    if (!apiConfigured) {
-      setWorkspaces([]);
-      setWorkspaceLoading(false);
-      setSelectedWorkspaceId(null);
-      setSelectedProjectId(null);
-      setRoute("workspace");
-      return;
-    }
-
     let cancelled = false;
     async function loadWorkspaces() {
       setWorkspaceLoading(true);
@@ -295,12 +286,19 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
           setSelectedProjectId(null);
           setRoute("workspace");
         }
-      } catch {
+      } catch (err) {
         if (!cancelled) {
           setWorkspaces([]);
           setSelectedWorkspaceId(null);
           setSelectedProjectId(null);
           setRoute("workspace");
+          // Surface actionable error — connection refused means service not running
+          const msg = err instanceof Error ? err.message : String(err);
+          const isOffline = msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("ECONNREFUSED");
+          if (isOffline) {
+            setStreamDetail("Sarathi service not running — start it with: sarathi-desktop");
+            setStreamState("offline");
+          }
         }
       } finally {
         if (!cancelled) {

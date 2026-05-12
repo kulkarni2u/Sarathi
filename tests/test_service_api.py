@@ -765,13 +765,17 @@ def test_callable_api_requires_token_when_configured(tmp_path):
     assert data == {"status": "ok"}
 
 
-def test_http_server_requires_token_and_returns_json(tmp_path):
+def test_http_server_loopback_bypasses_token(tmp_path):
+    # Loopback connections (127.0.0.1) bypass token auth — no token needed locally.
+    # Token auth only applies to non-loopback (remote) connections.
     with running_server(tmp_path / "sarathi.db", token="secret") as base_url:
-        status, unauthorized = http_json("GET", f"{base_url}/api/health")
-        assert status == 401
-        assert unauthorized["ok"] is False
-        assert unauthorized["error"]["code"] == "unauthorized"
+        # No token — succeeds because connection is from 127.0.0.1
+        status, payload = http_json("GET", f"{base_url}/api/health")
+        assert status == 200
+        assert payload["ok"] is True
+        assert payload["data"] == {"status": "ok"}
 
+        # Token also works
         status, payload = http_json(
             "GET",
             f"{base_url}/api/health",
@@ -781,7 +785,6 @@ def test_http_server_requires_token_and_returns_json(tmp_path):
         assert status == 200
         assert payload["ok"] is True
         assert payload["correlation_id"] == "corr-http"
-        assert payload["data"] == {"status": "ok"}
 
 
 def test_http_server_rejects_invalid_json(tmp_path):

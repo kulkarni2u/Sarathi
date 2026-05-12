@@ -303,6 +303,58 @@ def handle_home() -> None:
     print("  new workspace create or select a workspace")
 
 
+def _show_home() -> None:
+    import json as _json
+    from pathlib import Path as _Path
+
+    banner = r"""
+  ███████  █████  ██████   █████  ████████ ██   ██ ██
+  ██      ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
+  ███████ ███████ ██████  ███████    ██    ███████ ██
+       ██ ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
+  ███████ ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
+    """
+    print(banner)
+    print("  Your AI Charioteer  ·  Workflow Orchestration Framework")
+    print()
+
+    # Try to read service discovery
+    service_url = None
+    workspace_count = None
+    discovery_path = _Path.home() / ".sarathi" / "service.json"
+    if discovery_path.exists():
+        try:
+            info = _json.loads(discovery_path.read_text())
+            service_url = info.get("url")
+        except Exception:
+            pass
+
+    if service_url:
+        try:
+            import urllib.request as _req
+            resp = _req.urlopen(f"{service_url}/api/workspaces", timeout=2)
+            data = _json.loads(resp.read())
+            workspace_count = len(data.get("data", {}).get("workspaces", []))
+        except Exception:
+            pass
+
+    if service_url and workspace_count is not None:
+        print(f"  Service   {service_url}  ({workspace_count} workspace{'s' if workspace_count != 1 else ''})")
+    elif service_url:
+        print(f"  Service   {service_url}  (connecting…)")
+    else:
+        print("  Service   not running  →  python3 -m src.service --db ~/.sarathi/sarathi.db --port 8765")
+
+    print()
+    print("  Commands")
+    print("    sarathi run \"<task>\" --policy-pack ./policy-pack   orchestrate a task")
+    print("    sarathi init .                                     initialize a project")
+    print("    sarathi validate ./policy-pack                     check policy pack")
+    print("    sarathi list                                       list tasks")
+    print("    sarathi log <task_id>                              show task log")
+    print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="sarathi",
@@ -450,8 +502,7 @@ def main() -> None:
         initial_message = sys.stdin.read().strip()
 
     if args.command is None:
-        from src.tui import launch_sarathi_tui
-        launch_sarathi_tui(initial_message, exit_after=args.exit)
+        _show_home()
         return
     if args.command == "chat":
         from src.tui import launch_sarathi_tui

@@ -21,11 +21,9 @@ def test_cli_without_arguments_shows_default_home():
     output = result.stdout + result.stderr
 
     assert result.returncode == 0
-    assert "Sarathi" in output
-    assert "chat" in output
-    assert "status" in output
-    assert "resume" in output
-    assert "new workspace" in output
+    assert "Charioteer" in output          # tagline
+    assert "sarathi run" in output         # primary command shown
+    assert "policy-pack" in output         # usage hint
     assert "No command specified" not in output
 
 

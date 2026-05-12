@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import {
+  approveTaskGate,
+  approveRepositoryAction,
+  createTaskGraphDraft,
   createTaskHandoff,
   ensureWorkspace,
   getSarathiApiConfig,
@@ -961,6 +964,70 @@ export default function ProjectDetail({
     }
   }
 
+  async function handleApproveGate(gateName: string) {
+    if (!selectedTask || !apiConfigured) {
+      setActionStatus("Connect the local service to approve gates.");
+      return;
+    }
+    try {
+      setActionStatus(`Approving ${gateName}…`);
+      await approveTaskGate(selectedTask.id, gateName, "approved");
+      setActionStatus(`${gateName} approved.`);
+      await reloadStudio();
+      await reloadPanel();
+    } catch (error) {
+      setActionStatus(error instanceof Error ? error.message : "Gate approval failed.");
+    }
+  }
+
+  async function handleRejectGate(gateName: string) {
+    if (!selectedTask || !apiConfigured) {
+      setActionStatus("Connect the local service to reject gates.");
+      return;
+    }
+    try {
+      setActionStatus(`Rejecting ${gateName}…`);
+      await approveTaskGate(selectedTask.id, gateName, "rejected");
+      setActionStatus(`${gateName} rejected.`);
+      await reloadStudio();
+      await reloadPanel();
+    } catch (error) {
+      setActionStatus(error instanceof Error ? error.message : "Gate rejection failed.");
+    }
+  }
+
+  async function handleApproveGraph() {
+    if (!selectedTask || !apiConfigured) {
+      setActionStatus("Connect the local service to approve the task graph.");
+      return;
+    }
+    try {
+      setActionStatus("Generating task graph…");
+      await createTaskGraphDraft(selectedTask.id);
+      setActionStatus("Task graph approved and scheduled.");
+      await reloadStudio();
+      await reloadPanel();
+    } catch (error) {
+      setActionStatus(error instanceof Error ? error.message : "Graph approval failed.");
+    }
+  }
+
+  async function handleApproveRepositoryAction(action: string) {
+    if (!selectedTask || !apiConfigured) {
+      setActionStatus("Connect the local service to approve repository actions.");
+      return;
+    }
+    try {
+      setActionStatus(`Approving repository action: ${action}…`);
+      const result = await approveRepositoryAction(selectedTask.id, action);
+      setActionStatus(`Repository action ${result.repository_action.action} ${result.repository_action.status}.`);
+      await reloadStudio();
+      await reloadPanel();
+    } catch (error) {
+      setActionStatus(error instanceof Error ? error.message : "Repository action failed.");
+    }
+  }
+
   async function handleStartNewSession() {
     if (!selectedTask || !taskCheckpoint) {
       setActionStatus("No checkpoint is available for this task.");
@@ -1181,9 +1248,28 @@ export default function ProjectDetail({
                   {" / "}
                   Review: {latestReview?.status ?? "not run"}
                 </small>
+                {pendingGate && (
+                  <div style={{ ...styles.actionRow, marginTop: 10 }}>
+                    <button
+                      style={styles.primaryButton}
+                      onClick={() => void handleApproveGate(pendingGate.name)}
+                      disabled={!selectedTask || !apiConfigured}
+                    >
+                      Approve {pendingGate.name}
+                    </button>
+                    <button
+                      style={styles.secondaryButton}
+                      onClick={() => void handleRejectGate(pendingGate.name)}
+                      disabled={!selectedTask || !apiConfigured}
+                    >
+                      Reject
+                    </button>
+                  </div>
+                )}
               </Card>
               <div style={styles.actionRow}>
-                <button style={styles.secondaryButton} onClick={() => void handleSchedule()} disabled={!selectedTask || !apiConfigured}>Schedule ready units</button>
+                <button style={styles.secondaryButton} onClick={() => void handleApproveGraph()} disabled={!selectedTask || !apiConfigured}>Approve graph</button>
+                <button style={styles.secondaryButton} onClick={() => void handleSchedule()} disabled={!selectedTask || !apiConfigured}>Schedule units</button>
                 <button style={styles.secondaryButton} onClick={() => void handleReview()} disabled={!selectedTask || !apiConfigured}>Run review</button>
                 <button style={styles.secondaryButton} onClick={() => void handleHandoff()} disabled={!selectedTask || !apiConfigured}>Create handoff</button>
               </div>
@@ -1276,6 +1362,17 @@ export default function ProjectDetail({
                 </Pill>
                 <p>Commit and PR stay disabled until you explicitly opt in from Settings.</p>
                 <small>Scope: {repositoryPreference.scope}</small>
+                {repositoryPreference.mode !== "no_action" && selectedTask && (
+                  <div style={{ ...styles.actionRow, marginTop: 10 }}>
+                    <button
+                      style={styles.secondaryButton}
+                      onClick={() => void handleApproveRepositoryAction(repositoryPreference.mode)}
+                      disabled={!apiConfigured}
+                    >
+                      Approve {repositoryActionLabel(repositoryPreference.mode)}
+                    </button>
+                  </div>
+                )}
               </Card>
               {githubIssueReferenceText ? (
                 <Card style={styles.summaryCard}>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Badge, Theme } from "@radix-ui/themes";
 if (typeof globalThis !== "undefined" && !(globalThis as Record<string, unknown>).__SARATHI_RUNTIME_CONFIG__) {
   const env = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
@@ -16,8 +16,11 @@ import {
   BarChartIcon,
   CheckboxIcon,
   ChevronRightIcon,
+  CodeIcon,
   ClockIcon,
   DashboardIcon,
+  FileIcon,
+  FileTextIcon,
   GearIcon,
   LayersIcon,
   LoopIcon,
@@ -28,8 +31,10 @@ import {
   PlusIcon,
   Share2Icon,
   SunIcon,
-} from "@radix-ui/react-icons";
+  TimerIcon,
+  } from "@radix-ui/react-icons";
 import {
+  addBrainstormTurn,
   attachWorkspaceRepository,
   approveDogfoodLearning,
   approveRepositoryAction,
@@ -62,6 +67,7 @@ import {
   testProviderConnection,
   transitionSubtask,
   type ApprovalGateRecord,
+  type BrainstormSession,
   type DispatchRecord,
   type DogfoodAcceptanceSnapshot,
   type EvidenceArtifactRecord,
@@ -102,8 +108,16 @@ import AgentsPage from "./pages/Agents";
 import SettingsPage from "./pages/Settings";
 import ProjectDetail from "./pages/ProjectDetail";
 import BrainstormPage from "./pages/Brainstorm";
+import KnowledgeCenter, { type KnowledgeCenterSection } from "./pages/KnowledgeCenter";
+import SkillsPage from "./pages/Skills";
 
-export type AppRoute = "workspace" | "dashboard" | "inbox" | "agents" | "settings" | "project" | "brainstorm";
+type BrainstormStarter = string | {
+  title: string;
+  prompt?: string;
+  metadata?: BrainstormSession["metadata"];
+};
+
+export type AppRoute = "workspace" | "dashboard" | "inbox" | "agents" | "settings" | "project" | "brainstorm" | "knowledge" | "wiki" | "skills" | "context" | "proposals" | "learnings";
 
 type TaskTab = "messages" | "evidence" | "review" | "history" | "handoff";
 
@@ -133,6 +147,12 @@ const routeIcons: Record<AppRoute, ReactNode> = {
   settings:    <GearIcon />,
   project:     <LayersIcon />,
   brainstorm:  <MixIcon />,
+  knowledge:   <FileTextIcon />,
+  wiki:        <FileIcon />,
+  skills:      <CodeIcon />,
+  context:     <TimerIcon />,
+  proposals:   <MixIcon />,
+  learnings:   <MixIcon />,
 };
 
 const routes: Record<AppRoute, string> = {
@@ -143,7 +163,29 @@ const routes: Record<AppRoute, string> = {
   settings: "Settings",
   project: "Project",
   brainstorm: "Brainstorm",
+  knowledge: "Knowledge Center",
+  wiki: "Wiki",
+  skills: "Skills",
+  context: "Context",
+  proposals: "Proposals",
+  learnings: "Learnings",
 };
+
+function mergeWorkspaceProjects(
+  existing: WorkspaceProjectRecord[],
+  incoming: WorkspaceProjectRecord[],
+): WorkspaceProjectRecord[] {
+  if (existing.length === 0) return incoming;
+  if (incoming.length === 0) return existing;
+  const merged = [...incoming];
+  const seen = new Set(incoming.map((project) => project.id));
+  for (const project of existing) {
+    if (!seen.has(project.id)) {
+      merged.push(project);
+    }
+  }
+  return merged;
+}
 
 type NavItem = { id: AppRoute; count?: string };
 type NavGroup = { label: string; items: NavItem[] };
@@ -162,6 +204,8 @@ function buildNavGroups(counts: { inbox: string; dashboard: string; agents: stri
       label: "Library",
       items: [
         { id: "agents", count: counts.agents || undefined },
+        { id: "knowledge" },
+        { id: "skills" },
       ],
     },
     {
@@ -171,6 +215,25 @@ function buildNavGroups(counts: { inbox: string; dashboard: string; agents: stri
       ],
     },
   ];
+}
+
+function knowledgeSectionForRoute(route: AppRoute): KnowledgeCenterSection {
+  if (route === "wiki") return "wiki";
+  if (route === "context") return "context";
+  if (route === "proposals") return "proposals";
+  if (route === "learnings") return "learnings";
+  return "overview";
+}
+
+function isKnowledgeRoute(route: AppRoute) {
+  return route === "knowledge" || route === "wiki" || route === "context" || route === "proposals" || route === "learnings";
+}
+
+function isNavItemActive(route: AppRoute, itemId: AppRoute) {
+  if (itemId === "knowledge") {
+    return isKnowledgeRoute(route);
+  }
+  return route === itemId;
 }
 
 const WORKSPACE_SELECTION_KEY = "sarathi.desktop.workspace.selection.v1";
@@ -191,6 +254,9 @@ function mockProjectTasks(): TaskDashboardItem[] {
     next_gate: task.status === "waiting_human" ? "approval required" : null,
     node_count: task.progress > 0 ? Math.ceil(task.progress / 25) : 1,
     blocked_count: 0,
+    review_needed_count: 0,
+    checkpoint_state: "none",
+    handoff_state: "none",
     roles: ["Pravaha"],
     providers: ["Codex"],
     updated_at: new Date(Date.now() - 5 * 60000).toISOString(),
@@ -232,6 +298,9 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
   const [projectCreateRequest, setProjectCreateRequest] = useState(0);
   const [taskCreateRequest, setTaskCreateRequest] = useState(0);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+const [focusedLearningTaskId, setFocusedLearningTaskId] = useState<string | null>(null);
+  const [focusedProposalId, setFocusedProposalId] = useState<string | null>(null);
+  const [focusedSavedViewId, setFocusedSavedViewId] = useState<string | null>(null);
   const [brainstormSessionId, setBrainstormSessionId] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<TaskDashboardItem | null>(null);
   const [selectedUnitId, setSelectedUnitId] = useState("ST-02");
@@ -242,6 +311,9 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
   const [streamState, setStreamState] = useState(apiConfigured ? "connecting" : "demo");
   const [streamDetail, setStreamDetail] = useState(apiConfigured ? "SSE connecting" : "Demo mode");
   const [navCounts, setNavCounts] = useState({ inbox: "0", dashboard: "0", agents: "0" });
+  const workspacesRef = useRef<WorkspaceRecord[]>([]);
+  const selectedWorkspaceIdRef = useRef<string | null>(selectedWorkspaceId);
+  const workspaceMutationVersionRef = useRef(0);
 
   const selectedUnit = useMemo(
     () => subtasks.find((unit) => unit.id === selectedUnitId) ?? subtasks[0],
@@ -257,6 +329,14 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
     [projectsByWorkspace, selectedWorkspaceId],
   );
 
+  useEffect(() => {
+    workspacesRef.current = workspaces;
+  }, [workspaces]);
+
+  useEffect(() => {
+    selectedWorkspaceIdRef.current = selectedWorkspaceId;
+  }, [selectedWorkspaceId]);
+
   const selectedProject = useMemo(
     () => selectedProjects.find((project) => project.id === selectedProjectId) ?? null,
     [selectedProjects, selectedProjectId],
@@ -270,12 +350,24 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
     let cancelled = false;
     async function loadWorkspaces() {
       setWorkspaceLoading(true);
+      const requestMutationVersion = workspaceMutationVersionRef.current;
       try {
         const list = await listWorkspaces();
         if (cancelled) return;
-        setWorkspaces(list);
+        if (requestMutationVersion !== workspaceMutationVersionRef.current && list.length === 0) {
+          return;
+        }
+        const currentWorkspaces = workspacesRef.current;
+        const preserveLocalSelection = list.length === 0 && currentWorkspaces.length > 0;
+        const nextList = preserveLocalSelection ? currentWorkspaces : list;
+        setWorkspaces(nextList);
         const preferred = readSelectedWorkspaceId();
-        const nextWorkspace = list.find((candidate) => candidate.id === preferred) ?? list[0] ?? null;
+        const currentSelection = selectedWorkspaceIdRef.current;
+        const nextWorkspace =
+          nextList.find((candidate) => candidate.id === preferred)
+          ?? nextList.find((candidate) => candidate.id === currentSelection)
+          ?? nextList[0]
+          ?? null;
         setSelectedWorkspaceId(nextWorkspace?.id ?? null);
         if (nextWorkspace) {
           const nextProjects = projectsByWorkspace[nextWorkspace.id] ?? [];
@@ -317,13 +409,15 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
     if (!apiConfigured || !selectedWorkspaceId) return;
     const workspaceId = selectedWorkspaceId;
     let cancelled = false;
+    const requestVersion = workspaceMutationVersionRef.current;
     async function loadProjects() {
       try {
         const projects = await listWorkspaceProjects(workspaceId);
         if (cancelled) return;
+        if (workspaceMutationVersionRef.current !== requestVersion) return;
         setProjectsByWorkspace((current) => ({
           ...current,
-          [workspaceId]: projects,
+          [workspaceId]: mergeWorkspaceProjects(current[workspaceId] ?? [], projects),
         }));
         if (projects.length > 0) {
           setSelectedProjectId((prev) => {
@@ -352,18 +446,12 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
     let cancelled = false;
     async function refreshNavCounts() {
       try {
-        const [tasks, providers] = await Promise.all([
-          listTaskDashboard(workspaceId),
-          listProviders(workspaceId).catch(() => [] as { id: string }[]),
-        ]);
+        const operations = await getWorkspaceOperationalViews(workspaceId);
         if (cancelled) return;
-        const inboxCount = tasks.filter(
-          (t) => ["prd_pending", "graph_pending", "approval_pending"].includes(t.approval_state) || t.blocked_count > 0
-        ).length;
         setNavCounts({
-          inbox: inboxCount > 0 ? String(inboxCount) : "",
-          dashboard: tasks.length > 0 ? String(tasks.length) : "",
-          agents: providers.length > 0 ? String(providers.length) : "",
+          inbox: operations.inbox.length > 0 ? String(operations.inbox.length) : "",
+          dashboard: operations.usage.tasks.total > 0 ? String(operations.usage.tasks.total) : "",
+          agents: operations.usage.providers.total > 0 ? String(operations.usage.providers.total) : "",
         });
       } catch {
         // fail silently — badges degrade to empty
@@ -452,6 +540,7 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
   }, [setRoute]);
 
   async function handleCreateWorkspace(name: string, rootPath: string): Promise<WorkspaceRecord> {
+    workspaceMutationVersionRef.current += 1;
     if (!apiConfigured) {
       const created: WorkspaceRecord = {
         id: name.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-+|-+$/g, "") || `ws-${Date.now()}`,
@@ -495,15 +584,16 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
     setRoute("workspace");
   }
 
-  async function handleCreateProject(name: string, description: string) {
+async function handleCreateProject(name: string, description: string) {
     const workspaceId = selectedWorkspace?.id;
     if (!workspaceId) {
       throw new Error("Select a workspace first.");
     }
+    workspaceMutationVersionRef.current += 1;
     const project = await createWorkspaceProject(workspaceId, { name, description });
     setProjectsByWorkspace((current) => ({
       ...current,
-      [workspaceId]: [...(current[workspaceId] ?? []), project],
+[workspaceId]: [...(current[workspaceId] ?? []), project],
     }));
     setSelectedProjectId(project.id);
     setShowWorkspaceCreate(false);
@@ -515,13 +605,22 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
     setRoute("dashboard");
   }
 
-  async function handleStartBrainstorm(title: string) {
+  async function handleStartBrainstorm(starter: BrainstormStarter) {
     const workspaceId = selectedWorkspace?.id;
     if (!workspaceId || !getSarathiApiConfig()) return;
     try {
+      const title = typeof starter === "string" ? starter : starter.title;
       const session = await createBrainstormSession(workspaceId, title, {
         projectId: selectedProjectId ?? undefined,
+        ...(typeof starter === "object" && starter.metadata ? { metadata: starter.metadata } : {}),
       });
+      if (typeof starter === "object" && starter.prompt?.trim()) {
+        await addBrainstormTurn(session.id, {
+          role: "user",
+          content: starter.prompt.trim(),
+          selected: null,
+        });
+      }
       setBrainstormSessionId(session.id);
       setRoute("brainstorm");
     } catch {
@@ -533,13 +632,10 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
     if (!selectedWorkspaceId) return;
     const nextProjects = projectsByWorkspace[selectedWorkspaceId] ?? [];
     if (nextProjects.length === 0) {
-      if (selectedProjectId !== null) {
-        setSelectedProjectId(null);
-      }
       return;
     }
     const hasCurrent = nextProjects.some((project) => project.id === selectedProjectId);
-    if (!hasCurrent) {
+    if (!hasCurrent && selectedProjectId !== null) {
       setSelectedProjectId(nextProjects[0].id);
     }
   }, [projectsByWorkspace, selectedProjectId, selectedWorkspaceId]);
@@ -560,7 +656,7 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
           ? "New project"
           : "New task";
   const secondaryActionLabel = route === "dashboard" && selectedWorkspace
-    ? "Workspace home"
+    ? "Workspace dashboard"
     : null;
 
   function openWorkspaceCreate() {
@@ -676,9 +772,18 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
               <span className="nav-label">{group.label}</span>
               {group.items.map((item) => (
                 <button
-                  className={route === item.id ? "nav-item active" : "nav-item"}
+                  className={isNavItemActive(route, item.id) ? "nav-item active" : "nav-item"}
                   key={item.id}
-                  onClick={() => setRoute(item.id)}
+                  onClick={() => {
+                    if (item.id === "knowledge") {
+                      setFocusedLearningTaskId(null);
+                      setFocusedProposalId(null);
+                    }
+                    if (item.id === "workspace") {
+                      setFocusedSavedViewId(null);
+                    }
+                    setRoute(item.id);
+                  }}
                 >
                   <span>{routeIcons[item.id]}{routes[item.id]}</span>
                   {item.count ? <em>{item.count}</em> : null}
@@ -772,10 +877,13 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
             <WorkspaceDashboard
               workspace={selectedWorkspace}
               projects={currentProjects}
+              focusedSavedViewId={focusedSavedViewId}
               createRequestedAt={projectCreateRequest}
               onCreateProject={handleCreateProject}
               onOpenProject={handleOpenProject}
               onStartBrainstorm={handleStartBrainstorm}
+              onOpenInbox={() => setRoute("inbox")}
+              onOpenSavedView={(nextRoute) => setRoute(nextRoute)}
             />
           )}
           {route === "dashboard" && (
@@ -794,10 +902,13 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
               <WorkspaceDashboard
                 workspace={selectedWorkspace}
                 projects={currentProjects}
+                focusedSavedViewId={focusedSavedViewId}
                 createRequestedAt={projectCreateRequest}
                 onCreateProject={handleCreateProject}
                 onOpenProject={handleOpenProject}
                 onStartBrainstorm={handleStartBrainstorm}
+                onOpenInbox={() => setRoute("inbox")}
+                onOpenSavedView={(nextRoute) => setRoute(nextRoute)}
               />
             ) : (
 <Dashboard
@@ -823,6 +934,15 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
               setSelectedTaskId={setSelectedTaskId}
               setRoute={setRoute as unknown as (route: string) => void}
               liveTick={liveTick}
+              onOpenProposal={(proposalId) => {
+                setFocusedProposalId(proposalId);
+                setFocusedLearningTaskId(null);
+                setRoute("proposals");
+              }}
+              onOpenWorkspace={(viewId) => {
+                setFocusedSavedViewId(viewId ?? null);
+                setRoute("workspace");
+              }}
             />
           )}
           {route === "brainstorm" && brainstormSessionId && (
@@ -834,6 +954,46 @@ const [workspaceSwitcherOpen, setWorkspaceSwitcherOpen] = useState(false);
                 setBrainstormSessionId(null);
                 setRoute("project");
               }}
+            />
+          )}
+          {isKnowledgeRoute(route) && (
+            <KnowledgeCenter
+              workspaceId={selectedWorkspaceId ?? selectedWorkspace?.id ?? null}
+              activeSection={knowledgeSectionForRoute(route)}
+              focusedLearningTaskId={focusedLearningTaskId}
+              focusedProposalId={focusedProposalId}
+              onSectionChange={(section) => {
+                setFocusedLearningTaskId(null);
+                setFocusedProposalId(null);
+                if (section === "overview") {
+                  setRoute("knowledge");
+                  return;
+                }
+                setRoute(section);
+              }}
+              onOpenTask={(taskId) => {
+                setSelectedTaskId(taskId);
+                setRoute("project");
+              }}
+              onOpenWorkspace={(viewId) => {
+                setFocusedSavedViewId(viewId ?? null);
+                setRoute("workspace");
+              }}
+              onOpenLearning={(taskId) => {
+                setFocusedLearningTaskId(taskId);
+                setFocusedProposalId(null);
+                setRoute("learnings");
+              }}
+              onOpenProposal={(proposalId) => {
+                setFocusedProposalId(proposalId);
+                setFocusedLearningTaskId(null);
+                setRoute("proposals");
+              }}
+            />
+          )}
+          {route === "skills" && (
+            <SkillsPage
+              workspaceId={selectedWorkspaceId ?? selectedWorkspace?.id ?? null}
             />
           )}
         </div>
@@ -928,7 +1088,7 @@ function Orchestrator({ setRoute }: { setRoute: (route: AppRoute) => void }) {
           />
         ))}
         <form className="composer" onSubmit={(e) => { e.preventDefault(); void createDraft(); }}>
-          <button type="button">Current task agents</button>
+          <span className="pill-mini">Current task agents</span>
           <input value={prompt} onChange={(event) => setPrompt(event.target.value)} />
           <button className="primary" type="submit" disabled={isCreating}>
             {isCreating ? "Drafting" : "Send"}
@@ -1228,6 +1388,9 @@ function mockTaskToDashboardItem(task: (typeof tasks)[number]): TaskDashboardIte
     next_gate: task.status === "complete" ? null : "Task graph",
     node_count: subtasks.length,
     blocked_count: subtasks.filter((unit) => unit.state === "blocked").length,
+    review_needed_count: 0,
+    checkpoint_state: "none",
+    handoff_state: "none",
     roles: Array.from(new Set(subtasks.map((unit) => unit.role))),
     providers: Array.from(new Set(subtasks.map((unit) => unit.provider))),
     updated_at: new Date().toISOString(),
@@ -1746,6 +1909,458 @@ function ApprovalGates({ gates }: { gates?: ApprovalGateRecord[] }) {
   );
 }
 
+type ArtifactReviewFinding = {
+  message: string;
+  severity: string | null;
+  provider: string | null;
+  filePath: string | null;
+  check: string | null;
+  acId: string | null;
+  criterion: string | null;
+  lineStart: number | null;
+  lineEnd: number | null;
+  confidence: number | null;
+  source: string | null;
+};
+
+type ArtifactSnapshot = {
+  filesChanged: string[];
+  testsRun: string[];
+  knownRisks: string[];
+  reviewFindings: ArtifactReviewFinding[];
+};
+
+type DispatchTraceSource = {
+  label: string;
+  detail: string;
+};
+
+type DispatchInspectorModel = {
+  objective: string | null;
+  tokenBudget: number | null;
+  estimatedTokens: number | null;
+  summary: string | null;
+  nextAgent: string | null;
+  findings: string[];
+  decisions: string[];
+  artifacts: ArtifactSnapshot;
+  traceSources: DispatchTraceSource[];
+};
+
+type ArtifactOverviewModel = ArtifactSnapshot & {
+  dispatchCount: number;
+  evidenceCount: number;
+  reviewEvidenceCount: number;
+  testEvidenceCount: number;
+};
+
+type CompletionContextModel = {
+  filesChanged: string[];
+  testsRun: string[];
+  findings: string[];
+  risks: string[];
+  summaries: string[];
+  decisions: string[];
+};
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function asFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function asStringList(value: unknown): string[] {
+  if (typeof value === "string" && value.trim()) {
+    return [value.trim()];
+  }
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => String(item).trim())
+    .filter((item) => item.length > 0);
+}
+
+function uniqueStrings(values: Iterable<string>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function uniqueTraceSources(values: Iterable<DispatchTraceSource>): DispatchTraceSource[] {
+  const seen = new Set<string>();
+  const result: DispatchTraceSource[] = [];
+  for (const entry of values) {
+    const key = `${entry.label}::${entry.detail}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(entry);
+  }
+  return result;
+}
+
+function dedupeReviewFindings(values: Iterable<ArtifactReviewFinding>): ArtifactReviewFinding[] {
+  const seen = new Set<string>();
+  const result: ArtifactReviewFinding[] = [];
+  for (const value of values) {
+    const key = [
+      value.message,
+      value.filePath ?? "",
+      value.lineStart ?? "",
+      value.lineEnd ?? "",
+      value.acId ?? "",
+      value.provider ?? "",
+    ].join("|");
+    if (!value.message.trim() || seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
+}
+
+function normalizeReviewFindings(value: unknown): ArtifactReviewFinding[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const findings: ArtifactReviewFinding[] = [];
+  value.forEach((item) => {
+    if (typeof item === "string" && item.trim()) {
+      findings.push({
+        message: item.trim(),
+        severity: null,
+        provider: null,
+        filePath: null,
+        check: null,
+        acId: null,
+        criterion: null,
+        lineStart: null,
+        lineEnd: null,
+        confidence: null,
+        source: null,
+      });
+      return;
+    }
+    const finding = asObject(item);
+    if (!finding) return;
+    const message = typeof finding.message === "string"
+      ? finding.message
+      : typeof finding.summary === "string"
+        ? finding.summary
+        : typeof finding.finding === "string"
+          ? finding.finding
+          : null;
+    if (!message?.trim()) return;
+    findings.push({
+      message: message.trim(),
+      severity: typeof finding.severity === "string" ? finding.severity : null,
+      provider: typeof finding.provider === "string" ? finding.provider : null,
+      filePath: typeof finding.file_path === "string" ? finding.file_path : null,
+      check: typeof finding.check === "string" ? finding.check : null,
+      acId: typeof finding.ac_id === "string" ? finding.ac_id : null,
+      criterion: typeof finding.criterion === "string" ? finding.criterion : null,
+      lineStart: asFiniteNumber(finding.line_start),
+      lineEnd: asFiniteNumber(finding.line_end),
+      confidence: asFiniteNumber(finding.confidence),
+      source: typeof finding.source === "string" ? finding.source : null,
+    });
+  });
+  return dedupeReviewFindings(findings);
+}
+
+function readArtifactSnapshot(metadataValue: unknown): ArtifactSnapshot {
+  const metadata = asObject(metadataValue) ?? {};
+  const artifactIndex = asObject(metadata.artifact_index);
+  const responseEvidence = asObject(metadata.response_evidence);
+  const filesChanged = artifactIndex
+    ? asStringList(artifactIndex.files_changed)
+    : asStringList(responseEvidence?.changed_files);
+  return {
+    filesChanged: uniqueStrings(filesChanged),
+    testsRun: uniqueStrings(asStringList(artifactIndex?.tests_run)),
+    knownRisks: uniqueStrings(asStringList(artifactIndex?.known_risks)),
+    reviewFindings: normalizeReviewFindings(artifactIndex?.review_findings),
+  };
+}
+
+function readDispatchTraceSources(metadataValue: unknown): DispatchTraceSource[] {
+  const metadata = asObject(metadataValue) ?? {};
+  const artifactIndex = asObject(metadata.artifact_index);
+  const responseEvidence = asObject(metadata.response_evidence);
+  const entries: DispatchTraceSource[] = [];
+
+  if (asObject(metadata.context_pack)) {
+    entries.push({ label: "Compiled context pack", detail: "context_pack.agent_input + compilation" });
+  }
+  if (asObject(metadata.agent_output)) {
+    entries.push({ label: "Normalized agent output", detail: "agent_output.summary/findings/decisions" });
+  }
+  if (artifactIndex) {
+    entries.push({ label: "Normalized artifact index", detail: "artifact_index.files_changed/tests_run/review_findings" });
+  }
+  if (responseEvidence) {
+    entries.push({
+      label: artifactIndex ? "Raw provider evidence retained" : "Compatibility fallback",
+      detail: "response_evidence.*",
+    });
+  }
+
+  return uniqueTraceSources(entries);
+}
+
+function readDispatchInspector(dispatch: DispatchRecord): DispatchInspectorModel | null {
+  const metadata = asObject(dispatch.metadata) ?? {};
+  const contextPack = asObject(metadata.context_pack);
+  const agentInput = asObject(contextPack?.agent_input);
+  const compilation = asObject(contextPack?.compilation);
+  const agentOutput = asObject(metadata.agent_output);
+  const artifacts = readArtifactSnapshot(metadata);
+  const objective = typeof agentInput?.objective === "string" ? agentInput.objective : null;
+  const tokenBudget = asFiniteNumber(agentInput?.token_budget);
+  const estimatedTokens = asFiniteNumber(compilation?.estimated_tokens);
+  const summary = typeof agentOutput?.summary === "string" ? agentOutput.summary : null;
+  const nextAgent = typeof agentOutput?.next_recommended_agent === "string"
+    ? agentOutput.next_recommended_agent
+    : null;
+  const findings = uniqueStrings(asStringList(agentOutput?.findings));
+  const decisions = uniqueStrings(asStringList(agentOutput?.decisions));
+  const traceSources = readDispatchTraceSources(metadata);
+
+  if (
+    !objective &&
+    !summary &&
+    !nextAgent &&
+    findings.length === 0 &&
+    decisions.length === 0 &&
+    traceSources.length === 0 &&
+    artifacts.filesChanged.length === 0 &&
+    artifacts.testsRun.length === 0 &&
+    artifacts.reviewFindings.length === 0 &&
+    artifacts.knownRisks.length === 0
+  ) {
+    return null;
+  }
+
+  return {
+    objective,
+    tokenBudget,
+    estimatedTokens,
+    summary,
+    nextAgent,
+    findings,
+    decisions,
+    artifacts,
+    traceSources,
+  };
+}
+
+function buildArtifactOverview(
+  evidence: EvidenceArtifactRecord[],
+  dispatches: DispatchRecord[],
+): ArtifactOverviewModel {
+  const allFiles: string[] = [];
+  const allTests: string[] = [];
+  const allRisks: string[] = [];
+  const allFindings: ArtifactReviewFinding[] = [];
+
+  evidence.forEach((item) => {
+    const snapshot = readArtifactSnapshot(item.metadata);
+    allFiles.push(...snapshot.filesChanged);
+    allTests.push(...snapshot.testsRun);
+    allRisks.push(...snapshot.knownRisks);
+    allFindings.push(...snapshot.reviewFindings);
+  });
+
+  dispatches.forEach((dispatch) => {
+    const snapshot = readArtifactSnapshot(dispatch.metadata);
+    allFiles.push(...snapshot.filesChanged);
+    allTests.push(...snapshot.testsRun);
+    allRisks.push(...snapshot.knownRisks);
+    allFindings.push(...snapshot.reviewFindings);
+  });
+
+  return {
+    filesChanged: uniqueStrings(allFiles),
+    testsRun: uniqueStrings(allTests),
+    knownRisks: uniqueStrings(allRisks),
+    reviewFindings: dedupeReviewFindings(allFindings),
+    dispatchCount: dispatches.length,
+    evidenceCount: evidence.length,
+    reviewEvidenceCount: evidence.filter((item) => item.artifact_type === "review").length,
+    testEvidenceCount: evidence.filter(
+      (item) => item.artifact_type === "test" || String(item.metadata.subtask_id ?? "").includes("test"),
+    ).length,
+  };
+}
+
+function readCompletionContext(handoff: HandoffRecord | null | undefined): CompletionContextModel | null {
+  const metadata = asObject(handoff?.metadata);
+  const context = asObject(metadata?.normalized_completion_context);
+  if (!context) return null;
+  return {
+    filesChanged: uniqueStrings(asStringList(context.files_changed)),
+    testsRun: uniqueStrings(asStringList(context.tests_run)),
+    findings: uniqueStrings(asStringList(context.findings)),
+    risks: uniqueStrings(asStringList(context.risks)),
+    summaries: uniqueStrings(asStringList(context.summaries)),
+    decisions: uniqueStrings(asStringList(context.decisions)),
+  };
+}
+
+function formatTokenBudget(estimatedTokens: number | null, tokenBudget: number | null): string | null {
+  if (estimatedTokens === null && tokenBudget === null) return null;
+  if (estimatedTokens !== null && tokenBudget !== null) return `${estimatedTokens}/${tokenBudget} tokens`;
+  if (tokenBudget !== null) return `${tokenBudget} token budget`;
+  return `${estimatedTokens} estimated tokens`;
+}
+
+function formatFindingMeta(finding: ArtifactReviewFinding): string | null {
+  const parts: string[] = [];
+  if (finding.filePath) {
+    const lineSuffix = finding.lineStart !== null
+      ? `:${finding.lineStart}${finding.lineEnd !== null && finding.lineEnd !== finding.lineStart ? `-${finding.lineEnd}` : ""}`
+      : "";
+    parts.push(`${finding.filePath}${lineSuffix}`);
+  }
+  if (finding.check) parts.push(finding.check);
+  if (finding.acId) parts.push(finding.acId);
+  if (finding.provider) parts.push(finding.provider);
+  return parts.length ? parts.join(" · ") : null;
+}
+
+function ArtifactStatCard({ label, value, note }: { label: string; value: string; note: string }) {
+  return (
+    <div className="artifact-stat-card">
+      <small>{label}</small>
+      <strong>{value}</strong>
+      <span>{note}</span>
+    </div>
+  );
+}
+
+function ArtifactStringSection({
+  title,
+  items,
+  tone = "default",
+  emptyLabel,
+}: {
+  title: string;
+  items: string[];
+  tone?: Tone | string;
+  emptyLabel?: string;
+}) {
+  if (items.length === 0 && !emptyLabel) return null;
+  return (
+    <section className="artifact-section">
+      <div className="panel-title artifact-section-title">
+        <h3 style={{ fontSize: "0.8rem" }}>{title}</h3>
+        <Pill tone={tone}>{items.length}</Pill>
+      </div>
+      {items.length > 0 ? (
+        <div className="artifact-list">
+          {items.map((item) => (
+            <div className="artifact-list-item" key={`${title}-${item}`}>
+              <span>{item}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="artifact-empty">{emptyLabel}</div>
+      )}
+    </section>
+  );
+}
+
+function ArtifactFindingSection({ findings }: { findings: ArtifactReviewFinding[] }) {
+  if (findings.length === 0) return null;
+  return (
+    <section className="artifact-section">
+      <div className="panel-title artifact-section-title">
+        <h3 style={{ fontSize: "0.8rem" }}>Review findings</h3>
+        <Pill tone="warning">{findings.length}</Pill>
+      </div>
+      <div className="artifact-list">
+        {findings.map((finding, index) => {
+          const meta = formatFindingMeta(finding);
+          return (
+            <div className="artifact-list-item artifact-list-item-detail" key={`${finding.message}-${index}`}>
+              <div>
+                <strong>{finding.message}</strong>
+                {meta ? <small>{meta}</small> : null}
+              </div>
+              <div className="artifact-pill-row">
+                {finding.severity ? <Pill tone={stateTone(finding.severity)}>{finding.severity}</Pill> : null}
+                {finding.confidence !== null ? <Pill tone="default">{Math.round(finding.confidence * 100)}%</Pill> : null}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function DispatchInspector({ dispatch }: { dispatch: DispatchRecord }) {
+  const inspector = readDispatchInspector(dispatch);
+  if (!inspector) return null;
+
+  const tokenLabel = formatTokenBudget(inspector.estimatedTokens, inspector.tokenBudget);
+  return (
+    <div className="dispatch-inspector">
+      <div className="dispatch-inspector-header">
+        <div className="dispatch-inspector-copy">
+          {inspector.objective ? <p className="dispatch-inspector-objective">{inspector.objective}</p> : null}
+          {inspector.summary ? <p className="dispatch-inspector-summary">{inspector.summary}</p> : null}
+        </div>
+        {tokenLabel ? <span className="dispatch-token-badge">{tokenLabel}</span> : null}
+      </div>
+      <div className="artifact-pill-row">
+        {inspector.artifacts.filesChanged.length > 0 ? <Pill tone="draft">{inspector.artifacts.filesChanged.length} files</Pill> : null}
+        {inspector.artifacts.testsRun.length > 0 ? <Pill tone="draft">{inspector.artifacts.testsRun.length} tests</Pill> : null}
+        {inspector.artifacts.reviewFindings.length > 0 ? <Pill tone="warning">{inspector.artifacts.reviewFindings.length} findings</Pill> : null}
+        {inspector.artifacts.knownRisks.length > 0 ? <Pill tone="warning">{inspector.artifacts.knownRisks.length} risks</Pill> : null}
+      </div>
+      {inspector.nextAgent || inspector.decisions.length > 0 || inspector.findings.length > 0 ? (
+        <div className="dispatch-inspector-detail">
+          {inspector.nextAgent ? (
+            <small>
+              Next recommended agent: <strong>{inspector.nextAgent}</strong>
+            </small>
+          ) : null}
+          {inspector.decisions.length > 0 ? (
+            <small>Decisions: {inspector.decisions.slice(0, 3).join(" · ")}</small>
+          ) : null}
+          {inspector.findings[0] ? (
+            <small>Signal: {inspector.findings[0]}</small>
+          ) : null}
+        </div>
+      ) : null}
+      {inspector.traceSources.length > 0 ? (
+        <div className="dispatch-inspector-detail">
+          <small>Trace sources: {inspector.traceSources.map((entry) => entry.label).join(" · ")}</small>
+        </div>
+      ) : null}
+      {inspector.artifacts.reviewFindings.length > 0 ? (
+        <div className="dispatch-preview-list">
+          {inspector.artifacts.reviewFindings.slice(0, 2).map((finding, index) => (
+            <div className="dispatch-preview-row" key={`${dispatch.id}-finding-${index}`}>
+              <strong>{finding.message}</strong>
+              {formatFindingMeta(finding) ? <small>{formatFindingMeta(finding)}</small> : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function TaskTabPanel({
   tab,
   taskId,
@@ -1847,76 +2462,121 @@ function TaskTabPanel({
   }
   if (tab === "evidence") {
     if (taskEvidence) {
-      const allFiles: string[] = [];
-      taskEvidence.forEach(e => {
-        const files = (e.metadata.response_evidence as { changed_files?: unknown })?.changed_files;
-        if (Array.isArray(files)) files.forEach(f => allFiles.push(String(f)));
-      });
-      const testEv = taskEvidence.filter(e => e.artifact_type === "test" || String(e.metadata.subtask_id)?.includes("test"));
-      const reviewEv = taskEvidence.filter(e => e.artifact_type === "review");
+      const artifactOverview = buildArtifactOverview(taskEvidence, dispatches ?? []);
+      const dispatchInspectors = (dispatches ?? [])
+        .map((dispatch) => ({ dispatch, inspector: readDispatchInspector(dispatch) }))
+        .filter((item): item is { dispatch: DispatchRecord; inspector: DispatchInspectorModel } => item.inspector !== null);
+      const testEv = taskEvidence.filter(
+        (item) => item.artifact_type === "test" || String(item.metadata.subtask_id ?? "").includes("test"),
+      );
+      const reviewEv = taskEvidence.filter((item) => item.artifact_type === "review");
       return (
         <>
-          {allFiles.length > 0 && (
-            <section>
+          <section className="artifact-section">
+            <div className="panel-title artifact-section-title">
+              <h3 style={{ fontSize: "0.82rem" }}>Artifact overview</h3>
+              <Pill tone="default">{artifactOverview.evidenceCount} records</Pill>
+            </div>
+            <div className="artifact-summary-grid">
+              <ArtifactStatCard
+                label="Changed files"
+                value={String(artifactOverview.filesChanged.length)}
+                note="Normalized from artifact index first."
+              />
+              <ArtifactStatCard
+                label="Tests run"
+                value={String(artifactOverview.testsRun.length)}
+                note={`${artifactOverview.testEvidenceCount} captured test artifact${artifactOverview.testEvidenceCount === 1 ? "" : "s"}.`}
+              />
+              <ArtifactStatCard
+                label="Review findings"
+                value={String(artifactOverview.reviewFindings.length)}
+                note={`${artifactOverview.reviewEvidenceCount} review artifact${artifactOverview.reviewEvidenceCount === 1 ? "" : "s"}.`}
+              />
+              <ArtifactStatCard
+                label="Known risks"
+                value={String(artifactOverview.knownRisks.length)}
+                note={`${artifactOverview.dispatchCount} dispatch${artifactOverview.dispatchCount === 1 ? "" : "es"} inspected.`}
+              />
+            </div>
+          </section>
+          <ArtifactStringSection
+            title="Changed files"
+            items={artifactOverview.filesChanged}
+            tone="active"
+            emptyLabel="No normalized changed-file list is attached yet."
+          />
+          <ArtifactStringSection
+            title="Tests run"
+            items={artifactOverview.testsRun}
+            tone="healthy"
+          />
+          <ArtifactFindingSection findings={artifactOverview.reviewFindings} />
+          <ArtifactStringSection
+            title="Known risks"
+            items={artifactOverview.knownRisks}
+            tone="warning"
+          />
+          {dispatchInspectors.length > 0 && (
+            <section className="artifact-section">
               <div className="panel-title" style={{ paddingBottom: 8, marginBottom: 8 }}>
-                <h3 style={{ fontSize: "0.8rem" }}>Changed files</h3>
-                <Pill tone="active">{allFiles.length}</Pill>
+                <h3 style={{ fontSize: "0.8rem" }}>Dispatch inspectors</h3>
+                <Pill tone="default">{dispatchInspectors.length}</Pill>
               </div>
-              <div className="mini-list">
-                {allFiles.map((file, i) => (
-                  <span key={i} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <input type="checkbox" readOnly defaultChecked style={{ width: 14, height: 14 }} />
-                    <span>{file}</span>
-                  </span>
+              <div className="artifact-card-stack">
+                {dispatchInspectors.map(({ dispatch }) => (
+                  <Card key={dispatch.id} style={{ display: "grid", gap: 10 }}>
+                    <div className="dispatch-card-header">
+                      <div>
+                        <strong>Dispatch {dispatch.id.slice(0, 8)}</strong>
+                        <small>{dispatch.agent_name} · {dispatch.created_at?.slice(0, 19)}</small>
+                      </div>
+                      <Pill tone={stateTone(dispatch.status)}>{dispatch.status}</Pill>
+                    </div>
+                    <DispatchInspector dispatch={dispatch} />
+                  </Card>
                 ))}
               </div>
             </section>
           )}
-          {testEv.length > 0 && (
-            <section style={{ marginTop: 16 }}>
-              <div className="panel-title" style={{ paddingBottom: 8, marginBottom: 8 }}>
-                <h3 style={{ fontSize: "0.8rem" }}>Tests</h3>
-                <Pill tone="healthy">{testEv.length}</Pill>
+          {(testEv.length > 0 || reviewEv.length > 0) && (
+            <section className="artifact-section">
+              <div className="panel-title artifact-section-title">
+                <h3 style={{ fontSize: "0.8rem" }}>Captured evidence records</h3>
+                <Pill tone="default">{testEv.length + reviewEv.length}</Pill>
               </div>
-              {testEv.map(item => (
-                <Card key={item.id}><strong>{item.id.slice(0, 8)}</strong><p>{item.uri}</p></Card>
-              ))}
-            </section>
-          )}
-          {reviewEv.length > 0 && (
-            <section style={{ marginTop: 16 }}>
-              <div className="panel-title" style={{ paddingBottom: 8, marginBottom: 8 }}>
-                <h3 style={{ fontSize: "0.8rem" }}>Review verdict</h3>
-                <Pill tone="healthy">reviewed</Pill>
+              <div className="artifact-card-stack">
+                {testEv.map((item) => (
+                  <Card key={item.id}>
+                    <strong>Test artifact {item.id.slice(0, 8)}</strong>
+                    <p>{item.uri}</p>
+                    <small>{item.created_at?.slice(0, 19)}</small>
+                  </Card>
+                ))}
+                {reviewEv.map((item) => (
+                  <Card key={item.id}>
+                    <strong>Review artifact {item.id.slice(0, 8)}</strong>
+                    <p>{item.uri}</p>
+                    <small>{String(item.metadata.provider ?? "provider")} · {item.created_at?.slice(0, 19)}</small>
+                  </Card>
+                ))}
               </div>
-              {reviewEv.map(item => (
-                <Card key={item.id}>
-                  <strong>Review {item.id.slice(0, 8)}</strong>
-                  <small>{String(item.metadata.provider)} / {item.created_at?.slice(0, 19)}</small>
-                </Card>
-              ))}
-            </section>
-          )}
-          {dispatches && dispatches.length > 0 && (
-            <section style={{ marginTop: 16 }}>
-              <div className="panel-title" style={{ paddingBottom: 8, marginBottom: 8 }}>
-                <h3 style={{ fontSize: "0.8rem" }}>Dispatches</h3>
-                <Pill tone="default">{dispatches.length}</Pill>
-              </div>
-              {dispatches.map((dispatch) => (
-                <Card key={dispatch.id}>
-                  <strong>Dispatch {dispatch.id.slice(0, 8)}</strong>
-                  <Pill tone={stateTone(dispatch.status)}>{dispatch.status}</Pill>
-                  <p>{dispatch.agent_name}</p>
-                  <small>{dispatch.created_at?.slice(11, 19)}</small>
-                </Card>
-              ))}
             </section>
           )}
         </>
       );
     }
-    return <>{evidence.map((item) => <Card key={item.id}><strong>{item.id} - {item.title}</strong><Pill tone={stateTone(item.state)}>{item.state}</Pill><p>{item.source} / {item.linkedUnit} / {item.linkedGate} / {item.linkedEvent}</p></Card>)}</>;
+    return (
+      <>
+        {evidence.map((item) => (
+          <Card key={item.id}>
+            <strong>{item.id} - {item.title}</strong>
+            <Pill tone={stateTone(item.state)}>{item.state}</Pill>
+            <p>{item.source} / {item.linkedUnit} / {item.linkedGate} / {item.linkedEvent}</p>
+          </Card>
+        ))}
+      </>
+    );
   }
   if (tab === "review") {
     if (taskReviews) {
@@ -2054,6 +2714,7 @@ function TaskTabPanel({
   const acCoverage = handoff?.metadata.ac_coverage as
     | Array<{ id?: string; criterion?: string; covered?: boolean }>
     | undefined;
+  const normalizedCompletionContext = readCompletionContext(handoff);
   return (
     <>
       <div className="actions" style={{ marginBottom: 16 }}>
@@ -2092,6 +2753,42 @@ function TaskTabPanel({
               </div>
             </section>
           ) : null}
+          {normalizedCompletionContext && (
+            <section className="artifact-section artifact-section-inset">
+              <div className="panel-title artifact-section-title">
+                <h3 style={{ fontSize: "0.8rem" }}>Completion context</h3>
+                <Pill tone="default">normalized</Pill>
+              </div>
+              <div className="artifact-summary-grid">
+                <ArtifactStatCard
+                  label="Files"
+                  value={String(normalizedCompletionContext.filesChanged.length)}
+                  note="Completion-ready file scope."
+                />
+                <ArtifactStatCard
+                  label="Tests"
+                  value={String(normalizedCompletionContext.testsRun.length)}
+                  note="Recorded verification traces."
+                />
+                <ArtifactStatCard
+                  label="Findings"
+                  value={String(normalizedCompletionContext.findings.length)}
+                  note="Signals handed to the reviewer."
+                />
+                <ArtifactStatCard
+                  label="Decisions"
+                  value={String(normalizedCompletionContext.decisions.length)}
+                  note="Recent orchestration decisions."
+                />
+              </div>
+              <ArtifactStringSection title="Completion summaries" items={normalizedCompletionContext.summaries} tone="default" />
+              <ArtifactStringSection title="Decision trace" items={normalizedCompletionContext.decisions} tone="default" />
+              <ArtifactStringSection title="Files changed" items={normalizedCompletionContext.filesChanged} tone="active" />
+              <ArtifactStringSection title="Tests run" items={normalizedCompletionContext.testsRun} tone="healthy" />
+              <ArtifactStringSection title="Known risks" items={normalizedCompletionContext.risks} tone="warning" />
+              <ArtifactStringSection title="Reviewer signals" items={normalizedCompletionContext.findings} tone="warning" />
+            </section>
+          )}
         </Card>
       ) : (
         <Card>

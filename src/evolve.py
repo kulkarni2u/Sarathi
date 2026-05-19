@@ -57,6 +57,9 @@ class PolicyProposal:
             "id": self.proposal_id,
             "title": self.title,
             "policy_file": self.policy_file,
+            "proposal_kind": self.proposal_kind,
+            "impacted_assets": self.impacted_assets,
+            "risk_level": self.risk_level,
             "rationale": self.rationale,
             "suggested_change": self.suggested_change,
             "evidence_refs": self.evidence_refs,
@@ -64,6 +67,36 @@ class PolicyProposal:
             "source": self.source,
             "routing_hint": self.routing_hint,
         }
+
+    @property
+    def proposal_kind(self) -> str:
+        if self.source == "context_gaps":
+            return "context_update"
+        normalized_file = self.policy_file.strip().lower()
+        if normalized_file == "skills.md":
+            return "skill_update"
+        if normalized_file.startswith("wiki/"):
+            return "wiki_update"
+        if self.routing_hint:
+            return "routing_hint"
+        return "policy_note"
+
+    @property
+    def impacted_assets(self) -> list[str]:
+        normalized_file = self.policy_file.strip().lstrip("/")
+        if normalized_file.startswith("policy-pack/") or normalized_file.startswith("wiki/"):
+            return [normalized_file]
+        return [f"policy-pack/{normalized_file}"]
+
+    @property
+    def risk_level(self) -> str:
+        if self.proposal_kind == "routing_hint":
+            return "high"
+        if self.proposal_kind == "context_update":
+            return "medium"
+        if self.proposal_kind in {"skill_update", "wiki_update"} or self.confidence >= 0.8:
+            return "medium"
+        return "low"
 
 
 class Evolver:
@@ -99,6 +132,7 @@ class Evolver:
         provider_failures: dict[tuple[str, str], dict[str, Any]] = {}
         escalations: dict[str, dict[str, Any]] = {}
         hotspots: dict[str, dict[str, Any]] = {}
+        context_gaps: dict[str, dict[str, Any]] = {}
 
         for record in records:
             task_id = str(self._record_value(record, "task_id", "unknown"))
@@ -128,12 +162,18 @@ class Evolver:
                 "iteration_hotspots",
                 "iterations",
             )
+            self._accumulate_context_signal(
+                context_gaps,
+                self._record_value(record, "context_gaps", []),
+                task_id,
+            )
 
         proposals: list[PolicyProposal] = []
         proposals.extend(self._proposals_for_repeated_failures(failures))
         proposals.extend(self._proposals_for_provider_failures(provider_failures))
         proposals.extend(self._proposals_for_escalations(escalations))
         proposals.extend(self._proposals_for_iteration_hotspots(hotspots))
+        proposals.extend(self._proposals_for_context_gaps(context_gaps))
         return sorted(proposals, key=lambda proposal: (proposal.policy_file, proposal.title))
 
     def propose_from_patterns(self, patterns: list[Pattern]) -> list[PolicyProposal]:
@@ -144,13 +184,13 @@ class Evolver:
             proposals.append(
                 PolicyProposal(
                     title=f"Promote learned pattern: {pattern.name}",
-                    policy_file="conventions.md",
+                    policy_file="skills.md",
                     rationale=(
                         f"Pattern '{pattern.name}' met the promotion gate with "
                         f"{pattern.pass_rate:.0%} pass rate."
                     ),
                     suggested_change=(
-                        f"Document '{pattern.name}' as a reusable convention, including "
+                        f"Capture '{pattern.name}' as a reusable skill or routing hint, including "
                         "the evidence needed before applying it by default."
                     ),
                     evidence_refs=list(pattern.evidence_refs),
@@ -195,6 +235,34 @@ class Evolver:
             entry["total"] += value
             entry["evidence_refs"].append(f"{task_id}:provider_failures:{phase}:{provider}")
 
+    def _accumulate_context_signal(
+        self,
+        bucket: dict[str, dict[str, Any]],
+        items: Any,
+        task_id: str,
+    ) -> None:
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            phase = str(item.get("phase", "unknown"))
+            value = self._positive_int(item.get("count", 1))
+            trimmed = item.get("trimmed_sections") if isinstance(item.get("trimmed_sections"), list) else []
+            reasons = item.get("reasons") if isinstance(item.get("reasons"), list) else []
+            estimated = self._positive_int(item.get("estimated_tokens", 0))
+            budget = self._positive_int(item.get("token_budget", 0))
+            entry = bucket.setdefault(
+                phase,
+                {"total": 0, "evidence_refs": [], "trimmed_sections": set(), "reasons": set(), "estimated_tokens": 0, "token_budget": 0},
+            )
+            entry["total"] += value
+            entry["evidence_refs"].append(f"{task_id}:context_gaps:{phase}")
+            entry["trimmed_sections"].update(str(section) for section in trimmed if str(section).strip())
+            entry["reasons"].update(str(reason) for reason in reasons if str(reason).strip())
+            if estimated > entry["estimated_tokens"]:
+                entry["estimated_tokens"] = estimated
+            if budget > entry["token_budget"]:
+                entry["token_budget"] = budget
+
     def _proposals_for_repeated_failures(
         self, failures: dict[str, dict[str, Any]]
     ) -> list[PolicyProposal]:
@@ -229,12 +297,12 @@ class Evolver:
                 continue
             proposals.append(
                 PolicyProposal(
-                    title=f"Tighten {phase} escalation criteria",
-                    policy_file="escalation.md",
+                    title=f"Capture {phase} escalation playbook",
+                    policy_file="wiki/review-loop.md",
                     rationale=f"{phase} recorded {total} escalation signal(s).",
                     suggested_change=(
-                        f"Clarify when {phase} should reduce scope, request help, "
-                        "or stop for user input before another escalation."
+                        f"Document a reusable {phase} escalation playbook with stop conditions, "
+                        "handoff cues, and reviewer expectations before another escalation loop."
                     ),
                     evidence_refs=data["evidence_refs"],
                     confidence=self._confidence(total),
@@ -286,16 +354,55 @@ class Evolver:
                 continue
             proposals.append(
                 PolicyProposal(
-                    title=f"Reduce {phase} iteration hotspot",
-                    policy_file=self._policy_file_for_phase(phase),
+                    title=f"Add {phase} iteration guard skill",
+                    policy_file="skills.md",
                     rationale=f"{phase} accumulated {total} iteration hotspot signal(s).",
                     suggested_change=(
-                        f"Add a reusable {phase} optimization or pre-check to reduce "
-                        "avoidable iteration loops."
+                        f"Add a reusable {phase} pre-check or routing skill hint to reduce "
+                        "avoidable iteration loops before another full execution pass."
                     ),
                     evidence_refs=data["evidence_refs"],
                     confidence=self._confidence(total),
                     source="iteration_hotspots",
+                )
+            )
+        return proposals
+
+    def _proposals_for_context_gaps(
+        self, context_gaps: dict[str, dict[str, Any]]
+    ) -> list[PolicyProposal]:
+        proposals: list[PolicyProposal] = []
+        for phase, data in context_gaps.items():
+            total = data["total"]
+            if total < self.PROPOSAL_GATE:
+                continue
+            trimmed_sections = sorted(str(item) for item in data.get("trimmed_sections", set()) if str(item).strip())
+            reasons = sorted(str(item) for item in data.get("reasons", set()) if str(item).strip())
+            detail_bits: list[str] = []
+            estimated = data.get("estimated_tokens", 0)
+            budget = data.get("token_budget", 0)
+            if trimmed_sections:
+                detail_bits.append("trimmed sections: " + ", ".join(trimmed_sections[:3]))
+            if "near_budget" in reasons and estimated and budget:
+                detail_bits.append(f"near budget: {estimated}/{budget} tokens")
+            detail = f" Context pressure: {'; '.join(detail_bits)}." if detail_bits else ""
+            has_trimmed = "trimmed_sections" in reasons
+            title_verb = "Reduce" if has_trimmed else "Optimize"
+            proposals.append(
+                PolicyProposal(
+                    title=f"{title_verb} {phase} context omission risk" if has_trimmed else f"{title_verb} {phase} context budget pressure",
+                    policy_file="wiki/context-compiler.md",
+                    rationale=(
+                        f"{phase} recorded {total} context-pressure signal(s)."
+                        f"{detail} Consider documenting which sections can be safely prioritized or when to expand retrieval."
+                    ),
+                    suggested_change=(
+                        f"Add {phase} context-compilation guidance to wiki/context-compiler.md. "
+                        + (f"Specifically address: {', '.join(trimmed_sections[:2])}." if trimmed_sections else "Document token budget allocation strategy.")
+                    ),
+                    evidence_refs=data["evidence_refs"],
+                    confidence=self._confidence(total),
+                    source="context_gaps",
                 )
             )
         return proposals
@@ -331,15 +438,15 @@ class ProposalReviewStore:
 
     def __init__(self, policy_pack_path: str | Path):
         self.policy_pack_path = Path(policy_pack_path)
+        self.workspace_root = self.policy_pack_path.parent
         self.review_dir = self.policy_pack_path / ".sarathi-proposals"
         self.review_dir.mkdir(parents=True, exist_ok=True)
 
     def accept(self, proposal: PolicyProposal) -> dict[str, Any]:
-        policy_file = self.policy_pack_path / proposal.policy_file
-        if not policy_file.exists():
-            raise FileNotFoundError(f"Policy file not found: {policy_file}")
+        policy_file = self._resolve_target_path(proposal)
+        policy_file.parent.mkdir(parents=True, exist_ok=True)
         marker = f"proposal-id: {proposal.proposal_id}"
-        current = policy_file.read_text()
+        current = policy_file.read_text() if policy_file.exists() else ""
         if marker not in current:
             policy_file.write_text(self._apply_to_policy_text(current, proposal))
         decision = self._decision("accepted", proposal)
@@ -350,6 +457,23 @@ class ProposalReviewStore:
         decision = self._decision("rejected", proposal, reason=reason)
         self._write_decision(decision)
         return decision
+
+    def preview_acceptance(self, proposal: PolicyProposal) -> dict[str, Any]:
+        policy_file = self._resolve_target_path(proposal)
+        if not policy_file.exists():
+            return {
+                "path": str(policy_file),
+                "exists": False,
+                "current_content": "",
+                "accepted_preview": self._apply_to_policy_text("", proposal),
+            }
+        current = policy_file.read_text()
+        return {
+            "path": str(policy_file),
+            "exists": True,
+            "current_content": current,
+            "accepted_preview": self._apply_to_policy_text(current, proposal),
+        }
 
     def _accepted_section(self, proposal: PolicyProposal) -> str:
         evidence = "\n".join(f"- {ref}" for ref in proposal.evidence_refs) or "- none"
@@ -394,6 +518,9 @@ class ProposalReviewStore:
                 "id": proposal.proposal_id,
                 "title": proposal.title,
                 "source": proposal.source,
+                "proposal_kind": proposal.proposal_kind,
+                "impacted_assets": proposal.impacted_assets,
+                "risk_level": proposal.risk_level,
                 "confidence": proposal.confidence,
                 "suggested_change": proposal.suggested_change,
                 "evidence_refs": proposal.evidence_refs,
@@ -402,6 +529,12 @@ class ProposalReviewStore:
         )
         replacement = "```yaml\n" + yaml.safe_dump(parsed, sort_keys=False).rstrip() + "\n```"
         return current[: yaml_match.start()] + replacement + current[yaml_match.end():]
+
+    def _resolve_target_path(self, proposal: PolicyProposal) -> Path:
+        target = proposal.policy_file.strip().lstrip("/")
+        if target.startswith("wiki/") or target in {"SARATHI.md", "learnings.md"}:
+            return self.workspace_root / target
+        return self.policy_pack_path / target
 
     def _decision(
         self,
@@ -415,6 +548,12 @@ class ProposalReviewStore:
             "policy_file": proposal.policy_file,
             "title": proposal.title,
             "source": proposal.source,
+            "proposal_kind": proposal.proposal_kind,
+            "impacted_assets": proposal.impacted_assets,
+            "risk_level": proposal.risk_level,
+            "confidence": proposal.confidence,
+            "suggested_change": proposal.suggested_change,
+            "evidence_refs": proposal.evidence_refs,
             "routing_hint": proposal.routing_hint,
             "reason": reason,
             "reviewed_at": datetime.utcnow().isoformat() + "Z",

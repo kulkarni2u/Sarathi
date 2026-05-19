@@ -21,3 +21,10 @@ desktop/dist/
 
 # Local desktop config (contains dev tokens + localhost URLs)
 desktop/public/sarathi-runtime.js
+
+# macOS Finder artifacts
+.DS_Store
+
+# Local AI handoff scratch packs
+.opencode-*.md
+.claude-*.md

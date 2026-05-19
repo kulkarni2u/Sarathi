@@ -1,5 +1,6 @@
 import http.client
 import json
+import uuid
 import threading
 from urllib.parse import urlparse
 
@@ -106,6 +107,144 @@ def test_workspace_repository_action_preference_can_be_saved(tmp_path):
 
     _, workspace_again = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}"))
     assert workspace_again["workspace"]["metadata"]["repository_action_preference"]["mode"] == "draft_pr"
+
+
+def test_workspace_provider_priority_can_be_saved_and_emits_governance_event(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "PATCH",
+            f"/api/workspaces/{workspace_id}",
+            {
+                "metadata": {
+                    "provider_priority": ["codex", "claude"],
+                }
+            },
+        )
+    )
+
+    assert status == 200
+    assert data["workspace"]["metadata"]["provider_priority"] == ["codex", "claude"]
+
+    _, events = assert_ok(request(app, "GET", f"/api/events?workspace_id={workspace_id}"))
+    governance_events = [
+        event for event in events["events"] if event["event_type"] == "workspace.governance_updated"
+    ]
+    assert governance_events
+    assert governance_events[-1]["payload"]["changed_keys"] == ["provider_priority"]
+    assert governance_events[-1]["payload"]["snapshot"]["provider_priority"] == ["codex", "claude"]
+
+
+def test_workspace_reuse_preferences_emit_reuse_event(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sarathi App", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "PATCH",
+            f"/api/workspaces/{workspace_id}",
+            {
+                "metadata": {
+                    "reuse_preferences": {
+                        "active_saved_view_id": "blocked-projects",
+                        "custom_saved_views": [
+                            {
+                                "id": "ops-handoffs",
+                                "name": "Ops handoffs",
+                                "role": "operator",
+                                "route": "workspace",
+                                "description": "Custom reusable view for handoff work.",
+                                "metric_label": "ready handoffs",
+                                "filters": {"task_state": "handoff_ready"},
+                            }
+                        ],
+                    },
+                }
+            },
+        )
+    )
+
+    assert status == 200
+    assert data["workspace"]["metadata"]["reuse_preferences"]["active_saved_view_id"] == "blocked-projects"
+    assert data["workspace"]["metadata"]["reuse_preferences"]["custom_saved_views"][0]["id"] == "ops-handoffs"
+
+    _, events = assert_ok(request(app, "GET", f"/api/events?workspace_id={workspace_id}"))
+    reuse_events = [event for event in events["events"] if event["event_type"] == "workspace.reuse_updated"]
+    governance_events = [event for event in events["events"] if event["event_type"] == "workspace.governance_updated"]
+    assert reuse_events
+    assert not governance_events
+    assert reuse_events[-1]["payload"]["changed_keys"] == ["reuse_preferences"]
+    assert reuse_events[-1]["payload"]["snapshot"]["reuse_preferences"]["active_saved_view_id"] == "blocked-projects"
+    assert reuse_events[-1]["payload"]["snapshot"]["reuse_preferences"]["custom_saved_views"][0]["id"] == "ops-handoffs"
+
+
+def test_brainstorm_session_metadata_persists_into_task_reuse_metadata(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sarathi App", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    status, session_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/brainstorm/sessions",
+            {
+                "workspace_id": workspace_id,
+                "title": "Template: feature delivery",
+                "metadata": {
+                    "reuse_source": {"kind": "workflow_template", "id": "feature-delivery", "name": "Feature delivery"},
+                    "workflow_template_id": "feature-delivery",
+                    "recommended_view_ids": ["approvals-inbox", "handoff-readiness"],
+                    "recommended_repository_action_mode": "draft_pr",
+                    "recommended_auto_approve_mode": "below_threshold",
+                    "suggested_provider_priority": ["codex", "claude"],
+                },
+            },
+        )
+    )
+
+    assert status == 200
+    assert session_data["session"]["metadata"]["workflow_template_id"] == "feature-delivery"
+
+    _, approved = assert_ok(
+        request(app, "POST", f"/api/brainstorm/{session_data['session']['id']}/approve", {})
+    )
+
+    reuse_metadata = approved["task"]["metadata"]["reuse"]
+    assert reuse_metadata["reuse_source"]["kind"] == "workflow_template"
+    assert reuse_metadata["reuse_source"]["id"] == "feature-delivery"
+    assert reuse_metadata["workflow_template_id"] == "feature-delivery"
+    assert reuse_metadata["recommended_view_ids"] == ["approvals-inbox", "handoff-readiness"]
+    assert reuse_metadata["recommended_repository_action_mode"] == "draft_pr"
+    assert reuse_metadata["recommended_auto_approve_mode"] == "below_threshold"
+    assert reuse_metadata["suggested_provider_priority"] == ["codex", "claude"]
 
 
 def test_browser_cors_allows_loopback_vite_port(tmp_path):
@@ -1375,3 +1514,337 @@ def test_auto_approve_ignores_gates_not_meeting_threshold(tmp_path):
     _, result = assert_ok(request(app, "POST", f"/api/tasks/{task_id}/auto-approve"))
     assert len(result["approved"]) == 1
     assert result["approved"][0]["name"] == "Code review"
+
+
+def test_workspace_proposals_list_pending_candidates_from_workspace_signals(tmp_path):
+    db_path = tmp_path / "sarathi.db"
+    app = create_app(db_path)
+    workspace_id = _seed_workspace_proposal_signals(app, db_path, tmp_path)
+
+    status, data = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/proposals"))
+
+    assert status == 200
+    assert data["workspace_id"] == workspace_id
+    titles = {proposal["title"] for proposal in data["proposals"]}
+    assert "Add Build failure recovery guidance" in titles
+    assert "Reroute Build away from codex" in titles
+    assert "Capture Review escalation playbook" in titles
+    assert "Add Build iteration guard skill" in titles
+    assert "Reduce Build context omission risk" in titles or "Optimize Build context budget pressure" in titles
+    repeated_failure = next(item for item in data["proposals"] if item["policy_file"] == "commands.md")
+    provider_failure = next(item for item in data["proposals"] if item["policy_file"] == "model-routing.md")
+    wiki_proposal = next(item for item in data["proposals"] if item["policy_file"] == "wiki/review-loop.md")
+    skill_proposal = next(item for item in data["proposals"] if item["policy_file"] == "skills.md")
+    context_proposal = next(item for item in data["proposals"] if item["policy_file"] == "wiki/context-compiler.md")
+    assert repeated_failure["proposal_kind"] == "policy_note"
+    assert repeated_failure["impacted_assets"] == ["policy-pack/commands.md"]
+    assert repeated_failure["risk_level"] == "low"
+    assert provider_failure["proposal_kind"] == "routing_hint"
+    assert provider_failure["impacted_assets"] == ["policy-pack/model-routing.md"]
+    assert provider_failure["risk_level"] == "high"
+    assert wiki_proposal["proposal_kind"] == "wiki_update"
+    assert wiki_proposal["impacted_assets"] == ["wiki/review-loop.md"]
+    assert wiki_proposal["risk_level"] == "medium"
+    assert skill_proposal["proposal_kind"] == "skill_update"
+    assert skill_proposal["impacted_assets"] == ["policy-pack/skills.md"]
+    assert skill_proposal["risk_level"] == "medium"
+    assert context_proposal["proposal_kind"] == "context_update"
+    assert context_proposal["impacted_assets"] == ["wiki/context-compiler.md"]
+    assert context_proposal["risk_level"] == "medium"
+    assert "trimmed sections: prior_findings, relevant_files" in context_proposal["rationale"]
+    assert "near budget: 118/120 tokens" in context_proposal["rationale"]
+    assert "Specifically address: prior_findings, relevant_files." in context_proposal["suggested_change"]
+    assert data["reviewed_history"] == []
+    assert data["source"] == "synthesized_from_workspace_state"
+
+
+def test_workspace_skills_payload_filters_evolution_proposals_to_behavior_changes(tmp_path):
+    db_path = tmp_path / "sarathi.db"
+    app = create_app(db_path)
+    workspace_id = _seed_workspace_proposal_signals(app, db_path, tmp_path)
+
+    status, data = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/skills"))
+
+    assert status == 200
+    titles = {proposal["title"] for proposal in data["evolution_proposals"]}
+    assets = {proposal["impacted_assets"][0] for proposal in data["evolution_proposals"]}
+    assert "Reroute Build away from codex" in titles
+    assert "Add Build iteration guard skill" in titles
+    assert "Capture Review escalation playbook" not in titles
+    assert "Improve Build context compilation guidance" not in titles
+    assert "Reduce Build context omission risk" not in titles
+    assert "Optimize Build context budget pressure" not in titles
+    assert assets == {"policy-pack/model-routing.md", "policy-pack/skills.md"}
+
+
+def test_workspace_skills_payload_includes_evolution_history(tmp_path):
+    db_path = tmp_path / "sarathi.db"
+    app = create_app(db_path)
+    workspace_id = _seed_workspace_proposal_signals(app, db_path, tmp_path)
+
+    _, all_proposals = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/proposals"))
+    skill_proposals = [p for p in all_proposals["proposals"] if p["policy_file"] in ("skills.md", "model-routing.md")]
+
+    accepted_count = 0
+    for proposal in skill_proposals:
+        accept_status, _ = assert_ok(
+            request(app, "POST", f"/api/workspaces/{workspace_id}/proposals/{proposal['id']}/accept", {})
+        )
+        if accept_status == 200:
+            accepted_count += 1
+
+    (tmp_path / "policy-pack" / ".sarathi-proposals").mkdir(parents=True, exist_ok=True)
+    import uuid
+    fake_rejected = {
+        "id": str(uuid.uuid4())[:8],
+        "status": "rejected",
+        "title": "Fake rejected proposal",
+        "policy_file": "skills.md",
+        "proposal_kind": "skill_update",
+        "reviewed_at": "2026-05-15T10:00:00Z",
+        "reason": "Test rejection",
+    }
+    (tmp_path / "policy-pack" / ".sarathi-proposals" / f"{fake_rejected['id']}.json").write_text(
+        json.dumps(fake_rejected), encoding="utf-8"
+    )
+
+    status, data = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/skills"))
+
+    assert status == 200
+    assert "evolution_history" in data
+    assert isinstance(data["evolution_history"], list)
+
+    accepted = [h for h in data["evolution_history"] if h["status"] == "accepted"]
+    rejected = [h for h in data["evolution_history"] if h["status"] == "rejected"]
+
+    assert len(accepted) >= 1
+    assert len(rejected) >= 1
+
+    for item in data["evolution_history"]:
+        assert item["status"] in ("accepted", "rejected")
+        assert item["title"]
+        assert item["reviewed_at"]
+        assert "skills.md" in item["policy_file"].lower() or "model-routing" in item["policy_file"].lower()
+
+
+def test_workspace_proposals_can_be_accepted_and_filtered_from_pending_list(tmp_path):
+    db_path = tmp_path / "sarathi.db"
+    app = create_app(db_path)
+    workspace_id = _seed_workspace_proposal_signals(app, db_path, tmp_path)
+
+    _, data = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/proposals"))
+    proposal = next(item for item in data["proposals"] if item["policy_file"] == "commands.md")
+
+    status, decision_data = assert_ok(
+        request(app, "POST", f"/api/workspaces/{workspace_id}/proposals/{proposal['id'][:8]}/accept", {})
+    )
+
+    assert status == 200
+    assert decision_data["decision"]["status"] == "accepted"
+    assert decision_data["decision"]["evidence_refs"]
+    commands_text = (tmp_path / "policy-pack" / "commands.md").read_text(encoding="utf-8")
+    assert "accepted_proposals:" in commands_text
+
+    _, refreshed = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/proposals"))
+    refreshed_ids = {item["id"] for item in refreshed["proposals"]}
+    assert proposal["id"] not in refreshed_ids
+    accepted_history = next(item for item in refreshed["reviewed_history"] if item["id"] == proposal["id"])
+    assert accepted_history["status"] == "accepted"
+    assert accepted_history["evidence_refs"]
+
+
+def test_workspace_proposal_detail_returns_current_content_and_accept_preview(tmp_path):
+    db_path = tmp_path / "sarathi.db"
+    app = create_app(db_path)
+    workspace_id = _seed_workspace_proposal_signals(app, db_path, tmp_path)
+
+    _, data = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/proposals"))
+    proposal = next(item for item in data["proposals"] if item["policy_file"] == "commands.md")
+
+    status, detail = assert_ok(
+        request(app, "GET", f"/api/workspaces/{workspace_id}/proposals/{proposal['id']}")
+    )
+
+    assert status == 200
+    assert detail["proposal"]["id"] == proposal["id"]
+    assert detail["proposal"]["proposal_kind"] == "policy_note"
+    assert detail["proposal"]["impacted_assets"] == ["policy-pack/commands.md"]
+    assert detail["proposal"]["risk_level"] == "low"
+    assert detail["policy_preview"]["exists"] is True
+    assert detail["policy_preview"]["path"].endswith("policy-pack/commands.md")
+    assert "command: pytest" in detail["policy_preview"]["current_content"]
+    assert "accepted_proposals:" in detail["policy_preview"]["accepted_preview"]
+    assert proposal["id"] in detail["policy_preview"]["accepted_preview"]
+
+
+def test_workspace_wiki_proposal_preview_and_accept_can_create_target_asset(tmp_path):
+    db_path = tmp_path / "sarathi.db"
+    app = create_app(db_path)
+    workspace_id = _seed_workspace_proposal_signals(app, db_path, tmp_path)
+
+    _, data = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/proposals"))
+    proposal = next(item for item in data["proposals"] if item["policy_file"] == "wiki/review-loop.md")
+
+    status, detail = assert_ok(
+        request(app, "GET", f"/api/workspaces/{workspace_id}/proposals/{proposal['id']}")
+    )
+
+    assert status == 200
+    assert detail["proposal"]["proposal_kind"] == "wiki_update"
+    assert detail["policy_preview"]["exists"] is False
+    assert detail["policy_preview"]["path"].endswith("wiki/review-loop.md")
+    assert "Capture Review escalation playbook" in detail["policy_preview"]["accepted_preview"]
+
+    status, decision_data = assert_ok(
+        request(app, "POST", f"/api/workspaces/{workspace_id}/proposals/{proposal['id']}/accept", {})
+    )
+
+    assert status == 200
+    assert decision_data["decision"]["status"] == "accepted"
+    created_text = (tmp_path / "wiki" / "review-loop.md").read_text(encoding="utf-8")
+    assert "Capture Review escalation playbook" in created_text
+
+
+def test_workspace_context_proposal_preview_and_accept_can_create_target_asset(tmp_path):
+    db_path = tmp_path / "sarathi.db"
+    app = create_app(db_path)
+    workspace_id = _seed_workspace_proposal_signals(app, db_path, tmp_path)
+
+    _, data = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/proposals"))
+    proposal = next(item for item in data["proposals"] if item["policy_file"] == "wiki/context-compiler.md")
+
+    status, detail = assert_ok(
+        request(app, "GET", f"/api/workspaces/{workspace_id}/proposals/{proposal['id']}")
+    )
+
+    assert status == 200
+    assert detail["proposal"]["proposal_kind"] == "context_update"
+    assert detail["policy_preview"]["exists"] is False
+    assert detail["policy_preview"]["path"].endswith("wiki/context-compiler.md")
+    assert "Reduce Build context omission risk" in detail["policy_preview"]["accepted_preview"]
+    assert "prior_findings, relevant_files" in detail["policy_preview"]["accepted_preview"]
+    assert "118/120 tokens" in detail["policy_preview"]["accepted_preview"]
+
+    status, decision_data = assert_ok(
+        request(app, "POST", f"/api/workspaces/{workspace_id}/proposals/{proposal['id']}/accept", {})
+    )
+
+    assert status == 200
+    assert decision_data["decision"]["status"] == "accepted"
+    created_text = (tmp_path / "wiki" / "context-compiler.md").read_text(encoding="utf-8")
+    assert "Reduce Build context omission risk" in created_text
+    assert "prior_findings, relevant_files" in created_text
+    assert "118/120 tokens" in created_text
+
+
+def test_workspace_proposals_can_be_rejected_and_recorded(tmp_path):
+    db_path = tmp_path / "sarathi.db"
+    app = create_app(db_path)
+    workspace_id = _seed_workspace_proposal_signals(app, db_path, tmp_path)
+
+    _, data = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/proposals"))
+    proposal = next(item for item in data["proposals"] if item["policy_file"] == "model-routing.md")
+
+    status, decision_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/proposals/{proposal['id']}/reject",
+            {"reason": "Not needed right now"},
+        )
+    )
+
+    assert status == 200
+    assert decision_data["decision"]["status"] == "rejected"
+    assert decision_data["decision"]["evidence_refs"]
+    decision_path = tmp_path / "policy-pack" / ".sarathi-proposals" / f"{proposal['id']}.json"
+    assert decision_path.exists()
+    assert "Not needed right now" in decision_path.read_text(encoding="utf-8")
+
+    _, refreshed = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/proposals"))
+    rejected_history = next(item for item in refreshed["reviewed_history"] if item["id"] == proposal["id"])
+    assert rejected_history["status"] == "rejected"
+    assert rejected_history["reason"] == "Not needed right now"
+
+
+def _seed_workspace_proposal_signals(app, db_path, root_path):
+    _write_workspace_proposal_policy_pack(root_path)
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Proposal Workspace", "root_path": str(root_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    with connect(db_path) as conn:
+        storage = Storage(conn)
+        for index in range(2):
+            task = storage.create_task(
+                workspace_id=workspace_id,
+                title=f"Failing build {index + 1}",
+                description=None,
+                metadata={"complexity": "high"},
+            )
+            subtask = storage.create_subtask(
+                workspace_id=workspace_id,
+                task_id=task["id"],
+                title="Implement scoped change",
+                status="failed",
+                metadata={"role": "Pravaha"},
+            )
+            storage.create_dispatch(
+                workspace_id=workspace_id,
+                task_id=task["id"],
+                agent_name="codex",
+                status="failed",
+                metadata={
+                    "subtask_id": subtask["id"],
+                    "agent_output": {"status": "failed", "summary": "codex failed during Build"},
+                },
+            )
+            storage.create_dispatch(
+                workspace_id=workspace_id,
+                task_id=task["id"],
+                agent_name="codex",
+                status="complete",
+                metadata={
+                    "subtask_id": subtask["id"],
+                    "agent_output": {"status": "complete", "summary": "codex needed a second Build pass"},
+                    "context_pack": {
+                        "phase": "Build",
+                        "agent_input": {"token_budget": 120},
+                        "compilation": {
+                            "estimated_tokens": 118,
+                            "trimmed_sections": ["prior_findings", "relevant_files"],
+                        },
+                    },
+                },
+            )
+            storage.create_review_run(
+                workspace_id=workspace_id,
+                task_id=task["id"],
+                status="rejected",
+                summary="Review rejected after repeated drift.",
+                metadata={},
+            )
+    return workspace_id
+
+
+def _write_workspace_proposal_policy_pack(root_path):
+    policy_dir = root_path / "policy-pack"
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    (policy_dir / "commands.md").write_text(
+        """# Commands
+
+```yaml
+test:
+  command: pytest
+```
+""",
+        encoding="utf-8",
+    )
+    (policy_dir / "model-routing.md").write_text("# Model routing\n", encoding="utf-8")
+    (policy_dir / "escalation.md").write_text("# Escalation\n", encoding="utf-8")

@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 
-LATEST_SCHEMA_VERSION = 5
+LATEST_SCHEMA_VERSION = 6
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -70,6 +70,13 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
             (5, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 6:
+        conn.executescript(_MIGRATION_006)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (6, _utc_now()),
         )
         conn.commit()
 
@@ -353,6 +360,7 @@ class Storage:
         project_id: str | None = None,
         provider: str | None = None,
         output_format: str = "markdown",
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         session_id = _new_id()
         now = _utc_now()
@@ -360,12 +368,12 @@ class Storage:
             """
             INSERT INTO brainstorm_sessions (
                 id, workspace_id, project_id, title, provider, output_format,
-                dialogue_turns, research_findings, visual_options,
+                dialogue_turns, research_findings, visual_options, metadata,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (session_id, workspace_id, project_id, title, provider, output_format,
-             "[]", "[]", "[]", now, now),
+             "[]", "[]", "[]", _dump_json(metadata), now, now),
         )
         self.conn.commit()
         session = self.get_brainstorm_session(session_id)
@@ -378,6 +386,7 @@ class Storage:
             SELECT id, workspace_id, project_id, task_id, status, title, provider,
                    spec_path, spec_content, output_format, dialogue_turns,
                    research_findings, visual_options, approved_at, created_at, updated_at
+                   , metadata
             FROM brainstorm_sessions WHERE id = ?
             """,
             (session_id,),
@@ -393,6 +402,7 @@ class Storage:
                 SELECT id, workspace_id, project_id, task_id, status, title, provider,
                        spec_path, spec_content, output_format, dialogue_turns,
                        research_findings, visual_options, approved_at, created_at, updated_at
+                       , metadata
                 FROM brainstorm_sessions
                 WHERE workspace_id = ? AND status = ?
                 ORDER BY created_at DESC
@@ -405,6 +415,7 @@ class Storage:
                 SELECT id, workspace_id, project_id, task_id, status, title, provider,
                        spec_path, spec_content, output_format, dialogue_turns,
                        research_findings, visual_options, approved_at, created_at, updated_at
+                       , metadata
                 FROM brainstorm_sessions
                 WHERE workspace_id = ?
                 ORDER BY created_at DESC
@@ -858,6 +869,18 @@ class Storage:
             ORDER BY created_at, id
             """,
             (task_id,),
+        ).fetchall()
+        return [_dispatch_from_row(row) for row in rows]
+
+    def list_dispatches_for_workspace(self, workspace_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, task_id, agent_name, status, metadata, created_at, updated_at
+            FROM dispatches
+            WHERE workspace_id = ?
+            ORDER BY created_at DESC
+            """,
+            (workspace_id,),
         ).fetchall()
         return [_dispatch_from_row(row) for row in rows]
 
@@ -1487,6 +1510,7 @@ def _brainstorm_session_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "dialogue_turns": _load_json_list(row["dialogue_turns"]),
         "research_findings": _load_json_list(row["research_findings"]),
         "visual_options": _load_json_list(row["visual_options"]),
+        "metadata": _load_json(row["metadata"]),
         "approved_at": row["approved_at"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -1979,4 +2003,9 @@ CREATE INDEX IF NOT EXISTS idx_brainstorm_sessions_workspace
 
 CREATE INDEX IF NOT EXISTS idx_brainstorm_sessions_status
     ON brainstorm_sessions(workspace_id, status);
+"""
+
+
+_MIGRATION_006 = """
+ALTER TABLE brainstorm_sessions ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';
 """

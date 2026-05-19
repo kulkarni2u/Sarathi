@@ -1,9 +1,13 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import {
+  activeSavedViewFromReuseKit,
   getSarathiApiConfig,
+  getWorkspaceReuseKit,
   listTaskDashboard,
   createTaskDraft,
+  filterTaskDashboardItemsBySavedView,
   type TaskDashboardItem,
+  type SavedViewSnapshot,
 } from "../apiClient";
 import { tasks } from "../mockData";
 
@@ -29,6 +33,36 @@ function getStatusLabel(status: string): string {
   return "Pending";
 }
 
+function queueLabel(task: TaskDashboardItem): string {
+  if (task.handoff_state === "ready") return "Handoff ready";
+  if (task.review_needed_count > 0) return "Needs review";
+  if (task.approval_state !== "approved" && task.approval_state !== "none") return "Awaiting approval";
+  if (task.blocked_count > 0) return "Blocked";
+  if (task.checkpoint_state !== "none") return "Checkpoint ready";
+  if (task.status === "in_progress") return "Running";
+  if (task.status === "done") return "Done";
+  return "Ready";
+}
+
+function queueTone(task: TaskDashboardItem): string {
+  if (task.blocked_count > 0 || task.review_needed_count > 0) return "warning";
+  if (task.approval_state !== "approved" && task.approval_state !== "none") return "warning";
+  if (task.handoff_state === "ready" || task.checkpoint_state !== "none") return "active";
+  if (task.status === "done") return "done";
+  if (task.status === "in_progress") return "active";
+  return "pending";
+}
+
+function nextCue(task: TaskDashboardItem): string {
+  if (task.handoff_state === "ready") return "Review handoff";
+  if (task.review_needed_count > 0) return "Re-open review";
+  if (task.approval_state !== "approved" && task.next_gate) return `Approve ${task.next_gate}`;
+  if (task.blocked_count > 0) return "Resolve blocker";
+  if (task.checkpoint_state !== "none") return "Resume from checkpoint";
+  if (task.status === "in_progress") return "Monitor execution";
+  return "Open task";
+}
+
 function mockTasksToDashboardItems(): TaskDashboardItem[] {
   return tasks.map((t) => ({
     id: t.id,
@@ -43,6 +77,9 @@ function mockTasksToDashboardItems(): TaskDashboardItem[] {
     next_gate: t.status === "waiting_human" ? "approval required" : null,
     node_count: t.progress > 0 ? Math.ceil(t.progress / 25) : 1,
     blocked_count: 0,
+    review_needed_count: 0,
+    checkpoint_state: "none",
+    handoff_state: "none",
     roles: ["Pravaha"],
     providers: ["Codex"],
     updated_at: new Date(Date.now() - 5 * 60000).toISOString(),
@@ -86,6 +123,7 @@ export default function Dashboard({
   const [newPrompt, setNewPrompt] = useState("");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [activeSavedView, setActiveSavedView] = useState<SavedViewSnapshot | null>(null);
 
   const guidanceCopy = apiConfigured
     ? "Describe what you want to build. Sarathi will ask what it needs, then create the task."
@@ -107,12 +145,19 @@ export default function Dashboard({
     }
     setLoading(true);
     try {
-      const list = await listTaskDashboard(workspaceId, { projectId });
-      setItems(list);
-      onTasksLoaded?.(list);
+      const [list, reuseKit] = await Promise.all([
+        listTaskDashboard(workspaceId, { projectId }),
+        getWorkspaceReuseKit(workspaceId),
+      ]);
+      const savedView = activeSavedViewFromReuseKit(reuseKit);
+      const filtered = filterTaskDashboardItemsBySavedView(list, savedView);
+      setActiveSavedView(savedView);
+      setItems(filtered);
+      onTasksLoaded?.(filtered);
     } catch {
       setItems([]);
       onTasksLoaded?.([]);
+      setActiveSavedView(null);
     } finally {
       setLoading(false);
     }
@@ -166,6 +211,9 @@ export default function Dashboard({
         next_gate: "prd approval",
         node_count: 0,
         blocked_count: 0,
+        review_needed_count: 0,
+        checkpoint_state: "none",
+        handoff_state: "none",
         roles: [],
         providers: [],
         updated_at: task.updated_at,
@@ -193,6 +241,12 @@ export default function Dashboard({
   }, [items, filter, search]);
 
   const hasProject = Boolean(projectId);
+  const summary = useMemo(() => ({
+    active: items.filter((task) => task.status === "in_progress").length,
+    approvals: items.filter((task) => task.approval_state !== "approved" && task.approval_state !== "none").length,
+    checkpoints: items.filter((task) => task.checkpoint_state !== "none").length,
+    handoffs: items.filter((task) => task.handoff_state === "ready").length,
+  }), [items]);
   const emptyMessage = hasProject
     ? "No tasks yet."
     : "No projects yet.";
@@ -212,6 +266,11 @@ export default function Dashboard({
             ? "Describe what you want to build. Sarathi will ask what it needs, then create the task."
             : "Describe what you want to build. When the service is offline, Sarathi will fall back to a local draft."}
         </p>
+        {activeSavedView ? (
+          <p className="dashboard-subtitle" style={{ marginTop: 8 }}>
+            Active saved view: <strong>{activeSavedView.name}</strong>. {activeSavedView.description}
+          </p>
+        ) : null}
       </div>
 
       <div className="task-composer">
@@ -296,6 +355,37 @@ export default function Dashboard({
         </div>
       </div>
 
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+          gap: 12,
+          marginBottom: 18,
+        }}
+      >
+        {[
+          { label: "Running", value: summary.active },
+          { label: "Awaiting approval", value: summary.approvals },
+          { label: "Checkpoint ready", value: summary.checkpoints },
+          { label: "Handoff ready", value: summary.handoffs },
+        ].map((item) => (
+          <div
+            key={item.label}
+            style={{
+              border: "1px solid var(--border)",
+              background: "var(--surface)",
+              borderRadius: "var(--radius)",
+              padding: "12px 14px",
+            }}
+          >
+            <div style={{ fontSize: "0.74rem", textTransform: "uppercase", letterSpacing: "0.04em", color: "var(--muted)" }}>
+              {item.label}
+            </div>
+            <div style={{ marginTop: 8, fontSize: "1.35rem", fontWeight: 700 }}>{item.value}</div>
+          </div>
+        ))}
+      </div>
+
       <div className="task-list">
         {loading && (
           <p className="loading-text">Loading tasks…</p>
@@ -344,6 +434,8 @@ function TaskCard({
   const phaseLine = task.phase ? `${task.phase} phase` : null;
   const providerLine = task.providers.length > 0 ? task.providers.join(" · ") : null;
   const isBlocked = task.blocked_count > 0;
+  const queue = queueLabel(task);
+  const cue = nextCue(task);
 
   return (
     <button
@@ -357,6 +449,7 @@ function TaskCard({
         <span className={getStatusPillClass(task.status)}>
           {getStatusLabel(task.status)}
         </span>
+        <span className={`status-pill ${queueTone(task)}`}>{queue}</span>
         {phaseLine && <span className="phase-pill">{phaseLine}</span>}
         <span className="task-timestamp">{relativeTime(task.updated_at)}</span>
       </div>
@@ -375,7 +468,20 @@ function TaskCard({
         {task.next_gate && (
           <span className="meta-item gate">&#9888; gate pending</span>
         )}
+        {task.review_needed_count > 0 && (
+          <span className="meta-item gate">{task.review_needed_count} review need{task.review_needed_count === 1 ? "s" : ""}</span>
+        )}
+        {task.checkpoint_state !== "none" && (
+          <span className="meta-item">checkpoint {task.checkpoint_state}</span>
+        )}
+        {task.handoff_state !== "none" && (
+          <span className="meta-item">handoff {task.handoff_state}</span>
+        )}
         {providerLine && <span className="meta-item">{providerLine}</span>}
+      </div>
+
+      <div className="task-meta">
+        <span className="meta-item">Next: {cue}</span>
       </div>
     </button>
   );

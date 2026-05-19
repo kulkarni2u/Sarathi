@@ -45,6 +45,9 @@ def test_task_dashboard_summarizes_workspace_tasks_and_graph_state(tmp_path):
     assert prd_summary["approval_state"] == "prd_pending"
     assert prd_summary["graph_state"] == "not_started"
     assert prd_summary["node_count"] == 0
+    assert prd_summary["review_needed_count"] == 0
+    assert prd_summary["checkpoint_state"] == "none"
+    assert prd_summary["handoff_state"] == "none"
 
     graph_summary = summaries[1]
     assert graph_summary["id"] == graph_task["id"]
@@ -52,6 +55,9 @@ def test_task_dashboard_summarizes_workspace_tasks_and_graph_state(tmp_path):
     assert graph_summary["graph_state"] == "pending_approval"
     assert graph_summary["node_count"] == 3
     assert graph_summary["blocked_count"] == 2
+    assert graph_summary["review_needed_count"] == 0
+    assert graph_summary["checkpoint_state"] == "none"
+    assert graph_summary["handoff_state"] == "none"
     assert graph_summary["next_gate"] == "Task graph"
     assert graph_summary["roles"] == ["Disha", "Pravaha", "Nirnaya"]
     assert graph_summary["providers"] == ["Codex", "Claude"]
@@ -103,6 +109,72 @@ def test_task_dashboard_can_be_filtered_to_a_project(tmp_path):
 
     assert status == 200
     assert [summary["title"] for summary in data["tasks"]] == ["Project one task"]
+
+
+def test_task_dashboard_items_include_control_tower_fields(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    workspace_id = create_workspace(app, tmp_path)
+    task = create_task_draft(app, workspace_id, "Control tower task", "Control Tower Task")
+
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task['id']}/approve",
+            {"name": "PRD/AC", "status": "approved"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/graph-draft"))
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task['id']}/approve",
+            {"name": "Task graph", "status": "approved"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, studio_data = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    first_node = studio_data["graph"]["nodes"][0]
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{first_node['id']}/dispatch",
+            {"provider": "local"},
+        )
+    )
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task['id']}/reviews/run",
+            {"review_type": "functional"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/handoff"))
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task['id']}/repository-action",
+            {"action": "no_action", "approved": True},
+        )
+    )
+
+    status, data = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/task-dashboard"))
+
+    assert status == 200
+    assert len(data["tasks"]) == 1
+    task_summary = data["tasks"][0]
+
+    assert "checkpoint_state" in task_summary
+    assert "handoff_state" in task_summary
+    assert "review_needed_count" in task_summary
+
+    assert task_summary["checkpoint_state"] in {"none", "ready"}
+    assert task_summary["handoff_state"] in {"none", "draft", "ready"}
+    assert isinstance(task_summary["review_needed_count"], int)
 
 
 def create_workspace(app, tmp_path):

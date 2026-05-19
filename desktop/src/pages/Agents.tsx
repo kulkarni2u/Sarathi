@@ -44,6 +44,23 @@ function healthTone(health: string): string {
   return "draft";
 }
 
+function transportTone(posture?: string): string {
+  if (posture === "builtin") return "healthy";
+  if (posture === "sdk" || posture === "api") return "active";
+  if (posture === "cli_fallback") return "warning";
+  return "draft";
+}
+
+function transportLabel(provider: ProviderHealthRecord): string {
+  const posture = provider.transport_posture;
+  if (posture === "builtin") return "Built in";
+  if (posture === "sdk") return "SDK";
+  if (posture === "api") return "API";
+  if (posture === "cli_fallback") return "CLI fallback";
+  if (provider.transport_kind) return provider.transport_kind;
+  return "Unknown transport";
+}
+
 function authLabel(auth: string): string {
   if (auth === "connected") return "Connected";
   if (auth === "missing") return "Missing";
@@ -54,14 +71,18 @@ function authLabel(auth: string): string {
 }
 
 function adaptMock(p: typeof mockProviders[0]): ProviderHealthRecord {
+  const isLocal = p.id === "local" || p.type === "local" || p.type === "deterministic";
   return {
     id: p.id,
     name: p.name,
     provider_type: p.type,
+    transport_kind: isLocal ? "deterministic" : "cli",
+    transport_posture: isLocal ? "builtin" : "cli_fallback",
     health: p.health,
     auth: p.auth,
     path: p.path,
     capabilities: p.capabilities,
+    degraded_reason: isLocal ? null : "Demo provider is shown through the CLI fallback posture.",
     last_checked_at: null,
     last_error: null,
   };
@@ -151,7 +172,10 @@ export default function Agents({ workspaceId, liveTick }: Props) {
     if (!workspaceId) return;
     setTestingId(provider.id);
     try {
-      const updated = await testProviderConnection(workspaceId, provider.id, provider.path, provider.auth);
+      const updated = await testProviderConnection(workspaceId, provider.id, {
+        path: provider.path,
+        auth: provider.auth,
+      });
       setProviders((current) => current.map((candidate) => (candidate.id === updated.id ? updated : candidate)));
     } finally {
       setTestingId(null);
@@ -163,7 +187,12 @@ export default function Agents({ workspaceId, liveTick }: Props) {
     setTestingAll(true);
     try {
       const results = await Promise.allSettled(
-        providers.map((provider) => testProviderConnection(workspaceId, provider.id, provider.path, provider.auth)),
+        providers.map((provider) =>
+          testProviderConnection(workspaceId, provider.id, {
+            path: provider.path,
+            auth: provider.auth,
+          }),
+        ),
       );
       setProviders((current) =>
         current.map((provider, index) => {
@@ -309,7 +338,7 @@ export default function Agents({ workspaceId, liveTick }: Props) {
           <div>
             <strong>Provider inventory</strong>
             <p style={{ margin: "4px 0 0", fontSize: "0.78rem", color: "var(--muted)" }}>
-              Health, auth posture, CLI path, and execution capabilities.
+              Health, transport posture, auth posture, CLI path, and execution capabilities.
             </p>
           </div>
           {providers.length > 0 ? <Pill tone="draft">{providers.length} total</Pill> : null}
@@ -346,11 +375,17 @@ export default function Agents({ workspaceId, liveTick }: Props) {
                     <span style={healthDot(provider.health)} />
                     <strong>{provider.name}</strong>
                     <Pill tone={healthTone(provider.health)}>{provider.health}</Pill>
+                    <Pill tone={transportTone(provider.transport_posture)}>{transportLabel(provider)}</Pill>
                     <span style={{ fontSize: "0.72rem", color: "var(--muted)" }}>{provider.provider_type}</span>
                   </div>
                   <p style={{ margin: "8px 0 0", fontSize: "0.77rem", color: "var(--muted)" }}>
                     {provider.path || "CLI path not configured"}
                   </p>
+                  {provider.degraded_reason ? (
+                    <p style={{ margin: "8px 0 0", fontSize: "0.76rem", color: "var(--status-amber-fg)" }}>
+                      {provider.degraded_reason}
+                    </p>
+                  ) : null}
                   {provider.last_error ? (
                     <p style={{ margin: "8px 0 0", fontSize: "0.76rem", color: "var(--status-red-fg)" }}>
                       {provider.last_error}

@@ -61,6 +61,11 @@ def choose_port(preferred: int) -> int:
         return int(sock.getsockname()[1])
 
 
+def connect_base_url(host: str, port: int) -> str:
+    connect_host = "127.0.0.1" if host in {"0.0.0.0", "::", "::0"} else host
+    return f"http://{connect_host}:{port}"
+
+
 def build_launch_config(args: argparse.Namespace) -> dict[str, Any]:
     root = repo_root()
     service_port = choose_port(args.service_port)
@@ -78,7 +83,8 @@ def build_launch_config(args: argparse.Namespace) -> dict[str, Any]:
         "vite_host": args.vite_host,
         "vite_port": vite_port,
         "token": token,
-        "base_url": f"http://{args.service_host}:{service_port}",
+        "service_timeout": args.service_timeout,
+        "base_url": connect_base_url(args.service_host, service_port),
     }
 
 
@@ -123,6 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--service-port", type=int, default=8765, help="Port for the local Python service. Use 0 to auto-pick.")
     parser.add_argument("--vite-host", default="127.0.0.1", help="Host for the Vite desktop UI.")
     parser.add_argument("--vite-port", type=int, default=5173, help="Port for the Vite desktop UI. Use 0 to auto-pick.")
+    parser.add_argument("--service-timeout", type=float, default=12.0, help="Seconds to wait for the local service health check.")
     parser.add_argument("--runtime-script", help="Path to the generated runtime config script.")
     parser.add_argument("--ui-only", action="store_true", help="Start only the desktop UI using runtime config from the provided host/port/token.")
     parser.add_argument("--service-only", action="store_true", help="Start only the local Python service.")
@@ -166,7 +173,11 @@ def main() -> None:
                 cwd=root,
                 text=True,
             )
-            wait_for_service(base_url=config["base_url"], token=config["token"])
+            wait_for_service(
+                base_url=config["base_url"],
+                token=config["token"],
+                timeout_seconds=float(config["service_timeout"]),
+            )
             print(f"Sarathi desktop service ready at {config['base_url']}", flush=True)
 
         if args.service_only:

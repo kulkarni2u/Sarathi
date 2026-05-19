@@ -149,7 +149,7 @@ export default function ChatThread({ taskId, messages, approvalGates, onAction }
                   >
                     Approve
                   </button>
-                  <button style={styles.viewBtn}>View</button>
+                  <span style={styles.viewHint}>Inspect in task panel</span>
                 </div>
               </div>
             ))}
@@ -290,15 +290,13 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     fontWeight: 600,
   },
-  viewBtn: {
+  viewHint: {
+    display: "inline-flex",
+    alignItems: "center",
     height: 30,
-    padding: "0 12px",
-    fontSize: "0.78rem",
-    background: "var(--gray-a2)",
-    border: "1px solid var(--border)",
-    borderRadius: 6,
+    padding: "0 10px",
+    fontSize: "0.75rem",
     color: "var(--muted)",
-    cursor: "pointer",
   },
   inputBar: {
     display: "flex",

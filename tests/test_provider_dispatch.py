@@ -6,6 +6,7 @@ from src.service import _provider_dispatch_command, create_app
 from src.runtime import DispatchRequest
 from src.runtime.providers.configured import CommandProviderAdapter
 from src.runtime.providers.local import LocalProviderAdapter
+from src.runtime.providers.base import ProviderSession
 
 
 def request(app, method, path, body=None, correlation_id="corr-provider-dispatch"):
@@ -46,7 +47,14 @@ def test_provider_health_lists_local_deterministic_provider(tmp_path):
     assert local["name"] == "Local deterministic"
     assert local["health"] == "online"
     assert local["auth"] == "not_required"
+    assert local["transport_kind"] == "deterministic"
+    assert local["transport_posture"] == "builtin"
+    assert local["degraded_reason"] is None
     assert "child_task_execution" in local["capabilities"]
+    opencode = next(provider for provider in data["providers"] if provider["id"] == "opencode")
+    assert opencode["transport_kind"] == "sdk"
+    assert opencode["transport_posture"] == "sdk"
+    assert opencode["degraded_reason"] is None
 
 
 def test_provider_settings_can_be_saved_and_health_checked(tmp_path):
@@ -68,6 +76,9 @@ def test_provider_settings_can_be_saved_and_health_checked(tmp_path):
     assert provider["path"] == "python3"
     assert provider["auth"] == "connected"
     assert provider["health"] == "online"
+    assert provider["transport_kind"] == "sdk"
+    assert provider["transport_posture"] == "sdk"
+    assert "OpenAI SDK is the primary path" in provider["degraded_reason"]
     assert provider["last_checked_at"]
 
     _, providers_data = assert_ok(
@@ -76,6 +87,84 @@ def test_provider_settings_can_be_saved_and_health_checked(tmp_path):
     codex = next(item for item in providers_data["providers"] if item["id"] == "codex")
     assert codex["path"] == "python3"
     assert codex["health"] == "online"
+    assert codex["transport_posture"] == "sdk"
+    assert "OpenAI SDK is the primary path" in codex["degraded_reason"]
+
+
+def test_codex_provider_can_be_configured_for_sdk_only_mode(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    workspace = create_workspace(app, tmp_path)
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace['id']}/providers/codex/test",
+            {
+                "path": "",
+                "auth": "connected",
+                "api_key": "sk-test",
+                "base_url": "https://example.invalid/v1",
+                "model": "gpt-4.1-mini",
+            },
+        )
+    )
+
+    assert status == 200
+    provider = data["provider"]
+    assert provider["path"] == ""
+    assert provider["health"] == "online"
+    assert provider["transport_kind"] == "sdk"
+    assert provider["api_key_configured"] is True
+    assert provider["base_url"] == "https://example.invalid/v1"
+    assert provider["model"] == "gpt-4.1-mini"
+
+    _, providers_data = assert_ok(
+        request(app, "GET", f"/api/providers?workspace_id={workspace['id']}")
+    )
+    codex = next(item for item in providers_data["providers"] if item["id"] == "codex")
+    assert codex["path"] == ""
+    assert codex["api_key_configured"] is True
+    assert codex["base_url"] == "https://example.invalid/v1"
+    assert codex["model"] == "gpt-4.1-mini"
+
+
+def test_claude_provider_can_be_configured_for_sdk_only_mode(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    workspace = create_workspace(app, tmp_path)
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace['id']}/providers/claude/test",
+            {
+                "path": "",
+                "auth": "connected",
+                "api_key": "anthropic-test",
+                "base_url": "https://example.invalid/anthropic",
+                "model": "claude-sonnet-4-0",
+            },
+        )
+    )
+
+    assert status == 200
+    provider = data["provider"]
+    assert provider["path"] == ""
+    assert provider["health"] == "online"
+    assert provider["transport_kind"] == "sdk"
+    assert provider["api_key_configured"] is True
+    assert provider["base_url"] == "https://example.invalid/anthropic"
+    assert provider["model"] == "claude-sonnet-4-0"
+
+    _, providers_data = assert_ok(
+        request(app, "GET", f"/api/providers?workspace_id={workspace['id']}")
+    )
+    claude = next(item for item in providers_data["providers"] if item["id"] == "claude")
+    assert claude["path"] == ""
+    assert claude["api_key_configured"] is True
+    assert claude["base_url"] == "https://example.invalid/anthropic"
+    assert claude["model"] == "claude-sonnet-4-0"
 
 
 def test_provider_settings_are_scoped_per_workspace(tmp_path):
@@ -184,13 +273,30 @@ def test_local_dispatch_persists_dispatch_evidence_and_moves_unit_to_review(tmp_
     assert status == 201
     assert data["dispatch"]["agent_name"] == "local"
     assert data["dispatch"]["status"] == "completed"
+    assert data["dispatch"]["metadata"]["context_pack"]["phase"] == "TaskTracking"
+    assert data["dispatch"]["metadata"]["context_pack"]["agent_input"]["objective"]
+    assert data["dispatch"]["metadata"]["context_pack"]["compilation"]["full_history_excluded"] is True
+    assert data["dispatch"]["metadata"]["agent_output"]["status"] == "completed"
+    assert data["dispatch"]["metadata"]["agent_output"]["next_recommended_agent"] == "Nirnaya"
+    assert data["dispatch"]["metadata"]["artifact_index"]["files_changed"] == [
+        "src/confirm_plan_and.py",
+        "tests/test_confirm_plan_and.py",
+    ]
+    assert data["dispatch"]["metadata"]["artifact_index"]["tests_run"] == [
+        "python3 -m pytest tests/test_confirm_plan_and.py"
+    ]
     assert data["evidence"]["artifact_type"] == "dispatch_result"
+    assert data["evidence"]["metadata"]["artifact_index"]["files_changed"] == [
+        "src/confirm_plan_and.py",
+        "tests/test_confirm_plan_and.py",
+    ]
     assert data["subtask"]["status"] == "review"
 
     _, studio_data = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
     assert studio_data["dispatches"][0]["id"] == data["dispatch"]["id"]
     assert studio_data["evidence"][0]["id"] == data["evidence"]["id"]
     event_types = [event["event_type"] for event in studio_data["events"]]
+    assert "context.compiled" in event_types
     assert "subtask.dispatched" in event_types
     assert "evidence.created" in event_types
 
@@ -216,7 +322,11 @@ def test_configured_command_provider_dispatches_non_local_work_unit(tmp_path):
             "'summary': 'Codex shim completed work unit'"
             "}"
             "},"
-            "'evidence': {'command_provider': True},"
+            "'evidence': {"
+            "'command_provider': True,"
+            "'changed_files': ['src/codex_provider.py'],"
+            "'tests_ran': ['python3 -m pytest tests/test_codex_provider.py']"
+            "},"
             "'artifacts': {'bridge': 'shim'}"
             "}))"
         ),
@@ -251,6 +361,13 @@ def test_configured_command_provider_dispatches_non_local_work_unit(tmp_path):
     assert data["dispatch"]["status"] == "completed"
     assert data["dispatch"]["metadata"]["outputs"]["work_unit_result"]["provider"] == "codex"
     assert data["dispatch"]["metadata"]["artifacts"]["bridge"] == "shim"
+    assert data["dispatch"]["metadata"]["agent_output"]["summary"] == "Codex shim completed work unit"
+    assert data["dispatch"]["metadata"]["artifact_index"]["files_changed"] == [
+        "src/codex_provider.py"
+    ]
+    assert data["dispatch"]["metadata"]["artifact_index"]["tests_run"] == [
+        "python3 -m pytest tests/test_codex_provider.py"
+    ]
     assert data["subtask"]["status"] == "review"
     assert data["evidence"]["metadata"]["provider"] == "codex"
     assert data["evidence"]["metadata"]["response_evidence"]["command_provider"] is True
@@ -321,6 +438,19 @@ def test_command_provider_dispatch_uses_reported_usage_when_available(tmp_path):
     assert response.usage.estimated is False
     assert response.usage.total_tokens == 75
     assert response.usage.budget_state == "warning"
+
+
+def test_command_provider_defaults_to_session_unsupported_response(tmp_path):
+    script = tmp_path / "noop_provider.py"
+    script.write_text("print('{}')")
+    adapter = CommandProviderAdapter("demo", [sys.executable, str(script)])
+    session = ProviderSession(session_id="sess-1", provider_name="demo", transport_kind="command")
+
+    response = adapter.send_session_input(session, "continue")
+
+    assert response.success is False
+    assert response.error == "Provider 'demo' does not support session input"
+    assert response.artifacts["session_id"] == "sess-1"
 
 
 def test_dispatch_rejects_offline_non_local_provider(tmp_path):
@@ -472,6 +602,335 @@ def test_native_copilot_dispatch_uses_github_cli_shape_and_records_invocation_me
     assert dispatch_artifacts["script"] == "gh"
     assert dispatch_artifacts["invocation_kind"] == "native_cli"
     assert dispatch_artifacts["workspace_root"] == workspace_root
+
+
+def test_native_opencode_dispatch_prefers_sdk_and_records_invocation_metadata(tmp_path, monkeypatch):
+    from src.runtime.providers.opencode_sdk import OpenCodeSdkProviderAdapter
+
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+    native_opencode = _write_provider_script(
+        tmp_path / "providers" / "opencode",
+        "print('opencode version 1.0.0')",
+    )
+
+    monkeypatch.setattr(
+        OpenCodeSdkProviderAdapter,
+        "_run_sdk_bridge",
+        lambda self, payload, timeout_seconds: {
+            "success": True,
+            "outputs": {"messages": ["OpenCode SDK bridge executed"]},
+            "evidence": {
+                "opencode_sdk": True,
+                "provider_session_id": "sdk-session-123",
+                "workspace_root_used": self.workspace_root,
+            },
+            "artifacts": {
+                "provider_session_id": "sdk-session-123",
+                "server_url": "http://127.0.0.1:4096",
+            },
+        },
+    )
+
+    _, studio_before = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    workspace_id = studio_before["task"]["workspace_id"]
+    workspace_root = str(tmp_path)
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/providers/opencode/test",
+            {"path": str(native_opencode), "auth": "connected"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, scheduled_snapshot = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    running_node = scheduled_snapshot["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{running_node['id']}/dispatch",
+            {"provider": "opencode"},
+        )
+    )
+
+    response_evidence = data["evidence"]["metadata"]["response_evidence"]
+    dispatch_artifacts = data["dispatch"]["metadata"]["artifacts"]
+
+    assert status == 201
+    assert data["dispatch"]["agent_name"] == "opencode"
+    assert response_evidence["opencode_sdk"] is True
+    assert response_evidence["provider_session_id"] == "sdk-session-123"
+    assert response_evidence["workspace_root_used"] == workspace_root
+    assert dispatch_artifacts["invocation_kind"] == "sdk"
+    assert dispatch_artifacts["transport_kind"] == "sdk"
+    assert dispatch_artifacts["workspace_root"] == workspace_root
+
+
+def test_native_codex_dispatch_prefers_sdk_and_records_invocation_metadata(tmp_path, monkeypatch):
+    from src.runtime.providers.openai_sdk import OpenAISdkProviderAdapter
+
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+    native_codex = _write_provider_script(
+        tmp_path / "providers" / "codex",
+        "print('codex version 1.0.0')",
+    )
+
+    monkeypatch.setattr(
+        OpenAISdkProviderAdapter,
+        "_run_sdk_bridge",
+        lambda self, payload, timeout_seconds: {
+            "success": True,
+            "outputs": {"messages": ["OpenAI SDK bridge executed"]},
+            "evidence": {
+                "openai_sdk": True,
+                "provider_session_id": "sdk-session-codex-123",
+                "workspace_root_used": self.workspace_root,
+                "model": "gpt-4.1",
+            },
+            "artifacts": {
+                "provider_session_id": "sdk-session-codex-123",
+                "model": "gpt-4.1",
+            },
+        },
+    )
+
+    _, studio_before = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    workspace_id = studio_before["task"]["workspace_id"]
+    workspace_root = str(tmp_path)
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/providers/codex/test",
+            {"path": str(native_codex), "auth": "connected"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, scheduled_snapshot = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    running_node = scheduled_snapshot["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{running_node['id']}/dispatch",
+            {"provider": "codex"},
+        )
+    )
+
+    response_evidence = data["evidence"]["metadata"]["response_evidence"]
+    dispatch_artifacts = data["dispatch"]["metadata"]["artifacts"]
+
+    assert status == 201
+    assert data["dispatch"]["agent_name"] == "codex"
+    assert response_evidence["openai_sdk"] is True
+    assert response_evidence["provider_session_id"] == "sdk-session-codex-123"
+    assert response_evidence["workspace_root_used"] == workspace_root
+    assert response_evidence["model"] == "gpt-4.1"
+    assert dispatch_artifacts["invocation_kind"] == "sdk"
+    assert dispatch_artifacts["transport_kind"] == "sdk"
+    assert dispatch_artifacts["workspace_root"] == workspace_root
+
+
+def test_native_claude_dispatch_prefers_sdk_and_records_invocation_metadata(tmp_path, monkeypatch):
+    from src.runtime.providers.anthropic_sdk import AnthropicSdkProviderAdapter
+
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+    native_claude = _write_provider_script(
+        tmp_path / "providers" / "claude",
+        "print('claude version 1.0.0')",
+    )
+
+    monkeypatch.setattr(
+        AnthropicSdkProviderAdapter,
+        "_run_sdk_bridge",
+        lambda self, payload, timeout_seconds: {
+            "success": True,
+            "outputs": {"messages": ["Anthropic SDK bridge executed"]},
+            "evidence": {
+                "anthropic_sdk": True,
+                "provider_session_id": "sdk-session-claude-123",
+                "workspace_root_used": self.workspace_root,
+                "model": "claude-sonnet-4-0",
+            },
+            "artifacts": {
+                "provider_session_id": "sdk-session-claude-123",
+                "model": "claude-sonnet-4-0",
+            },
+        },
+    )
+
+    _, studio_before = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    workspace_id = studio_before["task"]["workspace_id"]
+    workspace_root = str(tmp_path)
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/providers/claude/test",
+            {"path": str(native_claude), "auth": "connected"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, scheduled_snapshot = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    running_node = scheduled_snapshot["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{running_node['id']}/dispatch",
+            {"provider": "claude"},
+        )
+    )
+
+    response_evidence = data["evidence"]["metadata"]["response_evidence"]
+    dispatch_artifacts = data["dispatch"]["metadata"]["artifacts"]
+
+    assert status == 201
+    assert data["dispatch"]["agent_name"] == "claude"
+    assert response_evidence["anthropic_sdk"] is True
+    assert response_evidence["provider_session_id"] == "sdk-session-claude-123"
+    assert response_evidence["workspace_root_used"] == workspace_root
+    assert response_evidence["model"] == "claude-sonnet-4-0"
+    assert dispatch_artifacts["invocation_kind"] == "sdk"
+    assert dispatch_artifacts["transport_kind"] == "sdk"
+    assert dispatch_artifacts["workspace_root"] == workspace_root
+
+
+def test_codex_dispatch_can_run_in_sdk_only_mode_without_cli_path(tmp_path, monkeypatch):
+    from src.runtime.providers.openai_sdk import OpenAISdkProviderAdapter
+
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+
+    monkeypatch.setattr(
+        OpenAISdkProviderAdapter,
+        "_run_sdk_bridge",
+        lambda self, payload, timeout_seconds: {
+            "success": True,
+            "outputs": {"messages": ["OpenAI SDK bridge executed without CLI"]},
+            "evidence": {
+                "openai_sdk": True,
+                "provider_session_id": "sdk-only-codex-123",
+                "workspace_root_used": self.workspace_root,
+                "model": payload.get("model"),
+            },
+            "artifacts": {
+                "provider_session_id": "sdk-only-codex-123",
+                "model": payload.get("model"),
+            },
+        },
+    )
+
+    _, studio_before = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    workspace_id = studio_before["task"]["workspace_id"]
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/providers/codex/test",
+            {
+                "path": "",
+                "auth": "connected",
+                "api_key": "sk-test",
+                "model": "gpt-4.1-mini",
+            },
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, scheduled_snapshot = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    running_node = scheduled_snapshot["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{running_node['id']}/dispatch",
+            {"provider": "codex"},
+        )
+    )
+
+    response_evidence = data["evidence"]["metadata"]["response_evidence"]
+    dispatch_artifacts = data["dispatch"]["metadata"]["artifacts"]
+
+    assert status == 201
+    assert data["dispatch"]["status"] == "completed"
+    assert response_evidence["openai_sdk"] is True
+    assert response_evidence["provider_session_id"] == "sdk-only-codex-123"
+    assert response_evidence["model"] == "gpt-4.1-mini"
+    assert dispatch_artifacts["invocation_kind"] == "sdk"
+    assert dispatch_artifacts["transport_kind"] == "sdk"
+
+
+def test_claude_dispatch_can_run_in_sdk_only_mode_without_cli_path(tmp_path, monkeypatch):
+    from src.runtime.providers.anthropic_sdk import AnthropicSdkProviderAdapter
+
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+
+    monkeypatch.setattr(
+        AnthropicSdkProviderAdapter,
+        "_run_sdk_bridge",
+        lambda self, payload, timeout_seconds: {
+            "success": True,
+            "outputs": {"messages": ["Anthropic SDK bridge executed without CLI"]},
+            "evidence": {
+                "anthropic_sdk": True,
+                "provider_session_id": "sdk-only-claude-123",
+                "workspace_root_used": self.workspace_root,
+                "model": payload.get("model"),
+            },
+            "artifacts": {
+                "provider_session_id": "sdk-only-claude-123",
+                "model": payload.get("model"),
+            },
+        },
+    )
+
+    _, studio_before = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    workspace_id = studio_before["task"]["workspace_id"]
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/providers/claude/test",
+            {
+                "path": "",
+                "auth": "connected",
+                "api_key": "anthropic-test",
+                "model": "claude-sonnet-4-0",
+            },
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, scheduled_snapshot = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    running_node = scheduled_snapshot["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{running_node['id']}/dispatch",
+            {"provider": "claude"},
+        )
+    )
+
+    response_evidence = data["evidence"]["metadata"]["response_evidence"]
+    dispatch_artifacts = data["dispatch"]["metadata"]["artifacts"]
+
+    assert status == 201
+    assert data["dispatch"]["status"] == "completed"
+    assert response_evidence["anthropic_sdk"] is True
+    assert response_evidence["provider_session_id"] == "sdk-only-claude-123"
+    assert response_evidence["model"] == "claude-sonnet-4-0"
+    assert dispatch_artifacts["invocation_kind"] == "sdk"
+    assert dispatch_artifacts["transport_kind"] == "sdk"
 
 
 def create_workspace(app, tmp_path):

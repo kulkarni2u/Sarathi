@@ -388,3 +388,12 @@ The next highest-leverage step is:
 That means teaching Sarathi to produce reviewer-grade line-level diff annotations with provider trace depth, so rich hunks can evolve into deeper line-level reasoning and patch-region scoring.
 
 Multi-provider confidence fusion follows after.
+
+## Learning-Loop Cross-Link Slice (2026-05-19)
+
+Implemented durable cross-navigation between learnings and proposals:
+
+- **Learning cards → Proposals**: KnowledgeCenter.tsx "Open proposal" button already calls `onOpenProposal(linked_proposal_id)` - working as designed.
+- **Proposals → auto-focus**: Proposals.tsx now accepts `focusedProposalId` prop, auto-expands and scrolls to the targeted proposal when provided.
+- **Task-side related learnings → exact proposal**: ProjectDetail.tsx "View proposal" button now calls `onOpenProposal(proposalId)` with the specific linked proposal ID instead of routing generically to "proposals".
+- Build: `npm run build` passes (TypeScript + Vite)

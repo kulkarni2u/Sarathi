@@ -515,6 +515,12 @@ def _provider_prompt(provider: str, request: DispatchRequest) -> str:
         f"Inputs: {json.dumps(request.inputs)}",
         f"Constraints: {json.dumps(request.constraints)}",
     ]
+    if request.context_pack is not None:
+        lines.append(f"Context Pack: {json.dumps(request.context_pack)}")
+        lines.append("Use the context pack as the primary source of task truth instead of reconstructing history.")
+    if request.token_budget is not None:
+        lines.append(f"Token Budget: {request.token_budget}")
+        lines.append("Prefer concise reasoning and artifact references over verbose restatement.")
     if evidence_hint:
         lines.append(evidence_hint)
     if output_hint:

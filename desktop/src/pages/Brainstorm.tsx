@@ -94,6 +94,8 @@ export default function Brainstorm({ sessionId, workspaceId, onApproved }: Brain
   if (error || !session) return <div style={{ padding: 32, color: "var(--red)" }}>{error ?? "Session not found"}</div>;
 
   const approved = session.status === "approved";
+  const reuseSource = session.metadata?.reuse_source;
+  const recommendedViews = session.metadata?.recommended_view_ids ?? [];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
@@ -121,6 +123,32 @@ export default function Brainstorm({ sessionId, workspaceId, onApproved }: Brain
           </span>
         )}
       </div>
+
+      {(reuseSource?.name || recommendedViews.length > 0) && (
+        <div style={{
+          display: "flex",
+          flexWrap: "wrap",
+          gap: 8,
+          padding: "10px 20px",
+          borderBottom: "1px solid var(--border)",
+          background: "var(--surface-subtle, var(--surface))",
+        }}>
+          {reuseSource?.name ? (
+            <span className="status-pill">
+              {reuseSource.kind?.replace(/_/g, " ") ?? "workflow"}: {reuseSource.name}
+            </span>
+          ) : null}
+          {session.metadata?.workflow_template_id ? (
+            <span className="status-pill">template {session.metadata.workflow_template_id}</span>
+          ) : null}
+          {session.metadata?.learning_playbook_id ? (
+            <span className="status-pill healthy">playbook {session.metadata.learning_playbook_id}</span>
+          ) : null}
+          {recommendedViews.length > 0 ? (
+            <span className="status-pill">recommended views: {recommendedViews.join(", ")}</span>
+          ) : null}
+        </div>
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", flex: 1, overflow: "hidden" }}>
         <div style={{

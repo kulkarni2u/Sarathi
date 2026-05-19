@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import socketserver
@@ -16,12 +17,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 from uuid import uuid4
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from src.dispatch import LocalDispatcher
+from src.evolve import Evolver, ProposalReviewStore
 from src.init import InitWorkflow
 from src.policy import compile_policy_pack
-from src.runtime import DispatchRequest, GraphExecutionPolicy, UsageRecord, list_agent_roles
+from src.runtime import (
+    ContextCompiler,
+    DispatchRequest,
+    GraphExecutionPolicy,
+    UsageRecord,
+    build_artifact_index,
+    get_agent_role,
+    list_agent_roles,
+    list_phase_agent_roles,
+    normalize_agent_output,
+)
 from src.storage import Storage, connect, run_migrations
 
 MAX_BODY_BYTES = 64 * 1024
@@ -143,6 +155,7 @@ class ServiceApp:
                 )
 
             next_metadata = dict(workspace.get("metadata") or {})
+            changed_keys: list[str] = []
 
             if "repository_action_preference" in raw_metadata:
                 preference = _normalize_repository_action_preference(
@@ -156,6 +169,7 @@ class ServiceApp:
                         400,
                     )
                 next_metadata["repository_action_preference"] = preference
+                changed_keys.append("repository_action_preference")
 
             if "auto_approve_preference" in raw_metadata:
                 preference = _normalize_auto_approve_preference(
@@ -169,15 +183,73 @@ class ServiceApp:
                         400,
                     )
                 next_metadata["auto_approve_preference"] = preference
+                changed_keys.append("auto_approve_preference")
 
-            if "repository_action_preference" not in next_metadata and "auto_approve_preference" not in next_metadata:
+            if "provider_priority" in raw_metadata:
+                priority = raw_metadata["provider_priority"]
+                if not isinstance(priority, list) or not priority:
+                    raise ServiceError(
+                        "invalid_request",
+                        "Field 'provider_priority' must be a non-empty list of provider identifiers.",
+                        400,
+                    )
+                if not all(isinstance(p, str) for p in priority):
+                    raise ServiceError(
+                        "invalid_request",
+                        "Field 'provider_priority' must contain only string values.",
+                        400,
+                    )
+                next_metadata["provider_priority"] = list(priority)
+                changed_keys.append("provider_priority")
+
+            if "reuse_preferences" in raw_metadata:
+                preferences = _normalize_reuse_preferences(raw_metadata["reuse_preferences"])
+                if preferences is None:
+                    raise ServiceError(
+                        "invalid_request",
+                        "Unsupported reuse preferences.",
+                        400,
+                    )
+                next_metadata["reuse_preferences"] = preferences
+                changed_keys.append("reuse_preferences")
+
+            if not changed_keys:
                 raise ServiceError(
                     "invalid_request",
-                    "At least one preference field is required: 'repository_action_preference' or 'auto_approve_preference'.",
+                    "At least one update field is required: 'repository_action_preference', 'auto_approve_preference', 'provider_priority', or 'reuse_preferences'.",
                     400,
                 )
 
             updated_workspace = storage.update_workspace(parts[1], metadata=next_metadata)
+
+            if changed_keys:
+                governance_keys = [
+                    key
+                    for key in changed_keys
+                    if key in {"repository_action_preference", "auto_approve_preference", "provider_priority"}
+                ]
+                reuse_keys = [key for key in changed_keys if key == "reuse_preferences"]
+                if governance_keys:
+                    storage.create_lifecycle_event(
+                        workspace_id=parts[1],
+                        event_type="workspace.governance_updated",
+                        payload={
+                            "object_id": parts[1],
+                            "changed_keys": governance_keys,
+                            "snapshot": {key: next_metadata.get(key) for key in governance_keys},
+                        },
+                    )
+                if reuse_keys:
+                    storage.create_lifecycle_event(
+                        workspace_id=parts[1],
+                        event_type="workspace.reuse_updated",
+                        payload={
+                            "object_id": parts[1],
+                            "changed_keys": reuse_keys,
+                            "snapshot": {key: next_metadata.get(key) for key in reuse_keys},
+                        },
+                    )
+
             return 200, {"workspace": updated_workspace}
 
         if (
@@ -347,6 +419,17 @@ class ServiceApp:
             method == "GET"
             and len(parts) == 3
             and parts[0] == "workspaces"
+            and parts[2] == "reuse-kit"
+        ):
+            workspace_id = parts[1]
+            if storage.get_workspace(workspace_id) is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, _workspace_reuse_kit(storage, workspace_id)
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
             and parts[2] == "dogfood-acceptance"
         ):
             workspace_id = parts[1]
@@ -354,6 +437,147 @@ class ServiceApp:
             if workspace is None:
                 raise ServiceError("not_found", "Workspace not found.", 404)
             return 200, _dogfood_acceptance(storage, workspace)
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
+            and parts[2] == "knowledge-center"
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, _workspace_knowledge_center(storage, workspace)
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
+            and parts[2] == "wiki"
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, _workspace_wiki(workspace)
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
+            and parts[2] == "wiki"
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, _save_workspace_wiki_page(workspace, body)
+
+        if (
+            method == "GET"
+            and len(parts) == 4
+            and parts[0] == "workspaces"
+            and parts[2] == "wiki"
+            and parts[3]
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            wiki_page = unquote(parts[3])
+            return 200, _workspace_wiki_page(workspace, wiki_page)
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
+            and parts[2] == "skills"
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, _workspace_skills(storage, workspace)
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
+            and parts[2] == "skills"
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, _save_workspace_skills(storage, workspace, body)
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
+            and parts[2] == "context-bundles"
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, _workspace_context_bundles(storage, workspace)
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
+            and parts[2] == "proposals"
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, _workspace_proposals(storage, workspace)
+
+        if (
+            method == "GET"
+            and len(parts) == 4
+            and parts[0] == "workspaces"
+            and parts[2] == "proposals"
+            and parts[3]
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            proposal_id = parts[3]
+            return 200, _workspace_proposal_detail(storage, workspace, proposal_id)
+
+        if (
+            method == "POST"
+            and len(parts) == 5
+            and parts[0] == "workspaces"
+            and parts[2] == "proposals"
+            and parts[4] == "accept"
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            proposal_id = parts[3]
+            return 200, _accept_proposal(storage, workspace, proposal_id)
+
+        if (
+            method == "POST"
+            and len(parts) == 5
+            and parts[0] == "workspaces"
+            and parts[2] == "proposals"
+            and parts[4] == "reject"
+        ):
+            workspace_id = parts[1]
+            workspace = storage.get_workspace(workspace_id)
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            proposal_id = parts[3]
+            reason = body.get("reason") if body else None
+            return 200, _reject_proposal(storage, workspace, proposal_id, reason)
 
         if (
             method == "POST"
@@ -955,15 +1179,18 @@ class ServiceApp:
             project_id = _optional_text(body, "project_id")
             provider = _optional_text(body, "provider")
             output_format = _optional_text(body, "output_format") or "markdown"
+            metadata = _normalize_brainstorm_metadata(_optional_dict(body, "metadata"))
             session = storage.create_brainstorm_session(
                 workspace_id=workspace_id,
                 title=title,
                 project_id=project_id,
                 provider=provider,
                 output_format=output_format,
+                metadata=metadata,
             )
             _emit_brainstorm_event(storage, "brainstorm.session_started", {
                 "session_id": session["id"], "workspace_id": workspace_id, "title": title,
+                "metadata": metadata,
             }, workspace_id=workspace_id)
             return 200, {"session": session}
 
@@ -1019,15 +1246,19 @@ class ServiceApp:
             if session["status"] == "approved":
                 raise ServiceError("conflict", "Session already approved.", 409)
             spec_content = session["spec_content"] or f"# {session['title']}\n"
+            session_metadata = _normalize_brainstorm_metadata(session.get("metadata")) or {}
+            task_metadata = {
+                "source": "brainstorm",
+                "brainstorm_session_id": session["id"],
+                "project_id": session["project_id"],
+            }
+            if session_metadata:
+                task_metadata["reuse"] = session_metadata
             task = storage.create_task(
                 workspace_id=session["workspace_id"],
                 title=session["title"],
                 description=spec_content,
-                metadata={
-                    "source": "brainstorm",
-                    "brainstorm_session_id": session["id"],
-                    "project_id": session["project_id"],
-                },
+                metadata=task_metadata,
             )
             approved = storage.approve_brainstorm_session(session["id"], task_id=task["id"])
             spec_path = _write_brainstorm_spec(approved)
@@ -1300,6 +1531,165 @@ def _default_repository_action_preference() -> dict[str, Any]:
         "mode": "no_action",
         "allowed_modes": list(_REPOSITORY_ACTION_MODES),
     }
+
+
+def _default_provider_priority() -> list[str]:
+    return ["claude", "codex", "copilot", "opencode"]
+
+
+def _normalize_saved_view_filters(filters: Any) -> dict[str, Any] | None:
+    if not isinstance(filters, Mapping):
+        return None
+    normalized: dict[str, Any] = {}
+    project_state = filters.get("project_state")
+    if isinstance(project_state, str) and project_state.strip() in {"all", "blocked"}:
+        normalized["project_state"] = project_state.strip()
+    task_state = filters.get("task_state")
+    if isinstance(task_state, str) and task_state.strip() in {"handoff_ready", "checkpoint_ready", "approval_pending"}:
+        normalized["task_state"] = task_state.strip()
+    kind = filters.get("kind")
+    if isinstance(kind, str) and kind.strip() == "approval":
+        normalized["kind"] = "approval"
+    provider_health = filters.get("provider_health")
+    if isinstance(provider_health, str) and provider_health.strip() == "degraded_or_offline":
+        normalized["provider_health"] = "degraded_or_offline"
+    governance = filters.get("governance")
+    if isinstance(governance, str) and governance.strip() == "overrides":
+        normalized["governance"] = "overrides"
+    return normalized
+
+
+def _normalize_custom_saved_view(definition: Any) -> dict[str, Any] | None:
+    if not isinstance(definition, Mapping):
+        return None
+    raw_name = definition.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return None
+    raw_id = definition.get("id")
+    view_id = raw_id.strip() if isinstance(raw_id, str) and raw_id.strip() else f"custom-view-{uuid4().hex[:8]}"
+    role = definition.get("role")
+    route = definition.get("route")
+    description = definition.get("description")
+    metric_label = definition.get("metric_label")
+    filters = _normalize_saved_view_filters(definition.get("filters") or {})
+    if filters is None:
+        return None
+    normalized_route = route.strip() if isinstance(route, str) and route.strip() in {"workspace", "inbox", "settings"} else "workspace"
+    normalized: dict[str, Any] = {
+        "id": view_id,
+        "name": raw_name.strip(),
+        "role": role.strip() if isinstance(role, str) and role.strip() else "custom",
+        "route": normalized_route,
+        "description": description.strip() if isinstance(description, str) and description.strip() else "Custom saved view for recurring Sarathi operations.",
+        "metric_label": metric_label.strip() if isinstance(metric_label, str) and metric_label.strip() else "matching items",
+        "filters": filters,
+    }
+    return normalized
+
+
+def _normalize_brainstorm_metadata(metadata: Any) -> dict[str, Any] | None:
+    if metadata is None:
+        return None
+    if not isinstance(metadata, Mapping):
+        return None
+    normalized: dict[str, Any] = {}
+    reuse_source = metadata.get("reuse_source")
+    if isinstance(reuse_source, Mapping):
+        source_kind = reuse_source.get("kind")
+        source_id = reuse_source.get("id")
+        source_name = reuse_source.get("name")
+        normalized_reuse_source = {
+            "kind": source_kind.strip() if isinstance(source_kind, str) and source_kind.strip() else "workflow",
+            "id": source_id.strip() if isinstance(source_id, str) and source_id.strip() else None,
+            "name": source_name.strip() if isinstance(source_name, str) and source_name.strip() else None,
+        }
+        normalized["reuse_source"] = normalized_reuse_source
+    workflow_template_id = metadata.get("workflow_template_id")
+    if isinstance(workflow_template_id, str) and workflow_template_id.strip():
+        normalized["workflow_template_id"] = workflow_template_id.strip()
+    learning_playbook_id = metadata.get("learning_playbook_id")
+    if isinstance(learning_playbook_id, str) and learning_playbook_id.strip():
+        normalized["learning_playbook_id"] = learning_playbook_id.strip()
+    recommended_view_ids = metadata.get("recommended_view_ids")
+    if isinstance(recommended_view_ids, list):
+        normalized_ids = [value.strip() for value in recommended_view_ids if isinstance(value, str) and value.strip()]
+        if normalized_ids:
+            normalized["recommended_view_ids"] = normalized_ids[:4]
+    recommended_repository_action_mode = metadata.get("recommended_repository_action_mode")
+    if isinstance(recommended_repository_action_mode, str) and recommended_repository_action_mode.strip():
+        normalized["recommended_repository_action_mode"] = recommended_repository_action_mode.strip()
+    recommended_auto_approve_mode = metadata.get("recommended_auto_approve_mode")
+    if isinstance(recommended_auto_approve_mode, str) and recommended_auto_approve_mode.strip():
+        normalized["recommended_auto_approve_mode"] = recommended_auto_approve_mode.strip()
+    suggested_provider_priority = metadata.get("suggested_provider_priority")
+    if isinstance(suggested_provider_priority, list):
+        allowed = set(_default_provider_priority())
+        normalized_priority = [
+            value.strip()
+            for value in suggested_provider_priority
+            if isinstance(value, str) and value.strip() in allowed
+        ]
+        if normalized_priority:
+            normalized["suggested_provider_priority"] = normalized_priority
+    return normalized
+
+
+def _normalize_reuse_preferences(preferences: Any) -> dict[str, Any] | None:
+    if not isinstance(preferences, Mapping):
+        return None
+    active_saved_view_id = preferences.get("active_saved_view_id")
+    if active_saved_view_id is not None and not isinstance(active_saved_view_id, str):
+        return None
+    normalized: dict[str, Any] = {}
+    if isinstance(active_saved_view_id, str) and active_saved_view_id.strip():
+        normalized["active_saved_view_id"] = active_saved_view_id.strip()
+    custom_saved_views = preferences.get("custom_saved_views")
+    if custom_saved_views is not None:
+        if not isinstance(custom_saved_views, list):
+            return None
+        builtin_ids = {
+            "all-projects",
+            "approvals-inbox",
+            "blocked-projects",
+            "handoff-readiness",
+            "checkpoint-queue",
+            "provider-posture",
+            "governance-overrides",
+        }
+        seen_ids: set[str] = set()
+        normalized_saved_views: list[dict[str, Any]] = []
+        for item in custom_saved_views[:8]:
+            normalized_view = _normalize_custom_saved_view(item)
+            if normalized_view is None:
+                continue
+            if normalized_view["id"] in builtin_ids or normalized_view["id"] in seen_ids:
+                continue
+            seen_ids.add(normalized_view["id"])
+            normalized_saved_views.append(normalized_view)
+        normalized["custom_saved_views"] = normalized_saved_views
+    return normalized
+
+
+def _normalize_provider_priority(priority: Any) -> list[str] | None:
+    if not isinstance(priority, list):
+        return None
+    allowed = _default_provider_priority()
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for value in priority:
+        if not isinstance(value, str):
+            continue
+        provider_id = value.strip()
+        if not provider_id or provider_id not in allowed or provider_id in seen:
+            continue
+        seen.add(provider_id)
+        normalized.append(provider_id)
+    if not normalized:
+        return None
+    for provider_id in allowed:
+        if provider_id not in seen:
+            normalized.append(provider_id)
+    return normalized
 
 
 def _normalize_repository_action_preference(
@@ -1704,16 +2094,31 @@ def _graph_for_task(storage: Storage, task: dict[str, Any]) -> dict[str, Any]:
 
 def _task_studio_snapshot(storage: Storage, task: dict[str, Any]) -> dict[str, Any]:
     task_id = task["id"]
+    graph = _graph_for_task(storage, task)
+    approvals = storage.list_approval_gates_for_task(task_id)
+    reviews = storage.list_review_runs_for_task(task_id)
+    latest_handoff = _latest_or_none(storage.list_handoffs_for_task(task_id))
+    latest_checkpoint = _latest_or_none(storage.list_checkpoint_capsules_for_task(task_id))
+    workspace = storage.get_workspace(task["workspace_id"])
     return {
         "task": task,
-        "graph": _graph_for_task(storage, task),
+        "graph": graph,
+        "header": _task_studio_header(
+            task,
+            graph=graph,
+            approvals=approvals,
+            reviews=reviews,
+            handoff=latest_handoff,
+            checkpoint=latest_checkpoint,
+            workspace=workspace,
+        ),
         "messages": storage.list_messages(task_id=task_id),
-        "approval_gates": storage.list_approval_gates_for_task(task_id),
+        "approval_gates": approvals,
         "events": storage.list_events(task_id=task_id),
         "dispatches": storage.list_dispatches_for_task(task_id),
         "evidence": storage.list_evidence_artifacts_for_task(task_id),
-        "reviews": storage.list_review_runs_for_task(task_id),
-        "handoff": _latest_or_none(storage.list_handoffs_for_task(task_id)),
+        "reviews": reviews,
+        "handoff": latest_handoff,
     }
 
 
@@ -1723,6 +2128,7 @@ def _workspace_operational_views(storage: Storage, workspace_id: str) -> dict[st
     repositories = storage.list_workspace_repositories(workspace_id)
     history = storage.list_events(workspace_id=workspace_id)
     messages = storage.list_messages(workspace_id=workspace_id)
+    workspace = storage.get_workspace(workspace_id)
     providers = _provider_health(storage, workspace_id)
     all_subtasks: list[dict[str, Any]] = []
     all_dispatches: list[dict[str, Any]] = []
@@ -1730,19 +2136,47 @@ def _workspace_operational_views(storage: Storage, workspace_id: str) -> dict[st
     all_reviews: list[dict[str, Any]] = []
     all_handoffs: list[dict[str, Any]] = []
     diagrams: list[dict[str, Any]] = []
+    project_rollups: dict[str, dict[str, int]] = {
+        project["id"]: {
+            "approval_pending_count": 0,
+            "checkpoint_ready_count": 0,
+            "handoff_ready_count": 0,
+        }
+        for project in projects
+    }
 
     for task in tasks:
         graph = _graph_for_task(storage, task)
         subtasks = storage.list_subtasks_for_task(task["id"])
+        approvals = storage.list_approval_gates_for_task(task["id"])
         dispatches = storage.list_dispatches_for_task(task["id"])
         evidence = storage.list_evidence_artifacts_for_task(task["id"])
         reviews = storage.list_review_runs_for_task(task["id"])
         handoffs = storage.list_handoffs_for_task(task["id"])
+        latest_checkpoint = _latest_or_none(storage.list_checkpoint_capsules_for_task(task["id"]))
+        latest_handoff = _latest_or_none(handoffs)
         all_subtasks.extend(subtasks)
         all_dispatches.extend(dispatches)
         all_evidence.extend(evidence)
         all_reviews.extend(reviews)
         all_handoffs.extend(handoffs)
+        project_id = str((task.get("metadata") or {}).get("project_id") or "")
+        if project_id and project_id in project_rollups:
+            header = _task_studio_header(
+                task,
+                graph=graph,
+                approvals=approvals,
+                reviews=reviews,
+                handoff=latest_handoff,
+                checkpoint=latest_checkpoint,
+                workspace=workspace,
+            )
+            if header["approval_state"] not in {"approved", "none"}:
+                project_rollups[project_id]["approval_pending_count"] += 1
+            if header["checkpoint_ready"]:
+                project_rollups[project_id]["checkpoint_ready_count"] += 1
+            if header["handoff_state"] == "ready":
+                project_rollups[project_id]["handoff_ready_count"] += 1
         if graph["nodes"]:
             diagrams.append(
                 {
@@ -1772,7 +2206,6 @@ def _workspace_operational_views(storage: Storage, workspace_id: str) -> dict[st
                     ],
                 }
             )
-        latest_handoff = _latest_or_none(handoffs)
         if latest_handoff is not None:
             diagrams.append(
                 {
@@ -1802,22 +2235,47 @@ def _workspace_operational_views(storage: Storage, workspace_id: str) -> dict[st
     project_summaries: list[dict[str, Any]] = []
     for project in projects:
         stats = storage.get_project_stats(project["id"])
+        rollup = project_rollups.get(project["id"], {})
         project_summaries.append(
             {
                 **project,
                 "task_count": stats["task_count"],
                 "blocked_count": stats["blocked_count"],
                 "review_needed_count": stats["review_needed_count"],
+                "approval_pending_count": int(rollup.get("approval_pending_count", 0)),
+                "checkpoint_ready_count": int(rollup.get("checkpoint_ready_count", 0)),
+                "handoff_ready_count": int(rollup.get("handoff_ready_count", 0)),
                 "updated_at": stats["last_activity"] or project["updated_at"],
             }
         )
 
+    inbox = _build_inbox_items(storage, tasks)
+    workspace_metadata = (workspace.get("metadata") or {}) if workspace else {}
+
+    governance = _workspace_governance(
+        storage,
+        workspace_id,
+        workspace_metadata,
+        providers,
+        history,
+        all_handoffs,
+    )
+
     return {
         "workspace_id": workspace_id,
+        "summary": {
+            "project_count": len(project_summaries),
+            "approvals_pending": sum(1 for item in inbox if item["kind"] == "approval"),
+            "checkpoint_ready_count": sum(1 for item in inbox if item["kind"] == "checkpoint_ready"),
+            "handoff_ready_count": sum(1 for item in inbox if item["kind"] == "handoff_ready"),
+            "provider_online_count": len([provider for provider in providers if provider["health"] == "online"]),
+        },
         "projects": project_summaries,
+        "inbox": inbox,
         "history": history,
         "lifecycle": lifecycle,
         "diagrams": diagrams,
+        "governance": governance,
         "usage": {
             "tasks": {
                 "total": len(tasks),
@@ -1844,6 +2302,482 @@ def _workspace_operational_views(storage: Storage, workspace_id: str) -> dict[st
             },
         },
     }
+
+
+def _workspace_governance(
+    storage: Storage,
+    workspace_id: str,
+    workspace_metadata: dict[str, Any],
+    providers: list[dict[str, Any]],
+    history: list[dict[str, Any]],
+    handoffs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    repository_action_preference = _normalize_repository_action_preference(
+        workspace_metadata.get("repository_action_preference"),
+        fallback_scope="workspace",
+    ) or _default_repository_action_preference()
+    auto_approve_preference = _normalize_auto_approve_preference(
+        workspace_metadata.get("auto_approve_preference"),
+        fallback_scope="workspace",
+    ) or _default_auto_approve_preference()
+    provider_priority = _get_provider_priority(storage, workspace_id)
+    policy_posture = {
+        "repository_action_preference": repository_action_preference,
+        "auto_approve_preference": auto_approve_preference,
+        "provider_priority": provider_priority,
+        "provider_priority_source": "workspace" if workspace_metadata.get("provider_priority") else "default",
+    }
+
+    provider_map = {p["id"]: p for p in providers}
+    provider_health_map = {p["id"]: p.get("health", "offline") for p in providers}
+
+    selected_provider = _select_available_provider(storage, workspace_id, provider_priority)
+    fallback_candidates = [
+        pid for pid in provider_priority
+        if pid != selected_provider and provider_map.get(pid) is not None
+    ]
+
+    provider_routing = {
+        "priority_order": provider_priority,
+        "selected_provider": selected_provider or "local",
+        "fallback_candidates": fallback_candidates,
+        "provider_health": {
+            pid: provider_health_map.get(pid, "unknown") for pid in provider_priority if pid in provider_map
+        },
+        "providers": [
+            {
+                "id": provider["id"],
+                "name": provider["name"],
+                "health": provider["health"],
+                "auth": provider["auth"],
+                "transport_posture": provider.get("transport_posture"),
+                "degraded_reason": provider.get("degraded_reason"),
+                "last_error": provider.get("last_error"),
+                "model": provider.get("model"),
+            }
+            for provider in providers
+        ],
+    }
+
+    override_history: list[dict[str, Any]] = []
+    for event in history:
+        payload = event.get("payload") or {}
+        event_type = str(event.get("event_type") or "")
+        if event_type == "workspace.governance_updated":
+            changed_keys = payload.get("changed_keys", [])
+            override_history.append(
+                {
+                    "id": event["id"],
+                    "event_type": event_type,
+                    "task_id": event.get("task_id"),
+                    "summary": f"Workspace governance updated: {', '.join(changed_keys) if isinstance(changed_keys, list) and changed_keys else 'governance settings'}",
+                    "severity": "warning",
+                    "created_at": event["created_at"],
+                    "metadata": payload,
+                }
+            )
+        elif event_type == "approval.recorded" and payload.get("auto_approved") is True:
+            override_history.append(
+                {
+                    "id": event["id"],
+                    "event_type": event_type,
+                    "task_id": event.get("task_id"),
+                    "summary": "A pending gate was auto-approved under workspace policy.",
+                    "severity": "warning",
+                    "created_at": event["created_at"],
+                    "metadata": payload,
+                }
+            )
+        elif event_type == "repository_action.approved":
+            override_history.append(
+                {
+                    "id": event["id"],
+                    "event_type": event_type,
+                    "task_id": event.get("task_id"),
+                    "summary": f"Repository action approved: {payload.get('action') or 'no_action'}",
+                    "severity": "active",
+                    "created_at": event["created_at"],
+                    "metadata": payload,
+                }
+            )
+        elif event_type == "provider.health_checked":
+            health = str(payload.get("health") or "")
+            if health in {"offline", "rate_limited"}:
+                override_history.append(
+                    {
+                        "id": event["id"],
+                        "event_type": event_type,
+                        "task_id": event.get("task_id"),
+                        "summary": f"Provider posture changed: {payload.get('object_id') or 'provider'} is {health}.",
+                        "severity": "warning",
+                        "created_at": event["created_at"],
+                        "metadata": payload,
+                    }
+                )
+    override_history = sorted(override_history, key=lambda item: item["created_at"], reverse=True)[:10]
+
+    task_titles = {task["id"]: task["title"] for task in storage.list_tasks_for_workspace(workspace_id)}
+    repository_action_recent = []
+    for handoff in sorted(handoffs, key=lambda item: item["created_at"], reverse=True):
+        metadata = handoff.get("metadata") or {}
+        repository_action = metadata.get("repository_action") or {}
+        repository_action_preference = metadata.get("repository_action_preference") or {}
+        repository_action_recent.append(
+            {
+                "id": handoff["id"],
+                "task_id": handoff["task_id"],
+                "title": task_titles.get(handoff["task_id"], "Unknown task"),
+                "summary": handoff["summary"],
+                "status": repository_action.get("status", "pending"),
+                "action": repository_action.get("action") or repository_action.get("mode") or repository_action_preference.get("mode") or "no_action",
+                "mode": repository_action_preference.get("mode") or repository_action.get("mode") or "no_action",
+                "created_at": handoff["created_at"],
+            }
+        )
+    repository_action_recent = repository_action_recent[:8]
+
+    repository_action_governance = {
+        "pending_count": sum(1 for item in repository_action_recent if item["status"] == "pending"),
+        "approved_count": sum(1 for item in repository_action_recent if item["status"] == "approved"),
+        "recent": repository_action_recent,
+    }
+
+    return {
+        "policy_posture": policy_posture,
+        "provider_routing": provider_routing,
+        "override_history": override_history,
+        "repository_action_governance": repository_action_governance,
+    }
+
+
+def _workspace_reuse_kit(storage: Storage, workspace_id: str) -> dict[str, Any]:
+    workspace = storage.get_workspace(workspace_id)
+    if workspace is None:
+        raise ServiceError("not_found", "Workspace not found.", 404)
+
+    reuse_preferences = _normalize_reuse_preferences((workspace.get("metadata") or {}).get("reuse_preferences")) or {}
+    operations = _workspace_operational_views(storage, workspace_id)
+    templates = _builtin_workflow_templates()
+    saved_views = _workspace_saved_views(
+        operations,
+        custom_saved_views=reuse_preferences.get("custom_saved_views") or [],
+    )
+    playbooks = _workspace_learning_playbooks(
+        storage,
+        workspace,
+        templates=templates,
+        saved_views=saved_views,
+    )
+    return {
+        "workspace_id": workspace_id,
+        "active_saved_view_id": reuse_preferences.get("active_saved_view_id") or "all-projects",
+        "templates": templates,
+        "saved_views": saved_views,
+        "playbooks": playbooks,
+    }
+
+
+def _builtin_workflow_templates() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "feature-delivery",
+            "name": "Feature delivery",
+            "category": "delivery",
+            "summary": "Turn a feature request into PRD, AC coverage, governed execution, review, and final handoff.",
+            "complexity": "medium",
+            "starter_title": "Template: feature delivery",
+            "recommended_repository_action_mode": "draft_pr",
+            "recommended_auto_approve_mode": "below_threshold",
+            "suggested_provider_priority": ["codex", "claude", "copilot", "opencode"],
+            "recommended_view_ids": ["approvals-inbox", "handoff-readiness"],
+        },
+        {
+            "id": "bugfix-regression",
+            "name": "Bug fix and regression guard",
+            "category": "stability",
+            "summary": "Bias the workflow toward root-cause clarity, targeted implementation, and explicit regression proof.",
+            "complexity": "low",
+            "starter_title": "Template: bug fix and regression guard",
+            "recommended_repository_action_mode": "prepare_patch",
+            "recommended_auto_approve_mode": "manual_only",
+            "suggested_provider_priority": ["claude", "codex", "copilot", "opencode"],
+            "recommended_view_ids": ["blocked-projects", "approvals-inbox"],
+        },
+        {
+            "id": "governed-release-handoff",
+            "name": "Governed release handoff",
+            "category": "handoff",
+            "summary": "Focus the team on checklist completion, repository posture, acceptance coverage, and a release-ready dossier.",
+            "complexity": "high",
+            "starter_title": "Template: governed release handoff",
+            "recommended_repository_action_mode": "ready_pr",
+            "recommended_auto_approve_mode": "manual_only",
+            "suggested_provider_priority": ["claude", "codex", "copilot", "opencode"],
+            "recommended_view_ids": ["handoff-readiness", "governance-overrides"],
+        },
+        {
+            "id": "provider-recovery",
+            "name": "Provider recovery and fallback",
+            "category": "operations",
+            "summary": "Stabilize degraded providers, validate fallback order, and capture routing decisions as durable evidence.",
+            "complexity": "medium",
+            "starter_title": "Template: provider recovery and fallback",
+            "recommended_repository_action_mode": "no_action",
+            "recommended_auto_approve_mode": "manual_only",
+            "suggested_provider_priority": ["claude", "codex", "copilot", "opencode"],
+            "recommended_view_ids": ["provider-posture", "governance-overrides"],
+        },
+    ]
+
+
+def _saved_view_count(filters: Mapping[str, Any], operations: dict[str, Any]) -> int:
+    governance = operations.get("governance") or {}
+    provider_routing = governance.get("provider_routing") or {}
+    repository_action_governance = governance.get("repository_action_governance") or {}
+    override_history = governance.get("override_history") or []
+    provider_rows = provider_routing.get("providers") or []
+    degraded_provider_count = len(
+        [provider for provider in provider_rows if provider.get("health") not in {"online", "unknown"}]
+    )
+    blocked_projects = len(
+        [project for project in operations.get("projects") or [] if int(project.get("blocked_count") or 0) > 0]
+    )
+    if filters.get("kind") == "approval" or filters.get("task_state") == "approval_pending":
+        return int((operations.get("summary") or {}).get("approvals_pending") or 0)
+    if filters.get("project_state") == "blocked":
+        return blocked_projects
+    if filters.get("task_state") == "handoff_ready":
+        return int((operations.get("summary") or {}).get("handoff_ready_count") or 0)
+    if filters.get("task_state") == "checkpoint_ready":
+        return int((operations.get("summary") or {}).get("checkpoint_ready_count") or 0)
+    if filters.get("provider_health") == "degraded_or_offline":
+        return degraded_provider_count
+    if filters.get("governance") == "overrides":
+        return len(override_history) + int(repository_action_governance.get("pending_count") or 0)
+    return len(operations.get("projects") or [])
+
+
+def _workspace_saved_views(
+    operations: dict[str, Any],
+    *,
+    custom_saved_views: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    saved_views = [
+        {
+            "id": "all-projects",
+            "name": "All projects",
+            "role": "workspace",
+            "route": "workspace",
+            "description": "Default workspace view with every attached project visible.",
+            "metric_label": "visible projects",
+            "count": _saved_view_count({"project_state": "all"}, operations),
+            "filters": {"project_state": "all"},
+            "origin": "builtin",
+        },
+        {
+            "id": "approvals-inbox",
+            "name": "Approval inbox",
+            "role": "operator",
+            "route": "inbox",
+            "description": "Review pending gates and human decisions without scanning the full workspace.",
+            "metric_label": "pending approvals",
+            "count": _saved_view_count({"kind": "approval"}, operations),
+            "filters": {"kind": "approval"},
+            "origin": "builtin",
+        },
+        {
+            "id": "blocked-projects",
+            "name": "Blocked projects",
+            "role": "tech_lead",
+            "route": "workspace",
+            "description": "Jump straight to blocked delivery work that needs routing or repository decisions.",
+            "metric_label": "blocked projects",
+            "count": _saved_view_count({"project_state": "blocked"}, operations),
+            "filters": {"project_state": "blocked"},
+            "origin": "builtin",
+        },
+        {
+            "id": "handoff-readiness",
+            "name": "Handoff readiness",
+            "role": "product_owner",
+            "route": "workspace",
+            "description": "Track what is ready for governed handoff and where final proof is still missing.",
+            "metric_label": "handoff-ready tasks",
+            "count": _saved_view_count({"task_state": "handoff_ready"}, operations),
+            "filters": {"task_state": "handoff_ready"},
+            "origin": "builtin",
+        },
+        {
+            "id": "checkpoint-queue",
+            "name": "Checkpoint queue",
+            "role": "operator",
+            "route": "workspace",
+            "description": "Resume work from persisted checkpoints instead of asking agents to rediscover state.",
+            "metric_label": "checkpoint-ready tasks",
+            "count": _saved_view_count({"task_state": "checkpoint_ready"}, operations),
+            "filters": {"task_state": "checkpoint_ready"},
+            "origin": "builtin",
+        },
+        {
+            "id": "provider-posture",
+            "name": "Provider posture",
+            "role": "workspace_admin",
+            "route": "settings",
+            "description": "Inspect degraded providers, fallback ordering, and SDK or CLI routing posture in one place.",
+            "metric_label": "degraded providers",
+            "count": _saved_view_count({"provider_health": "degraded_or_offline"}, operations),
+            "filters": {"provider_health": "degraded_or_offline"},
+            "origin": "builtin",
+        },
+        {
+            "id": "governance-overrides",
+            "name": "Governance overrides",
+            "role": "owner",
+            "route": "settings",
+            "description": "Inspect recent auto-approvals, routing changes, and repository-action decisions with audit context.",
+            "metric_label": "recent overrides",
+            "count": _saved_view_count({"governance": "overrides"}, operations),
+            "filters": {"governance": "overrides"},
+            "origin": "builtin",
+        },
+    ]
+    for definition in custom_saved_views or []:
+        filters = definition.get("filters") or {}
+        saved_views.append(
+            {
+                "id": definition["id"],
+                "name": definition["name"],
+                "role": definition.get("role") or "custom",
+                "route": definition.get("route") or "workspace",
+                "description": definition.get("description") or "Custom saved view.",
+                "metric_label": definition.get("metric_label") or "matching items",
+                "count": _saved_view_count(filters, operations),
+                "filters": filters,
+                "origin": "custom",
+            }
+        )
+    return saved_views
+
+
+def _workspace_learning_playbooks(
+    storage: Storage,
+    workspace: dict[str, Any],
+    *,
+    templates: list[dict[str, Any]],
+    saved_views: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    learning_path = workspace_root / "learnings.md"
+    if not learning_path.exists():
+        return []
+
+    learning_sections = _parse_workspace_learnings(learning_path)
+    if not learning_sections:
+        return []
+
+    accepted_events = [
+        event
+        for event in storage.list_events(workspace_id=workspace["id"])
+        if event.get("event_type") == "learning.accepted"
+    ]
+    events_by_task = {
+        str((event.get("payload") or {}).get("task_id") or ""): event for event in accepted_events
+    }
+    template_ids = {template["id"] for template in templates}
+    saved_view_ids = {view["id"] for view in saved_views}
+
+    playbooks: list[dict[str, Any]] = []
+    for index, section in enumerate(learning_sections[:4]):
+        recommended_template_id = _playbook_template_for_learning(section)
+        event = events_by_task.get(section.get("task_id") or "")
+        recommended_views = [
+            view_id
+            for view_id in _playbook_saved_views_for_learning(section)
+            if view_id in saved_view_ids
+        ]
+        playbooks.append(
+            {
+                "id": event["id"] if event is not None else f"learning-playbook-{index + 1}",
+                "name": section.get("title") or f"Accepted learning {index + 1}",
+                "summary": section.get("summary") or "Accepted learning with reusable operator guidance.",
+                "recommended_template_id": recommended_template_id if recommended_template_id in template_ids else None,
+                "recommended_view_ids": recommended_views,
+                "source": "accepted_learning",
+                "provenance": {
+                    "task_id": section.get("task_id"),
+                    "source_file": str(learning_path),
+                    "event_id": event["id"] if event is not None else None,
+                    "evidence_refs": section.get("evidence_refs") or [],
+                    "tags": section.get("tags") or [],
+                },
+            }
+        )
+    return playbooks
+
+
+def _parse_workspace_learnings(learning_path: Path) -> list[dict[str, Any]]:
+    content = learning_path.read_text(encoding="utf-8")
+    sections: list[dict[str, Any]] = []
+    for raw_section in content.split("\n## "):
+        section = raw_section.strip()
+        if not section:
+            continue
+        title_line, _, remainder = section.partition("\n")
+        normalized_title = title_line.strip().removeprefix("## ").strip()
+        if "Accepted" not in normalized_title:
+            continue
+        parsed = {
+            "title": normalized_title,
+            "summary": "",
+            "task_id": "",
+            "tags": [],
+            "evidence_refs": [],
+        }
+        for line in remainder.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- Task:"):
+                parsed["task_id"] = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("- Summary:"):
+                parsed["summary"] = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("- Tags:"):
+                parsed["tags"] = [
+                    part.strip()
+                    for part in stripped.split(":", 1)[1].split(",")
+                    if part.strip()
+                ]
+            elif stripped.startswith("- ") and ":" in stripped and "(" in stripped and ")" in stripped:
+                evidence = stripped.split("(", 1)[1].rstrip(")")
+                parsed["evidence_refs"].extend(
+                    [part.strip() for part in evidence.split(",") if part.strip() and part.strip() != "no refs"]
+                )
+        sections.append(parsed)
+    return sections
+
+
+def _playbook_template_for_learning(section: dict[str, Any]) -> str:
+    summary = str(section.get("summary") or "").lower()
+    tags = {str(tag).lower() for tag in section.get("tags") or []}
+    has_dogfood_tag = any("dogfood" in tag for tag in tags)
+    if "bug" in summary or "regression" in summary:
+        return "bugfix-regression"
+    if "provider" in summary or "routing" in summary or "fallback" in summary:
+        return "provider-recovery"
+    if "handoff" in summary or "release" in summary or has_dogfood_tag:
+        return "governed-release-handoff"
+    return "feature-delivery"
+
+
+def _playbook_saved_views_for_learning(section: dict[str, Any]) -> list[str]:
+    summary = str(section.get("summary") or "").lower()
+    tags = {str(tag).lower() for tag in section.get("tags") or []}
+    has_dogfood_tag = any("dogfood" in tag for tag in tags)
+    if "provider" in summary or "routing" in summary or "fallback" in summary:
+        return ["provider-posture", "governance-overrides"]
+    if "release" in summary or "handoff" in summary or has_dogfood_tag:
+        return ["handoff-readiness", "governance-overrides"]
+    if "bug" in summary or "regression" in summary:
+        return ["blocked-projects", "approvals-inbox"]
+    return ["approvals-inbox", "checkpoint-queue"]
 
 
 def _workspace_lifecycle_roles(
@@ -2084,6 +3018,914 @@ def _approve_dogfood_learning(
     return {"learning_record": learning_record, "acceptance": acceptance}
 
 
+def _workspace_knowledge_center(
+    storage: Storage,
+    workspace: dict[str, Any],
+) -> dict[str, Any]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    guide_status = _repository_guide_status(workspace_root)
+    wiki_pages = _list_wiki_pages(workspace_root)
+    learnings_status = _learnings_status(workspace_root)
+    enriched_learnings = _enrich_learnings_with_linkages(storage, workspace, learnings_status)
+    skills_summary = _skills_summary(workspace_root)
+    recent_contexts = _recent_context_bundles_summary(storage, workspace["id"])
+    proposals_summary = _proposal_summary(storage, workspace)
+    section_health = {
+        "wiki": {
+            "page_count": len(wiki_pages),
+            "deep_links": _count_wiki_deep_links(wiki_pages),
+            "last_updated": _get_most_recent_wiki_update(workspace_root),
+        },
+        "context": {
+            "total_bundles": recent_contexts.get("total_bundles", 0),
+            "recent_count": recent_contexts.get("recent_count", 0),
+            "unique_tasks": _count_unique_task_contexts(storage, workspace["id"]),
+        },
+        "proposals": {
+            "pending": proposals_summary.get("pending_count", 0),
+            "accepted": proposals_summary.get("accepted_count", 0),
+            "rejected": proposals_summary.get("rejected_count", 0),
+            "last_reviewed": proposals_summary.get("last_reviewed_at"),
+        },
+        "learnings": {
+            "accepted_count": len(enriched_learnings.get("accepted_learnings", [])),
+            "sections": learnings_status.get("sections", 0),
+        },
+    }
+    accepted_context_guidance = _accepted_context_proposals(workspace_root)
+    return {
+        "workspace_id": workspace["id"],
+        "guide": guide_status,
+        "wiki": wiki_pages,
+        "learnings": enriched_learnings,
+        "skills": skills_summary,
+        "recent_contexts": recent_contexts,
+        "proposals": proposals_summary,
+        "section_health": section_health,
+        "context_compiler_guidance": accepted_context_guidance,
+    }
+
+
+def _workspace_wiki(workspace: dict[str, Any]) -> dict[str, Any]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    pages = _list_wiki_pages(workspace_root)
+    return {
+        "workspace_id": workspace["id"],
+        "pages": pages,
+    }
+
+
+def _workspace_wiki_page(workspace: dict[str, Any], page: str) -> dict[str, Any]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    wiki_dir = workspace_root / "wiki"
+    page_path = _resolve_workspace_wiki_page_path(wiki_dir, page)
+    if not wiki_dir.exists():
+        raise ServiceError("not_found", "Wiki directory not found.", 404)
+    if not page_path.exists():
+        raise ServiceError("not_found", f"Wiki page '{page}' not found.", 404)
+    content = page_path.read_text(encoding="utf-8") if page_path.is_file() else ""
+    return {
+        "workspace_id": workspace["id"],
+        "page": page,
+        "content": content,
+        "path": str(page_path),
+    }
+
+
+def _save_workspace_wiki_page(workspace: dict[str, Any], body: Mapping[str, Any] | None) -> dict[str, Any]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    wiki_dir = workspace_root / "wiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    page = _required_text(body, "page")
+    content = _required_text(body, "content")
+    page_path = _resolve_workspace_wiki_page_path(wiki_dir, page)
+    page_path.parent.mkdir(parents=True, exist_ok=True)
+    page_path.write_text(content, encoding="utf-8")
+    return {
+        "workspace_id": workspace["id"],
+        "page": page,
+        "content": content,
+        "path": str(page_path),
+    }
+
+
+def _workspace_skills(storage: Storage, workspace: dict[str, Any]) -> dict[str, Any]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    skills = _list_skills(workspace_root)
+    routes = _list_skill_routes(workspace_root)
+    role_mappings = _role_mappings()
+    behavior_assets = _behavior_assets(workspace_root)
+    skills_file = workspace_root / "policy-pack" / "skills.md"
+    evolution_proposals = _filtered_evolution_proposals(storage, workspace)
+    evolution_history = _reviewed_evolution_history(workspace)
+    return {
+        "workspace_id": workspace["id"],
+        "skills": skills,
+        "routes": routes,
+        "role_mappings": role_mappings,
+        "behavior_assets": behavior_assets,
+        "evolution_proposals": evolution_proposals,
+        "evolution_history": evolution_history,
+        "path": str(skills_file),
+        "source_content": skills_file.read_text(encoding="utf-8") if skills_file.exists() else "",
+    }
+
+
+def _filtered_evolution_proposals(storage: Storage, workspace: dict[str, Any]) -> list[dict[str, Any]]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    policy_pack_path = workspace_root / "policy-pack"
+    if not policy_pack_path.exists():
+        return []
+    records = _synthesize_learning_records(storage, workspace["id"])
+    reviewed_ids = _reviewed_proposal_ids(policy_pack_path)
+    skill_relevant_kinds = {"skill_update", "routing_hint"}
+    skill_relevant_files = {"skills.md", "model-routing.md"}
+    proposals = [
+        proposal.to_artifact()
+        for proposal in Evolver().generate_policy_proposals(learning_records=records)
+        if proposal.proposal_id not in reviewed_ids
+        and (
+            proposal.proposal_kind in skill_relevant_kinds
+            or any(
+                proposal.policy_file.endswith(f) or f"policy-pack/{f}" in proposal.policy_file
+                for f in skill_relevant_files
+            )
+        )
+    ]
+    return proposals
+
+
+def _reviewed_evolution_history(workspace: dict[str, Any]) -> list[dict[str, Any]]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    policy_pack_path = workspace_root / "policy-pack"
+    if not policy_pack_path.exists():
+        return []
+    all_decisions = _reviewed_proposal_decisions(policy_pack_path)
+    skill_relevant_kinds = {"skill_update", "routing_hint"}
+    skill_relevant_files = {"skills.md", "model-routing.md"}
+    history: list[dict[str, Any]] = []
+    for decision in all_decisions:
+        if not isinstance(decision, dict):
+            continue
+        status = str(decision.get("status", "")).strip().lower()
+        if status not in {"accepted", "rejected"}:
+            continue
+        title = str(decision.get("title", "")).strip()
+        proposal_id = str(decision.get("id", "")).strip()
+        policy_file = str(decision.get("policy_file", "")).strip()
+        reviewed_at = str(decision.get("reviewed_at", "")).strip()
+        reason = str(decision.get("reason", "")).strip() if status == "rejected" else ""
+        source = str(decision.get("source", "")).strip()
+        raw_impacted_assets = decision.get("impacted_assets", [])
+        if isinstance(raw_impacted_assets, list):
+            impacted_assets = [str(asset).strip() for asset in raw_impacted_assets if str(asset).strip()]
+        else:
+            impacted_assets_str = str(raw_impacted_assets).strip()
+            impacted_assets = [a.strip() for a in impacted_assets_str.split(",")] if impacted_assets_str else []
+        proposal_kind = str(decision.get("proposal_kind", "")).strip() or (
+            "skill_update" if "skills.md" in policy_file.lower()
+            else "routing_hint" if "model-routing" in policy_file.lower()
+            else "policy_note"
+        )
+        if not (proposal_kind in skill_relevant_kinds or any(f in policy_file.lower() for f in skill_relevant_files)):
+            continue
+        history.append({
+            "status": status,
+            "title": title,
+            "proposal_id": proposal_id,
+            "policy_file": policy_file,
+            "proposal_kind": proposal_kind,
+            "reviewed_at": reviewed_at,
+            "reason": reason,
+            "source": source,
+            "impacted_assets": impacted_assets,
+        })
+    return sorted(history, key=lambda h: h["reviewed_at"], reverse=True)
+
+
+def _save_workspace_skills(storage: Storage, workspace: dict[str, Any], body: Mapping[str, Any] | None) -> dict[str, Any]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    policy_pack_dir = workspace_root / "policy-pack"
+    policy_pack_dir.mkdir(parents=True, exist_ok=True)
+    skills_file = policy_pack_dir / "skills.md"
+    content = _required_text(body, "content")
+    skills_file.write_text(content, encoding="utf-8")
+    return _workspace_skills(storage, workspace)
+
+
+def _workspace_context_bundles(
+    storage: Storage,
+    workspace: dict[str, Any],
+) -> dict[str, Any]:
+    bundles = _recent_context_bundles_detail(storage, workspace["id"])
+    return {
+        "workspace_id": workspace["id"],
+        "bundles": bundles,
+    }
+
+
+def _repository_guide_status(workspace_root: Path) -> dict[str, Any]:
+    required_files = [
+        "SARATHI.md",
+        "coding-standards.md",
+        "guidelines.md",
+    ]
+    present = [f for f in required_files if (workspace_root / f).exists()]
+    return {
+        "status": "complete" if len(present) == len(required_files) else "partial" if present else "not_initialized",
+        "present_files": present,
+        "required_files": required_files,
+    }
+
+
+def _list_wiki_pages(workspace_root: Path) -> list[dict[str, Any]]:
+    wiki_dir = workspace_root / "wiki"
+    if not wiki_dir.exists():
+        return []
+    pages = []
+    for md_file in sorted(wiki_dir.rglob("*.md")):
+        relative = md_file.relative_to(wiki_dir)
+        page_name = str(relative.with_suffix("")).replace("/", " / ")
+        pages.append({
+            "name": page_name,
+            "path": str(relative),
+            "exists": True,
+        })
+    return pages
+
+
+def _resolve_workspace_wiki_page_path(wiki_dir: Path, page: str) -> Path:
+    if ".." in page or page.startswith("/"):
+        raise ServiceError("invalid_request", "Invalid wiki page path.", 400)
+    page_path = wiki_dir / page
+    if page_path.suffix.lower() != ".md":
+        page_path = wiki_dir / f"{page}.md"
+    return page_path
+
+
+def _learnings_status(workspace_root: Path) -> dict[str, Any]:
+    learning_path = workspace_root / "learnings.md"
+    if not learning_path.exists():
+        return {
+            "status": "empty",
+            "path": str(learning_path),
+            "sections": 0,
+            "accepted_learnings": [],
+        }
+    content = learning_path.read_text(encoding="utf-8")
+    sections = content.count("## ")
+    learning_sections = _parse_workspace_learnings(learning_path)
+    accepted_learnings = [
+        {
+            "title": section.get("title", ""),
+            "summary": section.get("summary", ""),
+            "task_id": section.get("task_id", ""),
+            "tags": section.get("tags", []),
+            "evidence_refs": section.get("evidence_refs", []),
+            "recommended_template_id": _playbook_template_for_learning(section),
+            "recommended_view_ids": _playbook_saved_views_for_learning(section),
+            "source_file": str(learning_path),
+            "linked_proposal_id": None,
+            "linked_proposal_title": None,
+            "linked_playbook_id": None,
+            "linked_playbook_name": None,
+        }
+        for section in learning_sections
+    ]
+    return {
+        "status": "populated",
+        "path": str(learning_path),
+        "sections": sections,
+        "accepted_learnings": accepted_learnings,
+    }
+
+
+def _enrich_learnings_with_linkages(
+    storage: Storage,
+    workspace: dict[str, Any],
+    learnings_status: dict[str, Any],
+) -> dict[str, Any]:
+    accepted_learnings = learnings_status.get("accepted_learnings", [])
+    if not accepted_learnings:
+        return learnings_status
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    policy_pack_path = workspace_root / "policy-pack"
+    accepted_proposals = _reviewed_proposal_decisions(policy_pack_path)
+    accepted_proposals_by_id = {
+        str(p.get("id", "")).strip(): p
+        for p in accepted_proposals
+        if p.get("status") == "accepted" and p.get("id")
+    }
+    operations = _workspace_operational_views(storage, workspace["id"])
+    templates = _builtin_workflow_templates()
+    saved_views = _workspace_saved_views(operations)
+    playbooks_by_task_id: dict[str, dict[str, Any]] = {}
+    for playbook in _workspace_learning_playbooks(
+        storage,
+        workspace,
+        templates=templates,
+        saved_views=saved_views,
+    ):
+        provenance = playbook.get("provenance", {})
+        task_id = provenance.get("task_id")
+        if task_id:
+            playbooks_by_task_id[str(task_id).strip()] = playbook
+    enriched_learnings = []
+    for learning in accepted_learnings:
+        learning_task_id = str(learning.get("task_id") or "").strip()
+        linked_proposal_id = None
+        linked_proposal_title = None
+        if learning_task_id:
+            for prop_id, prop_data in accepted_proposals_by_id.items():
+                evidence_refs = prop_data.get("evidence_refs", [])
+                if isinstance(evidence_refs, list):
+                    for ref in evidence_refs:
+                        ref_str = str(ref).strip()
+                        if ref_str.startswith(learning_task_id + ":"):
+                            linked_proposal_id = prop_id
+                            linked_proposal_title = prop_data.get("title")
+                            break
+                if linked_proposal_id:
+                    break
+        linked_playbook = playbooks_by_task_id.get(learning_task_id)
+        linked_playbook_id = linked_playbook.get("id") if linked_playbook else None
+        linked_playbook_name = linked_playbook.get("name") if linked_playbook else None
+        enriched_learnings.append({
+            **learning,
+            "linked_proposal_id": linked_proposal_id,
+            "linked_proposal_title": linked_proposal_title,
+            "linked_playbook_id": linked_playbook_id,
+            "linked_playbook_name": linked_playbook_name,
+        })
+    return {
+        **learnings_status,
+        "accepted_learnings": enriched_learnings,
+    }
+
+
+def _count_wiki_deep_links(wiki_pages: list[dict[str, Any]]) -> int:
+    workspace_root = Path(wiki_pages[0]["path"]).parent.parent if wiki_pages else None
+    if not workspace_root:
+        return 0
+    wiki_dir = workspace_root / "wiki"
+    if not wiki_dir.exists():
+        return 0
+    link_count = 0
+    for md_file in wiki_dir.rglob("*.md"):
+        try:
+            content = md_file.read_text(encoding="utf-8")
+            link_count += content.count("[[") + content.count("](")
+        except Exception:
+            pass
+    return link_count
+
+
+def _get_most_recent_wiki_update(workspace_root: Path) -> str | None:
+    wiki_dir = workspace_root / "wiki"
+    if not wiki_dir.exists():
+        return None
+    most_recent = 0.0
+    for md_file in wiki_dir.rglob("*.md"):
+        try:
+            mtime = md_file.stat().st_mtime
+            if mtime > most_recent:
+                most_recent = mtime
+        except Exception:
+            pass
+    if most_recent > 0:
+        from datetime import datetime
+        return datetime.fromtimestamp(most_recent).isoformat()
+    return None
+
+
+def _count_unique_task_contexts(storage: Storage, workspace_id: str) -> int:
+    try:
+        dispatch_dir = storage.tasks_dir(workspace_id)
+        if not dispatch_dir.exists():
+            return 0
+        task_ids = set()
+        for task_dir in dispatch_dir.iterdir():
+            if task_dir.is_dir():
+                task_ids.add(task_dir.name)
+        return len(task_ids)
+    except Exception:
+        return 0
+
+
+def _accepted_context_proposals(workspace_root: Path) -> list[dict[str, Any]]:
+    policy_pack_dir = workspace_root / "policy-pack"
+    if not policy_pack_dir.exists():
+        return []
+    context_guidance: list[dict[str, Any]] = []
+    for md_file in policy_pack_dir.glob("*.md"):
+        if md_file.name == "commands.md":
+            continue
+        try:
+            content = md_file.read_text(encoding="utf-8")
+            import re
+            yaml_match = re.search(r"```yaml\s*(.*?)\s*```", content, re.DOTALL)
+            if yaml_match:
+                import yaml
+                parsed = yaml.safe_load(yaml_match.group(1)) or {}
+                for proposal in parsed.get("accepted_proposals", []):
+                    if isinstance(proposal, dict) and proposal.get("proposal_kind") == "context_update":
+                        context_guidance.append({
+                            "title": proposal.get("title", ""),
+                            "policy_file": proposal.get("policy_file", ""),
+                            "suggested_change": proposal.get("suggested_change", ""),
+                            "impacted_assets": proposal.get("impacted_assets", []),
+                            "reviewed_at": proposal.get("reviewed_at", ""),
+                        })
+        except Exception:
+            pass
+    return context_guidance
+
+
+def _skills_summary(workspace_root: Path) -> dict[str, Any]:
+    policy_pack_dir = workspace_root / "policy-pack"
+    skills_file = policy_pack_dir / "skills.md"
+    if not skills_file.exists():
+        return {
+            "status": "not_found",
+            "path": str(skills_file),
+            "family_count": 0,
+            "skill_count": 0,
+        }
+    skills = _list_skills(workspace_root)
+    return {
+        "status": "available",
+        "path": str(skills_file),
+        "family_count": len({skill.get("family") for skill in skills if skill.get("family")}),
+        "skill_count": len(skills),
+    }
+
+
+def _list_skills(workspace_root: Path) -> list[dict[str, Any]]:
+    policy_pack_dir = workspace_root / "policy-pack"
+    skills_file = policy_pack_dir / "skills.md"
+    if not skills_file.exists():
+        return []
+    compiled = compile_policy_pack(str(policy_pack_dir))
+    raw_skills = compiled.typed_get("skills").as_dict()
+    skills: list[dict[str, Any]] = []
+    for family, payload in raw_skills.items():
+        if family == "task_type_to_skill" or not isinstance(payload, Mapping):
+            continue
+        family_description = str(payload.get("description") or "").strip()
+        for skill_name in payload.get("skills", []):
+            if not isinstance(skill_name, str) or not skill_name.strip():
+                continue
+            skills.append(
+                {
+                    "name": skill_name.strip(),
+                    "family": str(family),
+                    "source": "policy-pack/skills.md",
+                    "description": family_description,
+                }
+            )
+    return skills
+
+
+def _list_skill_routes(workspace_root: Path) -> list[dict[str, Any]]:
+    policy_pack_dir = workspace_root / "policy-pack"
+    skills_file = policy_pack_dir / "skills.md"
+    if not skills_file.exists():
+        return []
+    compiled = compile_policy_pack(str(policy_pack_dir))
+    raw_skills = compiled.typed_get("skills").as_dict()
+    task_type_mapping = raw_skills.get("task_type_to_skill")
+    if not isinstance(task_type_mapping, Mapping):
+        return []
+    routes: list[dict[str, Any]] = []
+    for task_type, config in task_type_mapping.items():
+        if not isinstance(task_type, str) or not task_type.strip():
+            continue
+        routes.append({
+            "task_type": task_type.strip(),
+            "primary": str(config.get("primary") or "").strip() if isinstance(config, dict) else "",
+            "secondary": _parse_secondary(config.get("secondary")) if isinstance(config, dict) else [],
+            "always_invoke": bool(config.get("always_invoke", False)) if isinstance(config, dict) else False,
+        })
+    return routes
+
+
+def _parse_secondary(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if v and str(v).strip()]
+    if isinstance(value, str) and value.strip():
+        if "," in value:
+            return [v.strip() for v in value.split(",") if v.strip()]
+        return [value.strip()]
+    return []
+
+
+def _recent_context_bundles_summary(
+    storage: Storage,
+    workspace_id: str,
+) -> dict[str, Any]:
+    dispatches = storage.list_dispatches_for_workspace(workspace_id)
+    dispatch_with_context = [d for d in dispatches if d.get("metadata", {}).get("context_pack")]
+    recent = sorted(dispatch_with_context, key=lambda d: d.get("created_at", ""), reverse=True)[:10]
+    return {
+        "total_bundles": len(dispatch_with_context),
+        "recent_count": len(recent),
+        "bundles": [
+            {
+                "dispatch_id": d["id"],
+                "task_id": d.get("task_id"),
+                "agent": d.get("agent_name"),
+                "created_at": d.get("created_at"),
+            }
+            for d in recent
+        ],
+    }
+
+
+def _recent_context_bundles_detail(
+    storage: Storage,
+    workspace_id: str,
+) -> list[dict[str, Any]]:
+    dispatches = storage.list_dispatches_for_workspace(workspace_id)
+    bundles = []
+    for d in dispatches:
+        metadata = d.get("metadata", {})
+        context_pack = metadata.get("context_pack")
+        if context_pack:
+            agent_output = metadata.get("agent_output") if isinstance(metadata.get("agent_output"), Mapping) else {}
+            artifact_index = metadata.get("artifact_index") if isinstance(metadata.get("artifact_index"), Mapping) else {}
+            bundles.append({
+                "dispatch_id": d["id"],
+                "task_id": d.get("task_id"),
+                "agent": d.get("agent_name"),
+                "status": d.get("status"),
+                "created_at": d.get("created_at"),
+                "context_pack": {
+                    "role": context_pack.get("role"),
+                    "phase": context_pack.get("phase"),
+                    "summary": context_pack.get("summary"),
+                    "agent_input": {
+                        "objective": context_pack.get("agent_input", {}).get("objective"),
+                        "constraints": context_pack.get("agent_input", {}).get("constraints", []),
+                        "acceptance_criteria": context_pack.get("agent_input", {}).get("acceptance_criteria", []),
+                        "relevant_files": context_pack.get("agent_input", {}).get("relevant_files", []),
+                        "prior_findings": context_pack.get("agent_input", {}).get("prior_findings", []),
+                        "available_tools": context_pack.get("agent_input", {}).get("available_tools", []),
+                        "token_budget": context_pack.get("agent_input", {}).get("token_budget"),
+                    },
+                    "estimated_tokens": context_pack.get("compilation", {}).get("estimated_tokens"),
+                    "trimmed_sections": context_pack.get("compilation", {}).get("trimmed_sections", []),
+                    "source_artifacts": [
+                        {"type": sa.get("type"), "ref": sa.get("ref")}
+                        for sa in context_pack.get("source_artifacts", [])
+                    ],
+                },
+                "agent_output": {
+                    "status": agent_output.get("status"),
+                    "summary": agent_output.get("summary"),
+                    "artifacts": agent_output.get("artifacts", []),
+                    "decisions": agent_output.get("decisions", []),
+                    "findings": agent_output.get("findings", []),
+                    "next_recommended_agent": agent_output.get("next_recommended_agent"),
+                },
+                "artifact_index": {
+                    "files_changed": artifact_index.get("files_changed", []),
+                    "tests_run": artifact_index.get("tests_run", []),
+                    "known_risks": artifact_index.get("known_risks", []),
+                    "review_findings": artifact_index.get("review_findings", []),
+                },
+                "provenance": {
+                    "sources": [
+                        label
+                        for label, present in (
+                            ("context_pack", bool(context_pack)),
+                            ("agent_output", bool(agent_output)),
+                            ("artifact_index", bool(artifact_index)),
+                            ("response_evidence", isinstance(metadata.get("response_evidence"), Mapping)),
+                        )
+                        if present
+                    ]
+                },
+            })
+    return sorted(bundles, key=lambda b: b.get("created_at", ""), reverse=True)[:20]
+
+
+def _workspace_proposals(storage: Storage, workspace: dict[str, Any]) -> dict[str, Any]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    policy_pack_path = workspace_root / "policy-pack"
+    if not policy_pack_path.exists():
+        return {"workspace_id": workspace["id"], "proposals": [], "reviewed_history": [], "status": "no_policy_pack"}
+    records = _synthesize_learning_records(storage, workspace["id"])
+    reviewed_history = sorted(
+        _reviewed_proposal_decisions(policy_pack_path),
+        key=lambda decision: str(decision.get("reviewed_at") or ""),
+        reverse=True,
+    )
+    reviewed_ids = {
+        decision.get("id")
+        for decision in reviewed_history
+        if isinstance(decision.get("id"), str)
+    }
+    proposals = [
+        proposal.to_artifact()
+        for proposal in Evolver().generate_policy_proposals(learning_records=records)
+        if proposal.proposal_id not in reviewed_ids
+    ]
+    return {
+        "workspace_id": workspace["id"],
+        "proposals": proposals,
+        "reviewed_history": reviewed_history,
+        "status": "ok",
+        "source": "synthesized_from_workspace_state",
+    }
+
+
+def _workspace_proposal_detail(
+    storage: Storage,
+    workspace: dict[str, Any],
+    proposal_id: str,
+) -> dict[str, Any]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    policy_pack_path = workspace_root / "policy-pack"
+    if not policy_pack_path.exists():
+        raise ServiceError("not_found", "Policy pack not found.", 404)
+    target = _find_workspace_proposal(storage, workspace, proposal_id)
+    if target is None:
+        raise ServiceError("not_found", f"Proposal {proposal_id} not found.", 404)
+    preview = ProposalReviewStore(policy_pack_path).preview_acceptance(target)
+    return {
+        "workspace_id": workspace["id"],
+        "proposal": target.to_artifact(),
+        "policy_preview": preview,
+    }
+
+
+def _accept_proposal(storage: Storage, workspace: dict[str, Any], proposal_id: str) -> dict[str, Any]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    policy_pack_path = workspace_root / "policy-pack"
+    if not policy_pack_path.exists():
+        raise ServiceError("not_found", "Policy pack not found.", 404)
+    target = _find_workspace_proposal(storage, workspace, proposal_id)
+    if target is None:
+        raise ServiceError("not_found", f"Proposal {proposal_id} not found.", 404)
+    store = ProposalReviewStore(policy_pack_path)
+    decision = store.accept(target)
+    storage.create_lifecycle_event(
+        workspace_id=workspace["id"],
+        event_type="proposal.accepted",
+        payload={"proposal_id": proposal_id, "title": target.title, "policy_file": target.policy_file},
+    )
+    return {"workspace_id": workspace["id"], "proposal_id": proposal_id, "decision": decision}
+
+
+def _reject_proposal(
+    storage: Storage,
+    workspace: dict[str, Any],
+    proposal_id: str,
+    reason: str | None,
+) -> dict[str, Any]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    policy_pack_path = workspace_root / "policy-pack"
+    if not policy_pack_path.exists():
+        raise ServiceError("not_found", "Policy pack not found.", 404)
+    target = _find_workspace_proposal(storage, workspace, proposal_id)
+    if target is None:
+        raise ServiceError("not_found", f"Proposal {proposal_id} not found.", 404)
+    store = ProposalReviewStore(policy_pack_path)
+    decision = store.reject(target, reason=reason)
+    storage.create_lifecycle_event(
+        workspace_id=workspace["id"],
+        event_type="proposal.rejected",
+        payload={"proposal_id": proposal_id, "title": target.title, "reason": reason},
+    )
+    return {"workspace_id": workspace["id"], "proposal_id": proposal_id, "decision": decision}
+
+
+def _synthesize_learning_records(storage: Storage, workspace_id: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    phase_by_subtask: dict[str, str] = {}
+    for task in storage.list_tasks_for_workspace(workspace_id):
+        task_id = str(task.get("id") or "")
+        if not task_id:
+            continue
+        complexity = str(task.get("metadata", {}).get("complexity") or "medium")
+        generated_at = str(task.get("updated_at") or task.get("created_at") or "")
+        repeated_failures: dict[str, int] = {}
+        provider_failures: dict[tuple[str, str], int] = {}
+        escalations: dict[str, int] = {}
+        iteration_hotspots: list[dict[str, Any]] = []
+        context_gaps: list[dict[str, Any]] = []
+
+        subtasks = storage.list_subtasks_for_task(task_id)
+        for subtask in subtasks:
+            phase_by_subtask[subtask["id"]] = _proposal_phase_for_subtask(subtask)
+        dispatches = storage.list_dispatches_for_task(task_id)
+        for dispatch in dispatches:
+            metadata = dispatch.get("metadata", {})
+            phase = _proposal_phase_for_dispatch(metadata, phase_by_subtask)
+            if dispatch.get("status") == "failed":
+                repeated_failures[phase] = repeated_failures.get(phase, 0) + 1
+                provider = str(dispatch.get("agent_name") or "unknown").strip() or "unknown"
+                key = (phase, provider)
+                provider_failures[key] = provider_failures.get(key, 0) + 1
+            context_pack = metadata.get("context_pack") if isinstance(metadata.get("context_pack"), dict) else {}
+            if context_pack:
+                trimmed = context_pack.get("compilation", {}).get("trimmed_sections", [])
+                estimated = context_pack.get("compilation", {}).get("estimated_tokens", 0)
+                budget = context_pack.get("agent_input", {}).get("token_budget", 0)
+                if trimmed:
+                    reasons = ["trimmed_sections"]
+                    if budget and estimated and estimated >= budget * 0.9:
+                        reasons.append("near_budget")
+                    context_gaps.append({
+                        "phase": phase,
+                        "count": 1,
+                        "trimmed_sections": trimmed,
+                        "reasons": reasons,
+                        "estimated_tokens": estimated,
+                        "token_budget": budget,
+                    })
+                elif budget and estimated and estimated >= budget * 0.9:
+                    context_gaps.append({
+                        "phase": phase,
+                        "count": 1,
+                        "trimmed_sections": [],
+                        "reasons": ["near_budget"],
+                        "estimated_tokens": estimated,
+                        "token_budget": budget,
+                    })
+        reviews = storage.list_review_runs_for_task(task_id)
+        rejected_reviews = [review for review in reviews if review.get("status") == "rejected"]
+        if rejected_reviews:
+            escalations["Review"] = len(rejected_reviews)
+        if len(dispatches) > 1:
+            iteration_hotspots.append({"phase": "Build", "iterations": len(dispatches)})
+        has_signals = repeated_failures or provider_failures or escalations or iteration_hotspots or context_gaps
+        if not has_signals:
+            continue
+        records.append(
+            {
+                "task_id": task_id,
+                "complexity": complexity,
+                "generated_at": generated_at,
+                "summary": f"Workspace proposal synthesis for {task.get('title') or task_id}",
+                "repeated_failures": [
+                    {"phase": phase, "count": count}
+                    for phase, count in sorted(repeated_failures.items())
+                ],
+                "provider_failures": [
+                    {"phase": phase, "provider": provider, "count": count}
+                    for (phase, provider), count in sorted(provider_failures.items())
+                ],
+                "escalations": [
+                    {"phase": phase, "count": count}
+                    for phase, count in sorted(escalations.items())
+                ],
+                "iteration_hotspots": iteration_hotspots,
+                "context_gaps": context_gaps,
+                "phase_outcomes": [],
+            }
+        )
+    return records
+
+
+def _find_workspace_proposal(storage: Storage, workspace: dict[str, Any], proposal_id: str):
+    proposals = Evolver().generate_policy_proposals(
+        learning_records=_synthesize_learning_records(storage, workspace["id"])
+    )
+    matches = [
+        proposal
+        for proposal in proposals
+        if proposal.proposal_id == proposal_id or proposal.proposal_id.startswith(proposal_id)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _reviewed_proposal_ids(policy_pack_path: Path) -> set[str]:
+    return {decision.get("id") for decision in _reviewed_proposal_decisions(policy_pack_path) if isinstance(decision.get("id"), str)}
+
+
+def _reviewed_proposal_decisions(policy_pack_path: Path) -> list[dict[str, Any]]:
+    review_dir = policy_pack_path / ".sarathi-proposals"
+    if not review_dir.exists():
+        return []
+    reviewed: list[dict[str, Any]] = []
+    for path in review_dir.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            reviewed.append(payload)
+    return reviewed
+
+
+def _proposal_summary(storage: Storage, workspace: dict[str, Any]) -> dict[str, Any]:
+    workspace_root = Path(workspace["root_path"]).expanduser()
+    policy_pack_path = workspace_root / "policy-pack"
+    if not policy_pack_path.exists():
+        return {
+            "pending_count": 0,
+            "accepted_count": 0,
+            "rejected_count": 0,
+            "last_reviewed_at": None,
+        }
+    records = _synthesize_learning_records(storage, workspace["id"])
+    reviewed_decisions = _reviewed_proposal_decisions(policy_pack_path)
+    reviewed_ids = {
+        decision.get("id")
+        for decision in reviewed_decisions
+        if isinstance(decision.get("id"), str) and str(decision.get("id")).strip()
+    }
+    pending_count = len(
+        [
+            proposal
+            for proposal in Evolver().generate_policy_proposals(learning_records=records)
+            if proposal.proposal_id not in reviewed_ids
+        ]
+    )
+    accepted = [decision for decision in reviewed_decisions if decision.get("status") == "accepted"]
+    rejected = [decision for decision in reviewed_decisions if decision.get("status") == "rejected"]
+    reviewed_at_values = [
+        str(decision.get("reviewed_at"))
+        for decision in reviewed_decisions
+        if isinstance(decision.get("reviewed_at"), str) and str(decision.get("reviewed_at")).strip()
+    ]
+    return {
+        "pending_count": pending_count,
+        "accepted_count": len(accepted),
+        "rejected_count": len(rejected),
+        "last_reviewed_at": max(reviewed_at_values) if reviewed_at_values else None,
+    }
+
+
+def _proposal_phase_for_subtask(subtask: Mapping[str, Any]) -> str:
+    metadata = subtask.get("metadata") if isinstance(subtask.get("metadata"), Mapping) else {}
+    role = str(metadata.get("role") or "").strip()
+    return {
+        "Disha": "Plan",
+        "Pravaha": "Build",
+        "Nirnaya": "Review",
+        "Samanvaya": "Review",
+        "Sarathi": "Plan",
+    }.get(role, "Build")
+
+
+def _role_mappings() -> list[dict[str, Any]]:
+    mappings: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for mapping in list_phase_agent_roles():
+        phase = str(mapping.get("phase") or "").strip()
+        role_name = str(mapping.get("name") or "").strip()
+        role_key = str(mapping.get("key") or "").strip()
+        if not phase or not role_name or not role_key:
+            continue
+        identity = (phase, role_key)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        role = get_agent_role(role_key)
+        mappings.append(
+            {
+                "role": role.name,
+                "phase": phase,
+                "purpose": role.description,
+            }
+        )
+    return mappings
+
+
+def _behavior_assets(workspace_root: Path) -> list[dict[str, Any]]:
+    candidates = [
+        ("policy-pack/skills.md", "Skill routing and provider selection"),
+        ("SARATHI.md", "Repository-level orientation and shared operating context"),
+        ("learnings.md", "Accepted learnings and reusable execution patterns"),
+        ("wiki/context-compiler.md", "Context compilation guidance and omission rules"),
+    ]
+    assets: list[dict[str, Any]] = []
+    for relative_path, purpose in candidates:
+        asset_path = workspace_root / relative_path
+        assets.append(
+            {
+                "path": relative_path,
+                "exists": asset_path.exists(),
+                "purpose": purpose,
+            }
+        )
+    return assets
+
+
+def _proposal_phase_for_dispatch(
+    metadata: Mapping[str, Any],
+    phase_by_subtask: Mapping[str, str],
+) -> str:
+    subtask_id = metadata.get("subtask_id")
+    if isinstance(subtask_id, str) and subtask_id in phase_by_subtask:
+        return phase_by_subtask[subtask_id]
+    return "Build"
+
+
 def _acceptance_check(
     check_id: str,
     label: str,
@@ -2144,6 +3986,65 @@ def _format_dogfood_learning_section(
     )
 
 
+def _build_normalized_completion_context(
+    dispatches: list[dict[str, Any]],
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build normalized completion context from dispatches and evidence.
+
+    Prefers normalized agent_output and artifact_index over raw response_evidence
+    to enable later resumes without needing to parse raw provider blobs first.
+    """
+    all_files_changed: list[str] = []
+    all_tests_run: list[str] = []
+    all_findings: list[str] = []
+    all_risks: list[str] = []
+    summaries: list[str] = []
+    decisions: list[str] = []
+
+    for dispatch in dispatches:
+        dispatch_metadata = dispatch.get("metadata", {})
+        agent_output = dispatch_metadata.get("agent_output")
+        artifact_index = dispatch_metadata.get("artifact_index")
+        response_evidence = dispatch_metadata.get("response_evidence", {})
+
+        if isinstance(agent_output, Mapping):
+            summary = agent_output.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                summaries.append(summary.strip())
+            findings = agent_output.get("findings", [])
+            if isinstance(findings, list):
+                all_findings.extend(str(f).strip() for f in findings if str(f).strip())
+            dispatch_decisions = agent_output.get("decisions", [])
+            if isinstance(dispatch_decisions, list):
+                decisions.extend(str(d).strip() for d in dispatch_decisions if str(d).strip())
+
+        if isinstance(artifact_index, Mapping):
+            files = artifact_index.get("files_changed", [])
+            if isinstance(files, list):
+                all_files_changed.extend(str(f).strip() for f in files if str(f).strip())
+            tests = artifact_index.get("tests_run", [])
+            if isinstance(tests, list):
+                all_tests_run.extend(str(t).strip() for t in tests if str(t).strip())
+            risks = artifact_index.get("known_risks", [])
+            if isinstance(risks, list):
+                all_risks.extend(str(r).strip() for r in risks if str(r).strip())
+
+        if not artifact_index and isinstance(response_evidence, Mapping):
+            changed_files = response_evidence.get("changed_files", [])
+            if isinstance(changed_files, list):
+                all_files_changed.extend(str(f).strip() for f in changed_files if str(f).strip())
+
+    return {
+        "files_changed": _unique_ordered(all_files_changed),
+        "tests_run": _unique_ordered(all_tests_run),
+        "findings": _unique_ordered(all_findings[:20]),
+        "risks": _unique_ordered(all_risks[:10]),
+        "summaries": summaries[-3:],
+        "decisions": decisions[-6:],
+    }
+
+
 def _create_task_handoff(storage: Storage, task: dict[str, Any]) -> dict[str, Any]:
     reviews = storage.list_review_runs_for_task(task["id"])
     approved_reviews = [review for review in reviews if review["status"] == "approved"]
@@ -2152,7 +4053,7 @@ def _create_task_handoff(storage: Storage, task: dict[str, Any]) -> dict[str, An
             "approval_required",
             "An approved review is required before final handoff.",
             409,
-    )
+        )
     graph = _graph_for_task(storage, task)
     evidence = storage.list_evidence_artifacts_for_task(task["id"])
     dispatches = storage.list_dispatches_for_task(task["id"])
@@ -2166,6 +4067,9 @@ def _create_task_handoff(storage: Storage, task: dict[str, Any]) -> dict[str, An
         f"{len(graph['nodes'])} units complete, {len(evidence)} evidence artifacts, "
         f"{len(approved_reviews)} approved reviews."
     )
+
+    normalized_completion_context = _build_normalized_completion_context(dispatches, evidence)
+
     handoff = storage.create_handoff(
         workspace_id=task["workspace_id"],
         task_id=task["id"],
@@ -2186,6 +4090,7 @@ def _create_task_handoff(storage: Storage, task: dict[str, Any]) -> dict[str, An
                 "action": None,
                 "mode": repository_action_preference["mode"],
             },
+            "normalized_completion_context": normalized_completion_context,
         },
     )
     gate = storage.create_approval_gate(
@@ -2448,15 +4353,7 @@ def _acceptance_coverage(task: dict[str, Any], evidence: list[dict[str, Any]]) -
     has_evidence = bool(evidence)
     spec_refs: list[dict[str, Any]] = []
     for item in evidence:
-        response_evidence = item["metadata"].get("response_evidence", {})
-        if not isinstance(response_evidence, Mapping):
-            continue
-        spec_trace = _provider_spec_trace(response_evidence)
-        if spec_trace is None:
-            continue
-        for reference in spec_trace.get("references", []):
-            if not isinstance(reference, Mapping):
-                continue
+        for reference in _spec_references_from_evidence(item):
             spec_refs.append(
                 {
                     "ac_id": str(reference.get("ac_id") or "").strip() or None,
@@ -2498,63 +4395,67 @@ def _review_diff_summary(evidence: list[dict[str, Any]]) -> dict[str, Any]:
     provider_spec_references = 0
     provider_spec_providers: list[str] = []
     for item in evidence:
-        response_evidence = item["metadata"].get("response_evidence", {})
-        if not isinstance(response_evidence, Mapping):
-            continue
-        changed_files = response_evidence.get("changed_files", [])
-        if isinstance(changed_files, list):
-            files.extend(str(path) for path in changed_files if str(path).strip())
-        review_trace = _provider_review_trace(response_evidence)
-        if review_trace is not None:
-            provider_trace_findings += len(review_trace.get("findings", []))
-            provider_name = review_trace.get("provider")
-            if isinstance(provider_name, str) and provider_name.strip():
-                provider_trace_providers.append(provider_name.strip())
-        diff_trace = _provider_diff_trace(response_evidence)
-        if diff_trace is not None:
-            provider_diff_hunks += len(diff_trace.get("hunks", []))
-            provider_name = diff_trace.get("provider")
-            if isinstance(provider_name, str) and provider_name.strip():
-                provider_diff_providers.append(provider_name.strip())
-            for hunk in diff_trace.get("hunks", []):
-                if not isinstance(hunk, Mapping):
-                    continue
-                status = str(hunk.get("status") or "").strip().lower()
-                if status in {"fail", "blocked", "rejected"}:
-                    provider_diff_blockers += 1
-                confidence = hunk.get("confidence")
-                if isinstance(confidence, (int, float)):
-                    provider_diff_confidences.append(float(confidence))
-                category = str(hunk.get("category") or "").strip()
-                if category:
-                    provider_diff_risk_categories.append(category)
-                    file_path = str(hunk.get("file_path") or "").strip()
-                    line_start = hunk.get("line_start")
-                    line_end = hunk.get("line_end")
-                    if file_path and isinstance(line_start, int) and isinstance(line_end, int):
-                        provider_diff_highlights.append(
-                            f"{category} / {file_path}:{line_start}-{line_end}"
-                        )
-                provider_diff_region_inputs.append(
-                    {
-                        "file_path": str(hunk.get("file_path") or "").strip() or None,
-                        "category": str(hunk.get("category") or "").strip() or None,
-                        "line_start": hunk.get("line_start"),
-                        "line_end": hunk.get("line_end"),
-                        "severity": str(hunk.get("severity") or "info"),
-                        "confidence": (
-                            float(hunk.get("confidence"))
-                            if isinstance(hunk.get("confidence"), (int, float))
-                            else None
-                        ),
-                    }
-                )
-        spec_trace = _provider_spec_trace(response_evidence)
-        if spec_trace is not None:
-            provider_spec_references += len(spec_trace.get("references", []))
-            provider_name = spec_trace.get("provider")
-            if isinstance(provider_name, str) and provider_name.strip():
-                provider_spec_providers.append(provider_name.strip())
+        changed_files = _files_changed_from_evidence(item)
+        if changed_files:
+            files.extend(changed_files)
+
+        provider_trace_findings_for_item = _provider_trace_findings_from_evidence(item)
+        provider_trace_findings += len(provider_trace_findings_for_item)
+        provider_trace_providers.extend(
+            str(finding.get("provider")).strip()
+            for finding in provider_trace_findings_for_item
+            if isinstance(finding.get("provider"), str) and str(finding.get("provider")).strip()
+        )
+
+        diff_hunks = _diff_hunks_from_evidence(item)
+        provider_diff_hunks += len(diff_hunks)
+        provider_diff_providers.extend(
+            str(hunk.get("provider")).strip()
+            for hunk in diff_hunks
+            if isinstance(hunk.get("provider"), str) and str(hunk.get("provider")).strip()
+        )
+        for hunk in diff_hunks:
+            if not isinstance(hunk, Mapping):
+                continue
+            status = str(hunk.get("status") or "").strip().lower()
+            if status in {"fail", "blocked", "rejected"}:
+                provider_diff_blockers += 1
+            confidence = hunk.get("confidence")
+            if isinstance(confidence, (int, float)):
+                provider_diff_confidences.append(float(confidence))
+            category = str(hunk.get("category") or "").strip()
+            if category:
+                provider_diff_risk_categories.append(category)
+                file_path = str(hunk.get("file_path") or "").strip()
+                line_start = hunk.get("line_start")
+                line_end = hunk.get("line_end")
+                if file_path and isinstance(line_start, int) and isinstance(line_end, int):
+                    provider_diff_highlights.append(
+                        f"{category} / {file_path}:{line_start}-{line_end}"
+                    )
+            provider_diff_region_inputs.append(
+                {
+                    "file_path": str(hunk.get("file_path") or "").strip() or None,
+                    "category": str(hunk.get("category") or "").strip() or None,
+                    "line_start": hunk.get("line_start"),
+                    "line_end": hunk.get("line_end"),
+                    "severity": str(hunk.get("severity") or "info"),
+                    "confidence": (
+                        float(hunk.get("confidence"))
+                        if isinstance(hunk.get("confidence"), (int, float))
+                        else None
+                    ),
+                }
+            )
+
+        spec_references = _spec_references_from_evidence(item)
+        provider_spec_references += len(spec_references)
+        provider_spec_providers.extend(
+            str(reference.get("provider")).strip()
+            for reference in spec_references
+            if isinstance(reference.get("provider"), str) and str(reference.get("provider")).strip()
+        )
+
     unique_files = _unique_ordered(files)
     provider_diff_regions = _cluster_diff_regions(provider_diff_region_inputs)
     provider_diff_confidence = _average_confidence(provider_diff_confidences)
@@ -2585,121 +4486,48 @@ def _approved_review_findings(evidence: list[dict[str, Any]]) -> list[dict[str, 
     findings: list[dict[str, Any]] = []
     index = 1
     for item in evidence:
-        response_evidence = item["metadata"].get("response_evidence", {})
-        if not isinstance(response_evidence, Mapping):
-            continue
         subtask_id = str(item["metadata"].get("subtask_id") or "")
         provider_name = str(item["metadata"].get("provider") or "") or None
         structured_findings_added = False
-        review_trace = _provider_review_trace(response_evidence)
-        if review_trace is not None and review_trace.get("findings"):
-            provider_name = (
-                review_trace.get("provider")
-                if isinstance(review_trace.get("provider"), str)
-                else provider_name
-            )
-            for trace_finding in review_trace["findings"]:
-                if not isinstance(trace_finding, Mapping):
-                    continue
-                file_path = trace_finding.get("file_path")
-                file_text = str(file_path).strip() if file_path is not None else ""
-                line_start = trace_finding.get("line_start")
-                line_end = trace_finding.get("line_end")
-                findings.append(
-                    {
-                        "id": f"finding-{index:02d}",
-                        "check": str(trace_finding.get("check") or "provider_trace"),
-                        "status": str(trace_finding.get("status") or "pass"),
-                        "severity": str(trace_finding.get("severity") or "info"),
-                        "message": str(trace_finding.get("message") or "Provider review trace finding."),
-                        "file_path": file_text or None,
-                        "line_start": line_start if isinstance(line_start, int) else None,
-                        "line_end": line_end if isinstance(line_end, int) else None,
-                        "subtask_id": subtask_id,
-                        "evidence_id": item["id"],
-                        "provider": provider_name or None,
-                    }
-                )
-                index += 1
-                structured_findings_added = True
 
-        diff_trace = _provider_diff_trace(response_evidence)
-        if diff_trace is not None and diff_trace.get("hunks"):
-            provider_name = (
-                diff_trace.get("provider")
-                if isinstance(diff_trace.get("provider"), str)
-                else provider_name
+        for structured in _artifact_review_findings(item):
+            file_path = structured.get("file_path")
+            file_text = str(file_path).strip() if file_path is not None else ""
+            findings.append(
+                {
+                    "id": f"finding-{index:02d}",
+                    "check": str(structured.get("check") or "provider_trace"),
+                    "status": str(structured.get("status") or "pass"),
+                    "severity": str(structured.get("severity") or "info"),
+                    "message": str(structured.get("message") or "Provider review evidence."),
+                    "file_path": file_text or None,
+                    "line_start": structured.get("line_start") if isinstance(structured.get("line_start"), int) else None,
+                    "line_end": structured.get("line_end") if isinstance(structured.get("line_end"), int) else None,
+                    "header": str(structured.get("header") or "").strip() or None,
+                    "excerpt": str(structured.get("excerpt") or "").strip() or None,
+                    "category": str(structured.get("category") or "").strip() or None,
+                    "confidence": (
+                        round(float(structured.get("confidence")), 2)
+                        if isinstance(structured.get("confidence"), (int, float))
+                        else None
+                    ),
+                    "suggestion": str(structured.get("suggestion") or "").strip() or None,
+                    "criterion": str(structured.get("criterion") or "").strip() or None,
+                    "ac_id": str(structured.get("ac_id") or "").strip() or None,
+                    "subtask_id": subtask_id,
+                    "evidence_id": item["id"],
+                    "provider": (
+                        str(structured.get("provider")).strip()
+                        if isinstance(structured.get("provider"), str) and str(structured.get("provider")).strip()
+                        else provider_name or None
+                    ),
+                }
             )
-            for hunk in diff_trace["hunks"]:
-                if not isinstance(hunk, Mapping):
-                    continue
-                file_path = hunk.get("file_path")
-                file_text = str(file_path).strip() if file_path is not None else ""
-                line_start = hunk.get("line_start")
-                line_end = hunk.get("line_end")
-                findings.append(
-                    {
-                        "id": f"finding-{index:02d}",
-                        "check": str(hunk.get("check") or "diff_hunk"),
-                        "status": str(hunk.get("status") or "pass"),
-                        "severity": str(hunk.get("severity") or "info"),
-                        "message": str(hunk.get("message") or "Provider diff hunk evidence."),
-                        "file_path": file_text or None,
-                        "line_start": line_start if isinstance(line_start, int) else None,
-                        "line_end": line_end if isinstance(line_end, int) else None,
-                        "header": str(hunk.get("header") or "").strip() or None,
-                        "excerpt": str(hunk.get("excerpt") or "").strip() or None,
-                        "category": str(hunk.get("category") or "").strip() or None,
-                        "confidence": (
-                            round(float(hunk.get("confidence")), 2)
-                            if isinstance(hunk.get("confidence"), (int, float))
-                            else None
-                        ),
-                        "suggestion": str(hunk.get("suggestion") or "").strip() or None,
-                        "subtask_id": subtask_id,
-                        "evidence_id": item["id"],
-                        "provider": provider_name or None,
-                    }
-                )
-                index += 1
-                structured_findings_added = True
+            index += 1
+            structured_findings_added = True
 
-        spec_trace = _provider_spec_trace(response_evidence)
-        if spec_trace is not None and spec_trace.get("references"):
-            provider_name = (
-                spec_trace.get("provider")
-                if isinstance(spec_trace.get("provider"), str)
-                else provider_name
-            )
-            for reference in spec_trace["references"]:
-                if not isinstance(reference, Mapping):
-                    continue
-                file_path = reference.get("file_path")
-                file_text = str(file_path).strip() if file_path is not None else ""
-                line_start = reference.get("line_start")
-                line_end = reference.get("line_end")
-                findings.append(
-                    {
-                        "id": f"finding-{index:02d}",
-                        "check": str(reference.get("check") or "spec_reference"),
-                        "status": str(reference.get("status") or "pass"),
-                        "severity": str(reference.get("severity") or "major"),
-                        "message": str(reference.get("message") or "Provider spec reference evidence."),
-                        "file_path": file_text or None,
-                        "line_start": line_start if isinstance(line_start, int) else None,
-                        "line_end": line_end if isinstance(line_end, int) else None,
-                        "criterion": str(reference.get("criterion") or "").strip() or None,
-                        "ac_id": str(reference.get("ac_id") or "").strip() or None,
-                        "subtask_id": subtask_id,
-                        "evidence_id": item["id"],
-                        "provider": provider_name or None,
-                    }
-                )
-                index += 1
-                structured_findings_added = True
-
-        changed_files = response_evidence.get("changed_files", [])
-        if structured_findings_added or not isinstance(changed_files, list):
+        changed_files = _files_changed_from_evidence(item)
+        if structured_findings_added or not changed_files:
             continue
         for file_path in changed_files:
             file_text = str(file_path).strip()
@@ -2717,11 +4545,100 @@ def _approved_review_findings(evidence: list[dict[str, Any]]) -> list[dict[str, 
                     "line_end": 1,
                     "subtask_id": subtask_id,
                     "evidence_id": item["id"],
-                    "provider": str(item["metadata"].get("provider") or "") or None,
+                    "provider": provider_name or None,
                 }
             )
             index += 1
     return findings
+
+
+def _normalized_evidence_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata", {})
+    artifact_index = metadata.get("artifact_index")
+    agent_output = metadata.get("agent_output")
+    response_evidence = metadata.get("response_evidence", {})
+    if not isinstance(response_evidence, Mapping):
+        response_evidence = {}
+    return {
+        "artifact_index": artifact_index if isinstance(artifact_index, Mapping) else {},
+        "agent_output": agent_output if isinstance(agent_output, Mapping) else {},
+        "response_evidence": response_evidence,
+    }
+
+
+def _artifact_review_findings(item: dict[str, Any]) -> list[dict[str, Any]]:
+    findings = _normalized_evidence_metadata(item)["artifact_index"].get("review_findings")
+    if not isinstance(findings, list):
+        return []
+    return [dict(finding) for finding in findings if isinstance(finding, Mapping)]
+
+
+def _files_changed_from_evidence(item: dict[str, Any]) -> list[str]:
+    normalized = _normalized_evidence_metadata(item)
+    files = normalized["artifact_index"].get("files_changed", [])
+    if isinstance(files, list) and files:
+        return [str(f).strip() for f in files if str(f).strip()]
+    files = normalized["response_evidence"].get("changed_files", [])
+    if isinstance(files, list):
+        return [str(f).strip() for f in files if str(f).strip()]
+    return []
+
+
+def _provider_trace_findings_from_evidence(item: dict[str, Any]) -> list[dict[str, Any]]:
+    artifact_findings = [
+        finding
+        for finding in _artifact_review_findings(item)
+        if str(finding.get("check") or "").strip() == "provider_trace"
+    ]
+    if artifact_findings:
+        return artifact_findings
+    response_evidence = _normalized_evidence_metadata(item)["response_evidence"]
+    review_trace = _provider_review_trace(response_evidence)
+    if review_trace is None:
+        return []
+    return [
+        dict(finding, provider=finding.get("provider") or review_trace.get("provider"))
+        for finding in review_trace.get("findings", [])
+        if isinstance(finding, Mapping)
+    ]
+
+
+def _diff_hunks_from_evidence(item: dict[str, Any]) -> list[dict[str, Any]]:
+    artifact_findings = [
+        finding
+        for finding in _artifact_review_findings(item)
+        if str(finding.get("check") or "").strip() == "diff_hunk"
+    ]
+    if artifact_findings:
+        return artifact_findings
+    response_evidence = _normalized_evidence_metadata(item)["response_evidence"]
+    diff_trace = _provider_diff_trace(response_evidence)
+    if diff_trace is None:
+        return []
+    return [
+        dict(hunk, provider=hunk.get("provider") or diff_trace.get("provider"))
+        for hunk in diff_trace.get("hunks", [])
+        if isinstance(hunk, Mapping)
+    ]
+
+
+def _spec_references_from_evidence(item: dict[str, Any]) -> list[dict[str, Any]]:
+    artifact_findings = [
+        finding
+        for finding in _artifact_review_findings(item)
+        if str(finding.get("check") or "").strip() == "spec_reference"
+    ]
+    if artifact_findings:
+        return artifact_findings
+    response_evidence = _normalized_evidence_metadata(item)["response_evidence"]
+    spec_trace = _provider_spec_trace(response_evidence)
+    if spec_trace is None:
+        return []
+    return [
+        dict(reference, provider=reference.get("provider") or spec_trace.get("provider"))
+        for reference in spec_trace.get("references", [])
+        if isinstance(reference, Mapping)
+    ]
 
 
 def _provider_review_trace(response_evidence: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -2984,6 +4901,30 @@ def _dispatch_subtask(
         workspace_id=subtask["workspace_id"],
         provider_id=provider,
     )
+    task = storage.get_task(subtask["task_id"])
+    if task is None:
+        raise ServiceError("not_found", "Task not found.", 404)
+    context_pack = ContextCompiler().compile_task_tracking_context(
+        task=task,
+        subtask=subtask,
+        evidence_artifacts=storage.list_evidence_artifacts_for_task(task["id"]),
+        review_runs=storage.list_review_runs_for_task(task["id"]),
+        available_tools=["workspace_files", "git_diff", "test_results", "provider_dispatch"],
+    )
+    context_pack_artifact = context_pack.to_artifact()
+    storage.create_lifecycle_event(
+        workspace_id=subtask["workspace_id"],
+        task_id=subtask["task_id"],
+        event_type="context.compiled",
+        payload={
+            "object_id": subtask["id"],
+            "provider": provider,
+            "phase": context_pack.phase,
+            "role": context_pack.role,
+            "token_budget": context_pack.agent_input.token_budget,
+            "estimated_tokens": context_pack_artifact["compilation"]["estimated_tokens"],
+        },
+    )
 
     response = LocalDispatcher(provider_config=provider_config).dispatch(
         DispatchRequest(
@@ -2991,11 +4932,22 @@ def _dispatch_subtask(
             task_id=subtask["id"],
             phase="TaskTracking",
             prompt=subtask["title"],
-            inputs={"node": _graph_node_from_subtask(subtask)},
+            inputs={
+                "node": _graph_node_from_subtask(subtask),
+                "context_pack": context_pack_artifact,
+            },
             expected_outputs=["work_unit_result"],
             constraints={"purpose": "child_task_execution", "provider": provider},
+            context_pack=context_pack_artifact,
+            token_budget=context_pack.agent_input.token_budget,
         )
     )
+    artifact_index = build_artifact_index(response)
+    agent_output = normalize_agent_output(
+        response,
+        phase="TaskTracking",
+        purpose="child_task_execution",
+    ).to_artifact()
     status = "completed" if response.success else "failed"
     dispatch = storage.create_dispatch(
         workspace_id=subtask["workspace_id"],
@@ -3007,6 +4959,9 @@ def _dispatch_subtask(
             "outputs": response.outputs,
             "evidence": response.evidence,
             "artifacts": response.artifacts,
+            "context_pack": context_pack_artifact,
+            "agent_output": agent_output,
+            "artifact_index": artifact_index,
             **({"usage": response.usage.to_artifact()} if response.usage else {}),
             **({"error": response.error} if response.error else {}),
         },
@@ -3037,6 +4992,8 @@ def _dispatch_subtask(
                 "dispatch_id": dispatch["id"],
                 "provider": provider,
                 "response_evidence": response.evidence,
+                "agent_output": agent_output,
+                "artifact_index": artifact_index,
             },
         )
         storage.create_lifecycle_event(
@@ -3082,29 +5039,71 @@ def _provider_dispatch_adapter_config(
     if config.get("health") != "online":
         detail = config.get("last_error") or f"Provider '{provider_id}' is offline."
         raise ServiceError("provider_unavailable", detail, 409)
-    resolved_path = _resolve_provider_path(str(config.get("path", spec["path"])))
-    if resolved_path is None:
+    workspace = storage.get_workspace(workspace_id)
+    if workspace is None:
+        raise ServiceError("not_found", "Workspace not found.", 404)
+    path_value = str(config.get("path", spec["path"]) or "")
+    resolved_path = _resolve_provider_path(path_value) if path_value else None
+    command = (
+        _provider_dispatch_command(
+            provider_id=provider_id,
+            path=resolved_path,
+            workspace_root=str(workspace["root_path"]),
+        )
+        if resolved_path is not None
+        else None
+    )
+    provider_payload: dict[str, Any] = {
+        "type": "command",
+        "command": command or [],
+        "timeout_seconds": 300,
+    }
+    if provider_id == "claude" and (config.get("api_key_configured") or _native_bridge_provider(provider_id, resolved_path or "") == "claude"):
+        provider_payload = {
+            "type": "anthropic_sdk",
+            "workspace_root": str(workspace["root_path"]),
+            "provider_path": resolved_path,
+            **({"api_key": config.get("api_key")} if isinstance(config.get("api_key"), str) and config.get("api_key") else {}),
+            **({"base_url": config.get("base_url")} if isinstance(config.get("base_url"), str) and config.get("base_url") else {}),
+            **({"model": config.get("model")} if isinstance(config.get("model"), str) and config.get("model") else {}),
+            "timeout_seconds": 300,
+            "fallback_to_cli": resolved_path is not None,
+        }
+    elif provider_id == "codex" and (config.get("api_key_configured") or _native_bridge_provider(provider_id, resolved_path or "") == "codex"):
+        provider_payload = {
+            "type": "openai_sdk",
+            "workspace_root": str(workspace["root_path"]),
+            "provider_path": resolved_path,
+            **({"api_key": config.get("api_key")} if isinstance(config.get("api_key"), str) and config.get("api_key") else {}),
+            **({"base_url": config.get("base_url")} if isinstance(config.get("base_url"), str) and config.get("base_url") else {}),
+            **({"model": config.get("model")} if isinstance(config.get("model"), str) and config.get("model") else {}),
+            "timeout_seconds": 300,
+            "fallback_to_cli": resolved_path is not None,
+        }
+    elif provider_id == "opencode":
+        if resolved_path is None:
+            raise ServiceError(
+                "provider_unavailable",
+                f"CLI path not found: {config.get('path', spec['path'])}",
+                409,
+            )
+        provider_payload = {
+            "type": "opencode_sdk",
+            "workspace_root": str(workspace["root_path"]),
+            "provider_path": resolved_path,
+            "timeout_seconds": 300,
+            "fallback_to_cli": True,
+        }
+    elif resolved_path is None:
         raise ServiceError(
             "provider_unavailable",
             f"CLI path not found: {config.get('path', spec['path'])}",
             409,
         )
-    workspace = storage.get_workspace(workspace_id)
-    if workspace is None:
-        raise ServiceError("not_found", "Workspace not found.", 404)
-    command = _provider_dispatch_command(
-        provider_id=provider_id,
-        path=resolved_path,
-        workspace_root=str(workspace["root_path"]),
-    )
     return {
         "provider": provider_id,
         "providers": {
-            provider_id: {
-                "type": "command",
-                "command": command,
-                "timeout_seconds": 300,
-            }
+            provider_id: provider_payload
         },
     }
 
@@ -3171,46 +5170,61 @@ def _provider_specs() -> dict[str, dict[str, Any]]:
             "id": "local",
             "name": "Local deterministic",
             "provider_type": "deterministic",
+            "transport_kind": "deterministic",
+            "transport_posture": "builtin",
             "health": "online",
             "auth": "not_required",
             "path": "sarathi-local",
             "capabilities": ["child_task_execution", "planning", "review_fixture"],
+            "degraded_reason": None,
         },
         {
             "id": "codex",
             "name": "Codex",
             "provider_type": "cli",
+            "transport_kind": "sdk",
+            "transport_posture": "sdk",
             "health": "configured_by_user",
             "auth": "workspace_setting",
             "path": "codex",
             "capabilities": ["coding", "planning", "review"],
+            "degraded_reason": "OpenAI SDK is the primary path with automatic Codex CLI fallback when credentials are unavailable.",
         },
         {
             "id": "claude",
             "name": "Claude",
             "provider_type": "cli",
+            "transport_kind": "sdk",
+            "transport_posture": "sdk",
             "health": "configured_by_user",
             "auth": "workspace_setting",
             "path": "claude",
             "capabilities": ["research", "critique", "review"],
+            "degraded_reason": "Anthropic SDK is the primary path with automatic Claude CLI fallback when credentials are unavailable.",
         },
         {
             "id": "copilot",
             "name": "Copilot",
             "provider_type": "agent",
+            "transport_kind": "cli",
+            "transport_posture": "cli_fallback",
             "health": "configured_by_user",
             "auth": "github_auth",
             "path": "GitHub Copilot",
             "capabilities": ["coding", "pull_request_assist"],
+            "degraded_reason": "GitHub-native integration is planned, but current transport remains CLI-oriented.",
         },
         {
             "id": "opencode",
             "name": "OpenCode",
             "provider_type": "cli",
+            "transport_kind": "sdk",
+            "transport_posture": "sdk",
             "health": "configured_by_user",
             "auth": "workspace_setting",
             "path": "opencode",
             "capabilities": ["coding", "planning", "review"],
+            "degraded_reason": None,
         },
     ]
     return {spec["id"]: spec for spec in specs}
@@ -3266,10 +5280,10 @@ def _get_provider_priority(storage: Storage, workspace_id: str) -> list[str]:
     workspace = storage.get_workspace(workspace_id)
     if workspace:
         metadata = workspace.get("metadata") or {}
-        priority = metadata.get("provider_priority")
-        if isinstance(priority, list) and priority:
+        priority = _normalize_provider_priority(metadata.get("provider_priority"))
+        if priority:
             return priority
-    return ["claude", "codex", "copilot", "opencode"]
+    return _default_provider_priority()
 
 
 def _select_available_provider(
@@ -3298,9 +5312,27 @@ def _test_and_store_provider(
     if provider_id not in specs:
         raise ServiceError("not_found", "Provider not found.", 404)
     spec = specs[provider_id]
-    path = _optional_text(body, "path") or spec["path"]
+    existing = storage.get_provider(workspace_id, provider_id)
+    existing_config = dict(existing["config"]) if existing is not None else {}
+    path = spec["path"]
+    if "path" in body and isinstance(body.get("path"), str):
+        path = str(body.get("path") or "").strip()
+    elif isinstance(existing_config.get("path"), str):
+        path = str(existing_config.get("path") or "")
     auth = _optional_text(body, "auth") or spec["auth"]
-    config = _provider_check_config(spec, path=path, auth=auth)
+    api_key = existing_config.get("api_key") if isinstance(existing_config.get("api_key"), str) else None
+    if "api_key" in body:
+        value = body.get("api_key")
+        api_key = str(value).strip() if isinstance(value, str) and str(value).strip() else None
+    base_url = existing_config.get("base_url") if isinstance(existing_config.get("base_url"), str) else None
+    if "base_url" in body:
+        value = body.get("base_url")
+        base_url = str(value).strip() if isinstance(value, str) and str(value).strip() else None
+    model = existing_config.get("model") if isinstance(existing_config.get("model"), str) else None
+    if "model" in body:
+        value = body.get("model")
+        model = str(value).strip() if isinstance(value, str) and str(value).strip() else None
+    config = _provider_check_config(spec, path=path, auth=auth, api_key=api_key, base_url=base_url, model=model)
     storage.upsert_provider(
         workspace_id=workspace_id,
         provider_id=provider_id,
@@ -3316,7 +5348,15 @@ def _test_and_store_provider(
     return _provider_view(provider_id, spec, config)
 
 
-def _provider_check_config(spec: Mapping[str, Any], *, path: str, auth: str) -> dict[str, Any]:
+def _provider_check_config(
+    spec: Mapping[str, Any],
+    *,
+    path: str,
+    auth: str,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
     if spec["id"] == "local":
         return {
             "path": path,
@@ -3325,7 +5365,36 @@ def _provider_check_config(spec: Mapping[str, Any], *, path: str, auth: str) -> 
             "last_checked_at": _service_now(),
             "last_error": None,
         }
+    sdk_key_available = False
+    if spec["id"] == "codex":
+        sdk_key_available = bool(api_key or os.getenv("OPENAI_API_KEY"))
+    elif spec["id"] == "claude":
+        sdk_key_available = bool(api_key or os.getenv("ANTHROPIC_API_KEY"))
     resolved_path = shutil.which(path) if not Path(path).is_absolute() else (path if Path(path).exists() else None)
+    if spec["id"] in {"codex", "claude"} and sdk_key_available:
+        if auth == "missing":
+            return {
+                "path": path,
+                "auth": auth,
+                "health": "offline",
+                "last_checked_at": _service_now(),
+                "last_error": "Auth is missing.",
+                **({"api_key": api_key} if api_key else {}),
+                "api_key_configured": True,
+                "base_url": base_url,
+                "model": model,
+            }
+        return {
+            "path": path,
+            "auth": auth,
+            "health": "online",
+            "last_checked_at": _service_now(),
+            "last_error": None,
+            **({"api_key": api_key} if api_key else {}),
+            "api_key_configured": True,
+            "base_url": base_url,
+            "model": model,
+        }
     if not resolved_path:
         return {
             "path": path,
@@ -3333,6 +5402,10 @@ def _provider_check_config(spec: Mapping[str, Any], *, path: str, auth: str) -> 
             "health": "offline",
             "last_checked_at": _service_now(),
             "last_error": f"CLI path not found: {path}",
+            **({"api_key": api_key} if api_key else {}),
+            "api_key_configured": sdk_key_available,
+            "base_url": base_url,
+            "model": model,
         }
     if auth == "missing":
         return {
@@ -3341,6 +5414,10 @@ def _provider_check_config(spec: Mapping[str, Any], *, path: str, auth: str) -> 
             "health": "offline",
             "last_checked_at": _service_now(),
             "last_error": "Auth is missing.",
+            **({"api_key": api_key} if api_key else {}),
+            "api_key_configured": sdk_key_available,
+            "base_url": base_url,
+            "model": model,
         }
     try:
         import subprocess as _sp
@@ -3355,6 +5432,10 @@ def _provider_check_config(spec: Mapping[str, Any], *, path: str, auth: str) -> 
                 "health": "rate_limited",
                 "last_checked_at": _service_now(),
                 "last_error": "Provider rate limited",
+                **({"api_key": api_key} if api_key else {}),
+                "api_key_configured": sdk_key_available,
+                "base_url": base_url,
+                "model": model,
             }
     except Exception:
         pass
@@ -3364,6 +5445,10 @@ def _provider_check_config(spec: Mapping[str, Any], *, path: str, auth: str) -> 
         "health": "online",
         "last_checked_at": _service_now(),
         "last_error": None,
+        **({"api_key": api_key} if api_key else {}),
+        "api_key_configured": sdk_key_available,
+        "base_url": base_url,
+        "model": model,
     }
 
 
@@ -3377,10 +5462,16 @@ def _provider_view(
         "id": provider_id,
         "name": spec["name"],
         "provider_type": spec["provider_type"],
+        "transport_kind": str(spec.get("transport_kind", "external")),
+        "transport_posture": str(spec.get("transport_posture", "unknown")),
         "health": str(override.get("health", spec["health"])),
         "auth": str(override.get("auth", spec["auth"])),
         "path": str(override.get("path", spec["path"])),
         "capabilities": spec["capabilities"],
+        "api_key_configured": bool(override.get("api_key_configured", False)),
+        "base_url": override.get("base_url"),
+        "model": override.get("model"),
+        "degraded_reason": override.get("degraded_reason", spec.get("degraded_reason")),
         "last_checked_at": override.get("last_checked_at"),
         "last_error": override.get("last_error"),
     }
@@ -3671,6 +5762,10 @@ def _task_dashboard(
         approvals = storage.list_approval_gates_for_task(task["id"])
         graph = _graph_for_task(storage, task)
         next_gate = _next_pending_gate(approvals)
+        checkpoints = storage.list_checkpoint_capsules_for_task(task["id"])
+        handoffs = storage.list_handoffs_for_task(task["id"])
+        latest_checkpoint = _latest_or_none(checkpoints)
+        latest_handoff = _latest_or_none(handoffs)
         summaries.append(
             {
                 "id": task["id"],
@@ -3683,6 +5778,7 @@ def _task_dashboard(
                 "next_gate": next_gate["name"] if next_gate else None,
                 "node_count": len(graph["nodes"]),
                 "blocked_count": len(graph.get("blocked_nodes", [])) + len(graph.get("waiting_human_nodes", [])),
+                "review_needed_count": _review_needed_count(approvals, storage.list_review_runs_for_task(task["id"])),
                 "coordination_state": graph.get("coordination_state"),
                 "fan_out_ready_count": len(graph.get("fan_out_ready_nodes", [])),
                 "fan_in_count": len(graph.get("fan_in_nodes", [])),
@@ -3693,6 +5789,8 @@ def _task_dashboard(
                     str(node["provider"]) for node in graph["nodes"] if node.get("provider")
                 ),
                 "updated_at": task["updated_at"],
+                "checkpoint_state": _checkpoint_state(latest_checkpoint),
+                "handoff_state": _handoff_state(latest_handoff),
             }
         )
     return summaries
@@ -3709,28 +5807,223 @@ def _unique_ordered(values: Any) -> list[str]:
 
 
 def _next_pending_gate(approvals: list[dict[str, Any]]) -> dict[str, Any] | None:
-    for gate in reversed(approvals):
+    for gate in reversed(_current_approval_gates(approvals)):
         if gate["status"] == "pending":
             return gate
     return None
 
 
 def _approval_state(approvals: list[dict[str, Any]]) -> str:
-    if any(gate["name"] == "Task graph" and gate["status"] == "pending" for gate in approvals):
+    current = _current_approval_gates(approvals)
+    if any(gate["name"] == "Task graph" and gate["status"] == "pending" for gate in current):
         return "graph_pending"
-    if any(gate["name"] == "PRD/AC" and gate["status"] == "pending" for gate in approvals):
+    if any(gate["name"] == "PRD/AC" and gate["status"] == "pending" for gate in current):
         return "prd_pending"
-    if any(gate["status"] == "pending" for gate in approvals):
+    if any(gate["status"] == "pending" for gate in current):
         return "approval_pending"
-    return "approved" if approvals else "none"
+    return "approved" if current else "none"
 
 
 def _graph_state(graph: dict[str, Any], approvals: list[dict[str, Any]]) -> str:
     if not graph["nodes"]:
         return "not_started"
-    if any(gate["name"] == "Task graph" and gate["status"] == "pending" for gate in approvals):
+    if any(gate["name"] == "Task graph" and gate["status"] == "pending" for gate in _current_approval_gates(approvals)):
         return "pending_approval"
     return "approved"
+
+
+def _current_approval_gates(approvals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    current: list[dict[str, Any]] = []
+    for gate in reversed(approvals):
+        name = str(gate.get("name") or "")
+        if name in seen:
+            continue
+        seen.add(name)
+        current.append(gate)
+    current.reverse()
+    return current
+
+
+def _checkpoint_state(checkpoint: dict[str, Any] | None) -> str:
+    if checkpoint is None:
+        return "none"
+    return str(checkpoint.get("status") or "ready")
+
+
+def _handoff_state(handoff: dict[str, Any] | None) -> str:
+    if handoff is None:
+        return "none"
+    metadata = handoff.get("metadata") or {}
+    repository_action = metadata.get("repository_action") or {}
+    if repository_action.get("status") == "approved":
+        return "ready"
+    return "draft"
+
+
+def _review_needed_count(
+    approvals: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+) -> int:
+    pending_review_gates = sum(
+        1
+        for gate in approvals
+        if gate["status"] == "pending" and str(gate.get("name") or "").lower() == "review"
+    )
+    rejected_reviews = sum(1 for review in reviews if review["status"] == "rejected")
+    return pending_review_gates + rejected_reviews
+
+
+def _build_inbox_items(storage: Storage, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    inbox: list[dict[str, Any]] = []
+    for task in tasks:
+        approvals = storage.list_approval_gates_for_task(task["id"])
+        reviews = storage.list_review_runs_for_task(task["id"])
+        latest_checkpoint = _latest_or_none(storage.list_checkpoint_capsules_for_task(task["id"]))
+        latest_handoff = _latest_or_none(storage.list_handoffs_for_task(task["id"]))
+        project_id = task["metadata"].get("project_id")
+
+        for gate in approvals:
+            if gate["status"] != "pending":
+                continue
+            inbox.append(
+                {
+                    "id": f"approval-{gate['id']}",
+                    "kind": "approval",
+                    "workspace_id": task["workspace_id"],
+                    "project_id": project_id,
+                    "task_id": task["id"],
+                    "title": task["title"],
+                    "summary": f"Approval needed: {gate['name']}",
+                    "state": "awaiting_approval",
+                    "next_action": "Open task",
+                    "updated_at": gate["updated_at"],
+                }
+            )
+
+        if any(review["status"] == "rejected" for review in reviews):
+            latest_rejected = next(review for review in reversed(reviews) if review["status"] == "rejected")
+            inbox.append(
+                {
+                    "id": f"failed-review-{latest_rejected['id']}",
+                    "kind": "failed_review",
+                    "workspace_id": task["workspace_id"],
+                    "project_id": project_id,
+                    "task_id": task["id"],
+                    "title": task["title"],
+                    "summary": latest_rejected["summary"] or "Review failed.",
+                    "state": "failed",
+                    "next_action": "Re-open task review",
+                    "updated_at": latest_rejected["updated_at"],
+                }
+            )
+
+        if latest_checkpoint is not None:
+            inbox.append(
+                {
+                    "id": f"checkpoint-{latest_checkpoint['id']}",
+                    "kind": "checkpoint_ready",
+                    "workspace_id": task["workspace_id"],
+                    "project_id": project_id,
+                    "task_id": task["id"],
+                    "title": task["title"],
+                    "summary": latest_checkpoint["summary"],
+                    "state": "ready",
+                    "next_action": "Resume from checkpoint",
+                    "updated_at": latest_checkpoint["created_at"],
+                }
+            )
+
+        if latest_handoff is not None:
+            inbox.append(
+                {
+                    "id": f"handoff-{latest_handoff['id']}",
+                    "kind": "handoff_ready",
+                    "workspace_id": task["workspace_id"],
+                    "project_id": project_id,
+                    "task_id": task["id"],
+                    "title": task["title"],
+                    "summary": latest_handoff["summary"],
+                    "state": "handoff_ready",
+                    "next_action": "Review handoff",
+                    "updated_at": latest_handoff["created_at"],
+                }
+            )
+
+    return sorted(inbox, key=lambda item: item["updated_at"], reverse=True)
+
+
+def _task_studio_header(
+    task: dict[str, Any],
+    *,
+    graph: dict[str, Any],
+    approvals: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    handoff: dict[str, Any] | None,
+    checkpoint: dict[str, Any] | None,
+    workspace: dict[str, Any] | None,
+) -> dict[str, Any]:
+    handoff_state = _handoff_state(handoff)
+    queue_state = _task_studio_queue_state(task, graph, approvals, reviews, handoff_state)
+    repository_action_preference = _effective_repository_action_preference(task, workspace)
+    return {
+        "queue_state": queue_state,
+        "approval_state": _approval_state(approvals),
+        "next_safe_action": _task_studio_next_safe_action(queue_state, approvals, checkpoint),
+        "repository_action_mode": repository_action_preference["mode"],
+        "checkpoint_ready": checkpoint is not None,
+        "handoff_state": handoff_state,
+    }
+
+
+def _task_studio_queue_state(
+    task: dict[str, Any],
+    graph: dict[str, Any],
+    approvals: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    handoff_state: str,
+) -> str:
+    if handoff_state != "none":
+        return "handoff_ready"
+    if any(review["status"] == "rejected" for review in reviews):
+        return "failed"
+    if any(gate["status"] == "pending" for gate in approvals):
+        return "awaiting_approval"
+    coordination_state = graph.get("coordination_state")
+    if coordination_state == "waiting_human":
+        return "waiting_human"
+    if coordination_state == "blocked":
+        return "blocked"
+    if coordination_state == "active":
+        return "running"
+    if coordination_state == "ready":
+        return "ready"
+    if task["status"] in {"done", "complete"}:
+        return "done"
+    return "planning"
+
+
+def _task_studio_next_safe_action(
+    queue_state: str,
+    approvals: list[dict[str, Any]],
+    checkpoint: dict[str, Any] | None,
+) -> str:
+    if queue_state == "awaiting_approval":
+        next_gate = _next_pending_gate(approvals)
+        return f"Approve {next_gate['name']}" if next_gate else "Review pending approval"
+    if queue_state == "handoff_ready":
+        return "Review handoff"
+    if queue_state in {"blocked", "waiting_human"}:
+        return "Resolve blocker"
+    if queue_state == "failed":
+        return "Review failed checks"
+    if checkpoint is not None:
+        return "Resume from checkpoint"
+    if queue_state == "running":
+        return "Monitor execution"
+    if queue_state == "ready":
+        return "Dispatch ready work"
+    return "Open task"
 
 
 def _ready_subtask_ids(subtasks: list[dict[str, Any]]) -> list[str]:

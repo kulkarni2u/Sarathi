@@ -10,12 +10,27 @@ except ImportError:
     from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
 
 from .base import ProviderAdapter
+from .base import ProviderCapabilities
 
 
 class LocalProviderAdapter(ProviderAdapter):
     @property
     def name(self) -> str:
         return "local"
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            transport_kind="deterministic",
+            supports_workspace_execution=False,
+            supports_structured_output=True,
+            declared_capabilities=(
+                "child_task_execution",
+                "planning",
+                "review_fixture",
+                "quality_recovery_fix",
+            ),
+        )
 
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
         if request.mode == "explore":

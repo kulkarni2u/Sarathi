@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 import stat
 
 from src.service import create_app
+from src.storage import connect
 
 
 def request(app, method, path, body=None, correlation_id="corr-review-loop"):
@@ -159,6 +161,33 @@ def test_review_run_records_provider_diff_and_spec_references(tmp_path):
     assert data["requeued_subtasks"]
 
 
+def test_review_run_uses_normalized_artifact_index_when_raw_traces_are_removed(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_provider_diff_and_spec_unit(app, tmp_path)
+    _strip_raw_response_traces(tmp_path / "sarathi.db", task["id"])
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task['id']}/reviews/run",
+            {"review_type": "functional"},
+        )
+    )
+
+    assert status == 201
+    review = data["review"]
+    diff_summary = review["metadata"]["diff_summary"]
+    findings = review["metadata"]["findings"]
+
+    assert review["status"] == "rejected"
+    assert diff_summary["changed_files"] == 2
+    assert diff_summary["provider_diff_hunks"] == 2
+    assert diff_summary["provider_spec_references"] == 2
+    assert any(item["check"] == "diff_hunk" for item in findings)
+    assert any(item["check"] == "spec_reference" for item in findings)
+
+
 def test_review_run_rejects_provider_signaled_spec_drift_and_requeues_units(tmp_path):
     app = create_app(tmp_path / "sarathi.db")
     task = create_task_with_provider_spec_drift_unit(app, tmp_path)
@@ -281,6 +310,30 @@ def create_task_with_dispatched_unit(app, tmp_path):
         )
     )
     return task
+
+
+def _strip_raw_response_traces(db_path: Path, task_id: str) -> None:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, metadata FROM evidence_artifacts WHERE task_id = ? ORDER BY created_at, id",
+            (task_id,),
+        ).fetchall()
+        for row in rows:
+            raw_metadata = row["metadata"]
+            if isinstance(raw_metadata, str) and raw_metadata.strip():
+                metadata = json.loads(raw_metadata)
+            elif isinstance(raw_metadata, dict):
+                metadata = dict(raw_metadata)
+            else:
+                metadata = {}
+            raw = metadata.get("response_evidence")
+            if isinstance(raw, dict):
+                metadata["response_evidence"] = {}
+            conn.execute(
+                "UPDATE evidence_artifacts SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata), row["id"]),
+            )
+        conn.commit()
 
 
 def create_task_with_provider_traced_unit(app, tmp_path):

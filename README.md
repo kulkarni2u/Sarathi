@@ -57,6 +57,7 @@ sarathi log <task_id>
 ```bash
 sarathi status <task_id>        # Show task status, graph progress, escalation summary
 sarathi resume <task_id>        # Resume a paused or failed task
+sarathi reuse                   # Show live workflow templates, saved views, and learned playbooks
 ```
 
 ### Policy proposals
@@ -77,6 +78,8 @@ sarathi agents               # Show Sanskrit-inspired agent role names and phase
 ### Desktop local stack
 
 ```bash
+sarathi desktop
+# or
 sarathi-desktop
 # or
 python3 -m src.service.desktop
@@ -89,10 +92,11 @@ Useful helpers:
 ```bash
 python3 -m src.service.desktop --print-config
 python3 -m src.service.desktop --service-port 0 --vite-port 0
+python3 -m src.service.desktop --service-timeout 30
 python3 -m src.service.desktop --service-only
 ```
 
-The launcher starts the local service on `127.0.0.1`, generates a per-run token unless you provide one, writes runtime config for the UI, and restores the runtime stub on shutdown.
+The launcher starts the local service on `127.0.0.1`, generates a per-run token unless you provide one, writes runtime config for the UI, and restores the runtime stub on shutdown. `--service-timeout` is useful on slower machines or larger local databases where the default health-check deadline may be too short.
 
 ### Workspace Repository Bootstrap
 

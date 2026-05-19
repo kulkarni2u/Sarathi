@@ -47,6 +47,9 @@ def test_handoff_creates_release_dossier_and_pending_repository_action_gate(tmp_
     handoff = data["handoff"]
     assert handoff["summary"].startswith("Sarathi handoff for Review loop")
     assert handoff["metadata"]["ac_coverage"]
+    assert handoff["metadata"]["normalized_completion_context"]["files_changed"]
+    assert handoff["metadata"]["normalized_completion_context"]["tests_run"]
+    assert handoff["metadata"]["normalized_completion_context"]["summaries"]
     assert handoff["metadata"]["repository_action"]["status"] == "pending"
     assert data["repository_action_gate"]["name"] == "Repository action"
     assert data["repository_action_gate"]["status"] == "pending"

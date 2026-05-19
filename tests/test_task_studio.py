@@ -64,6 +64,75 @@ def test_task_studio_snapshot_combines_task_graph_messages_gates_and_history(tmp
     assert "message.created" in event_types
 
 
+def test_task_studio_exposes_header_state_posture(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_graph(app, tmp_path)
+
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task['id']}/approve",
+            {"name": "Task graph", "status": "approved"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+
+    _, studio_before = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    first_node = studio_before["graph"]["nodes"][0]
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{first_node['id']}/dispatch",
+            {"provider": "local"},
+        )
+    )
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task['id']}/reviews/run",
+            {"review_type": "functional"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/handoff"))
+
+    from src.storage import Storage, connect, run_migrations
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn)
+        storage.create_checkpoint_capsule(
+            workspace_id=task["workspace_id"],
+            task_id=task["id"],
+            project_id=None,
+            status="ready",
+            summary="Resume from this reviewed handoff.",
+            key_decisions=[],
+            evidence_refs=[],
+            repository_action_preference={
+                "scope": "task",
+                "mode": "no_action",
+                "allowed_modes": ["no_action"],
+                "source": "test",
+            },
+            next_start_point="Resume from checkpoint",
+            created_by="Sarathi",
+        )
+
+    status, data = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+
+    assert status == 200
+    assert "header" in data
+    header = data["header"]
+    assert header["queue_state"] == "handoff_ready"
+    assert header["next_safe_action"] == "Review handoff"
+    assert header["repository_action_mode"] == "no_action"
+    assert header["checkpoint_ready"] is True
+    assert header["handoff_state"] == "draft"
+    assert header["approval_state"] == "approval_pending"
+
+
 def create_task_with_graph(app, tmp_path):
     _, workspace_data = assert_ok(
         request(

@@ -13,8 +13,11 @@ try:
 except ImportError:
     from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
 
-from .base import ProviderAdapter
+from .base import ProviderAdapter, ProviderCapabilities
+from .anthropic_sdk import AnthropicSdkProviderAdapter
 from .local import LocalProviderAdapter
+from .openai_sdk import OpenAISdkProviderAdapter
+from .opencode_sdk import OpenCodeSdkProviderAdapter
 
 
 class ExternalProviderAdapter(ProviderAdapter):
@@ -35,6 +38,14 @@ class ExternalProviderAdapter(ProviderAdapter):
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            transport_kind="external",
+            supports_structured_output=True,
+            declared_capabilities=tuple(self.supported_modes),
+        )
 
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
         artifacts = {
@@ -167,6 +178,15 @@ class CommandProviderAdapter(ProviderAdapter):
     def name(self) -> str:
         return self._name
 
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            transport_kind="command",
+            supports_structured_output=True,
+            supports_workspace_execution=True,
+            declared_capabilities=("cli_fallback",),
+        )
+
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
         command = shlex.split(self.command) if isinstance(self.command, str) else list(self.command)
         payload = json.dumps(
@@ -261,6 +281,13 @@ class ConfiguredProviderAdapter(ProviderAdapter):
     def name(self) -> str:
         return self.default_provider
 
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        provider = self.providers.get(self.default_provider)
+        if provider is not None:
+            return provider.capabilities
+        return ProviderCapabilities(transport_kind="external", supports_structured_output=True)
+
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
         provider_name = self._provider_name_for(request)
         provider = self.providers.get(provider_name)
@@ -305,6 +332,45 @@ class ConfiguredProviderAdapter(ProviderAdapter):
         return None
 
     def _provider_from_config(self, provider_name: str, provider_cfg: Any) -> ProviderAdapter:
+        if provider_name == "claude" and isinstance(provider_cfg, Mapping) and provider_cfg.get("type") == "anthropic_sdk":
+            workspace_root = str(provider_cfg.get("workspace_root") or ".")
+            provider_path = provider_cfg.get("provider_path")
+            return AnthropicSdkProviderAdapter(
+                workspace_root=workspace_root,
+                provider_path=str(provider_path) if isinstance(provider_path, str) and provider_path else None,
+                api_key=str(provider_cfg["api_key"]) if isinstance(provider_cfg.get("api_key"), str) and provider_cfg.get("api_key") else None,
+                base_url=str(provider_cfg["base_url"]) if isinstance(provider_cfg.get("base_url"), str) and provider_cfg.get("base_url") else None,
+                model=str(provider_cfg["model"]) if isinstance(provider_cfg.get("model"), str) and provider_cfg.get("model") else None,
+                node_command=str(provider_cfg.get("node_command", "node") or "node"),
+                helper_script=str(provider_cfg["helper_script"]) if isinstance(provider_cfg.get("helper_script"), str) else None,
+                timeout_seconds=int(provider_cfg.get("timeout_seconds", 300) or 300),
+                fallback_to_cli=bool(provider_cfg.get("fallback_to_cli", True)),
+            )
+        if provider_name == "codex" and isinstance(provider_cfg, Mapping) and provider_cfg.get("type") == "openai_sdk":
+            workspace_root = str(provider_cfg.get("workspace_root") or ".")
+            provider_path = provider_cfg.get("provider_path")
+            return OpenAISdkProviderAdapter(
+                workspace_root=workspace_root,
+                provider_path=str(provider_path) if isinstance(provider_path, str) and provider_path else None,
+                api_key=str(provider_cfg["api_key"]) if isinstance(provider_cfg.get("api_key"), str) and provider_cfg.get("api_key") else None,
+                base_url=str(provider_cfg["base_url"]) if isinstance(provider_cfg.get("base_url"), str) and provider_cfg.get("base_url") else None,
+                model=str(provider_cfg["model"]) if isinstance(provider_cfg.get("model"), str) and provider_cfg.get("model") else None,
+                node_command=str(provider_cfg.get("node_command", "node") or "node"),
+                helper_script=str(provider_cfg["helper_script"]) if isinstance(provider_cfg.get("helper_script"), str) else None,
+                timeout_seconds=int(provider_cfg.get("timeout_seconds", 300) or 300),
+                fallback_to_cli=bool(provider_cfg.get("fallback_to_cli", True)),
+            )
+        if provider_name == "opencode" and isinstance(provider_cfg, Mapping) and provider_cfg.get("type") == "opencode_sdk":
+            workspace_root = str(provider_cfg.get("workspace_root") or ".")
+            provider_path = provider_cfg.get("provider_path")
+            return OpenCodeSdkProviderAdapter(
+                workspace_root=workspace_root,
+                provider_path=str(provider_path) if isinstance(provider_path, str) and provider_path else None,
+                node_command=str(provider_cfg.get("node_command", "node") or "node"),
+                helper_script=str(provider_cfg["helper_script"]) if isinstance(provider_cfg.get("helper_script"), str) else None,
+                timeout_seconds=int(provider_cfg.get("timeout_seconds", 300) or 300),
+                fallback_to_cli=bool(provider_cfg.get("fallback_to_cli", True)),
+            )
         if isinstance(provider_cfg, Mapping) and provider_cfg.get("type") == "command":
             command = provider_cfg.get("command")
             if isinstance(command, (str, list, tuple)):
@@ -336,6 +402,18 @@ def validate_provider_routing_config(config: Any) -> list[str]:
         for provider_name, provider_cfg in providers.items():
             if not isinstance(provider_name, str) or not provider_name:
                 issues.append("model_routing.providers keys must be non-empty strings")
+            if provider_name == "claude" and isinstance(provider_cfg, Mapping) and provider_cfg.get("type") == "anthropic_sdk":
+                workspace_root = provider_cfg.get("workspace_root")
+                if not isinstance(workspace_root, str) or not workspace_root:
+                    issues.append("model_routing.providers.claude.workspace_root must be a non-empty string")
+            if provider_name == "codex" and isinstance(provider_cfg, Mapping) and provider_cfg.get("type") == "openai_sdk":
+                workspace_root = provider_cfg.get("workspace_root")
+                if not isinstance(workspace_root, str) or not workspace_root:
+                    issues.append("model_routing.providers.codex.workspace_root must be a non-empty string")
+            if provider_name == "opencode" and isinstance(provider_cfg, Mapping) and provider_cfg.get("type") == "opencode_sdk":
+                workspace_root = provider_cfg.get("workspace_root")
+                if not isinstance(workspace_root, str) or not workspace_root:
+                    issues.append("model_routing.providers.opencode.workspace_root must be a non-empty string")
             if isinstance(provider_cfg, Mapping) and provider_cfg.get("type") == "command":
                 command = provider_cfg.get("command")
                 if not isinstance(command, (str, list, tuple)):

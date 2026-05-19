@@ -21,6 +21,8 @@ class DispatchRequest:
     inputs: dict[str, Any] = field(default_factory=dict)
     expected_outputs: list[str] = field(default_factory=list)
     constraints: dict[str, Any] = field(default_factory=dict)
+    context_pack: dict[str, Any] | None = None
+    token_budget: int | None = None
     timeout_seconds: int = 300
     retry_budget: int = 0
 

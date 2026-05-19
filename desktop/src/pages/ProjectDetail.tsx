@@ -1,24 +1,34 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import {
+  activeSavedViewFromReuseKit,
   approveTaskGate,
   approveRepositoryAction,
   createTaskGraphDraft,
   createTaskHandoff,
   ensureWorkspace,
+  filterTaskDashboardItemsBySavedView,
+  getKnowledgeCenter,
+  getProposals,
   getSarathiApiConfig,
   getTaskCheckpoint,
   getTaskPanel,
   getTaskStudio,
   getWorkspaceOperationalViews,
+  getWorkspaceReuseKit,
   listTaskDashboard,
   listTaskCheckpoints,
   restartTaskFromCheckpoint,
   runTaskReview,
   scheduleTask,
+  type DispatchRecord,
+  type EvidenceArtifactRecord,
+  type KnowledgeCenterSummary,
   type LifecycleEventRecord,
   type CheckpointCapsuleRecord,
   type OperationalViewsSnapshot,
+  type PolicyProposal,
   type ReviewRunRecord,
+  type SavedViewSnapshot,
   type TaskPanelEntry,
   type TaskDashboardItem,
   type TaskGraphNode,
@@ -42,6 +52,574 @@ import {
 
 type ProjectTab = "studio" | "lifecycle" | "history" | "usage";
 
+type ArtifactReviewFinding = {
+  message: string;
+  severity: string | null;
+  provider: string | null;
+  filePath: string | null;
+  check: string | null;
+  acId: string | null;
+  criterion: string | null;
+  lineStart: number | null;
+  lineEnd: number | null;
+  confidence: number | null;
+  source: string | null;
+  excerpt: string | null;
+  suggestion: string | null;
+  status: string | null;
+  header: string | null;
+  category: string | null;
+};
+
+type ArtifactProvenanceEntry = {
+  label: string;
+  detail: string;
+};
+
+type ArtifactProvenance = {
+  filesChanged: ArtifactProvenanceEntry[];
+  testsRun: ArtifactProvenanceEntry[];
+  knownRisks: ArtifactProvenanceEntry[];
+  reviewFindings: ArtifactProvenanceEntry[];
+};
+
+type ArtifactSnapshot = {
+  filesChanged: string[];
+  testsRun: string[];
+  knownRisks: string[];
+  reviewFindings: ArtifactReviewFinding[];
+  provenance: ArtifactProvenance;
+};
+
+type ArtifactOverviewModel = ArtifactSnapshot & {
+  dispatchCount: number;
+  evidenceCount: number;
+  dispatchSummaries: {
+    id: string;
+    agent: string;
+    status: string;
+    summary: string | null;
+    nextAgent: string | null;
+    filesChangedCount: number;
+    testsRunCount: number;
+    reviewFindingsCount: number;
+    knownRisksCount: number;
+    traceSources: ArtifactProvenanceEntry[];
+  }[];
+};
+
+type AcceptanceCoverageItem = {
+  id: string;
+  criterion: string;
+  covered: boolean;
+};
+
+type CompletionContextModel = {
+  filesChanged: string[];
+  testsRun: string[];
+  findings: string[];
+  risks: string[];
+  summaries: string[];
+  decisions: string[];
+};
+
+type DeliverySpineModel = {
+  prdProblem: string | null;
+  prdGoal: string | null;
+  prdScope: string[];
+  acceptanceCriteria: string[];
+  acCoverage: AcceptanceCoverageItem[];
+  coveredCriteriaCount: number;
+  latestReviewStatus: string | null;
+  handoffReady: boolean;
+  repositoryActionStatus: string | null;
+  missingItems: string[];
+  completionContext: CompletionContextModel | null;
+  checkpointReady: boolean;
+};
+
+type TaskOriginModel = {
+  launchSummary: string | null;
+  launchDetail: string | null;
+  workflowLineage: string[];
+  recommendedViews: string[];
+  launchPosture: string[];
+};
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function asStringList(value: unknown): string[] {
+  if (typeof value === "string" && value.trim()) {
+    return [value.trim()];
+  }
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => String(item).trim())
+    .filter((item) => item.length > 0);
+}
+
+function uniqueStrings(values: Iterable<string>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function uniqueProvenance(entries: Iterable<ArtifactProvenanceEntry>): ArtifactProvenanceEntry[] {
+  const seen = new Set<string>();
+  const result: ArtifactProvenanceEntry[] = [];
+  for (const entry of entries) {
+    const key = `${entry.label}::${entry.detail}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(entry);
+  }
+  return result;
+}
+
+function findingSeverityTone(value: string | null): string {
+  if (!value) return "draft";
+  const normalized = value.toLowerCase();
+  if (["critical", "major", "error", "failed"].includes(normalized)) return "blocked";
+  if (["warning", "minor"].includes(normalized)) return "warning";
+  if (["info", "passed", "ok", "success"].includes(normalized)) return "active";
+  return "draft";
+}
+
+function findingSeverityRank(value: string | null): number {
+  if (!value) return 5;
+  const normalized = value.toLowerCase();
+  if (["critical", "error"].includes(normalized)) return 0;
+  if (["major", "warning"].includes(normalized)) return 1;
+  if (["minor"].includes(normalized)) return 2;
+  if (["info", "passed", "ok", "success"].includes(normalized)) return 3;
+  return 4;
+}
+
+function formatFindingLocation(finding: ArtifactReviewFinding): string | null {
+  if (!finding.filePath) return null;
+  const range = finding.lineStart == null
+    ? ""
+    : finding.lineEnd != null && finding.lineEnd !== finding.lineStart
+      ? `:${finding.lineStart}-${finding.lineEnd}`
+      : `:${finding.lineStart}`;
+  return `${finding.filePath}${range}`;
+}
+
+function formatFindingTraceOrigin(value: string | null): ArtifactProvenanceEntry | null {
+  if (!value) return null;
+  if (value.startsWith("outputs.")) {
+    return { label: "Provider output trace", detail: value };
+  }
+  if (value.startsWith("evidence.")) {
+    return { label: "Normalized evidence trace", detail: value };
+  }
+  if (value.startsWith("artifacts.")) {
+    return { label: "Normalized artifact trace", detail: value };
+  }
+  return { label: "Trace origin", detail: value };
+}
+
+function humanizeIdentifier(value: string): string {
+  return value
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function titleCaseWords(value: string): string {
+  return value
+    .split(/\s+/)
+    .filter((part) => part.length > 0)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function normalizeAcceptanceCoverage(
+  value: unknown,
+  acceptanceCriteria: string[],
+): AcceptanceCoverageItem[] {
+  const coverage = Array.isArray(value) ? value : [];
+  const normalized = coverage
+    .map((item, index) => {
+      const mapped = asObject(item);
+      if (!mapped) return null;
+      const criterion = typeof mapped.criterion === "string"
+        ? mapped.criterion
+        : acceptanceCriteria[index] ?? null;
+      if (!criterion?.trim()) return null;
+      return {
+        id: typeof mapped.id === "string" && mapped.id.trim() ? mapped.id.trim() : `AC-${String(index + 1).padStart(2, "0")}`,
+        criterion: criterion.trim(),
+        covered: Boolean(mapped.covered),
+      };
+    })
+    .filter((item): item is AcceptanceCoverageItem => item !== null);
+  if (normalized.length > 0) {
+    return normalized;
+  }
+  return acceptanceCriteria.map((criterion, index) => ({
+    id: `AC-${String(index + 1).padStart(2, "0")}`,
+    criterion,
+    covered: false,
+  }));
+}
+
+function readCompletionContext(handoffMetadataValue: unknown): CompletionContextModel | null {
+  const metadata = asObject(handoffMetadataValue);
+  const context = asObject(metadata?.normalized_completion_context);
+  if (!context) return null;
+  return {
+    filesChanged: uniqueStrings(asStringList(context.files_changed)),
+    testsRun: uniqueStrings(asStringList(context.tests_run)),
+    findings: uniqueStrings(asStringList(context.findings)),
+    risks: uniqueStrings(asStringList(context.risks)),
+    summaries: uniqueStrings(asStringList(context.summaries)),
+    decisions: uniqueStrings(asStringList(context.decisions)),
+  };
+}
+
+function buildDeliverySpineModel(
+  taskMetadata: TaskMetadata,
+  latestReview: ReviewRunRecord | null,
+  handoff: Record<string, unknown> | null | undefined,
+  checkpointReady: boolean,
+): DeliverySpineModel {
+  const prd = asObject(taskMetadata.prd);
+  const acceptanceCriteria = Array.isArray(taskMetadata.acceptance_criteria)
+    ? taskMetadata.acceptance_criteria
+      .map((item) => String(item).trim())
+      .filter((item) => item.length > 0)
+    : [];
+  const reviewMetadata = asObject(latestReview?.metadata);
+  const handoffMetadata = asObject(handoff?.metadata);
+  const acCoverage = normalizeAcceptanceCoverage(
+    handoffMetadata?.ac_coverage ?? reviewMetadata?.ac_coverage,
+    acceptanceCriteria,
+  );
+  const coveredCriteriaCount = acCoverage.filter((item) => item.covered).length;
+  const repositoryAction = asObject(handoffMetadata?.repository_action);
+  const missingItems: string[] = [];
+  if (!prd?.problem && !prd?.goal) {
+    missingItems.push("PRD summary");
+  }
+  if (acceptanceCriteria.length === 0) {
+    missingItems.push("acceptance criteria");
+  }
+  if (!latestReview || latestReview.status !== "approved") {
+    missingItems.push("approved review");
+  }
+  if (acceptanceCriteria.length > 0 && acCoverage.some((item) => !item.covered)) {
+    missingItems.push("full AC coverage");
+  }
+  if (!handoff) {
+    missingItems.push("final handoff");
+  }
+  return {
+    prdProblem: typeof prd?.problem === "string" ? prd.problem : null,
+    prdGoal: typeof prd?.goal === "string" ? prd.goal : null,
+    prdScope: uniqueStrings(asStringList(prd?.scope)),
+    acceptanceCriteria,
+    acCoverage,
+    coveredCriteriaCount,
+    latestReviewStatus: latestReview?.status ?? null,
+    handoffReady: Boolean(handoff) && missingItems.length === 0,
+    repositoryActionStatus: typeof repositoryAction?.status === "string" ? repositoryAction.status : null,
+    missingItems,
+    completionContext: readCompletionContext(handoffMetadata),
+    checkpointReady,
+  };
+}
+
+function buildTaskOriginModel(taskMetadata: TaskMetadata): TaskOriginModel | null {
+  const reuse = asObject(taskMetadata.reuse);
+  const reuseSource = asObject(reuse?.reuse_source);
+  const workflowLineage: string[] = [];
+  const recommendedViews = uniqueStrings(asStringList(reuse?.recommended_view_ids));
+  const launchPosture: string[] = [];
+  const githubReference = githubIssueReference(taskMetadata);
+
+  if (reuseSource?.name && typeof reuseSource.name === "string") {
+    const kind = typeof reuseSource.kind === "string" && reuseSource.kind.trim()
+      ? titleCaseWords(humanizeIdentifier(reuseSource.kind))
+      : "Workflow";
+    workflowLineage.push(`${kind}: ${reuseSource.name}`);
+  }
+  if (typeof reuse?.workflow_template_id === "string" && reuse.workflow_template_id.trim()) {
+    workflowLineage.push(`Template id: ${reuse.workflow_template_id}`);
+  }
+  if (typeof reuse?.learning_playbook_id === "string" && reuse.learning_playbook_id.trim()) {
+    workflowLineage.push(`Playbook id: ${reuse.learning_playbook_id}`);
+  }
+  if (typeof reuse?.recommended_repository_action_mode === "string" && reuse.recommended_repository_action_mode.trim()) {
+    launchPosture.push(`Repo posture: ${humanizeIdentifier(reuse.recommended_repository_action_mode)}`);
+  }
+  if (typeof reuse?.recommended_auto_approve_mode === "string" && reuse.recommended_auto_approve_mode.trim()) {
+    launchPosture.push(`Auto-approve: ${humanizeIdentifier(reuse.recommended_auto_approve_mode)}`);
+  }
+  launchPosture.push(
+    ...uniqueStrings(asStringList(reuse?.suggested_provider_priority)).map(
+      (provider, index) => `${index === 0 ? "Provider priority" : "Fallback"}: ${provider}`,
+    ),
+  );
+
+  let launchSummary: string | null = null;
+  let launchDetail: string | null = null;
+  if (githubReference) {
+    launchSummary = "Imported GitHub issue";
+    launchDetail = githubReference;
+  } else if (taskMetadata.source === "brainstorm") {
+    launchSummary = "Approved brainstorm session";
+    launchDetail = typeof taskMetadata.brainstorm_session_id === "string"
+      ? `Session ${taskMetadata.brainstorm_session_id}`
+      : "This task was promoted from a brainstorm session.";
+  } else if (typeof taskMetadata.source_prompt === "string" && taskMetadata.source_prompt.trim()) {
+    launchSummary = "Created from task draft prompt";
+    launchDetail = taskMetadata.source_prompt.trim();
+  } else if (typeof taskMetadata.source === "string" && taskMetadata.source.trim()) {
+    launchSummary = titleCaseWords(humanizeIdentifier(taskMetadata.source));
+  }
+
+  if (!launchSummary && workflowLineage.length === 0 && recommendedViews.length === 0 && launchPosture.length === 0) {
+    return null;
+  }
+
+  return {
+    launchSummary,
+    launchDetail,
+    workflowLineage,
+    recommendedViews,
+    launchPosture,
+  };
+}
+
+function normalizeReviewFindings(value: unknown): ArtifactReviewFinding[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const findings: ArtifactReviewFinding[] = [];
+  value.forEach((item) => {
+    if (typeof item === "string" && item.trim()) {
+      findings.push({
+        message: item.trim(),
+        severity: null,
+        provider: null,
+        filePath: null,
+        check: null,
+        acId: null,
+        criterion: null,
+        lineStart: null,
+        lineEnd: null,
+        confidence: null,
+        source: null,
+        excerpt: null,
+        suggestion: null,
+        status: null,
+        header: null,
+        category: null,
+      });
+      return;
+    }
+    const finding = asObject(item);
+    if (!finding) return;
+    const message = typeof finding.message === "string"
+      ? finding.message
+      : typeof finding.summary === "string"
+        ? finding.summary
+        : typeof finding.finding === "string"
+          ? finding.finding
+          : null;
+    if (!message?.trim()) return;
+    findings.push({
+      message: message.trim(),
+      severity: typeof finding.severity === "string" ? finding.severity : null,
+      provider: typeof finding.provider === "string" ? finding.provider : null,
+      filePath: typeof finding.file_path === "string" ? finding.file_path : null,
+      check: typeof finding.check === "string" ? finding.check : null,
+      acId: typeof finding.ac_id === "string" ? finding.ac_id : null,
+      criterion: typeof finding.criterion === "string" ? finding.criterion : null,
+      lineStart: typeof finding.line_start === "number" ? finding.line_start : null,
+      lineEnd: typeof finding.line_end === "number" ? finding.line_end : null,
+      confidence: typeof finding.confidence === "number" ? finding.confidence : null,
+      source: typeof finding.source === "string" ? finding.source : null,
+      excerpt: typeof finding.excerpt === "string" ? finding.excerpt : null,
+      suggestion: typeof finding.suggestion === "string" ? finding.suggestion : null,
+      status: typeof finding.status === "string" ? finding.status : null,
+      header: typeof finding.header === "string" ? finding.header : null,
+      category: typeof finding.category === "string" ? finding.category : null,
+    });
+  });
+  return findings;
+}
+
+function readArtifactSnapshot(metadataValue: unknown): ArtifactSnapshot {
+  const metadata = asObject(metadataValue) ?? {};
+  const artifactIndex = asObject(metadata.artifact_index);
+  const responseEvidence = asObject(metadata.response_evidence);
+  const artifactFilesChanged = asStringList(artifactIndex?.files_changed);
+  const fallbackFilesChanged = artifactFilesChanged.length === 0
+    ? asStringList(responseEvidence?.changed_files)
+    : [];
+  const reviewFindings = normalizeReviewFindings(artifactIndex?.review_findings);
+  const testsRun = uniqueStrings(asStringList(artifactIndex?.tests_run));
+  const knownRisks = uniqueStrings(asStringList(artifactIndex?.known_risks));
+  return {
+    filesChanged: uniqueStrings(artifactFilesChanged.length > 0 ? artifactFilesChanged : fallbackFilesChanged),
+    testsRun,
+    knownRisks,
+    reviewFindings,
+    provenance: {
+      filesChanged: artifactFilesChanged.length > 0
+        ? [{ label: "Normalized artifact index", detail: "artifact_index.files_changed" }]
+        : fallbackFilesChanged.length > 0
+          ? [{ label: "Compatibility fallback", detail: "response_evidence.changed_files" }]
+          : [],
+      testsRun: testsRun.length > 0
+        ? [{ label: "Normalized artifact index", detail: "artifact_index.tests_run" }]
+        : [],
+      knownRisks: knownRisks.length > 0
+        ? [{ label: "Normalized artifact index", detail: "artifact_index.known_risks" }]
+        : [],
+      reviewFindings: reviewFindings.length > 0
+        ? [{ label: "Normalized artifact index", detail: "artifact_index.review_findings" }]
+        : [],
+    },
+  };
+}
+
+function readDispatchTraceSources(metadataValue: unknown): ArtifactProvenanceEntry[] {
+  const metadata = asObject(metadataValue) ?? {};
+  const artifactIndex = asObject(metadata.artifact_index);
+  const responseEvidence = asObject(metadata.response_evidence);
+  const entries: ArtifactProvenanceEntry[] = [];
+
+  if (asObject(metadata.context_pack)) {
+    entries.push({ label: "Compiled context pack", detail: "context_pack.agent_input + compilation" });
+  }
+  if (asObject(metadata.agent_output)) {
+    entries.push({ label: "Normalized agent output", detail: "agent_output.summary/findings/decisions" });
+  }
+  if (artifactIndex) {
+    entries.push({ label: "Normalized artifact index", detail: "artifact_index.files_changed/tests_run/review_findings" });
+  }
+  if (responseEvidence) {
+    entries.push({
+      label: artifactIndex ? "Raw provider evidence retained" : "Compatibility fallback",
+      detail: "response_evidence.*",
+    });
+  }
+
+  return uniqueProvenance(entries);
+}
+
+function buildArtifactOverview(
+  evidence: EvidenceArtifactRecord[],
+  dispatches: DispatchRecord[],
+): ArtifactOverviewModel {
+  const allFiles: string[] = [];
+  const allTests: string[] = [];
+  const allRisks: string[] = [];
+  const allFindings: ArtifactReviewFinding[] = [];
+  const allProvenance: ArtifactProvenance = {
+    filesChanged: [],
+    testsRun: [],
+    knownRisks: [],
+    reviewFindings: [],
+  };
+
+  evidence.forEach((item) => {
+    const snapshot = readArtifactSnapshot(item.metadata);
+    allFiles.push(...snapshot.filesChanged);
+    allTests.push(...snapshot.testsRun);
+    allRisks.push(...snapshot.knownRisks);
+    allFindings.push(...snapshot.reviewFindings);
+    allProvenance.filesChanged.push(...snapshot.provenance.filesChanged);
+    allProvenance.testsRun.push(...snapshot.provenance.testsRun);
+    allProvenance.knownRisks.push(...snapshot.provenance.knownRisks);
+    allProvenance.reviewFindings.push(...snapshot.provenance.reviewFindings);
+  });
+
+  const dispatchSummaries = dispatches.map((dispatch) => {
+    const snapshot = readArtifactSnapshot(dispatch.metadata);
+    allFiles.push(...snapshot.filesChanged);
+    allTests.push(...snapshot.testsRun);
+    allRisks.push(...snapshot.knownRisks);
+    allFindings.push(...snapshot.reviewFindings);
+    allProvenance.filesChanged.push(...snapshot.provenance.filesChanged);
+    allProvenance.testsRun.push(...snapshot.provenance.testsRun);
+    allProvenance.knownRisks.push(...snapshot.provenance.knownRisks);
+    allProvenance.reviewFindings.push(...snapshot.provenance.reviewFindings);
+    const metadata = asObject(dispatch.metadata) ?? {};
+    const agentOutput = asObject(metadata.agent_output);
+    const summary = typeof agentOutput?.summary === "string" ? agentOutput.summary : null;
+    const nextAgent = typeof agentOutput?.next_recommended_agent === "string"
+      ? agentOutput.next_recommended_agent
+      : null;
+    return {
+      id: dispatch.id,
+      agent: dispatch.agent_name,
+      status: dispatch.status,
+      summary,
+      nextAgent,
+      filesChangedCount: snapshot.filesChanged.length,
+      testsRunCount: snapshot.testsRun.length,
+      reviewFindingsCount: snapshot.reviewFindings.length,
+      knownRisksCount: snapshot.knownRisks.length,
+      traceSources: readDispatchTraceSources(dispatch.metadata),
+    };
+  }).filter((item) => {
+    return (
+      item.summary !== null ||
+      item.nextAgent !== null ||
+      item.filesChangedCount > 0 ||
+      item.testsRunCount > 0 ||
+      item.reviewFindingsCount > 0 ||
+      item.knownRisksCount > 0 ||
+      item.traceSources.length > 0
+    );
+  });
+
+  const seenMessages = new Set<string>();
+  const dedupedFindings: ArtifactReviewFinding[] = [];
+  for (const f of allFindings) {
+    const key = `${f.message}::${f.severity ?? ""}::${f.filePath ?? ""}::${f.lineStart ?? ""}::${f.lineEnd ?? ""}::${f.check ?? ""}`;
+    if (!seenMessages.has(key)) {
+      seenMessages.add(key);
+      dedupedFindings.push(f);
+    }
+  }
+  dedupedFindings.sort((left, right) => {
+    const severityDelta = findingSeverityRank(left.severity) - findingSeverityRank(right.severity);
+    if (severityDelta !== 0) return severityDelta;
+    return left.message.localeCompare(right.message);
+  });
+
+  return {
+    filesChanged: uniqueStrings(allFiles),
+    testsRun: uniqueStrings(allTests),
+    knownRisks: uniqueStrings(allRisks),
+    reviewFindings: dedupedFindings,
+    provenance: {
+      filesChanged: uniqueProvenance(allProvenance.filesChanged),
+      testsRun: uniqueProvenance(allProvenance.testsRun),
+      knownRisks: uniqueProvenance(allProvenance.knownRisks),
+      reviewFindings: uniqueProvenance(allProvenance.reviewFindings),
+    },
+    dispatchCount: dispatches.length,
+    evidenceCount: evidence.length,
+    dispatchSummaries,
+  };
+}
+
 interface Props {
   workspaceId?: string | null;
   projectId?: string | null;
@@ -49,6 +627,8 @@ interface Props {
   selectedTaskId?: string | null;
   setSelectedTaskId?: (id: string | null) => void;
   setRoute?: (route: string) => void;
+  onOpenProposal?: (proposalId: string) => void;
+  onOpenWorkspace?: (viewId?: string | null) => void;
 }
 
 function mockTasksToDashboardItems(): TaskDashboardItem[] {
@@ -64,6 +644,9 @@ function mockTasksToDashboardItems(): TaskDashboardItem[] {
     next_gate: task.status === "complete" ? null : "Task graph",
     node_count: subtasks.length,
     blocked_count: blockedCount,
+    review_needed_count: 0,
+    checkpoint_state: "none",
+    handoff_state: "none",
     roles: Array.from(new Set(subtasks.map((unit) => unit.role))),
     providers: Array.from(new Set(subtasks.map((unit) => unit.provider))),
     updated_at: new Date(Date.now() - index * 6 * 60 * 1000).toISOString(),
@@ -107,6 +690,9 @@ function taskRecordToDashboardItem(task: TaskRecord): TaskDashboardItem {
       : "draft";
   const nodeCount = typeof metadata.node_count === "number" ? metadata.node_count : 1;
   const blockedCount = typeof metadata.blocked_count === "number" ? metadata.blocked_count : 0;
+  const reviewNeededCount = typeof metadata.review_needed_count === "number" ? metadata.review_needed_count : 0;
+  const checkpointState = typeof metadata.checkpoint_state === "string" ? metadata.checkpoint_state : "none";
+  const handoffState = typeof metadata.handoff_state === "string" ? metadata.handoff_state : "none";
   return {
     id: task.id,
     workspace_id: task.workspace_id,
@@ -118,6 +704,9 @@ function taskRecordToDashboardItem(task: TaskRecord): TaskDashboardItem {
     next_gate: typeof metadata.next_gate === "string" ? metadata.next_gate : null,
     node_count: nodeCount,
     blocked_count: blockedCount,
+    review_needed_count: reviewNeededCount,
+    checkpoint_state: checkpointState,
+    handoff_state: handoffState,
     roles: Array.isArray(metadata.roles) ? metadata.roles.filter((value): value is string => typeof value === "string") : [],
     providers: Array.isArray(metadata.providers) ? metadata.providers.filter((value): value is string => typeof value === "string") : [],
     updated_at: task.updated_at,
@@ -187,6 +776,7 @@ function createDemoSnapshot(task: TaskDashboardItem): TaskStudioSnapshot {
       nodes,
       edges,
     },
+    header: deriveStudioHeaderFromTask(task),
     messages: mockMessages.map((message, index) => ({
       id: `demo-message-${index + 1}`,
       workspace_id: task.workspace_id,
@@ -244,6 +834,43 @@ function createDemoOperations(): OperationalViewsSnapshot {
 
   return {
     workspace_id: workspace.id,
+    summary: {
+      project_count: 1,
+      approvals_pending: mockApprovalGates.filter((gate) => gate.status === "pending" || gate.status === "waiting_human").length,
+      checkpoint_ready_count: tasks.filter((task) => task.status === "complete").length,
+      handoff_ready_count: 0,
+      provider_online_count: roles.filter((role) => role.state === "active" || role.state === "live").length,
+    },
+    projects: [
+      {
+        id: "demo-project",
+        workspace_id: workspace.id,
+        name: "Sarathi Desktop",
+        description: "Demo project",
+        status: "active",
+        task_count: totalTasks,
+        blocked_count: subtasks.filter((task) => task.state === "blocked").length,
+        review_needed_count: 1,
+        approval_pending_count: mockApprovalGates.filter((gate) => gate.status === "pending").length,
+        checkpoint_ready_count: tasks.filter((task) => task.status === "complete").length,
+        handoff_ready_count: 0,
+        updated_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      },
+    ],
+    inbox: [
+      {
+        id: "demo-approval",
+        kind: "approval",
+        workspace_id: workspace.id,
+        task_id: tasks[0]?.id ?? null,
+        title: tasks[0]?.title ?? "Task graph",
+        summary: "Approval needed: Task graph",
+        state: "awaiting_approval",
+        next_action: "Open task",
+        updated_at: new Date().toISOString(),
+      },
+    ],
     history: mockEvents.map((event, index) => ({
       id: `history-${index + 1}`,
       workspace_id: workspace.id,
@@ -283,6 +910,52 @@ function createDemoOperations(): OperationalViewsSnapshot {
         updated_at: new Date().toISOString(),
       },
     ],
+    governance: {
+      policy_posture: {
+        repository_action_preference: { scope: "workspace", mode: "no_action", allowed_modes: ["no_action", "prepare_patch", "commit", "draft_pr", "ready_pr"] },
+        auto_approve_preference: { scope: "workspace", mode: "manual_only", allowed_modes: ["manual_only", "below_threshold"] },
+        provider_priority: ["claude", "codex", "copilot", "opencode"],
+        provider_priority_source: "default",
+      },
+      provider_routing: {
+        priority_order: ["claude", "codex", "copilot", "opencode"],
+        selected_provider: "claude",
+        fallback_candidates: ["codex", "copilot", "opencode"],
+        provider_health: { claude: "online", codex: "online", copilot: "configured_by_user", opencode: "configured_by_user" },
+        providers: [
+          { id: "claude", name: "Claude", health: "online", auth: "connected", transport_posture: "sdk" },
+          { id: "codex", name: "Codex", health: "online", auth: "connected", transport_posture: "sdk" },
+          { id: "copilot", name: "Copilot", health: "configured_by_user", auth: "github_auth", transport_posture: "cli_fallback" },
+          { id: "opencode", name: "OpenCode", health: "configured_by_user", auth: "workspace_setting", transport_posture: "sdk" },
+        ],
+      },
+      override_history: [
+        {
+          id: "demo-governance-1",
+          event_type: "workspace.governance_updated",
+          summary: "Workspace governance updated: repository action and dispatch order.",
+          severity: "warning",
+          created_at: new Date().toISOString(),
+          metadata: {},
+        },
+      ],
+      repository_action_governance: {
+        pending_count: 0,
+        approved_count: 1,
+        recent: [
+          {
+            id: "demo-handoff-1",
+            task_id: tasks[0]?.id ?? "task-1",
+            title: tasks[0]?.title ?? "Task studio",
+            summary: "Repository action approved for release handoff.",
+            status: "approved",
+            action: "no_action",
+            mode: "no_action",
+            created_at: new Date().toISOString(),
+          },
+        ],
+      },
+    },
     usage: {
       tasks: { total: totalTasks, active: activeTasks, done: doneTasks, by_status: { in_progress: activeTasks, complete: doneTasks } },
       subtasks: {
@@ -540,6 +1213,70 @@ function nextPendingGate(approvalItems: TaskStudioSnapshot["approval_gates"]) {
     ?? null;
 }
 
+function deriveStudioHeaderFromTask(task: TaskDashboardItem | null): TaskStudioSnapshot["header"] {
+  if (!task) return undefined;
+  const queueState =
+    task.handoff_state !== "none" ? "handoff_ready"
+      : task.review_needed_count > 0 ? "failed"
+      : task.approval_state !== "approved" && task.approval_state !== "none" ? "awaiting_approval"
+      : task.blocked_count > 0 ? "blocked"
+      : task.checkpoint_state !== "none" ? "ready"
+      : task.status === "in_progress" ? "running"
+      : task.status === "done" ? "done"
+      : "planning";
+  const nextSafeAction =
+    queueState === "handoff_ready" ? "Review handoff"
+      : queueState === "failed" ? "Review failed checks"
+      : queueState === "awaiting_approval" ? `Approve ${task.next_gate ?? "pending gate"}`
+      : queueState === "blocked" ? "Resolve blocker"
+      : task.checkpoint_state !== "none" ? "Resume from checkpoint"
+      : queueState === "running" ? "Monitor execution"
+      : "Open task";
+  return {
+    queue_state: queueState,
+    approval_state: task.approval_state,
+    next_safe_action: nextSafeAction,
+    repository_action_mode: "no_action",
+    checkpoint_ready: task.checkpoint_state !== "none",
+    handoff_state: task.handoff_state,
+  };
+}
+
+function queueStateTone(value: string | undefined): "healthy" | "active" | "warning" | "blocked" | "draft" {
+  if (!value) return "draft";
+  if (["done"].includes(value)) return "healthy";
+  if (["ready", "running", "handoff_ready"].includes(value)) return "active";
+  if (["awaiting_approval", "waiting_human"].includes(value)) return "warning";
+  if (["blocked", "failed"].includes(value)) return "blocked";
+  return "draft";
+}
+
+function queueStateLabel(value: string | undefined): string {
+  if (!value) return "planning";
+  return value.replace(/_/g, " ");
+}
+
+function handoffStateTone(value: string | undefined): "healthy" | "active" | "warning" | "blocked" | "draft" {
+  if (!value || value === "none") return "draft";
+  if (["ready", "handoff_ready", "completed"].includes(value)) return "healthy";
+  if (["pending", "in_progress"].includes(value)) return "active";
+  if (["waiting_human", "awaiting_approval"].includes(value)) return "warning";
+  if (["failed", "rejected", "blocked"].includes(value)) return "blocked";
+  return "draft";
+}
+
+function proposalTone(confidence: number): "healthy" | "warning" | "draft" {
+  if (confidence >= 0.8) return "healthy";
+  if (confidence >= 0.6) return "warning";
+  return "draft";
+}
+
+function riskTone(riskLevel: string): "healthy" | "warning" | "blocked" | "draft" {
+  if (riskLevel === "high") return "blocked";
+  if (riskLevel === "medium") return "warning";
+  return "draft";
+}
+
 function deriveNextAction(
   task: TaskDashboardItem | null,
   approvalItems: TaskStudioSnapshot["approval_gates"],
@@ -592,12 +1329,15 @@ export default function ProjectDetail({
   selectedTaskId,
   setSelectedTaskId,
   setRoute,
+  onOpenProposal,
+  onOpenWorkspace,
 }: Props) {
   const apiConfigured = getSarathiApiConfig() !== null;
   const [resolvedWorkspaceId, setResolvedWorkspaceId] = useState<string | null>(
     workspaceId ?? (!apiConfigured ? workspace.id : null),
   );
   const [taskItems, setTaskItems] = useState<TaskDashboardItem[]>(mockTasksToDashboardItems());
+  const [activeSavedView, setActiveSavedView] = useState<SavedViewSnapshot | null>(null);
   const [selectedTaskIdState, setSelectedTaskIdState] = useState<string | null>(selectedTaskId ?? null);
   const [selectedTab, setSelectedTab] = useState<ProjectTab>("studio");
   const [snapshot, setSnapshot] = useState<TaskStudioSnapshot | null>(null);
@@ -610,6 +1350,8 @@ export default function ProjectDetail({
   const [opsLoadStatus, setOpsLoadStatus] = useState(apiConfigured ? "Loading lifecycle views." : "Demo lifecycle views.");
   const [actionStatus, setActionStatus] = useState("");
   const [checkpointExpanded, setCheckpointExpanded] = useState(false);
+  const [learnings, setLearnings] = useState<KnowledgeCenterSummary["learnings"] | null>(null);
+  const [proposals, setProposals] = useState<PolicyProposal[]>([]);
 
   useEffect(() => {
     if (workspaceId) {
@@ -639,6 +1381,48 @@ export default function ProjectDetail({
   }, [workspaceId, apiConfigured]);
 
   useEffect(() => {
+    if (!resolvedWorkspaceId || !apiConfigured) {
+      setLearnings(null);
+      return;
+    }
+    const workspaceKey = resolvedWorkspaceId;
+    let cancelled = false;
+    async function loadLearnings() {
+      try {
+        const kc = await getKnowledgeCenter(workspaceKey);
+        if (!cancelled) setLearnings(kc.learnings);
+      } catch {
+        if (!cancelled) setLearnings(null);
+      }
+    }
+    void loadLearnings();
+    return () => {
+      cancelled = true;
+    };
+  }, [resolvedWorkspaceId, apiConfigured]);
+
+  useEffect(() => {
+    if (!resolvedWorkspaceId || !apiConfigured) {
+      setProposals([]);
+      return;
+    }
+    const workspaceKey = resolvedWorkspaceId;
+    let cancelled = false;
+    async function loadProposals() {
+      try {
+        const data = await getProposals(workspaceKey);
+        if (!cancelled) setProposals(data.proposals);
+      } catch {
+        if (!cancelled) setProposals([]);
+      }
+    }
+    void loadProposals();
+    return () => {
+      cancelled = true;
+    };
+  }, [resolvedWorkspaceId, apiConfigured]);
+
+  useEffect(() => {
     if (selectedTaskId) {
       setSelectedTaskIdState(selectedTaskId);
     }
@@ -653,13 +1437,20 @@ export default function ProjectDetail({
       return { items: mockTasksToDashboardItems(), fallbackReason: "demo", fromApi: false };
     }
     try {
-      const list = await listTaskDashboard(workspaceKey, { projectId });
+      const [list, reuseKit] = await Promise.all([
+        listTaskDashboard(workspaceKey, { projectId }),
+        getWorkspaceReuseKit(workspaceKey),
+      ]);
+      const savedView = activeSavedViewFromReuseKit(reuseKit);
+      setActiveSavedView(savedView);
+      const filteredList = filterTaskDashboardItemsBySavedView(list, savedView);
       return {
-        items: list,
-        fallbackReason: list.length === 0 ? "empty" : null,
+        items: filteredList,
+        fallbackReason: filteredList.length === 0 ? "empty" : null,
         fromApi: true,
       };
     } catch {
+      setActiveSavedView(null);
       return { items: [], fallbackReason: "error", fromApi: true };
     }
   }
@@ -881,7 +1672,20 @@ export default function ProjectDetail({
   const selectedPhase = liveSnapshot?.task.metadata.phase ?? selectedTask?.phase ?? "Build";
   const selectedTaskTitle = liveSnapshot?.task.title ?? selectedTask?.title ?? "Task studio";
   const pendingGate = nextPendingGate(approvalItems);
+  const fallbackHeader = deriveStudioHeaderFromTask(selectedTask ?? null);
+  const studioHeader = liveSnapshot?.header ?? fallbackHeader;
+  const taskDispatches = liveSnapshot?.dispatches ?? [];
+  const taskEvidence = liveSnapshot?.evidence ?? [];
+  const artifactOverview = buildArtifactOverview(taskEvidence, taskDispatches);
+  const deliverySpine = buildDeliverySpineModel(taskMetadata, latestReview, taskHandoff, Boolean(studioHeader?.checkpoint_ready));
+  const taskOrigin = buildTaskOriginModel(taskMetadata);
   const nextAction = deriveNextAction(selectedTask ?? null, approvalItems, latestReview, Boolean(taskHandoff));
+  const postureAction = studioHeader?.next_safe_action ?? nextAction.label;
+  const postureTone = queueStateTone(studioHeader?.queue_state) ?? nextAction.tone;
+  const pendingRepositoryAction = taskHandoff?.metadata?.repository_action
+    && typeof taskHandoff.metadata.repository_action === "object"
+      ? taskHandoff.metadata.repository_action as Record<string, unknown>
+      : null;
 
   async function reloadStudio() {
     if (!selectedTask) return;
@@ -1046,6 +1850,9 @@ export default function ProjectDetail({
         next_gate: "Resume from checkpoint",
         node_count: 1,
         blocked_count: 0,
+        review_needed_count: 0,
+        checkpoint_state: "ready",
+        handoff_state: "none",
         roles: [],
         providers: [],
         updated_at: new Date().toISOString(),
@@ -1099,6 +1906,9 @@ export default function ProjectDetail({
 
   const lifecycleRows = liveOps.lifecycle ?? [];
   const historyRows = liveOps.history ?? [];
+  const governance = liveOps.governance;
+  const taskGovernanceOverrides = (governance?.override_history ?? []).filter((entry) => !entry.task_id || entry.task_id === selectedTask?.id);
+  const taskRepositoryGovernance = (governance?.repository_action_governance?.recent ?? []).filter((entry) => entry.task_id === selectedTask?.id);
   const usage = liveOps.usage;
   const budget = usage?.budget ?? null;
   const budgetLabel = budget
@@ -1114,6 +1924,11 @@ export default function ProjectDetail({
           <div style={styles.eyebrow}>Workspace / {workspaceId ?? workspace.id}</div>
           <h1 style={styles.title}>{selectedTaskTitle}</h1>
           <p style={styles.subtitle}>Task studio: dependency graph, selected unit packet, lifecycle gates, and task-scoped conversation in one place.</p>
+          {activeSavedView ? (
+            <p style={{ ...styles.subtitle, marginTop: 8 }}>
+              Active saved view: <strong>{activeSavedView.name}</strong>. {activeSavedView.description}
+            </p>
+          ) : null}
         </div>
         <div style={styles.headerActions}>
           <button style={styles.secondaryButton} onClick={() => setRoute?.("dashboard")}>Back to Dashboard</button>
@@ -1123,18 +1938,41 @@ export default function ProjectDetail({
 
       <section style={styles.cockpitStrip}>
         <div style={styles.cockpitSection}>
-          <div style={styles.cockpitLabel}>Task</div>
-          <div style={styles.cockpitValue}>{selectedTask?.status ?? "pending"}</div>
+          <div style={styles.cockpitLabel}>Queue</div>
+          <Pill tone={queueStateTone(studioHeader?.queue_state)}>{queueStateLabel(studioHeader?.queue_state)}</Pill>
         </div>
         <div style={styles.cockpitDivider} />
         <div style={styles.cockpitSection}>
-          <div style={styles.cockpitLabel}>Phase</div>
-          <div style={styles.cockpitValue}>{selectedPhase}</div>
+          <div style={styles.cockpitLabel}>Approval</div>
+          <Pill tone={stateTone(studioHeader?.approval_state ?? selectedTask?.approval_state ?? "draft")}>
+            {studioHeader?.approval_state ?? selectedTask?.approval_state ?? "draft"}
+          </Pill>
         </div>
         <div style={styles.cockpitDivider} />
         <div style={styles.cockpitSection}>
           <div style={styles.cockpitLabel}>Next Action</div>
-          <Pill tone={nextAction.tone}>{nextAction.label}</Pill>
+          <Pill tone={postureTone}>{postureAction}</Pill>
+        </div>
+        <div style={styles.cockpitDivider} />
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Checkpoint</div>
+          <Pill tone={studioHeader?.checkpoint_ready ? "healthy" : "draft"}>
+            {studioHeader?.checkpoint_ready ? "Ready" : "None"}
+          </Pill>
+        </div>
+        <div style={styles.cockpitDivider} />
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Handoff</div>
+          <Pill tone={queueStateTone(studioHeader?.handoff_state)}>
+            {queueStateLabel(studioHeader?.handoff_state)}
+          </Pill>
+        </div>
+        <div style={styles.cockpitDivider} />
+        <div style={styles.cockpitSection}>
+          <div style={styles.cockpitLabel}>Repo Action</div>
+          <Pill tone={stateTone(studioHeader?.repository_action_mode ?? repositoryPreference.mode)}>
+            {repositoryActionLabel(studioHeader?.repository_action_mode ?? repositoryPreference.mode)}
+          </Pill>
         </div>
         <div style={styles.cockpitDivider} />
         <div style={styles.cockpitSection}>
@@ -1143,23 +1981,8 @@ export default function ProjectDetail({
         </div>
         <div style={styles.cockpitDivider} />
         <div style={styles.cockpitSection}>
-          <div style={styles.cockpitLabel}>Checkpoint</div>
-          <Pill tone={taskCheckpoint ? "healthy" : "draft"}>{taskCheckpoint ? "Ready" : "None"}</Pill>
-        </div>
-        <div style={styles.cockpitDivider} />
-        <div style={styles.cockpitSection}>
           <div style={styles.cockpitLabel}>Units</div>
           <div style={styles.cockpitValue}>{graphNodes.length}</div>
-        </div>
-        <div style={styles.cockpitDivider} />
-        <div style={styles.cockpitSection}>
-          <div style={styles.cockpitLabel}>Messages</div>
-          <div style={styles.cockpitValue}>{taskMessages.length}</div>
-        </div>
-        <div style={styles.cockpitDivider} />
-        <div style={styles.cockpitSection}>
-          <div style={styles.cockpitLabel}>Gates</div>
-          <div style={styles.cockpitValue}>{approvalItems.length}</div>
         </div>
         <div style={styles.cockpitDivider} />
         <div style={styles.cockpitSection}>
@@ -1190,13 +2013,17 @@ export default function ProjectDetail({
           >
             <div style={styles.taskCardRow}>
               <span style={styles.taskCardId}>{task.id.split("-")[0]}</span>
-              <Pill tone={task.status === "done" ? "healthy" : task.status === "in_progress" ? "active" : "warning"}>{task.status}</Pill>
+              <Pill tone={queueStateTone(deriveStudioHeaderFromTask(task)?.queue_state)}>
+                {queueStateLabel(deriveStudioHeaderFromTask(task)?.queue_state)}
+              </Pill>
             </div>
             <div style={styles.taskCardTitleRow}>
               <span style={styles.taskCardTitle}>{task.title.length > 32 ? task.title.slice(0, 32) + "…" : task.title}</span>
             </div>
             <div style={styles.taskCardMetaRow}>
-              <span style={styles.taskCardMeta}>{task.phase} · {task.node_count} units</span>
+              <span style={styles.taskCardMeta}>
+                {task.phase} · {task.node_count} units · {deriveStudioHeaderFromTask(task)?.next_safe_action ?? "Open task"}
+              </span>
             </div>
           </button>
         ))}
@@ -1239,14 +2066,14 @@ export default function ProjectDetail({
               <PanelTitle title="Task actions" badge="Sutra" />
               <Card style={styles.summaryCard}>
                 <strong>Current posture</strong>
-                <Pill tone={nextAction.tone}>{nextAction.label}</Pill>
+                <Pill tone={postureTone}>{postureAction}</Pill>
                 <p>{nextAction.detail}</p>
                 <small>
-                  Phase: {selectedPhase}
+                  Queue: {queueStateLabel(studioHeader?.queue_state)}
                   {" / "}
-                  Gate: {pendingGate?.name ?? "clear"}
+                  Approval: {studioHeader?.approval_state ?? "clear"}
                   {" / "}
-                  Review: {latestReview?.status ?? "not run"}
+                  Repo action: {repositoryActionLabel(studioHeader?.repository_action_mode ?? repositoryPreference.mode)}
                 </small>
                 {pendingGate && (
                   <div style={{ ...styles.actionRow, marginTop: 10 }}>
@@ -1266,7 +2093,200 @@ export default function ProjectDetail({
                     </button>
                   </div>
                 )}
+                {!pendingGate && studioHeader?.checkpoint_ready && taskCheckpoint && (
+                  <div style={{ ...styles.actionRow, marginTop: 10 }}>
+                    <button style={styles.primaryButton} onClick={() => void handleStartNewSession()} disabled={!selectedTask || !taskCheckpoint}>
+                      Start from checkpoint
+                    </button>
+                    <button style={styles.secondaryButton} onClick={() => handleOpenSourceTask()} disabled={!taskCheckpoint}>
+                      Open source task
+                    </button>
+                  </div>
+                )}
+                {!pendingGate && studioHeader?.queue_state === "handoff_ready" && (
+                  <div style={{ ...styles.actionRow, marginTop: 10 }}>
+                    <button style={styles.primaryButton} onClick={() => setSelectedTab("history")}>
+                      Review handoff
+                    </button>
+                  </div>
+                )}
+                {!pendingGate && pendingRepositoryAction?.status === "pending" && typeof pendingRepositoryAction.action === "string" && (
+                  <div style={{ ...styles.actionRow, marginTop: 10 }}>
+                    <button
+                      style={styles.secondaryButton}
+                      onClick={() => void handleApproveRepositoryAction(pendingRepositoryAction.action as string)}
+                      disabled={!apiConfigured}
+                    >
+                      Approve {repositoryActionLabel(pendingRepositoryAction.action as string)}
+                    </button>
+                  </div>
+                )}
               </Card>
+              <Card style={styles.summaryCard}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                  <strong>Governance posture</strong>
+                  <Pill tone={governance?.override_history?.length ? "warning" : "healthy"}>
+                    {governance?.provider_routing?.selected_provider ?? "local"}
+                  </Pill>
+                </div>
+                <p style={{ marginTop: 8, marginBottom: 8 }}>
+                  Repository policy: {repositoryActionLabel(governance?.policy_posture?.repository_action_preference?.mode ?? studioHeader?.repository_action_mode ?? repositoryPreference.mode)}
+                  {" / "}
+                  Approval policy: {governance?.policy_posture?.auto_approve_preference?.mode ?? "manual_only"}
+                </p>
+                <small>
+                  Dispatch order: {(governance?.provider_routing?.priority_order ?? []).join(" → ") || "not set"}
+                </small>
+                {(governance?.provider_routing?.fallback_candidates?.length ?? 0) > 0 && (
+                  <small style={{ display: "block", marginTop: 6 }}>
+                    Fallbacks: {governance?.provider_routing?.fallback_candidates.join(", ")}
+                  </small>
+                )}
+                {(taskGovernanceOverrides.length > 0 || taskRepositoryGovernance.length > 0) && (
+                  <small style={{ display: "block", marginTop: 6 }}>
+                    {taskGovernanceOverrides.length} governance event{taskGovernanceOverrides.length === 1 ? "" : "s"} and {taskRepositoryGovernance.length} repository decision{taskRepositoryGovernance.length === 1 ? "" : "s"} in scope.
+                  </small>
+                )}
+              </Card>
+              {learnings?.accepted_learnings && learnings.accepted_learnings.length > 0 && selectedTask && (
+                (() => {
+                  const relatedLearnings = learnings.accepted_learnings.filter((l) => l.task_id === selectedTask.id);
+                  if (relatedLearnings.length === 0) return null;
+                  const durableProposalIds = Array.from(new Set(
+                    relatedLearnings
+                      .map((learning) => learning.linked_proposal_id)
+                      .filter((value): value is string => typeof value === "string" && value.length > 0),
+                  ));
+                  const linkedProposals = durableProposalIds.length > 0
+                    ? proposals.filter((proposal) => durableProposalIds.some((proposalId) => (
+                      proposal.id === proposalId || proposal.id.startsWith(`${proposalId}-`)
+                    )))
+                    : proposals.filter((proposal) =>
+                      proposal.evidence_refs.some((ref) => ref.startsWith(selectedTask.id)),
+                    );
+                  const reuseMetadata = asObject(taskMetadata.reuse);
+                  const playbookId = typeof reuseMetadata?.learning_playbook_id === "string"
+                    ? reuseMetadata.learning_playbook_id
+                    : null;
+                  const recommendedViews = asStringList(reuseMetadata?.recommended_view_ids);
+                  const primaryRecommendedView = recommendedViews[0] ?? relatedLearnings.flatMap((learning) => learning.recommended_view_ids ?? [])[0] ?? null;
+                  const primaryLinkedProposal = linkedProposals[0] ?? null;
+                  return (
+                    <Card style={styles.summaryCard}>
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                        <strong>Related learnings</strong>
+                        <Pill tone="active">{relatedLearnings.length}</Pill>
+                      </div>
+                      <div style={{ display: "grid", gap: 8 }}>
+                        {relatedLearnings.slice(0, 3).map((learning, idx) => (
+                          <div key={idx} style={{ padding: "8px 10px", background: "var(--surface)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)" }}>
+                            <div style={{ fontSize: "0.82rem", fontWeight: 500, marginBottom: 4 }}>{learning.title}</div>
+                            {learning.summary && (
+                              <p style={{ margin: 0, fontSize: "0.74rem", color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {learning.summary}
+                              </p>
+                            )}
+                            {learning.tags && learning.tags.length > 0 && (
+                              <div style={{ display: "flex", gap: 4, marginTop: 6, flexWrap: "wrap" }}>
+                                {learning.tags.slice(0, 3).map((tag) => (
+                                  <span key={tag} style={{ fontSize: "0.66rem", padding: "2px 5px", background: "var(--surface-2)", borderRadius: 3, color: "var(--faint)" }}>
+                                    {tag}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                        {relatedLearnings.length > 3 && (
+                          <small style={{ color: "var(--muted)", fontSize: "0.72rem" }}>+ {relatedLearnings.length - 3} more learnings</small>
+                        )}
+                      </div>
+                      {primaryLinkedProposal && (
+                        <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid var(--border)" }}>
+                          <div style={{ fontSize: "0.72rem", color: "var(--faint)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>
+                            Linked proposal
+                          </div>
+                          <div style={{ padding: "10px 12px", background: "var(--surface)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", display: "grid", gap: 8 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start", flexWrap: "wrap" }}>
+                              <strong style={{ fontSize: "0.82rem" }}>{primaryLinkedProposal.title}</strong>
+                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                                <Pill tone={riskTone(primaryLinkedProposal.risk_level)}>{primaryLinkedProposal.risk_level} risk</Pill>
+                                <Pill tone={proposalTone(primaryLinkedProposal.confidence)}>{primaryLinkedProposal.confidence.toFixed(2)} confidence</Pill>
+                              </div>
+                            </div>
+                            <p style={{ margin: 0, fontSize: "0.74rem", color: "var(--muted)" }}>{primaryLinkedProposal.rationale}</p>
+                            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                              {(primaryLinkedProposal.impacted_assets.length > 0 ? primaryLinkedProposal.impacted_assets : [primaryLinkedProposal.policy_file]).slice(0, 3).map((asset) => (
+                                <span key={asset} style={{ fontSize: "0.66rem", padding: "2px 6px", background: "var(--surface-2)", borderRadius: 3, color: "var(--faint)" }}>
+                                  {asset}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      {(linkedProposals.length > 0 || playbookId) && (
+                        <div style={{ display: "grid", gap: 8, marginTop: 10, paddingTop: 10, borderTop: "1px solid var(--border)" }}>
+                          {primaryLinkedProposal && (
+                            <div
+                              style={{
+                                padding: "10px 12px",
+                                background: "var(--surface)",
+                                borderRadius: "var(--radius-sm)",
+                                border: "1px solid var(--active)",
+                                cursor: onOpenProposal ? "pointer" : "default",
+                              }}
+                              onClick={() => onOpenProposal ? onOpenProposal(primaryLinkedProposal.id) : setRoute?.("proposals")}
+                            >
+                              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                                <span style={{ fontSize: "0.78rem", fontWeight: 600, color: "var(--active-fg)" }}>Linked proposal</span>
+                                <div style={{ display: "flex", gap: 4 }}>
+                                  <Pill tone="draft">{primaryLinkedProposal.proposal_kind.replaceAll("_", " ")}</Pill>
+                                  <Pill tone={riskTone(primaryLinkedProposal.risk_level)}>{primaryLinkedProposal.risk_level} risk</Pill>
+                                </div>
+                              </div>
+                              <div style={{ fontSize: "0.82rem", fontWeight: 500, marginBottom: 4, color: "var(--ink)" }}>
+                                {primaryLinkedProposal.title}
+                              </div>
+                              {primaryLinkedProposal.rationale && (
+                                <p style={{ margin: 0, fontSize: "0.72rem", color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                  {primaryLinkedProposal.rationale}
+                                </p>
+                              )}
+                              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                                <Pill tone={proposalTone(primaryLinkedProposal.confidence)}>{primaryLinkedProposal.confidence.toFixed(2)} confidence</Pill>
+                                {primaryLinkedProposal.impacted_assets[0] && (
+                                  <span style={{ fontSize: "0.68rem", color: "var(--faint)" }}>
+                                    Target: {primaryLinkedProposal.impacted_assets[0]}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                          {linkedProposals.length > 1 && (
+                            <button
+                              style={{ ...styles.secondaryButton, padding: "4px 10px", fontSize: "0.72rem" }}
+                              onClick={() => setRoute?.("proposals")}
+                            >
+                              View {linkedProposals.length - 1} more proposal{linkedProposals.length > 2 ? "s" : ""}
+                            </button>
+                          )}
+                          {playbookId && (
+                            <button
+                              style={{ ...styles.secondaryButton, padding: "4px 10px", fontSize: "0.72rem" }}
+                              onClick={() => onOpenWorkspace ? onOpenWorkspace(primaryRecommendedView) : setRoute?.("workspace")}
+                            >
+                              {primaryRecommendedView
+                                ? `Open playbook view: ${primaryRecommendedView}`
+                                : `Open playbook ${playbookId.slice(0, 8)}…`}
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </Card>
+                  );
+                })()
+              )}
               <div style={styles.actionRow}>
                 <button style={styles.secondaryButton} onClick={() => void handleApproveGraph()} disabled={!selectedTask || !apiConfigured}>Approve graph</button>
                 <button style={styles.secondaryButton} onClick={() => void handleSchedule()} disabled={!selectedTask || !apiConfigured}>Schedule units</button>
@@ -1287,19 +2307,266 @@ export default function ProjectDetail({
                   <p>No review has been run for this task yet.</p>
                 </Card>
               )}
-              {taskHandoff ? (
+{taskHandoff ? (
                 <Card style={styles.summaryCard}>
-                  <strong>Handoff</strong>
-                  <Pill tone="active">recorded</Pill>
-                  <p>{taskHandoff.summary}</p>
-                  <small>{taskHandoff.from_agent ?? "from"} → {taskHandoff.to_agent ?? "to"}</small>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                    <strong>Final handoff dossier</strong>
+                    <Pill tone={deliverySpine.repositoryActionStatus === "approved" ? "healthy" : "warning"}>
+                      Repo action {deliverySpine.repositoryActionStatus ?? "pending"}
+                    </Pill>
+                  </div>
+                  <p style={{ marginBottom: 8 }}>{taskHandoff.summary}</p>
+                  <small style={{ color: "var(--muted)" }}>
+                    {taskHandoff.from_agent ?? "Samanvaya"} → {taskHandoff.to_agent ?? "User"} / {taskHandoff.created_at?.slice(0, 19) ?? "recorded"}
+                  </small>
+                  {deliverySpine.acCoverage.length > 0 && (
+                    <section style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--border)" }}>
+                      <div style={{ paddingBottom: 8, marginBottom: 8 }}>
+                        <h3 style={{ fontSize: "0.8rem", fontWeight: 600 }}>AC Coverage</h3>
+                        <Pill tone={deliverySpine.coveredCriteriaCount === deliverySpine.acCoverage.length ? "healthy" : "warning"}>
+                          {deliverySpine.coveredCriteriaCount}/{deliverySpine.acCoverage.length} covered
+                        </Pill>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                        {deliverySpine.acCoverage.slice(0, 6).map((item) => (
+                          <div key={`${taskHandoff.id}-ac-${item.id}`} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "0.8rem" }}>
+                            <span style={{ color: item.covered ? "var(--green-11)" : "var(--red-11)", fontWeight: 500, width: 14 }}>
+                              {item.covered ? "✓" : "✗"}
+                            </span>
+                            <span style={{ color: "var(--muted)", minWidth: 40 }}>{item.id}</span>
+                            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.criterion}</span>
+                          </div>
+                        ))}
+                        {deliverySpine.acCoverage.length > 6 && (
+                          <small style={{ color: "var(--muted)", fontSize: "0.75rem" }}>+ {deliverySpine.acCoverage.length - 6} more criteria</small>
+                        )}
+                      </div>
+                    </section>
+                  )}
+                  {deliverySpine.completionContext && (
+                    <section style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--border)" }}>
+                      <div style={{ paddingBottom: 8, marginBottom: 8 }}>
+                        <h3 style={{ fontSize: "0.8rem", fontWeight: 600 }}>Completion context</h3>
+                        <Pill tone="default">normalized</Pill>
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8, marginBottom: 12 }}>
+                        <div style={{ textAlign: "center", padding: 8, background: "var(--surface-2)", borderRadius: 4 }}>
+                          <div style={{ fontSize: "1rem", fontWeight: 600 }}>{deliverySpine.completionContext.filesChanged.length}</div>
+                          <div style={{ fontSize: "0.65rem", color: "var(--muted)" }}>Files</div>
+                        </div>
+                        <div style={{ textAlign: "center", padding: 8, background: "var(--surface-2)", borderRadius: 4 }}>
+                          <div style={{ fontSize: "1rem", fontWeight: 600 }}>{deliverySpine.completionContext.testsRun.length}</div>
+                          <div style={{ fontSize: "0.65rem", color: "var(--muted)" }}>Tests</div>
+                        </div>
+                        <div style={{ textAlign: "center", padding: 8, background: "var(--surface-2)", borderRadius: 4 }}>
+                          <div style={{ fontSize: "1rem", fontWeight: 600 }}>{deliverySpine.completionContext.findings.length}</div>
+                          <div style={{ fontSize: "0.65rem", color: "var(--muted)" }}>Findings</div>
+                        </div>
+                        <div style={{ textAlign: "center", padding: 8, background: "var(--surface-2)", borderRadius: 4 }}>
+                          <div style={{ fontSize: "1rem", fontWeight: 600 }}>{deliverySpine.completionContext.decisions.length}</div>
+                          <div style={{ fontSize: "0.65rem", color: "var(--muted)" }}>Decisions</div>
+                        </div>
+                      </div>
+                      {deliverySpine.completionContext.summaries.length > 0 && (
+                        <div style={{ marginBottom: 8 }}>
+                          <small style={{ color: "var(--muted)", fontWeight: 500 }}>Summaries</small>
+                          <div style={{ fontSize: "0.8rem" }}>
+                            {deliverySpine.completionContext.summaries.slice(0, 2).map((s, i) => (
+                              <div key={`sum-${i}`} style={{ marginTop: 4 }}>{s}</div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {deliverySpine.completionContext.risks.length > 0 && (
+                        <div>
+                          <small style={{ color: "var(--warning)", fontWeight: 500 }}>Known risks</small>
+                          <div style={{ fontSize: "0.8rem" }}>
+                            {deliverySpine.completionContext.risks.slice(0, 2).map((r, i) => (
+                              <div key={`risk-${i}`} style={{ marginTop: 4, color: "var(--warning)" }}>{r}</div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </section>
+                  )}
                 </Card>
               ) : (
                 <Card style={styles.summaryCard}>
                   <strong>Handoff</strong>
-                  <p>No handoff has been recorded yet for this task.</p>
+                  <Pill tone="warning">not created</Pill>
+                  <p>Run the final review loop first, then create a handoff to capture AC coverage, evidence, and repository-action choices in one dossier.</p>
                 </Card>
               )}
+              <Card style={styles.summaryCard}>
+                <div style={styles.deliveryHeader}>
+                  <h3 style={styles.artifactHeading}>Delivery spine</h3>
+                  <Pill tone={deliverySpine.handoffReady ? "healthy" : "warning"}>
+                    {deliverySpine.handoffReady ? "handoff ready" : "in progress"}
+                  </Pill>
+                </div>
+                <p style={styles.deliverySummary}>
+                  Traceability from PRD through acceptance criteria, review, evidence, and handoff for this task.
+                </p>
+                <div style={styles.deliveryMetricGrid}>
+                  <Card style={styles.deliveryMetricCard}>
+                    <strong>Acceptance coverage</strong>
+                    <p>
+                      {deliverySpine.coveredCriteriaCount}/{deliverySpine.acCoverage.length || deliverySpine.acceptanceCriteria.length} covered
+                    </p>
+                    <small style={styles.helperText}>
+                      {deliverySpine.latestReviewStatus ? `Latest review: ${deliverySpine.latestReviewStatus}` : "No approved review recorded yet."}
+                    </small>
+                  </Card>
+                  <Card style={styles.deliveryMetricCard}>
+                    <strong>Evidence posture</strong>
+                    <p>{artifactOverview.evidenceCount} artifacts linked</p>
+                    <small style={styles.helperText}>
+                      {artifactOverview.filesChanged.length} files · {artifactOverview.testsRun.length} tests · {artifactOverview.reviewFindings.length} findings
+                    </small>
+                  </Card>
+                  <Card style={styles.deliveryMetricCard}>
+                    <strong>Handoff posture</strong>
+                    <p>{taskHandoff ? "Recorded" : "Not created"}</p>
+                    <small style={styles.helperText}>
+                      {deliverySpine.repositoryActionStatus ? `Repository action ${deliverySpine.repositoryActionStatus}` : "Repository action starts after handoff."}
+                    </small>
+                  </Card>
+                </div>
+                <section style={styles.deliverySection}>
+                  <div style={styles.artifactHeader}>
+                    <h3 style={styles.artifactHeading}>PRD brief</h3>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <Pill tone={deliverySpine.prdProblem || deliverySpine.prdGoal ? "active" : "draft"}>
+                        {deliverySpine.prdProblem || deliverySpine.prdGoal ? "captured" : "missing"}
+                      </Pill>
+                      <Pill tone={deliverySpine.checkpointReady ? "healthy" : "warning"}>
+                        checkpoint {deliverySpine.checkpointReady ? "ready" : "n/a"}
+                      </Pill>
+                    </div>
+                  </div>
+                  {deliverySpine.prdProblem || deliverySpine.prdGoal || deliverySpine.prdScope.length > 0 ? (
+                    <div style={styles.deliveryCopyBlock}>
+                      {deliverySpine.prdProblem ? (
+                        <div style={styles.deliveryDetailRow}>
+                          <strong>Problem</strong>
+                          <span>{deliverySpine.prdProblem}</span>
+                        </div>
+                      ) : null}
+                      {deliverySpine.prdGoal ? (
+                        <div style={styles.deliveryDetailRow}>
+                          <strong>Goal</strong>
+                          <span>{deliverySpine.prdGoal}</span>
+                        </div>
+                      ) : null}
+                      {deliverySpine.prdScope.length > 0 ? (
+                        <div style={styles.deliveryDetailRow}>
+                          <strong>Scope</strong>
+                          <span>{deliverySpine.prdScope.join(" · ")}</span>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <div style={styles.artifactEmpty}>No PRD summary has been captured for this task yet.</div>
+                  )}
+                </section>
+                <section style={styles.deliverySection}>
+                  <div style={styles.artifactHeader}>
+                    <h3 style={styles.artifactHeading}>Acceptance criteria</h3>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <Pill tone={deliverySpine.acCoverage.length > 0 && deliverySpine.acCoverage.every((item) => item.covered) ? "healthy" : "warning"}>
+                        {deliverySpine.coveredCriteriaCount}/{deliverySpine.acCoverage.length || deliverySpine.acceptanceCriteria.length}
+                      </Pill>
+                      <Pill tone={deliverySpine.checkpointReady ? "healthy" : "warning"}>
+                        checkpoint {deliverySpine.checkpointReady ? "ready" : "n/a"}
+                      </Pill>
+                    </div>
+                  </div>
+                  {deliverySpine.acCoverage.length > 0 ? (
+                    <div style={styles.deliveryChecklist}>
+                      {deliverySpine.acCoverage.map((item) => (
+                        <div key={`${selectedTask?.id ?? "task"}-${item.id}`} style={styles.deliveryChecklistItem}>
+                          <div style={styles.deliveryChecklistLead}>
+                            <span style={styles.deliveryChecklistMark}>{item.covered ? "✓" : "○"}</span>
+                            <span style={styles.deliveryChecklistId}>{item.id}</span>
+                          </div>
+                          <span>{item.criterion}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : deliverySpine.acceptanceCriteria.length > 0 ? (
+                    <div style={styles.deliveryChecklist}>
+                      {deliverySpine.acceptanceCriteria.map((criterion, index) => (
+                        <div key={`${selectedTask?.id ?? "task"}-criterion-${index}`} style={styles.deliveryChecklistItem}>
+                          <div style={styles.deliveryChecklistLead}>
+                            <span style={styles.deliveryChecklistMark}>○</span>
+                            <span style={styles.deliveryChecklistId}>{`AC-${String(index + 1).padStart(2, "0")}`}</span>
+                          </div>
+                          <span>{criterion}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={styles.artifactEmpty}>No acceptance criteria have been drafted yet.</div>
+                  )}
+                </section>
+                <section style={styles.deliverySection}>
+                  <div style={styles.artifactHeader}>
+                    <h3 style={styles.artifactHeading}>Ready for governed handoff</h3>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      <Pill tone={deliverySpine.handoffReady ? "healthy" : "warning"}>
+                        {deliverySpine.handoffReady ? "yes" : "not yet"}
+                      </Pill>
+                      <Pill tone={deliverySpine.checkpointReady ? "healthy" : "warning"}>
+                        checkpoint {deliverySpine.checkpointReady ? "ready" : "missing"}
+                      </Pill>
+                    </div>
+                  </div>
+                  {deliverySpine.missingItems.length > 0 ? (
+                    <div style={styles.deliveryMissingList}>
+                      {deliverySpine.missingItems.map((item) => (
+                        <div key={item} style={styles.deliveryMissingItem}>{item}</div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={styles.deliveryCopyBlock}>
+                      <div style={styles.deliveryDetailRow}>
+                        <strong>Status</strong>
+                        <span>PRD, acceptance criteria, review coverage, evidence, and handoff are all linked.</span>
+                      </div>
+                    </div>
+                  )}
+                </section>
+                {deliverySpine.completionContext ? (
+                  <section style={styles.deliverySection}>
+                    <div style={styles.artifactHeader}>
+                      <h3 style={styles.artifactHeading}>Completion context</h3>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <Pill tone="default">normalized</Pill>
+                        <Pill tone={deliverySpine.checkpointReady ? "healthy" : "warning"}>
+                          checkpoint {deliverySpine.checkpointReady ? "ready" : "missing"}
+                        </Pill>
+                      </div>
+                    </div>
+                    <div style={styles.deliveryMetricGrid}>
+                      <Card style={styles.deliveryMetricCard}>
+                        <strong>Files</strong>
+                        <p>{deliverySpine.completionContext.filesChanged.length}</p>
+                        <small style={styles.helperText}>Completion-ready file scope.</small>
+                      </Card>
+                      <Card style={styles.deliveryMetricCard}>
+                        <strong>Tests</strong>
+                        <p>{deliverySpine.completionContext.testsRun.length}</p>
+                        <small style={styles.helperText}>Recorded verification traces.</small>
+                      </Card>
+                      <Card style={styles.deliveryMetricCard}>
+                        <strong>Signals</strong>
+                        <p>{deliverySpine.completionContext.findings.length}</p>
+                        <small style={styles.helperText}>Reviewer findings and risks.</small>
+                      </Card>
+                    </div>
+                  </section>
+                ) : null}
+              </Card>
               {taskCheckpoint ? (
                 <Card style={styles.summaryCard}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -1357,12 +2624,22 @@ export default function ProjectDetail({
               )}
               <Card style={styles.summaryCard}>
                 <strong>Repository actions</strong>
-                <Pill tone={repositoryPreference.mode === "no_action" ? "draft" : "warning"}>
-                  {repositoryActionLabel(repositoryPreference.mode)}
+                <Pill tone={stateTone(studioHeader?.repository_action_mode ?? repositoryPreference.mode)}>
+                  {repositoryActionLabel(studioHeader?.repository_action_mode ?? repositoryPreference.mode)}
                 </Pill>
                 <p>Commit and PR stay disabled until you explicitly opt in from Settings.</p>
                 <small>Scope: {repositoryPreference.scope}</small>
-                {repositoryPreference.mode !== "no_action" && selectedTask && (
+                {pendingRepositoryAction?.status === "pending" && typeof pendingRepositoryAction.action === "string" ? (
+                  <div style={{ ...styles.actionRow, marginTop: 10 }}>
+                    <button
+                      style={styles.secondaryButton}
+                      onClick={() => void handleApproveRepositoryAction(pendingRepositoryAction.action as string)}
+                      disabled={!apiConfigured}
+                    >
+                      Approve {repositoryActionLabel(pendingRepositoryAction.action as string)}
+                    </button>
+                  </div>
+                ) : repositoryPreference.mode !== "no_action" && selectedTask ? (
                   <div style={{ ...styles.actionRow, marginTop: 10 }}>
                     <button
                       style={styles.secondaryButton}
@@ -1372,7 +2649,7 @@ export default function ProjectDetail({
                       Approve {repositoryActionLabel(repositoryPreference.mode)}
                     </button>
                   </div>
-                )}
+                ) : null}
               </Card>
               {githubIssueReferenceText ? (
                 <Card style={styles.summaryCard}>
@@ -1398,12 +2675,291 @@ export default function ProjectDetail({
 
             <div style={styles.panel}>
               <PanelTitle title="Evidence and events" badge="ledger" />
+              <p className="artifact-subtle-copy">
+                Summary-first operator view of what Sarathi knows, what it proved, and what still depends on raw provider evidence.
+              </p>
               <div style={styles.ledgerGrid}>
                 <Card style={styles.summaryCard}><strong>Messages</strong><p>{taskMessages.length} conversation entries</p></Card>
                 <Card style={styles.summaryCard}><strong>Approval gates</strong><p>{approvalItems.length} gates tracked</p></Card>
                 <Card style={styles.summaryCard}><strong>Events</strong><p>{liveSnapshot?.events.length ?? 0} lifecycle events</p></Card>
                 <Card style={styles.summaryCard}><strong>Selected task</strong><p>{selectedTask?.phase ?? "pending"}</p></Card>
               </div>
+              <section style={styles.artifactSection}>
+                <div style={styles.artifactHeader}>
+                  <h3 style={styles.artifactHeading}>Artifact overview</h3>
+                  <Pill tone="default">{artifactOverview.evidenceCount} records</Pill>
+                </div>
+                <p className="artifact-inline-summary">
+                  Normalized traces are surfaced first so later agents and operators do not have to reconstruct completion state from provider blobs.
+                </p>
+                <div style={styles.ledgerGrid}>
+                  <Card style={styles.summaryCard}>
+                    <strong>Changed files</strong>
+                    <p>{artifactOverview.filesChanged.length} normalized entries</p>
+                    <small style={styles.helperText}>Artifact index first.</small>
+                  </Card>
+                  <Card style={styles.summaryCard}>
+                    <strong>Tests run</strong>
+                    <p>{artifactOverview.testsRun.length} verification traces</p>
+                    <small style={styles.helperText}>Pulled from evidence and dispatches.</small>
+                  </Card>
+                  <Card style={styles.summaryCard}>
+                    <strong>Review findings</strong>
+                    <p>{artifactOverview.reviewFindings.length} captured findings</p>
+                    <small style={styles.helperText}>Only shows normalized findings.</small>
+                  </Card>
+                  <Card style={styles.summaryCard}>
+                    <strong>Known risks</strong>
+                    <p>{artifactOverview.knownRisks.length} tracked risks</p>
+                    <small style={styles.helperText}>{artifactOverview.dispatchCount} dispatches inspected.</small>
+                  </Card>
+                </div>
+              </section>
+              {taskOrigin ? (
+                <section style={styles.artifactSection}>
+                  <div style={styles.artifactHeader}>
+                    <h3 style={styles.artifactHeading}>Task origin</h3>
+                    <Pill tone="default">reuse-aware</Pill>
+                  </div>
+                  <p className="artifact-inline-summary">
+                    Launch context is preserved as durable task metadata so reused workflows remain legible long after the original session ends.
+                  </p>
+                  <Card style={styles.summaryCard}>
+                    <strong>{taskOrigin.launchSummary ?? "Recorded task origin"}</strong>
+                    <p>{taskOrigin.launchDetail ?? "Sarathi preserved this task's launch and reuse context so later operators do not have to reconstruct it from chat history."}</p>
+                    <div style={styles.provenanceDetailList}>
+                      {taskOrigin.workflowLineage.length > 0 ? (
+                        <div style={styles.findingDetailItem}>
+                          <strong>Workflow lineage</strong>
+                          <span>{taskOrigin.workflowLineage.join(" · ")}</span>
+                        </div>
+                      ) : null}
+                      {taskOrigin.recommendedViews.length > 0 ? (
+                        <div style={styles.findingDetailItem}>
+                          <strong>Recommended views</strong>
+                          <span>{taskOrigin.recommendedViews.join(", ")}</span>
+                        </div>
+                      ) : null}
+                      {taskOrigin.launchPosture.length > 0 ? (
+                        <div style={styles.findingDetailItem}>
+                          <strong>Launch posture</strong>
+                          <span>{taskOrigin.launchPosture.join(" · ")}</span>
+                        </div>
+                      ) : null}
+                    </div>
+                  </Card>
+                </section>
+              ) : null}
+              <section style={styles.artifactSection}>
+                <div style={styles.artifactHeader}>
+                  <h3 style={styles.artifactHeading}>Changed files</h3>
+                  <Pill tone="active">{artifactOverview.filesChanged.length}</Pill>
+                </div>
+                <div style={styles.artifactList}>
+                  {artifactOverview.filesChanged.length > 0 ? artifactOverview.filesChanged.map((file) => (
+                    <div key={file} style={styles.artifactListItem}>{file}</div>
+                  )) : (
+                    <div style={styles.artifactEmpty}>No normalized changed-file list is attached yet.</div>
+                  )}
+                </div>
+              </section>
+              <section style={styles.artifactSection}>
+                <div style={styles.artifactHeader}>
+                  <h3 style={styles.artifactHeading}>Tests run</h3>
+                  <Pill tone="healthy">{artifactOverview.testsRun.length}</Pill>
+                </div>
+                <div style={styles.artifactList}>
+                  {artifactOverview.testsRun.length > 0 ? artifactOverview.testsRun.map((test) => (
+                    <div key={test} style={styles.artifactListItem}>{test}</div>
+                  )) : (
+                    <div style={styles.artifactEmpty}>No normalized test trace is attached yet.</div>
+                  )}
+                </div>
+              </section>
+              <section style={styles.artifactSection}>
+                <div style={styles.artifactHeader}>
+                  <h3 style={styles.artifactHeading}>Known risks</h3>
+                  <Pill tone="warning">{artifactOverview.knownRisks.length}</Pill>
+                </div>
+                <div style={styles.artifactList}>
+                  {artifactOverview.knownRisks.length > 0 ? artifactOverview.knownRisks.map((risk) => (
+                    <div key={risk} style={styles.artifactListItem}>{risk}</div>
+                  )) : (
+                    <div style={styles.artifactEmpty}>No normalized risk list is attached yet.</div>
+                  )}
+                </div>
+              </section>
+              <section style={styles.artifactSection}>
+                <div style={styles.artifactHeader}>
+                  <h3 style={styles.artifactHeading}>Review findings</h3>
+                  <Pill tone="default">{artifactOverview.reviewFindings.length}</Pill>
+                </div>
+                <div style={styles.artifactList}>
+                  {artifactOverview.reviewFindings.length > 0 ? artifactOverview.reviewFindings.map((finding, index) => {
+                    const location = formatFindingLocation(finding);
+                    const traceOrigin = formatFindingTraceOrigin(finding.source);
+                    const hasExpandedDetails = Boolean(
+                      finding.excerpt ||
+                      finding.suggestion ||
+                      finding.acId ||
+                      finding.criterion ||
+                      finding.confidence != null ||
+                      traceOrigin ||
+                      finding.provider ||
+                      finding.category ||
+                      finding.header,
+                    );
+                    return (
+                      <Card key={`${finding.message.slice(0, 48)}-${index}`} style={styles.findingCard}>
+                        <div style={styles.findingHeader}>
+                          <Pill tone={findingSeverityTone(finding.severity)}>
+                            {finding.severity ?? "finding"}
+                          </Pill>
+                          {location ? <span style={styles.findingMeta}>{location}</span> : null}
+                          {finding.check ? <span style={styles.findingMeta}>{finding.check}</span> : null}
+                        </div>
+                        <p style={styles.findingMessage}>{finding.message}</p>
+                        {hasExpandedDetails ? (
+                          <details style={styles.findingDetails}>
+                            <summary style={styles.findingDetailsSummary}>Trace and remediation</summary>
+                            <div style={styles.findingDetailGrid}>
+                              {traceOrigin ? (
+                                <div style={styles.findingDetailItem}>
+                                  <strong>{traceOrigin.label}</strong>
+                                  <span>{traceOrigin.detail}</span>
+                                </div>
+                              ) : null}
+                              {finding.provider ? (
+                                <div style={styles.findingDetailItem}>
+                                  <strong>Provider</strong>
+                                  <span>{finding.provider}</span>
+                                </div>
+                              ) : null}
+                              {finding.header ? (
+                                <div style={styles.findingDetailItem}>
+                                  <strong>Header</strong>
+                                  <span>{finding.header}</span>
+                                </div>
+                              ) : null}
+                              {finding.category ? (
+                                <div style={styles.findingDetailItem}>
+                                  <strong>Category</strong>
+                                  <span>{finding.category}</span>
+                                </div>
+                              ) : null}
+                              {finding.acId ? (
+                                <div style={styles.findingDetailItem}>
+                                  <strong>Acceptance criteria</strong>
+                                  <span>{finding.acId}</span>
+                                </div>
+                              ) : null}
+                              {finding.criterion ? (
+                                <div style={styles.findingDetailItem}>
+                                  <strong>Criterion</strong>
+                                  <span>{finding.criterion}</span>
+                                </div>
+                              ) : null}
+                              {finding.confidence != null ? (
+                                <div style={styles.findingDetailItem}>
+                                  <strong>Confidence</strong>
+                                  <span>{Math.round(finding.confidence * 100)}%</span>
+                                </div>
+                              ) : null}
+                              {finding.excerpt ? (
+                                <div style={styles.findingDetailItem}>
+                                  <strong>Excerpt</strong>
+                                  <span>{finding.excerpt}</span>
+                                </div>
+                              ) : null}
+                              {finding.suggestion ? (
+                                <div style={styles.findingDetailItem}>
+                                  <strong>Suggestion</strong>
+                                  <span>{finding.suggestion}</span>
+                                </div>
+                              ) : null}
+                            </div>
+                          </details>
+                        ) : null}
+                      </Card>
+                    );
+                  }) : (
+                    <div style={styles.artifactEmpty}>No normalized review findings are attached yet.</div>
+                  )}
+                </div>
+              </section>
+              <section style={styles.artifactSection}>
+                <div style={styles.artifactHeader}>
+                  <h3 style={styles.artifactHeading}>Artifact provenance</h3>
+                  <Pill tone="default">normalized-first</Pill>
+                </div>
+                <p className="artifact-inline-summary">
+                  Every category shows whether Sarathi is reading from normalized contracts first or falling back to lower-level provider evidence.
+                </p>
+                <div style={styles.artifactList}>
+                  {([
+                    ["Changed files", artifactOverview.provenance.filesChanged],
+                    ["Tests run", artifactOverview.provenance.testsRun],
+                    ["Known risks", artifactOverview.provenance.knownRisks],
+                    ["Review findings", artifactOverview.provenance.reviewFindings],
+                  ] as Array<[string, ArtifactProvenanceEntry[]]>).map(([label, provenanceEntries]) => (
+                    <details key={label} style={styles.provenanceCard}>
+                      <summary style={styles.provenanceSummary}>
+                        <strong>{label}</strong>
+                        <span style={styles.provenanceSummaryText}>
+                          {provenanceEntries.length > 0
+                            ? provenanceEntries.map((entry) => entry.label).join(" · ")
+                            : "No artifact source recorded yet."}
+                        </span>
+                      </summary>
+                      <div style={styles.provenanceDetailList}>
+                        {provenanceEntries.length > 0 ? provenanceEntries.map((entry) => (
+                          <div key={`${label}-${entry.detail}`} style={styles.findingDetailItem}>
+                            <strong>{entry.label}</strong>
+                            <span>{entry.detail}</span>
+                          </div>
+                        )) : (
+                          <div style={styles.artifactEmpty}>This category has not emitted normalized provenance yet.</div>
+                        )}
+                      </div>
+                    </details>
+                  ))}
+                </div>
+              </section>
+              {artifactOverview.dispatchSummaries.length > 0 ? (
+                <section style={styles.artifactSection}>
+                  <div style={styles.artifactHeader}>
+                    <h3 style={styles.artifactHeading}>Dispatch inspectors</h3>
+                    <Pill tone="default">{artifactOverview.dispatchSummaries.length}</Pill>
+                  </div>
+                  <p className="artifact-inline-summary">
+                    Each dispatch card keeps the headline outcome visible first, with richer trace origin preserved below for deeper inspection.
+                  </p>
+                  <div style={styles.artifactList}>
+                    {artifactOverview.dispatchSummaries.map((dispatch) => (
+                      <Card key={dispatch.id} style={styles.summaryCard}>
+                        <div style={styles.dispatchInspectorHeader}>
+                          <strong>{dispatch.agent} · {dispatch.status}</strong>
+                          {dispatch.nextAgent ? <Pill tone="draft">Next {dispatch.nextAgent}</Pill> : null}
+                        </div>
+                        <p>{dispatch.summary ?? "No summary recorded."}</p>
+                        <small style={styles.helperText}>
+                          {dispatch.filesChangedCount} files · {dispatch.testsRunCount} tests · {dispatch.reviewFindingsCount} findings · {dispatch.knownRisksCount} risks
+                        </small>
+                        {dispatch.traceSources.length > 0 ? (
+                          <div style={styles.provenanceDetailList}>
+                            {dispatch.traceSources.map((entry) => (
+                              <div key={`${dispatch.id}-${entry.label}-${entry.detail}`} style={styles.findingDetailItem}>
+                                <strong>{entry.label}</strong>
+                                <span>{entry.detail}</span>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                      </Card>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
             </div>
           </section>
         </div>
@@ -1435,6 +2991,49 @@ export default function ProjectDetail({
               ))}
             </tbody>
           </table>
+
+          <div style={{ marginTop: 24, paddingTop: 18, borderTop: "1px solid var(--border)" }}>
+            <PanelTitle title="Task governance" badge="live" />
+            <p style={styles.helperText}>Governance posture for this task including repository actions and routing.</p>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12, marginTop: 12 }}>
+              <Card style={{ padding: 14 }}>
+                <strong style={{ fontSize: "0.8rem" }}>Repository action</strong>
+                <p style={{ margin: "8px 0 0", color: "var(--muted)", fontSize: "0.82rem" }}>
+                  {(liveSnapshot?.task.metadata?.repository_action_preference as { mode?: string })?.mode ?? "no_action"} - {(liveSnapshot?.task.metadata?.repository_action_preference as { scope?: string })?.scope ?? "default"}
+                </p>
+              </Card>
+              <Card style={{ padding: 14 }}>
+                <strong style={{ fontSize: "0.8rem" }}>Routing leader</strong>
+                <p style={{ margin: "8px 0 0", color: "var(--muted)", fontSize: "0.82rem" }}>
+                  {liveOps.governance?.provider_routing.selected_provider ?? "local"}
+                </p>
+              </Card>
+              <Card style={{ padding: 14 }}>
+                <strong style={{ fontSize: "0.8rem" }}>Repository actions</strong>
+                <p style={{ margin: "8px 0 0", color: "var(--muted)", fontSize: "0.82rem" }}>
+                  {liveOps.governance?.repository_action_governance.approved_count ?? 0} approved / {liveOps.governance?.repository_action_governance.pending_count ?? 0} pending
+                </p>
+              </Card>
+              <Card style={{ padding: 14 }}>
+                <strong style={{ fontSize: "0.8rem" }}>Policy source</strong>
+                <p style={{ margin: "8px 0 0", color: "var(--muted)", fontSize: "0.82rem" }}>
+                  {liveOps.governance?.policy_posture.provider_priority_source ?? "default"}
+                </p>
+              </Card>
+            </div>
+            {liveOps.governance?.override_history && liveOps.governance.override_history.length > 0 && (
+              <div style={{ marginTop: 16 }}>
+                <strong style={{ fontSize: "0.8rem" }}>Recent governance overrides</strong>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                  {liveOps.governance.override_history.slice(0, 5).map((entry) => (
+                    <span key={entry.id} style={{ fontSize: "0.72rem", padding: "4px 8px", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}>
+                      {entry.event_type}: {entry.summary}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
         </section>
       )}
 
@@ -1442,6 +3041,40 @@ export default function ProjectDetail({
         <section style={styles.panel}>
           <PanelTitle title="Audit trail" badge={operations ? "SQLite" : "demo"} />
           <p style={styles.helperText}>Chronological record of task, provider, review, and artifact events.</p>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12, marginBottom: 16 }}>
+            <Card style={styles.summaryCard}>
+              <strong>Governance overrides</strong>
+              <p style={{ margin: "8px 0 0" }}>{taskGovernanceOverrides.length} recent governance event{taskGovernanceOverrides.length === 1 ? "" : "s"} affect this task or workspace.</p>
+            </Card>
+            <Card style={styles.summaryCard}>
+              <strong>Repository actions</strong>
+              <p style={{ margin: "8px 0 0" }}>{taskRepositoryGovernance.length} decision record{taskRepositoryGovernance.length === 1 ? "" : "s"} captured for the selected task.</p>
+            </Card>
+          </div>
+          {(taskGovernanceOverrides.length > 0 || taskRepositoryGovernance.length > 0) && (
+            <div style={{ ...styles.timeline, marginBottom: 18 }}>
+              {taskGovernanceOverrides.map((event) => (
+                <div key={event.id} style={styles.timelineItem}>
+                  <span style={styles.timelineTime}>{formatTime(event.created_at)}</span>
+                  <span style={{ ...styles.timelineDot, background: event.severity === "warning" ? "#d97706" : "#2f6fdf" }} />
+                  <div style={styles.timelineBody}>
+                    <div style={styles.timelineTitle}>{event.event_type}</div>
+                    <div style={styles.timelineMeta}>{event.summary}</div>
+                  </div>
+                </div>
+              ))}
+              {taskRepositoryGovernance.map((entry) => (
+                <div key={entry.id} style={styles.timelineItem}>
+                  <span style={styles.timelineTime}>{formatTime(entry.created_at)}</span>
+                  <span style={{ ...styles.timelineDot, background: entry.status === "approved" ? "#1f8f5f" : "#d97706" }} />
+                  <div style={styles.timelineBody}>
+                    <div style={styles.timelineTitle}>repository_action.{entry.status}</div>
+                    <div style={styles.timelineMeta}>{entry.summary}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
           <div style={styles.timeline}>
             {historyRows.map((event) => {
               const payload = event.payload as Record<string, unknown>;
@@ -1472,6 +3105,8 @@ export default function ProjectDetail({
             <Card style={styles.metricCard}><strong>{usage.events.total}</strong><p>Events</p></Card>
             <Card style={styles.metricCard}><strong>{usage.messages.total}</strong><p>Messages</p></Card>
             <Card style={styles.metricCard}><strong>{usage.handoffs.total}</strong><p>Handoffs</p></Card>
+            <Card style={styles.metricCard}><strong>{governance?.override_history?.length ?? 0}</strong><p>Overrides</p></Card>
+            <Card style={styles.metricCard}><strong>{governance?.repository_action_governance?.approved_count ?? 0}</strong><p>Repo actions approved</p></Card>
           </div>
           <section style={styles.panel}>
             <PanelTitle title="Workspace usage" badge={operations ? "SQLite" : "demo"} />
@@ -1672,7 +3307,7 @@ const styles: Record<string, CSSProperties> = {
     borderRadius: 20,
     border: "1px solid var(--border)",
     background: "var(--panel)",
-    padding: 18,
+    padding: 16,
     boxShadow: "var(--shadow-sm)",
   },
   metaRow: {
@@ -1692,8 +3327,83 @@ const styles: Record<string, CSSProperties> = {
     margin: "12px 0 0",
   },
   summaryCard: {
-    padding: 14,
+    padding: 12,
+    marginTop: 10,
+  },
+  deliveryHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  deliverySummary: {
+    margin: "8px 0 0",
+  },
+  deliveryMetricGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+    gap: 10,
     marginTop: 12,
+  },
+  deliveryMetricCard: {
+    padding: 12,
+    marginTop: 0,
+  },
+  deliverySection: {
+    display: "grid",
+    gap: 10,
+    marginTop: 14,
+    paddingTop: 12,
+    borderTop: "1px solid var(--border)",
+  },
+  deliveryCopyBlock: {
+    display: "grid",
+    gap: 10,
+  },
+  deliveryDetailRow: {
+    display: "grid",
+    gap: 4,
+  },
+  deliveryChecklist: {
+    display: "grid",
+    gap: 8,
+  },
+  deliveryChecklistItem: {
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: "10px 12px",
+    background: "var(--canvas)",
+    fontSize: "0.82rem",
+    color: "var(--ink)",
+    display: "grid",
+    gap: 6,
+  },
+  deliveryChecklistLead: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    color: "var(--muted)",
+    fontSize: "0.74rem",
+    fontFamily: "var(--mono)",
+  },
+  deliveryChecklistMark: {
+    color: "var(--ink)",
+    fontWeight: 600,
+  },
+  deliveryChecklistId: {
+    color: "var(--muted)",
+  },
+  deliveryMissingList: {
+    display: "grid",
+    gap: 8,
+  },
+  deliveryMissingItem: {
+    border: "1px dashed var(--border)",
+    borderRadius: 12,
+    padding: "10px 12px",
+    background: "var(--canvas)",
+    fontSize: "0.8rem",
+    color: "var(--muted)",
   },
   checkpointHistoryItem: {
     border: "1px solid var(--border)",
@@ -1739,6 +3449,119 @@ const styles: Record<string, CSSProperties> = {
   ledgerGrid: {
     display: "grid",
     gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+    gap: 10,
+  },
+  artifactSection: {
+    display: "grid",
+    gap: 8,
+    marginTop: 12,
+  },
+  artifactHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  artifactHeading: {
+    margin: 0,
+    fontSize: "0.86rem",
+  },
+  artifactList: {
+    display: "grid",
+    gap: 8,
+  },
+  artifactListItem: {
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: "10px 12px",
+    background: "var(--canvas)",
+    fontSize: "0.82rem",
+    color: "var(--ink)",
+  },
+  artifactEmpty: {
+    border: "1px dashed var(--border)",
+    borderRadius: 12,
+    padding: "12px",
+    background: "var(--canvas)",
+    fontSize: "0.8rem",
+    color: "var(--muted)",
+  },
+  findingCard: {
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: "10px 12px",
+    background: "var(--surface)",
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  findingHeader: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  findingMeta: {
+    fontSize: "0.72rem",
+    color: "var(--muted)",
+    fontFamily: "var(--mono)",
+  },
+  findingMessage: {
+    margin: 0,
+    fontSize: "0.82rem",
+    color: "var(--ink)",
+    lineHeight: 1.4,
+  },
+  findingDetails: {
+    borderTop: "1px solid var(--border)",
+    paddingTop: 8,
+  },
+  findingDetailsSummary: {
+    cursor: "pointer",
+    color: "var(--muted)",
+    fontSize: "0.76rem",
+    listStyle: "none",
+  },
+  findingDetailGrid: {
+    display: "grid",
+    gap: 8,
+    marginTop: 8,
+  },
+  findingDetailItem: {
+    display: "grid",
+    gap: 4,
+    border: "1px solid var(--border)",
+    borderRadius: 10,
+    padding: "8px 10px",
+    background: "var(--canvas)",
+    fontSize: "0.76rem",
+    color: "var(--muted)",
+  },
+  provenanceCard: {
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: "10px 12px",
+    background: "var(--surface)",
+  },
+  provenanceSummary: {
+    cursor: "pointer",
+    display: "grid",
+    gap: 4,
+    color: "var(--ink)",
+  },
+  provenanceSummaryText: {
+    color: "var(--muted)",
+    fontSize: "0.76rem",
+  },
+  provenanceDetailList: {
+    display: "grid",
+    gap: 8,
+    marginTop: 10,
+  },
+  dispatchInspectorHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
     gap: 10,
   },
   metricGrid: {

@@ -2,15 +2,19 @@ import { useState, useEffect } from "react";
 import {
   getSarathiApiConfig,
   getWorkspace,
+  getWorkspaceOperationalViews,
   getWorkspacePolicyPack,
   listProviders,
   putWorkspacePolicyPackFile,
   testProviderConnection,
   updateWorkspace,
   type AutoApprovePreferenceRecord,
+  type OperationalViewsSnapshot,
   type PolicyPackFile,
+  type ProviderConnectionDraft,
   type ProviderHealthRecord,
   type RepositoryActionPreferenceRecord,
+  type WorkspaceGovernanceSnapshot,
   type WorkspaceRecord,
 } from "../apiClient";
 import { Badge } from "@radix-ui/themes";
@@ -187,27 +191,53 @@ interface SettingsProps {
   workspaceId?: string | null;
 }
 
+function defaultProviderDraft(provider: ProviderHealthRecord): ProviderConnectionDraft & { api_key_configured?: boolean } {
+  return {
+    path: provider.path,
+    auth: provider.auth,
+    api_key: "",
+    api_key_configured: provider.api_key_configured ?? false,
+    base_url: provider.base_url ?? "",
+    model: provider.model ?? "",
+  };
+}
+
+function providerUsesSdkFields(providerId: string): boolean {
+  return providerId === "codex" || providerId === "claude";
+}
+
+function providerApiKeyLabel(providerId: string): string {
+  return providerId === "claude" ? "Anthropic API key" : "OpenAI API key";
+}
+
+function providerModelPlaceholder(providerId: string): string {
+  return providerId === "claude" ? "Model (default claude-sonnet-4-0)" : "Model (default gpt-4.1)";
+}
+
+function providerSdkHelpText(providerId: string): string {
+  if (providerId === "claude") {
+    return "Claude can run SDK-first with Anthropic credentials only, or fall back to the real `claude` binary when configured.";
+  }
+  return "Codex can run SDK-first with API credentials only, or fall back to the real `codex` binary when configured.";
+}
+
 export default function Settings({ workspaceId }: SettingsProps) {
   const apiConfigured = getSarathiApiConfig() !== null;
   const [workspace, setWorkspace] = useState<WorkspaceRecord | null>(null);
+  const [governance, setGovernance] = useState<WorkspaceGovernanceSnapshot | null>(null);
   const [providerHealth, setProviderHealth] = useState<ProviderHealthRecord[]>([]);
-  const [providerDrafts, setProviderDrafts] = useState<Record<string, { path: string; auth: string }>>({});
+  const [providerDrafts, setProviderDrafts] = useState<Record<string, ProviderConnectionDraft & { api_key_configured?: boolean }>>({});
   const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
   const [testingProviderId, setTestingProviderId] = useState<string | null>(null);
   const [repositoryPreference, setRepositoryPreference] = useState<RepositoryActionPreferenceRecord>(defaultRepositoryActionPreference);
   const [autoApprovePreference, setAutoApprovePreference] = useState<AutoApprovePreferenceRecord>(defaultAutoApprovePreference);
   const [savingRepositoryPreference, setSavingRepositoryPreference] = useState(false);
   const [savingAutoApprovePreference, setSavingAutoApprovePreference] = useState(false);
+  const [savingProviderPriority, setSavingProviderPriority] = useState(false);
   const [settingsStatus, setSettingsStatus] = useState(
     apiConfigured ? "Loading provider settings." : "Demo provider settings.",
   );
-  const [providerPriority, setProviderPriority] = useState<string[]>(() => {
-    try {
-      return JSON.parse(localStorage.getItem("sarathi_provider_priority") || "null") || ["claude", "codex", "copilot", "opencode"];
-    } catch {
-      return ["claude", "codex", "copilot", "opencode"];
-    }
-  });
+  const [providerPriority, setProviderPriority] = useState<string[]>(["claude", "codex", "copilot", "opencode"]);
   const [policyFiles, setPolicyFiles] = useState<PolicyPackFile[]>([]);
   const [expandedPolicyFile, setExpandedPolicyFile] = useState<string | null>(null);
   const [policyDrafts, setPolicyDrafts] = useState<Record<string, string>>({});
@@ -222,6 +252,8 @@ export default function Settings({ workspaceId }: SettingsProps) {
       setProviderDrafts({});
       setRepositoryPreference(defaultRepositoryActionPreference);
       setAutoApprovePreference(defaultAutoApprovePreference);
+      setGovernance(null);
+      setProviderPriority(["claude", "codex", "copilot", "opencode"]);
       setPolicyFiles([]);
       setPolicyDrafts({});
       setSettingsStatus("Select a workspace to configure trust and provider posture.");
@@ -231,17 +263,19 @@ export default function Settings({ workspaceId }: SettingsProps) {
     let cancelled = false;
     async function loadSettingsProviders() {
       try {
-        const ws = await getWorkspace(activeWorkspaceId);
-        const nextProviders = await listProviders(activeWorkspaceId);
+        const [ws, nextProviders, operations] = await Promise.all([
+          getWorkspace(activeWorkspaceId),
+          listProviders(activeWorkspaceId),
+          getWorkspaceOperationalViews(activeWorkspaceId),
+        ]);
         if (!cancelled) {
           setWorkspace(ws);
           setRepositoryPreference(normalizeRepositoryActionPreference(ws.metadata.repository_action_preference));
           setAutoApprovePreference(normalizeAutoApprovePreference(ws.metadata.auto_approve_preference));
+          setGovernance(operations.governance);
+          setProviderPriority(operations.governance.policy_posture.provider_priority);
           setProviderHealth(nextProviders);
-          setProviderDrafts(Object.fromEntries(nextProviders.map((p) => [
-            p.id,
-            { path: p.path, auth: p.auth },
-          ])));
+          setProviderDrafts(Object.fromEntries(nextProviders.map((p) => [p.id, defaultProviderDraft(p)])));
           setSettingsStatus(`${nextProviders.length} providers loaded from workspace settings.`);
         }
       } catch (error) {
@@ -273,16 +307,26 @@ export default function Settings({ workspaceId }: SettingsProps) {
     }
     setTestingProviderId(provider.id);
     try {
-      setSettingsStatus(`Testing ${provider.name}...`);
-      const ws = workspace ?? await getWorkspace(workspaceId);
+      const ws = await getWorkspace(workspaceId);
       if (!workspace) {
         setWorkspace(ws);
         setRepositoryPreference(normalizeRepositoryActionPreference(ws.metadata.repository_action_preference));
       }
-      const draft = providerDrafts[provider.id] ?? { path: provider.path, auth: provider.auth };
-      const updated = await testProviderConnection(ws.id, provider.id, draft.path, draft.auth);
+      const draft = providerDrafts[provider.id] ?? defaultProviderDraft(provider);
+      const updated = await testProviderConnection(ws.id, provider.id, draft);
       setProviderHealth((current) => current.map((c) => c.id === updated.id ? updated : c));
-      setProviderDrafts((current) => ({ ...current, [updated.id]: { path: updated.path, auth: updated.auth } }));
+      setProviderDrafts((current) => ({
+        ...current,
+        [updated.id]: {
+          ...draft,
+          path: updated.path,
+          auth: updated.auth,
+          api_key: "",
+          api_key_configured: updated.api_key_configured ?? draft.api_key_configured,
+          base_url: updated.base_url ?? draft.base_url ?? "",
+          model: updated.model ?? draft.model ?? "",
+        },
+      }));
       setSettingsStatus(`${updated.name} is ${updated.health}${updated.last_error ? `: ${updated.last_error}` : "."}`);
     } catch (error) {
       setSettingsStatus(error instanceof Error ? error.message : "Provider test failed.");
@@ -349,6 +393,32 @@ export default function Settings({ workspaceId }: SettingsProps) {
     }
   }
 
+  async function saveProviderPriorityOrder() {
+    if (!apiConfigured || !workspaceId) {
+      setSettingsStatus("Saving provider routing requires a selected workspace and local service.");
+      return;
+    }
+    const ws = workspace ?? await getWorkspace(workspaceId);
+    if (!workspace) {
+      setWorkspace(ws);
+    }
+    setSavingProviderPriority(true);
+    try {
+      const updated = await updateWorkspace(ws.id, {
+        provider_priority: providerPriority,
+      });
+      setWorkspace(updated);
+      const operations = await getWorkspaceOperationalViews(ws.id);
+      setGovernance(operations.governance);
+      setProviderPriority(operations.governance.policy_posture.provider_priority);
+      setSettingsStatus(`Dispatch order saved. ${operations.governance.provider_routing.selected_provider} is currently first viable.`);
+    } catch (error) {
+      setSettingsStatus(error instanceof Error ? error.message : "Provider routing save failed.");
+    } finally {
+      setSavingProviderPriority(false);
+    }
+  }
+
   async function savePolicyFile(filename: string) {
     if (!apiConfigured || !workspaceId) return;
     setSavingPolicyFile(filename);
@@ -370,10 +440,19 @@ export default function Settings({ workspaceId }: SettingsProps) {
     id: p.id,
     name: p.name,
     provider_type: p.type,
+    transport_kind: p.id === "local" || p.type === "local" || p.type === "deterministic" ? "deterministic" : "cli",
+    transport_posture: p.id === "local" || p.type === "local" || p.type === "deterministic" ? "builtin" : "cli_fallback",
     health: p.health,
     auth: p.auth,
     path: p.path,
     capabilities: p.capabilities,
+    api_key_configured: false,
+    base_url: null,
+    model: null,
+    degraded_reason:
+      p.id === "local" || p.type === "local" || p.type === "deterministic"
+        ? null
+        : "Demo provider is shown through the CLI fallback posture.",
     last_checked_at: null,
     last_error: null,
   }));
@@ -401,6 +480,44 @@ export default function Settings({ workspaceId }: SettingsProps) {
     <div className="grid two">
       <section className="panel">
         <ReadinessCard readyItems={readyItems} pendingItems={pendingItems} />
+
+        <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--border)" }}>
+          <div className="section-header">
+            <h2 style={{ fontSize: "0.9rem", margin: 0 }}>Governance</h2>
+            <span className={`pill-mini ${governance?.override_history?.length ? "warning" : "healthy"}`}>
+              {governance?.override_history?.length ? `${governance.override_history.length} overrides` : "steady"}
+            </span>
+          </div>
+          <p className="section-summary">
+            Current repository posture, approval mode, and routing leader at a glance so governance stays readable instead of sprawling.
+          </p>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 8 }}>
+            <Card style={{ padding: 10 }}>
+              <div style={{ fontSize: "0.68rem", color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 4 }}>
+                Repo
+              </div>
+              <div style={{ fontSize: "0.82rem", fontWeight: 500 }}>
+                {repositoryActionModeLabel(repositoryPreference.mode)}
+              </div>
+            </Card>
+            <Card style={{ padding: 10 }}>
+              <div style={{ fontSize: "0.68rem", color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 4 }}>
+                Approvals
+              </div>
+              <div style={{ fontSize: "0.82rem", fontWeight: 500 }}>
+                {autoApproveModeLabel(autoApprovePreference.mode)}
+              </div>
+            </Card>
+            <Card style={{ padding: 10 }}>
+              <div style={{ fontSize: "0.68rem", color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 4 }}>
+                Leader
+              </div>
+              <div style={{ fontSize: "0.82rem", fontWeight: 500 }}>
+                {governance?.provider_routing.selected_provider ?? providerPriority[0] ?? "local"}
+              </div>
+            </Card>
+          </div>
+        </div>
 
         <div style={{ marginTop: 18, paddingTop: 18, borderTop: "1px solid var(--border)" }}>
           <div className="panel-title" style={{ marginBottom: 10 }}>
@@ -532,12 +649,19 @@ export default function Settings({ workspaceId }: SettingsProps) {
         <small style={{ display: "block", marginTop: 16, color: "var(--muted)" }}>{settingsStatus}</small>
       </section>
       <section className="panel">
-        <h2 style={{ marginBottom: 16 }}>AI providers</h2>
+        <h2 style={{ marginBottom: 12 }}>Providers</h2>
         {visibleProviders.map((provider) => {
-          const draft = providerDrafts[provider.id] ?? { path: provider.path, auth: provider.auth };
+          const draft = providerDrafts[provider.id] ?? defaultProviderDraft(provider);
           const isExpanded = expandedProviders.has(provider.id);
           return (
-            <Card key={provider.id} style={{ marginBottom: 12, padding: isExpanded ? 12 : "12px 16px" }}>
+            <Card
+              key={provider.id}
+              style={{
+                marginBottom: 8,
+                padding: isExpanded ? 10 : "10px 12px",
+                borderRadius: "var(--radius-sm)",
+              }}
+            >
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
                 onClick={() => {
                   setExpandedProviders((current) => {
@@ -554,17 +678,12 @@ export default function Settings({ workspaceId }: SettingsProps) {
                   });
                 }}
               >
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: provider.health === "online" ? "var(--green)" : provider.health === "degraded" ? "var(--amber)" : "var(--red)" }} />
-                  <strong>{provider.name}</strong>
-                  {provider.health === "online" && (
-                    <span style={{ fontSize: "0.7rem", color: "var(--muted)" }}>ready</span>
-                  )}
-                </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <Pill tone={provider.health}>{provider.health}</Pill>
-                  <span style={{ color: "var(--muted)", fontSize: "0.7rem" }}>{isExpanded ? "▲" : "▼"}</span>
+                  <span style={{ width: 6, height: 6, borderRadius: "50%", background: provider.health === "online" ? "var(--green)" : provider.health === "degraded" ? "var(--amber)" : "var(--red)" }} />
+                  <strong style={{ fontSize: "0.85rem" }}>{provider.name}</strong>
+                  <span className={`pill-mini ${provider.health}`}>{provider.health}</span>
                 </div>
+                <span style={{ color: "var(--muted)", fontSize: "0.7rem" }}>{isExpanded ? "▲" : "▼"}</span>
               </div>
               {isExpanded && (
                 <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--border)" }}>
@@ -595,6 +714,46 @@ export default function Settings({ workspaceId }: SettingsProps) {
                       <option value="github_auth">GitHub OAuth</option>
                     </select>
                   </div>
+                  {providerUsesSdkFields(provider.id) ? (
+                    <div style={{ display: "grid", gap: 8, marginBottom: 8 }}>
+                      <input
+                        aria-label={`${provider.name} API key`}
+                        type="password"
+                        value={draft.api_key ?? ""}
+                        onChange={(e) => setProviderDrafts({
+                          ...providerDrafts,
+                          [provider.id]: { ...draft, api_key: e.target.value },
+                        })}
+                        style={{ padding: "6px 10px", fontSize: "0.8rem", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)" }}
+                        placeholder={draft.api_key_configured ? "API key configured. Leave blank to keep." : providerApiKeyLabel(provider.id)}
+                      />
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <input
+                          aria-label={`${provider.name} base URL`}
+                          value={draft.base_url ?? ""}
+                          onChange={(e) => setProviderDrafts({
+                            ...providerDrafts,
+                            [provider.id]: { ...draft, base_url: e.target.value },
+                          })}
+                          style={{ flex: 1, padding: "6px 10px", fontSize: "0.8rem", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)" }}
+                          placeholder="Base URL (optional)"
+                        />
+                        <input
+                          aria-label={`${provider.name} model`}
+                          value={draft.model ?? ""}
+                          onChange={(e) => setProviderDrafts({
+                            ...providerDrafts,
+                            [provider.id]: { ...draft, model: e.target.value },
+                          })}
+                          style={{ flex: 1, padding: "6px 10px", fontSize: "0.8rem", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)" }}
+                          placeholder={providerModelPlaceholder(provider.id)}
+                        />
+                      </div>
+                      <small style={{ color: "var(--muted)", display: "block" }}>
+                        {providerSdkHelpText(provider.id)}
+                      </small>
+                    </div>
+                  ) : null}
                   {provider.last_checked_at && (
                     <small style={{ color: "var(--muted)", display: "block", marginBottom: 8 }}>
                       Last checked: {new Date(provider.last_checked_at).toLocaleString()}
@@ -603,6 +762,11 @@ export default function Settings({ workspaceId }: SettingsProps) {
                   {provider.last_error && (
                     <small style={{ color: "var(--red)", display: "block", marginBottom: 8 }}>
                       {provider.last_error}
+                    </small>
+                  )}
+                  {provider.degraded_reason && (
+                    <small style={{ color: "var(--amber)", display: "block", marginBottom: 8 }}>
+                      {provider.degraded_reason}
                     </small>
                   )}
                   <button
@@ -619,58 +783,67 @@ export default function Settings({ workspaceId }: SettingsProps) {
         })}
       </section>
       <section className="panel" style={{ gridColumn: "1 / -1" }}>
-        <h2 style={{ marginBottom: 4 }}>Agent dispatch order</h2>
-        <p style={{ fontSize: "0.83rem", color: "var(--muted)", marginBottom: 16 }}>
-          When you run a task, agents are tried in this order until one responds. Move your preferred agent to the top.
+        <div className="section-header">
+          <h2 style={{ fontSize: "0.9rem", margin: 0 }}>Dispatch order</h2>
+        </div>
+        <p className="section-summary">
+          Sarathi tries agents in this workspace order, then falls back. Keep it deliberate so provider routing is obvious during review.
         </p>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
           {providerPriority.map((pid, idx) => (
-            <div key={pid} style={{ display: "flex", alignItems: "center", gap: 2, padding: "6px 10px", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}>
-              <span style={{ 
-                fontSize: "0.72rem", 
-                fontWeight: 600, 
-                color: idx === 0 ? "var(--ink)" : "var(--muted)",
-                marginRight: 4 
-              }}>
+            <div key={pid} style={{ display: "flex", alignItems: "center", gap: 4, padding: "4px 8px", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}>
+              <span style={{ fontSize: "0.68rem", fontWeight: 600, color: idx === 0 ? "var(--ink)" : "var(--muted)" }}>
                 {idx + 1}
               </span>
-              <span style={{ fontSize: "0.85rem", fontWeight: idx === 0 ? 600 : 400 }}>{pid}</span>
-              <div style={{ display: "flex", flexDirection: "column", marginLeft: 4 }}>
+              <span style={{ fontSize: "0.8rem", fontWeight: idx === 0 ? 600 : 400 }}>{pid}</span>
+              {idx > 0 && (
                 <button
-                  disabled={idx === 0}
                   onClick={() => {
                     const newOrder = [...providerPriority];
                     [newOrder[idx - 1], newOrder[idx]] = [newOrder[idx], newOrder[idx - 1]];
                     setProviderPriority(newOrder);
-                    localStorage.setItem("sarathi_provider_priority", JSON.stringify(newOrder));
                   }}
-                  style={{ fontSize: "0.65rem", padding: "1px 4px", opacity: idx === 0 ? 0.2 : 1, border: "none", background: "transparent", cursor: "pointer", lineHeight: 1 }}
+                  style={{ fontSize: "0.6rem", padding: "1px 3px", opacity: 0.4, border: "none", background: "transparent", cursor: "pointer" }}
                 >
                   ▲
                 </button>
-                <button
-                  disabled={idx === providerPriority.length - 1}
-                  onClick={() => {
-                    const newOrder = [...providerPriority];
-                    [newOrder[idx], newOrder[idx + 1]] = [newOrder[idx + 1], newOrder[idx]];
-                    setProviderPriority(newOrder);
-                    localStorage.setItem("sarathi_provider_priority", JSON.stringify(newOrder));
-                  }}
-                  style={{ fontSize: "0.65rem", padding: "1px 4px", opacity: idx === providerPriority.length - 1 ? 0.2 : 1, border: "none", background: "transparent", cursor: "pointer", lineHeight: 1 }}
-                >
-                  ▼
-                </button>
-              </div>
+              )}
             </div>
           ))}
         </div>
+        <button style={{ height: 28, fontSize: "0.76rem" }} onClick={() => void saveProviderPriorityOrder()} disabled={savingProviderPriority || !workspace}>
+          {savingProviderPriority ? "Saving..." : "Save"}
+        </button>
       </section>
       <section className="panel" style={{ gridColumn: "1 / -1" }}>
-        <h2 style={{ marginBottom: 4 }}>Policy pack</h2>
-        <p style={{ fontSize: "0.83rem", color: "var(--muted)", marginBottom: 16 }}>
-          Policy files control how Sarathi routes, builds, reviews, and escalates tasks.
-          {!workspaceId && " Select a workspace to view policy files."}
+        <div className="section-header">
+          <h2 style={{ fontSize: "0.9rem", margin: 0 }}>Override history</h2>
+        </div>
+        <p className="section-summary">
+          A compact audit trail of the latest governance changes, repository decisions, and posture overrides for this workspace.
         </p>
+        {governance?.override_history?.length ? (
+          <div style={{ display: "grid", gap: 8 }}>
+            {governance.override_history.map((entry) => (
+              <Card key={entry.id} style={{ padding: 10, borderRadius: "var(--radius-sm)" }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 4 }}>
+                  <strong style={{ fontSize: "0.8rem" }}>{entry.summary}</strong>
+                  <span className="pill-mini">{entry.event_type.split(".").pop()}</span>
+                </div>
+                <div style={{ fontSize: "0.7rem", color: "var(--faint)" }}>
+                  {new Date(entry.created_at).toLocaleString()}
+                </div>
+              </Card>
+            ))}
+          </div>
+        ) : (
+          <div style={{ fontSize: "0.78rem", color: "var(--muted)" }}>No overrides recorded.</div>
+        )}
+      </section>
+      <section className="panel" style={{ gridColumn: "1 / -1" }}>
+        <div className="section-header">
+          <h2 style={{ fontSize: "0.9rem", margin: 0 }}>Policy pack</h2>
+        </div>
         {loadingPolicy && (
           <div style={{ fontSize: "0.82rem", color: "var(--muted)" }}>Loading policy files…</div>
         )}

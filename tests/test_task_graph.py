@@ -78,9 +78,17 @@ def test_graph_executor_dispatches_ready_nodes_as_child_work_units():
 
     assert dispatcher.requests[0].constraints["purpose"] == "child_task_execution"
     assert dispatcher.requests[0].inputs["node"]["id"] == "step-1"
+    assert dispatcher.requests[0].context_pack is not None
+    assert dispatcher.requests[0].context_pack["phase"] == "Build"
+    assert dispatcher.requests[0].token_budget is not None
     assert result["events"][0]["provider_result"]["success"] is True
+    assert result["events"][0]["provider_result"]["context_pack_summary"]["objective"] == "A"
+    assert result["events"][0]["provider_result"]["agent_output"]["next_recommended_agent"] == "Nirnaya"
+    assert result["events"][0]["provider_result"]["artifact_index"]["review_findings"] == []
     assert result["graph_state"]["completed_nodes"] == ["step-1"]
     assert dispatcher.requests[0].phase == "Build"
+    assert result["graph_state"]["nodes"][0]["context_pack_summary"]["objective"] == "A"
+    assert result["graph_state"]["nodes"][0]["artifact_index"]["review_findings"] == []
 
 
 def test_graph_executor_marks_provider_failed_node_failed():
@@ -267,6 +275,7 @@ def test_supervision_manifest_includes_parent_child_links_and_block_reasons():
                 "status": "blocked",
                 "depends_on": ["step-1"],
                 "last_error": "needs external input",
+                "context_pack_summary": {"objective": "Review child", "token_budget": 2200, "estimated_tokens": 180},
             },
         ],
     }
@@ -280,4 +289,5 @@ def test_supervision_manifest_includes_parent_child_links_and_block_reasons():
     assert manifest[0]["child_task_ids"] == ["step-2"]
     assert manifest[1]["needs_from"] == ["step-1"]
     assert manifest[1]["block_reason"] == "needs external input"
+    assert manifest[1]["context_pack_summary"]["objective"] == "Review child"
     assert supervision_summary(annotated)["done"] == 1

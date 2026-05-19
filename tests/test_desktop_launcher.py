@@ -4,6 +4,7 @@ import sys
 
 from src.service.desktop import (
     build_launch_config,
+    connect_base_url,
     default_db_path,
     render_runtime_script,
     render_runtime_stub,
@@ -22,6 +23,7 @@ def test_desktop_launcher_module_exposes_help():
     assert "Run the Sarathi local desktop stack with runtime config wiring." in result.stdout
     assert "--print-config" in result.stdout
     assert "--service-port" in result.stdout
+    assert "--service-timeout" in result.stdout
 
 
 def test_render_runtime_script_contains_base_url_and_token():
@@ -48,6 +50,7 @@ def test_build_launch_config_uses_random_token_and_default_db(monkeypatch, tmp_p
             "service_port": 8765,
             "vite_host": "127.0.0.1",
             "vite_port": 5173,
+            "service_timeout": 18.0,
             "runtime_script": None,
         },
     )()
@@ -56,7 +59,14 @@ def test_build_launch_config_uses_random_token_and_default_db(monkeypatch, tmp_p
 
     assert config["db_path"].endswith(str(default_db_path()))
     assert config["base_url"] == "http://127.0.0.1:8765"
+    assert config["service_timeout"] == 18.0
     assert config["token"]
+
+
+def test_connect_base_url_normalizes_wildcard_hosts():
+    assert connect_base_url("0.0.0.0", 8765) == "http://127.0.0.1:8765"
+    assert connect_base_url("::", 8765) == "http://127.0.0.1:8765"
+    assert connect_base_url("127.0.0.1", 8765) == "http://127.0.0.1:8765"
 
 
 def test_desktop_launcher_print_config_returns_json():

@@ -1,7 +1,9 @@
 """CLI implementation for Sarathi."""
 import argparse
+import json
 import re
 import sys
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -297,6 +299,8 @@ def handle_home() -> None:
     print("Workspace: no workspace selected")
     print("Actions:")
     print("  chat         start brainstorming or create a task")
+    print("  desktop      launch the local desktop stack")
+    print("  reuse        inspect workflow templates and learned playbooks")
     print("  run          execute a task through Sarathi")
     print("  status       inspect task progress")
     print("  resume       continue a saved task")
@@ -304,9 +308,6 @@ def handle_home() -> None:
 
 
 def _show_home() -> None:
-    import json as _json
-    from pathlib import Path as _Path
-
     banner = r"""
   ███████  █████  ██████   █████  ████████ ██   ██ ██
   ██      ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
@@ -318,23 +319,15 @@ def _show_home() -> None:
     print("  Your AI Charioteer  ·  Workflow Orchestration Framework")
     print()
 
-    # Try to read service discovery
     service_url = None
     workspace_count = None
-    discovery_path = _Path.home() / ".sarathi" / "service.json"
-    if discovery_path.exists():
-        try:
-            info = _json.loads(discovery_path.read_text())
-            service_url = info.get("url")
-        except Exception:
-            pass
-
+    info = _read_service_discovery()
+    if info is not None:
+        service_url = info.get("url")
     if service_url:
         try:
-            import urllib.request as _req
-            resp = _req.urlopen(f"{service_url}/api/workspaces", timeout=2)
-            data = _json.loads(resp.read())
-            workspace_count = len(data.get("data", {}).get("workspaces", []))
+            data = _service_get_json(service_url, "/api/workspaces")
+            workspace_count = len(data.get("workspaces", []))
         except Exception:
             pass
 
@@ -347,6 +340,8 @@ def _show_home() -> None:
 
     print()
     print("  Commands")
+    print("    sarathi desktop                                  launch the desktop stack")
+    print("    sarathi reuse                                    inspect workflow templates and playbooks")
     print("    sarathi run \"<task>\" --policy-pack ./policy-pack   orchestrate a task")
     print("    sarathi init .                                     initialize a project")
     print("    sarathi validate ./policy-pack                     check policy pack")
@@ -401,6 +396,8 @@ def main() -> None:
 
     # Chat command (launches TUI)
     chat_parser = subparsers.add_parser("chat", help="Start interactive chat mode")
+
+    subparsers.add_parser("desktop", help="Run the local Sarathi desktop stack")
 
     # Run command
     run_parser = subparsers.add_parser("run", help="Run a task through the lifecycle")
@@ -489,9 +486,19 @@ def main() -> None:
         default=None,
         help="Optional rejection reason",
     )
+    reuse_parser = subparsers.add_parser("reuse", help="Show reusable workflow templates, saved views, and learned playbooks")
+    reuse_parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace id or exact workspace name. Required only when multiple workspaces exist.",
+    )
     subparsers.add_parser("agents", help="Show Sarathi agent role names and phase mapping")
 
-    args = parser.parse_args()
+    if len(sys.argv) > 1 and sys.argv[1] == "desktop":
+        args, _desktop_passthrough = parser.parse_known_args()
+        setattr(args, "desktop_args", sys.argv[2:])
+    else:
+        args = parser.parse_args()
 
     # Check for stdin input or message argument
     initial_message = None
@@ -507,6 +514,9 @@ def main() -> None:
     if args.command == "chat":
         from src.tui import launch_sarathi_tui
         launch_sarathi_tui(initial_message, exit_after=args.exit)
+        return
+    if args.command == "desktop":
+        handle_desktop(args)
         return
     if args.command == "init":
         handle_init(args)
@@ -526,6 +536,8 @@ def main() -> None:
         handle_list_tasks()
     elif args.command == "proposals":
         handle_proposals(args)
+    elif args.command == "reuse":
+        handle_reuse(args)
     elif args.command == "agents":
         handle_agents()
 
@@ -731,6 +743,153 @@ def handle_agents() -> None:
     print("\nLifecycle Phase Mapping:")
     for mapping in list_phase_agent_roles():
         print(f"- {mapping['phase']}: {mapping['name']} ({mapping['purpose']})")
+
+
+def _service_discovery_path() -> Path:
+    return Path.home() / ".sarathi" / "service.json"
+
+
+def _read_service_discovery() -> dict[str, Any] | None:
+    discovery_path = _service_discovery_path()
+    if not discovery_path.exists():
+        return None
+    try:
+        payload = json.loads(discovery_path.read_text())
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _service_get_json(service_url: str, path: str) -> dict[str, Any]:
+    with urllib.request.urlopen(f"{service_url.rstrip('/')}{path}", timeout=2) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected service response.")
+    if not payload.get("ok"):
+        error = payload.get("error") or {}
+        raise RuntimeError(str(error.get("message") or "Service request failed."))
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("Service response did not contain a data object.")
+    return data
+
+
+def _desktop_launcher_main():
+    try:
+        from .service.desktop import main as desktop_main
+    except ImportError:
+        from service.desktop import main as desktop_main
+    return desktop_main
+
+
+def handle_desktop(args: argparse.Namespace) -> None:
+    """Run the integrated local desktop launcher via the main Sarathi CLI."""
+    launcher = _desktop_launcher_main()
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = ["sarathi desktop", *getattr(args, "desktop_args", [])]
+        launcher()
+    finally:
+        sys.argv = original_argv
+
+
+def handle_reuse(args: argparse.Namespace) -> None:
+    """Show the live reusable workflow kit from the running Sarathi local service."""
+    info = _read_service_discovery()
+    service_url = info.get("url") if isinstance(info, dict) else None
+    if not service_url:
+        print("Sarathi desktop service not running — start it with: sarathi desktop")
+        return
+
+    try:
+        workspaces = _service_get_json(service_url, "/api/workspaces").get("workspaces", [])
+    except Exception as error:
+        print(f"Failed to read Sarathi workspaces: {error}")
+        return
+
+    if not isinstance(workspaces, list) or len(workspaces) == 0:
+        print("No workspaces available yet. Create one in the desktop first.")
+        return
+
+    selector = getattr(args, "workspace", None)
+    selected = None
+    if isinstance(selector, str) and selector.strip():
+        needle = selector.strip()
+        selected = next(
+            (
+                workspace for workspace in workspaces
+                if workspace.get("id") == needle or workspace.get("name") == needle
+            ),
+            None,
+        )
+        if selected is None:
+            print(f"Workspace not found: {needle}")
+            return
+    elif len(workspaces) == 1:
+        selected = workspaces[0]
+    else:
+        print("Multiple workspaces found. Re-run with --workspace <id-or-name>.")
+        for workspace in workspaces:
+            print(f"  - {workspace.get('name')} ({workspace.get('id')})")
+        return
+
+    workspace_id = selected.get("id")
+    workspace_name = selected.get("name") or workspace_id
+    if not isinstance(workspace_id, str) or not workspace_id:
+        print("Selected workspace is missing an id.")
+        return
+
+    try:
+        reuse_kit = _service_get_json(
+            service_url,
+            f"/api/workspaces/{workspace_id}/reuse-kit",
+        )
+    except Exception as error:
+        print(f"Failed to read workspace reuse kit: {error}")
+        return
+
+    templates = reuse_kit.get("templates") if isinstance(reuse_kit.get("templates"), list) else []
+    saved_views = reuse_kit.get("saved_views") if isinstance(reuse_kit.get("saved_views"), list) else []
+    playbooks = reuse_kit.get("playbooks") if isinstance(reuse_kit.get("playbooks"), list) else []
+    active_saved_view = reuse_kit.get("active_saved_view_id")
+
+    print(f"Workspace reuse kit: {workspace_name}")
+    print(f"Active saved view: {active_saved_view or 'none'}")
+
+    print("\nWorkflow templates:")
+    if templates:
+        for template in templates:
+            name = template.get("name") or template.get("id") or "template"
+            summary = template.get("summary") or "Reusable workflow template."
+            recommended_views = template.get("recommended_view_ids") or []
+            line = f"  - {name}: {summary}"
+            if isinstance(recommended_views, list) and recommended_views:
+                line += f" | views: {', '.join(str(item) for item in recommended_views)}"
+            print(line)
+    else:
+        print("  No workflow templates recorded.")
+
+    print("\nSaved views:")
+    if saved_views:
+        for view in saved_views:
+            name = view.get("name") or view.get("id") or "view"
+            metric = view.get("metric_label") or "items"
+            print(f"  - {name}: {metric}")
+    else:
+        print("  No saved views recorded.")
+
+    print("\nLearned playbooks:")
+    if playbooks:
+        for playbook in playbooks:
+            name = playbook.get("name") or playbook.get("id") or "playbook"
+            summary = playbook.get("summary") or "Reusable playbook from accepted learnings."
+            recommended_template = playbook.get("recommended_template_id")
+            line = f"  - {name}: {summary}"
+            if isinstance(recommended_template, str) and recommended_template:
+                line += f" | template: {recommended_template}"
+            print(line)
+    else:
+        print("  No learned playbooks recorded yet.")
 
 
 def handle_proposals(args: argparse.Namespace | None = None) -> None:
@@ -955,6 +1114,15 @@ def _print_task_status(task: TaskContext, *, stale_after_seconds: int = 300) -> 
                     line += f" needs_from={','.join(item['needs_from'])}"
                 if item.get("block_reason"):
                     line += f" reason={item['block_reason']}"
+                context_summary = item.get("context_pack_summary")
+                if isinstance(context_summary, dict):
+                    objective = context_summary.get("objective")
+                    token_budget = context_summary.get("token_budget")
+                    estimated_tokens = context_summary.get("estimated_tokens")
+                    if isinstance(objective, str) and objective:
+                        line += f" ctx={objective}"
+                    if token_budget is not None and estimated_tokens is not None:
+                        line += f" budget={estimated_tokens}/{token_budget}"
                 print(line)
     if task.phase_results:
         last = task.phase_results[-1]
@@ -1011,7 +1179,10 @@ def handle_resume(args: argparse.Namespace) -> None:
         print(f"Task {args.task_id} not found. Available tasks: {persistence.list_tasks()}")
         return
 
-    policy_pack = discover_policy_pack() or "policy-pack"
+    policy_pack = discover_policy_pack()
+    if not policy_pack:
+        print("Error: No policy pack found. Run 'sarathi init' first or specify --policy-pack")
+        raise SystemExit(1)
     engine = Engine(policy_pack_path=policy_pack, enforce_preflight=True)
     engine.persistence = persistence
 

@@ -407,6 +407,11 @@ def task_manifest_from_graph(
                 "block_reason": _block_reason(node),
                 "attempts": int(node.get("attempts", 0) or 0),
                 "updated_at": _last_touched_at(node),
+                "context_pack_summary": (
+                    dict(node.get("context_pack_summary"))
+                    if isinstance(node.get("context_pack_summary"), dict)
+                    else None
+                ),
             }
         )
     return manifest

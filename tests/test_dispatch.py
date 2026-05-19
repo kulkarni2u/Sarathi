@@ -1,11 +1,14 @@
 import sys
 
 from src.dispatch import LocalDispatcher, NullDispatcher, TaskSpec
-from src.runtime import DispatchRequest
+from src.runtime import DispatchRequest, DispatchResponse
 from src.runtime.providers import (
+    AnthropicSdkProviderAdapter,
     ConfiguredProviderAdapter,
     ExternalProviderAdapter,
     LocalProviderAdapter,
+    OpenAISdkProviderAdapter,
+    OpenCodeSdkProviderAdapter,
 )
 
 
@@ -257,6 +260,236 @@ def test_configured_provider_reports_provider_failure():
     assert result.success is False
     assert result.error == "Provider 'acme' failed deterministically"
     assert result.artifacts["provider"] == "acme"
+
+
+def test_local_provider_exposes_capability_metadata():
+    provider = LocalProviderAdapter()
+
+    assert provider.capabilities.transport_kind == "deterministic"
+    assert provider.capabilities.supports_structured_output is True
+    assert "child_task_execution" in provider.capabilities.declared_capabilities
+
+
+def test_configured_provider_surfaces_selected_provider_capabilities():
+    provider = ConfiguredProviderAdapter(
+        {
+            "provider": "cmd",
+            "providers": {
+                "cmd": {"type": "command", "command": [sys.executable, "-c", "print('{}')"]},
+            },
+        }
+    )
+
+    assert provider.capabilities.transport_kind == "command"
+    assert provider.capabilities.supports_workspace_execution is True
+
+
+def test_opencode_sdk_provider_exposes_sdk_capabilities(tmp_path):
+    provider = OpenCodeSdkProviderAdapter(
+        workspace_root=str(tmp_path),
+        provider_path="/tmp/opencode",
+    )
+
+    assert provider.capabilities.transport_kind == "sdk"
+    assert provider.capabilities.supports_workspace_execution is True
+    assert "sdk_runtime" in provider.capabilities.declared_capabilities
+
+
+def test_opencode_sdk_provider_falls_back_to_cli_when_sdk_bridge_fails(tmp_path, monkeypatch):
+    provider = OpenCodeSdkProviderAdapter(
+        workspace_root=str(tmp_path),
+        provider_path="/usr/local/bin/opencode",
+    )
+    request = DispatchRequest(
+        mode="execute",
+        task_id="task-opencode",
+        phase="Build",
+        prompt="Implement the feature",
+    )
+
+    monkeypatch.setattr(
+        provider,
+        "_run_sdk_bridge",
+        lambda payload, timeout_seconds: {"success": False, "error": "SDK unavailable"},
+    )
+    monkeypatch.setattr(
+        "src.runtime.providers.opencode_sdk.dispatch_via_cli_bridge",
+        lambda **kwargs: DispatchResponse(
+            success=True,
+            outputs={"messages": ["CLI fallback executed"]},
+            evidence={"native_cli_family": "opencode"},
+            artifacts={"invocation_kind": "native_cli"},
+        ),
+    )
+
+    result = provider.dispatch(request)
+
+    assert result.success is True
+    assert result.outputs["messages"] == ["CLI fallback executed"]
+    assert result.artifacts["sdk_fallback_used"] is True
+    assert result.evidence["sdk_error"] == "SDK unavailable"
+
+
+def test_openai_sdk_provider_exposes_sdk_capabilities(tmp_path):
+    provider = OpenAISdkProviderAdapter(
+        workspace_root=str(tmp_path),
+        provider_path="/tmp/openai",
+    )
+
+    assert provider.name == "codex"
+    assert provider.capabilities.transport_kind == "sdk"
+    assert provider.capabilities.supports_workspace_execution is True
+    assert "sdk_runtime" in provider.capabilities.declared_capabilities
+
+
+def test_anthropic_sdk_provider_exposes_sdk_capabilities(tmp_path):
+    provider = AnthropicSdkProviderAdapter(
+        workspace_root=str(tmp_path),
+        provider_path="/tmp/claude",
+    )
+
+    assert provider.name == "claude"
+    assert provider.capabilities.transport_kind == "sdk"
+    assert provider.capabilities.supports_workspace_execution is True
+    assert "sdk_runtime" in provider.capabilities.declared_capabilities
+
+
+def test_anthropic_sdk_provider_forwards_api_settings_to_bridge(tmp_path, monkeypatch):
+    provider = AnthropicSdkProviderAdapter(
+        workspace_root=str(tmp_path),
+        provider_path=None,
+        api_key="anthropic-test",
+        base_url="https://example.invalid/anthropic",
+        model="claude-sonnet-4-0",
+    )
+    request = DispatchRequest(
+        mode="execute",
+        task_id="task-anthropic-config",
+        phase="Review",
+        prompt="Review the feature",
+    )
+    captured = {}
+
+    def _fake_run(payload, *, timeout_seconds):
+        captured.update(payload)
+        return {"success": False, "error": "SDK unavailable"}
+
+    monkeypatch.setattr(provider, "_run_sdk_bridge", _fake_run)
+
+    result = provider.dispatch(request)
+
+    assert result.success is False
+    assert captured["api_key"] == "anthropic-test"
+    assert captured["base_url"] == "https://example.invalid/anthropic"
+    assert captured["model"] == "claude-sonnet-4-0"
+
+
+def test_anthropic_sdk_provider_falls_back_to_cli_when_sdk_bridge_fails(tmp_path, monkeypatch):
+    provider = AnthropicSdkProviderAdapter(
+        workspace_root=str(tmp_path),
+        provider_path="/usr/local/bin/claude",
+    )
+    request = DispatchRequest(
+        mode="execute",
+        task_id="task-anthropic",
+        phase="Review",
+        prompt="Review the feature",
+    )
+
+    monkeypatch.setattr(
+        provider,
+        "_run_sdk_bridge",
+        lambda payload, timeout_seconds: {"success": False, "error": "SDK unavailable"},
+    )
+    captured = {}
+
+    def _fake_cli_bridge(**kwargs):
+        captured.update(kwargs)
+        return DispatchResponse(
+            success=True,
+            outputs={"messages": ["CLI fallback executed"]},
+            evidence={"native_cli_family": "claude"},
+            artifacts={"invocation_kind": "native_cli"},
+        )
+
+    monkeypatch.setattr("src.runtime.providers.anthropic_sdk.dispatch_via_cli_bridge", _fake_cli_bridge)
+
+    result = provider.dispatch(request)
+
+    assert result.success is True
+    assert result.outputs["messages"] == ["CLI fallback executed"]
+    assert result.artifacts["sdk_fallback_used"] is True
+    assert result.evidence["sdk_error"] == "SDK unavailable"
+    assert captured["provider"] == "claude"
+
+
+def test_openai_sdk_provider_forwards_api_settings_to_bridge(tmp_path, monkeypatch):
+    provider = OpenAISdkProviderAdapter(
+        workspace_root=str(tmp_path),
+        provider_path=None,
+        api_key="sk-test",
+        base_url="https://example.invalid/v1",
+        model="gpt-4.1-mini",
+    )
+    request = DispatchRequest(
+        mode="execute",
+        task_id="task-openai-config",
+        phase="Plan",
+        prompt="Plan the feature",
+    )
+    captured = {}
+
+    def _fake_run(payload, *, timeout_seconds):
+        captured.update(payload)
+        return {"success": False, "error": "SDK unavailable"}
+
+    monkeypatch.setattr(provider, "_run_sdk_bridge", _fake_run)
+
+    result = provider.dispatch(request)
+
+    assert result.success is False
+    assert captured["api_key"] == "sk-test"
+    assert captured["base_url"] == "https://example.invalid/v1"
+    assert captured["model"] == "gpt-4.1-mini"
+
+
+def test_openai_sdk_provider_falls_back_to_cli_when_sdk_bridge_fails(tmp_path, monkeypatch):
+    provider = OpenAISdkProviderAdapter(
+        workspace_root=str(tmp_path),
+        provider_path="/usr/local/bin/openai",
+    )
+    request = DispatchRequest(
+        mode="execute",
+        task_id="task-openai",
+        phase="Build",
+        prompt="Implement the feature",
+    )
+
+    monkeypatch.setattr(
+        provider,
+        "_run_sdk_bridge",
+        lambda payload, timeout_seconds: {"success": False, "error": "SDK unavailable"},
+    )
+    captured = {}
+
+    def _fake_cli_bridge(**kwargs):
+        captured.update(kwargs)
+        return DispatchResponse(
+            success=True,
+            outputs={"messages": ["CLI fallback executed"]},
+            evidence={"native_cli_family": "codex"},
+            artifacts={"invocation_kind": "native_cli"},
+        )
+
+    monkeypatch.setattr("src.runtime.providers.openai_sdk.dispatch_via_cli_bridge", _fake_cli_bridge)
+
+    result = provider.dispatch(request)
+
+    assert result.success is True
+    assert result.outputs["messages"] == ["CLI fallback executed"]
+    assert result.artifacts["sdk_fallback_used"] is True
+    assert result.evidence["sdk_error"] == "SDK unavailable"
+    assert captured["provider"] == "codex"
 
 
 def test_external_provider_reports_unsupported_mode():

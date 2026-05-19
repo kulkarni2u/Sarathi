@@ -61,6 +61,49 @@ def test_workspace_operational_views_aggregate_token_budget_from_dispatch_metada
     assert data["usage"]["budget"]["usage_source"] in {"reported", "estimated", "mixed"}
 
 
+def test_workspace_operational_views_include_governance_summary(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_completed_task(app, tmp_path)
+    workspace_id = task["workspace_id"]
+
+    assert_ok(
+        request(
+            app,
+            "PATCH",
+            f"/api/workspaces/{workspace_id}",
+            {
+                "metadata": {
+                    "repository_action_preference": {
+                        "scope": "workspace",
+                        "mode": "draft_pr",
+                    },
+                    "auto_approve_preference": {
+                        "scope": "workspace",
+                        "mode": "below_threshold",
+                    },
+                    "provider_priority": ["codex", "claude"],
+                }
+            },
+        )
+    )
+
+    status, data = assert_ok(
+        request(app, "GET", f"/api/workspaces/{workspace_id}/operational-views")
+    )
+
+    assert status == 200
+    governance = data["governance"]
+    assert governance["policy_posture"]["repository_action_preference"]["mode"] == "draft_pr"
+    assert governance["policy_posture"]["auto_approve_preference"]["mode"] == "below_threshold"
+    assert governance["policy_posture"]["provider_priority"] == ["codex", "claude", "copilot", "opencode"]
+    assert governance["provider_routing"]["priority_order"][0] == "codex"
+    assert governance["provider_routing"]["selected_provider"] in {"codex", "claude", "copilot", "opencode", "local"}
+    assert governance["override_history"]
+    assert any(item["event_type"] == "workspace.governance_updated" for item in governance["override_history"])
+    assert governance["repository_action_governance"]["approved_count"] >= 1
+    assert governance["repository_action_governance"]["recent"]
+
+
 def test_workspace_operational_views_requires_existing_workspace(tmp_path):
     app = create_app(tmp_path / "sarathi.db")
 
@@ -143,6 +186,194 @@ def test_workspace_operational_views_surface_project_summaries(tmp_path):
     assert project2_id in proj_summaries
     assert proj_summaries[project1_id]["task_count"] == 1
     assert proj_summaries[project2_id]["task_count"] == 2
+
+
+def test_workspace_operational_views_include_attention_inbox(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    from src.storage import Storage, connect, run_migrations
+
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sarathi App", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    _, approval_task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {"prompt": "Approval task", "title": "Approval task"},
+        )
+    )
+    approval_task = approval_task_data["task"]
+
+    _, checkpoint_task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {"prompt": "Checkpoint task", "title": "Checkpoint task"},
+        )
+    )
+    checkpoint_task = checkpoint_task_data["task"]
+
+    _, handoff_task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {"prompt": "Handoff task", "title": "Handoff task"},
+        )
+    )
+    handoff_task = handoff_task_data["task"]
+
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn)
+        storage.create_approval_gate(
+            workspace_id=workspace_id,
+            task_id=approval_task["id"],
+            name="Review",
+            status="pending",
+            metadata={"requires_human": True},
+        )
+        storage.create_checkpoint_capsule(
+            workspace_id=workspace_id,
+            project_id=None,
+            task_id=checkpoint_task["id"],
+            status="ready",
+            summary="Resume from here.",
+            key_decisions=[],
+            evidence_refs=[],
+            repository_action_preference={
+                "scope": "task",
+                "mode": "no_action",
+                "allowed_modes": ["no_action"],
+                "source": "test",
+            },
+            next_start_point="Resume from checkpoint",
+            created_by="Sarathi",
+        )
+        storage.create_handoff(
+            workspace_id=workspace_id,
+            task_id=handoff_task["id"],
+            summary="Ready for handoff review.",
+            metadata={},
+        )
+
+    status, data = assert_ok(
+        request(app, "GET", f"/api/workspaces/{workspace_id}/operational-views")
+    )
+
+    assert status == 200
+    assert "inbox" in data
+    kinds = [item["kind"] for item in data["inbox"]]
+    assert "approval" in kinds
+    assert "checkpoint_ready" in kinds
+    assert "handoff_ready" in kinds
+    assert data["summary"]["approvals_pending"] >= 1
+
+
+def test_inbox_projection_groups_attention_items(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    workspace_id, task_id = seed_attention_scenario(app, tmp_path)
+
+    status, data = assert_ok(
+        request(app, "GET", f"/api/workspaces/{workspace_id}/operational-views")
+    )
+
+    assert status == 200
+    assert "inbox" in data
+    inbox = data["inbox"]
+    inbox_kinds = {item["kind"] for item in inbox}
+
+    assert "approval" in inbox_kinds
+    assert "checkpoint_ready" in inbox_kinds
+    assert "handoff_ready" in inbox_kinds
+
+    approval_items = [item for item in inbox if item["kind"] == "approval"]
+    assert any(item["task_id"] == task_id for item in approval_items)
+
+    checkpoint_items = [item for item in inbox if item["kind"] == "checkpoint_ready"]
+    assert any(item["task_id"] == task_id for item in checkpoint_items)
+
+    handoff_items = [item for item in inbox if item["kind"] == "handoff_ready"]
+    assert any(item["task_id"] == task_id for item in handoff_items)
+
+
+def seed_attention_scenario(app, tmp_path):
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sarathi Attention", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    _, draft_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {"prompt": "Create attention scenario.", "title": "Attention Task"},
+        )
+    )
+    task_id = draft_data["task"]["id"]
+
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task_id}/approve",
+            {"name": "PRD/AC", "status": "approved"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task_id}/graph-draft"))
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task_id}/approve",
+            {"name": "Task graph", "status": "approved"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task_id}/schedule"))
+    _, studio_data = assert_ok(request(app, "GET", f"/api/tasks/{task_id}/studio"))
+    first_node = studio_data["graph"]["nodes"][0]
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{first_node['id']}/dispatch",
+            {"provider": "local"},
+        )
+    )
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task_id}/reviews/run",
+            {"review_type": "functional"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task_id}/handoff"))
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task_id}/repository-action",
+            {"action": "no_action", "approved": True},
+        )
+    )
+
+    return workspace_id, task_id
 
 
 def create_completed_task(app, tmp_path):

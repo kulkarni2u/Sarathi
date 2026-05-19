@@ -1,6 +1,8 @@
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
 from src import cli
 from src.engine import Complexity, PersistenceManager, Phase, PhaseResult, TaskContext
 
@@ -254,6 +256,11 @@ def test_handle_status_prints_compact_supervision_manifest(tmp_path, capsys):
                     "status": "waiting_human",
                     "depends_on": ["step-1"],
                     "last_error": "needs user input",
+                    "context_pack_summary": {
+                        "objective": "Resolve waiting input",
+                        "token_budget": 2200,
+                        "estimated_tokens": 160,
+                    },
                 },
             ],
         },
@@ -277,6 +284,8 @@ def test_handle_status_prints_compact_supervision_manifest(tmp_path, capsys):
     assert "step-2: Waiting [waiting_user]" in output
     assert "parent=task-supervision" in output
     assert "needs_from=step-1" in output
+    assert "ctx=Resolve waiting input" in output
+    assert "budget=160/2200" in output
 
 
 def test_handle_watch_once_prints_refresh_snapshot(tmp_path, capsys):
@@ -517,6 +526,38 @@ def test_handle_agents_prints_role_registry(capsys):
     assert "PhaseLog: Sutra (workflow spine/message bus)" in output
 
 
+def test_handle_desktop_forwards_args(monkeypatch):
+    captured = {}
+
+    def fake_launcher():
+        captured["argv"] = cli.sys.argv[:]
+
+    monkeypatch.setattr(cli, "_desktop_launcher_main", lambda: fake_launcher)
+
+    cli.handle_desktop(Namespace(desktop_args=["--print-config", "--service-timeout", "30"]))
+
+    assert captured["argv"] == ["sarathi desktop", "--print-config", "--service-timeout", "30"]
+
+
+def test_main_desktop_command_accepts_passthrough_flags(monkeypatch):
+    captured = {}
+
+    def fake_handle_desktop(args):
+        captured["desktop_args"] = args.desktop_args
+
+    class _FakeStdin:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(cli, "handle_desktop", fake_handle_desktop)
+    monkeypatch.setattr(cli.sys, "argv", ["sarathi", "desktop", "--print-config", "--service-timeout", "30"])
+    monkeypatch.setattr(cli.sys, "stdin", _FakeStdin())
+
+    cli.main()
+
+    assert captured["desktop_args"] == ["--print-config", "--service-timeout", "30"]
+
+
 def test_handle_resume_executes_saved_prephase_task(tmp_path, capsys):
     policy_dir = tmp_path / "policy-pack"
     _write_policy_pack(policy_dir)
@@ -545,6 +586,62 @@ def test_handle_resume_executes_saved_prephase_task(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "Resumed task: task-resume" in output
     assert "Phases executed:" in output
+
+
+def test_handle_reuse_requires_running_service(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_read_service_discovery", lambda: None)
+
+    cli.handle_reuse(Namespace(workspace=None))
+
+    output = capsys.readouterr().out
+    assert "Sarathi desktop service not running" in output
+
+
+def test_handle_reuse_prints_workspace_kit(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_read_service_discovery", lambda: {"url": "http://127.0.0.1:8765"})
+
+    def fake_service_get_json(service_url, path):
+        assert service_url == "http://127.0.0.1:8765"
+        if path == "/api/workspaces":
+            return {
+                "workspaces": [
+                    {"id": "ws-1", "name": "Sarathi"},
+                ]
+            }
+        if path == "/api/workspaces/ws-1/reuse-kit":
+            return {
+                "active_saved_view_id": "approvals-inbox",
+                "templates": [
+                    {
+                        "id": "feature-delivery",
+                        "name": "Feature delivery",
+                        "summary": "Route a feature from PRD through handoff.",
+                        "recommended_view_ids": ["approvals-inbox", "handoff-readiness"],
+                    }
+                ],
+                "saved_views": [
+                    {"id": "approvals-inbox", "name": "Approval inbox", "metric_label": "pending approvals"},
+                ],
+                "playbooks": [
+                    {
+                        "id": "learning-1",
+                        "name": "Accepted learning 1",
+                        "summary": "Reusable operator guidance from prior accepted work.",
+                        "recommended_template_id": "feature-delivery",
+                    }
+                ],
+            }
+        raise AssertionError(f"Unexpected path {path}")
+
+    monkeypatch.setattr(cli, "_service_get_json", fake_service_get_json)
+
+    cli.handle_reuse(Namespace(workspace=None))
+
+    output = capsys.readouterr().out
+    assert "Workspace reuse kit: Sarathi" in output
+    assert "Feature delivery" in output
+    assert "Approval inbox" in output
+    assert "Accepted learning 1" in output
 
 
 def test_handle_resume_continues_partial_task(tmp_path, capsys):
@@ -618,3 +715,31 @@ def test_handle_resume_reports_paused_build_task(tmp_path, capsys, monkeypatch):
     output = capsys.readouterr().out
     assert "Resumed task: task-paused" in output
     assert "Current phase: Build" in output
+
+
+def test_handle_resume_exits_cleanly_when_policy_pack_missing(tmp_path, capsys):
+    persistence = PersistenceManager(str(tmp_path / "tasks"))
+    task = TaskContext(
+        task_id="task-missing-policy",
+        description="Fix bug",
+        complexity=Complexity.LOW,
+    )
+    persistence.save_task(task)
+
+    original_pm = cli.PersistenceManager if hasattr(cli, "PersistenceManager") else None
+    original_discover = cli.discover_policy_pack
+    cli.PersistenceManager = lambda: persistence
+    cli.discover_policy_pack = lambda start_path=".": None
+    try:
+        with pytest.raises(SystemExit) as error:
+            cli.handle_resume(Namespace(task_id="task-missing-policy"))
+    finally:
+        cli.discover_policy_pack = original_discover
+        if original_pm is None:
+            delattr(cli, "PersistenceManager")
+        else:
+            cli.PersistenceManager = original_pm
+
+    output = capsys.readouterr().out
+    assert error.value.code == 1
+    assert "Error: No policy pack found." in output

@@ -545,6 +545,9 @@ def test_native_claude_dispatch_runs_in_workspace_and_records_invocation_metadat
     assert response_evidence["argv"][0] == "-p"
     assert "--add-dir" in response_evidence["argv"]
     assert response_evidence["argv"][response_evidence["argv"].index("--add-dir") + 1] == workspace_root
+    assert "--" in response_evidence["argv"]
+    assert "Prompt:" in response_evidence["argv"][-1]
+    assert "Task ID:" in response_evidence["argv"][-1]
     assert response_evidence["native_cli_family"] == "claude"
     assert response_evidence["workspace_root_used"] == workspace_root
     assert dispatch_artifacts["script"] == "claude"

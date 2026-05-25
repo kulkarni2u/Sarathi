@@ -113,10 +113,12 @@ def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> 
     prompt = _provider_prompt("claude", request)
     command = [
         path,
-        "-p", prompt,
+        "-p",
         "--output-format", "json",
         "--dangerously-skip-permissions",
         "--add-dir", workspace_root,
+        "--",
+        prompt,
     ]
     completed = subprocess.run(
         command,
@@ -164,15 +166,12 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
             cwd=workspace_root,
         )
         message = result.stdout if result.returncode == 0 else f"Error: {result.stderr}"
-        success = result.returncode == 0
         return_code = result.returncode
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         message = f"Timeout after {request.timeout_seconds}s"
-        success = False
         return_code = 124
     except Exception as exc:  # noqa: BLE001
         message = str(exc)
-        success = False
         return_code = 1
 
     completed = subprocess.CompletedProcess(command, return_code, stdout=message, stderr="")

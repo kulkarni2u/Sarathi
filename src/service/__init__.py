@@ -4912,6 +4912,13 @@ def _dispatch_subtask(
         available_tools=["workspace_files", "git_diff", "test_results", "provider_dispatch"],
     )
     context_pack_artifact = context_pack.to_artifact()
+    workspace = storage.get_workspace(subtask["workspace_id"])
+    workspace_root = Path(workspace["root_path"]).expanduser() if workspace is not None else None
+    use_ncp_handoff = bool(
+        provider in {"claude", "opencode"}
+        and workspace_root is not None
+        and (workspace_root / ".ncp" / "config.toml").exists()
+    )
     storage.create_lifecycle_event(
         workspace_id=subtask["workspace_id"],
         task_id=subtask["task_id"],
@@ -4937,7 +4944,19 @@ def _dispatch_subtask(
                 "context_pack": context_pack_artifact,
             },
             expected_outputs=["work_unit_result"],
-            constraints={"purpose": "child_task_execution", "provider": provider},
+            constraints={
+                "purpose": "child_task_execution",
+                "provider": provider,
+                **(
+                    {
+                        "ncp_handoff_enabled": True,
+                        "ncp_pipeline_id": f"sarathi_{subtask['id']}",
+                        "ncp_emit_to": "opencode" if provider == "claude" else "claude",
+                    }
+                    if use_ncp_handoff
+                    else {}
+                ),
+            },
             context_pack=context_pack_artifact,
             token_budget=context_pack.agent_input.token_budget,
         )
@@ -6214,12 +6233,6 @@ def _put_policy_pack_file(
 
 def _sarathi_transition_message(subtask: dict[str, Any], new_status: str) -> str:
     title = subtask.get("title", "Unit")
-    metadata = subtask.get("metadata", {})
-    provider = (
-        metadata.get("provider", "agent")
-        if isinstance(metadata, dict)
-        else "agent"
-    )
     msgs = {
         "in_progress": f"Starting: {title}",
         "review": f"Unit complete: {title}. Ready for review.",

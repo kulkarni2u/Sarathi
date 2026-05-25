@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import http.client
+import os
+import shutil
 import socket
 import time
 import urllib.error
@@ -110,6 +112,12 @@ def _run_copilot(*, path: str, workspace_root: str, request: DispatchRequest) ->
 
 
 def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> DispatchResponse:
+    if _should_use_ncp_handoff(provider="claude", workspace_root=workspace_root, request=request):
+        return _run_ncp_handoff_dispatch(
+            provider="claude",
+            workspace_root=workspace_root,
+            request=request,
+        )
     prompt = _provider_prompt("claude", request)
     command = [
         path,
@@ -147,6 +155,12 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
     Uses `opencode run -c --dangerously-skip-permissions --dir <workspace> -- <prompt>`
     which is the recommended way to invoke OpenCode from scripts.
     """
+    if _should_use_ncp_handoff(provider="opencode", workspace_root=workspace_root, request=request):
+        return _run_ncp_handoff_dispatch(
+            provider="opencode",
+            workspace_root=workspace_root,
+            request=request,
+        )
     prompt = _provider_prompt("opencode", request)
     command = [
         path,
@@ -428,6 +442,165 @@ def _normalize_native_response(
         },
         usage=usage,
     )
+
+
+def _should_use_ncp_handoff(
+    *,
+    provider: str,
+    workspace_root: str,
+    request: DispatchRequest,
+) -> bool:
+    if provider not in {"claude", "opencode"}:
+        return False
+    if not request.constraints.get("ncp_handoff_enabled"):
+        return False
+    if not (Path(workspace_root) / ".ncp" / "config.toml").exists():
+        return False
+    return _resolve_ncp_cli_path() is not None
+
+
+def _resolve_ncp_cli_path() -> str | None:
+    configured = os.environ.get("SARATHI_NCP_CLI_PATH", "").strip()
+    if configured:
+        return configured
+    return shutil.which("ncp")
+
+
+def _ncp_handoff_counterpart(provider: str, request: DispatchRequest) -> str | None:
+    explicit = request.constraints.get("ncp_emit_to")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    if provider == "claude":
+        return "opencode"
+    if provider == "opencode":
+        return "claude"
+    return None
+
+
+def _summarize_ncp_handoff_payload(provider: str, request: DispatchRequest) -> str:
+    context_pack = request.context_pack if isinstance(request.context_pack, dict) else {}
+    agent_input = context_pack.get("agent_input") if isinstance(context_pack.get("agent_input"), dict) else {}
+    relevant_files = agent_input.get("relevant_files") if isinstance(agent_input.get("relevant_files"), list) else []
+    acceptance = (
+        agent_input.get("acceptance_criteria")
+        if isinstance(agent_input.get("acceptance_criteria"), list)
+        else []
+    )
+    summary_parts = [
+        f"task={request.task_id}",
+        f"phase={request.phase}",
+        f"prompt={request.prompt}",
+    ]
+    if relevant_files:
+        summary_parts.append("files=" + ",".join(str(item) for item in relevant_files[:6]))
+    if acceptance:
+        summary_parts.append("acceptance=" + "; ".join(str(item) for item in acceptance[:3]))
+    summary_parts.append(f"provider={provider}")
+    payload = " | ".join(summary_parts)
+    return payload[:600]
+
+
+def _run_ncp_handoff_dispatch(
+    *,
+    provider: str,
+    workspace_root: str,
+    request: DispatchRequest,
+) -> DispatchResponse:
+    ncp_path = _resolve_ncp_cli_path()
+    if not ncp_path:
+        return DispatchResponse(
+            success=False,
+            artifacts={"provider": provider, "workspace_root": workspace_root, "ncp_handoff_used": False},
+            error="NCP CLI not available for handoff dispatch.",
+        )
+    pipeline_id = str(request.constraints.get("ncp_pipeline_id") or f"sarathi_{request.task_id}")
+    emit_command = [
+        ncp_path,
+        "emit",
+        "--cwd",
+        workspace_root,
+        "--from-agent",
+        "sarathi",
+        "--to",
+        provider,
+        "--type",
+        "share",
+        "--confidence",
+        "0.95",
+        "--pipeline-id",
+        pipeline_id,
+        "--payload",
+        _summarize_ncp_handoff_payload(provider, request),
+    ]
+    emit_completed = subprocess.run(
+        emit_command,
+        capture_output=True,
+        text=True,
+        cwd=workspace_root,
+        timeout=request.timeout_seconds,
+        check=False,
+    )
+    if emit_completed.returncode != 0:
+        return DispatchResponse(
+            success=False,
+            artifacts={
+                "provider": provider,
+                "workspace_root": workspace_root,
+                "ncp_handoff_used": True,
+                "ncp_pipeline_id": pipeline_id,
+                "emit_command": emit_command,
+                "emit_stdout": (emit_completed.stdout or "").strip(),
+            },
+            error=(emit_completed.stderr or emit_completed.stdout or "ncp emit failed").strip(),
+        )
+
+    handoff_command = [
+        ncp_path,
+        "handoff",
+        provider,
+        "--cwd",
+        workspace_root,
+        "--pipeline-id",
+        pipeline_id,
+        "--instruction",
+        _provider_prompt(provider, request),
+        "--timeout-seconds",
+        str(request.timeout_seconds),
+    ]
+    emit_to = _ncp_handoff_counterpart(provider, request)
+    if emit_to:
+        handoff_command.extend(["--emit-to", emit_to])
+    completed = subprocess.run(
+        handoff_command,
+        capture_output=True,
+        text=True,
+        cwd=workspace_root,
+        timeout=request.timeout_seconds,
+        check=False,
+    )
+    message = (completed.stdout or "").strip()
+    response = _normalize_native_response(
+        provider=provider,
+        path=ncp_path,
+        workspace_root=workspace_root,
+        request=request,
+        command=handoff_command,
+        completed=completed,
+        message=message,
+    )
+    response.artifacts = {
+        **response.artifacts,
+        "ncp_handoff_used": True,
+        "ncp_pipeline_id": pipeline_id,
+        "emit_command": emit_command,
+        "transport_kind": "ncp_handoff",
+    }
+    response.evidence = {
+        **response.evidence,
+        "ncp_handoff_used": True,
+        "ncp_pipeline_id": pipeline_id,
+    }
+    return response
 
 
 def _native_cli_family(provider: str, path: str) -> str:

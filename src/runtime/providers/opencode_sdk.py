@@ -15,7 +15,12 @@ except ImportError:
     from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
 
 from .base import ProviderAdapter, ProviderCapabilities, ProviderSession
-from .cli_bridge import dispatch_via_cli_bridge
+from .cli_bridge import (
+    _ensure_structured_outputs,
+    _parse_json_dict,
+    _provider_prompt,
+    dispatch_via_cli_bridge,
+)
 
 
 class OpenCodeSdkProviderAdapter(ProviderAdapter):
@@ -65,13 +70,20 @@ class OpenCodeSdkProviderAdapter(ProviderAdapter):
         )
 
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
+        if request.constraints.get("ncp_handoff_enabled") and self.provider_path:
+            return dispatch_via_cli_bridge(
+                provider="opencode",
+                path=self.provider_path,
+                workspace_root=self.workspace_root,
+                request=request,
+            )
         session = self.create_session(request)
         session.status = "running"
         bridge_payload = {
             "task_id": request.task_id,
             "phase": request.phase,
             "mode": request.mode,
-            "prompt": request.prompt,
+            "prompt": _provider_prompt("opencode", request),
             "title": f"Sarathi {request.phase} {request.task_id}",
             "timeout_seconds": request.timeout_seconds,
             "session_id": session.session_id,
@@ -138,6 +150,28 @@ class OpenCodeSdkProviderAdapter(ProviderAdapter):
         artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), Mapping) else {}
         messages = outputs.get("messages") if isinstance(outputs.get("messages"), list) else []
         response_text = "\n".join(str(message) for message in messages if isinstance(message, str))
+        parsed_payload = _parse_json_dict(response_text)
+        if parsed_payload is not None:
+            parsed_outputs = parsed_payload.get("outputs")
+            if isinstance(parsed_outputs, Mapping):
+                outputs = dict(parsed_outputs)
+                if not isinstance(outputs.get("messages"), list):
+                    outputs["messages"] = [response_text]
+            parsed_evidence = parsed_payload.get("evidence")
+            if isinstance(parsed_evidence, Mapping):
+                evidence = {**dict(evidence), **dict(parsed_evidence)}
+            parsed_artifacts = parsed_payload.get("artifacts")
+            if isinstance(parsed_artifacts, Mapping):
+                artifacts = {**dict(artifacts), **dict(parsed_artifacts)}
+            if isinstance(parsed_payload.get("error"), str):
+                result = {**dict(result), "error": parsed_payload["error"]}
+        outputs = _ensure_structured_outputs(
+            provider=self.name,
+            request=request,
+            outputs=dict(outputs),
+            fallback_summary=response_text or "OpenCode SDK completed the dispatch.",
+            success=True,
+        )
         usage = build_usage_record(
             provider_id=self.name,
             provider_family="sdk",

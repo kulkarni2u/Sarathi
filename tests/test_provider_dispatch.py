@@ -1,12 +1,14 @@
 import sys
 from pathlib import Path
 import stat
+import subprocess
 
 from src.service import _provider_dispatch_command, create_app
-from src.runtime import DispatchRequest
+from src.runtime import DispatchRequest, DispatchResponse
 from src.runtime.providers.configured import CommandProviderAdapter
 from src.runtime.providers.local import LocalProviderAdapter
 from src.runtime.providers.base import ProviderSession
+from src.runtime.providers.cli_bridge import dispatch_via_cli_bridge
 
 
 def request(app, method, path, body=None, correlation_id="corr-provider-dispatch"):
@@ -555,6 +557,55 @@ def test_native_claude_dispatch_runs_in_workspace_and_records_invocation_metadat
     assert dispatch_artifacts["workspace_root"] == workspace_root
 
 
+def test_cli_bridge_can_route_claude_via_ncp_handoff(tmp_path, monkeypatch):
+    workspace_root = tmp_path
+    (workspace_root / ".ncp").mkdir(parents=True)
+    (workspace_root / ".ncp" / "config.toml").write_text("[store]\ntype = 'sqlite'\n", encoding="utf-8")
+
+    calls: list[list[str]] = []
+
+    def _fake_run(command, **kwargs):
+        calls.append(list(command))
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(command, 0, stdout="Whisper emitted.\n", stderr="")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout='{"success":true,"outputs":{"messages":["ok"],"summary":"handled via ncp"},"evidence":{"ncp":true},"artifacts":{"script":"ncp"}}',
+            stderr="",
+        )
+
+    monkeypatch.setattr("src.runtime.providers.cli_bridge.shutil.which", lambda name: "/usr/local/bin/ncp" if name == "ncp" else None)
+    monkeypatch.setattr("src.runtime.providers.cli_bridge.subprocess.run", _fake_run)
+
+    response = dispatch_via_cli_bridge(
+        provider="claude",
+        path="/usr/local/bin/claude",
+        workspace_root=str(workspace_root),
+        request=DispatchRequest(
+            mode="execute",
+            task_id="subtask-123",
+            phase="TaskTracking",
+            prompt="Implement the slice.",
+            inputs={"node": {"id": "n1", "title": "Slice"}, "context_pack": {"agent_input": {"relevant_files": ["a.py"]}}},
+            constraints={"purpose": "child_task_execution", "provider": "claude", "ncp_handoff_enabled": True},
+        ),
+    )
+
+    assert response.success is True
+    assert response.artifacts["ncp_handoff_used"] is True
+    assert response.artifacts["transport_kind"] == "ncp_handoff"
+    assert response.evidence["ncp_handoff_used"] is True
+    assert calls[0][:3] == ["/usr/local/bin/ncp", "emit", "--cwd"]
+    assert "--to" in calls[0]
+    assert calls[0][calls[0].index("--to") + 1] == "claude"
+    assert calls[1][:3] == ["/usr/local/bin/ncp", "handoff", "claude"]
+    assert "--emit-to" in calls[1]
+    assert calls[1][calls[1].index("--emit-to") + 1] == "opencode"
+    assert "--pipeline-id" in calls[1]
+    assert calls[1][calls[1].index("--pipeline-id") + 1] == "sarathi_subtask-123"
+
+
 def test_native_copilot_dispatch_uses_github_cli_shape_and_records_invocation_metadata(tmp_path):
     app = create_app(tmp_path / "sarathi.db")
     task = create_task_with_ready_graph(app, tmp_path)
@@ -672,6 +723,124 @@ def test_native_opencode_dispatch_prefers_sdk_and_records_invocation_metadata(tm
     assert dispatch_artifacts["invocation_kind"] == "sdk"
     assert dispatch_artifacts["transport_kind"] == "sdk"
     assert dispatch_artifacts["workspace_root"] == workspace_root
+
+
+def test_claude_dispatch_uses_ncp_handoff_when_workspace_is_ncp_enabled(tmp_path, monkeypatch):
+    from src.runtime.providers.anthropic_sdk import AnthropicSdkProviderAdapter
+
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+    (tmp_path / ".ncp").mkdir(parents=True)
+    (tmp_path / ".ncp" / "config.toml").write_text("[store]\ntype = 'sqlite'\n", encoding="utf-8")
+    native_claude = _write_provider_script(
+        tmp_path / "providers" / "claude",
+        "print('claude version 1.0.0')",
+    )
+
+    monkeypatch.setattr(
+        AnthropicSdkProviderAdapter,
+        "_run_sdk_bridge",
+        lambda self, payload, timeout_seconds: (_ for _ in ()).throw(AssertionError("SDK path should not run")),
+    )
+    monkeypatch.setattr(
+        "src.runtime.providers.anthropic_sdk.dispatch_via_cli_bridge",
+        lambda **kwargs: DispatchResponse(
+            success=True,
+            outputs={
+                "work_unit_result": {
+                    "node_id": kwargs["request"].inputs["node"]["id"],
+                    "title": kwargs["request"].inputs["node"]["title"],
+                    "status": "completed",
+                    "provider": "claude",
+                    "summary": "routed through ncp handoff",
+                }
+            },
+            evidence={"ncp_handoff_used": True},
+            artifacts={"transport_kind": "ncp_handoff"},
+        ),
+    )
+
+    _, studio_before = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    workspace_id = studio_before["task"]["workspace_id"]
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/providers/claude/test",
+            {"path": str(native_claude), "auth": "connected"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, scheduled_snapshot = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    running_node = scheduled_snapshot["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(app, "POST", f"/api/subtasks/{running_node['id']}/dispatch", {"provider": "claude"})
+    )
+
+    assert status == 201
+    assert data["dispatch"]["agent_name"] == "claude"
+    assert data["dispatch"]["metadata"]["outputs"]["work_unit_result"]["provider"] == "claude"
+    assert data["dispatch"]["metadata"]["artifacts"]["transport_kind"] == "ncp_handoff"
+
+
+def test_opencode_dispatch_uses_ncp_handoff_when_workspace_is_ncp_enabled(tmp_path, monkeypatch):
+    from src.runtime.providers.opencode_sdk import OpenCodeSdkProviderAdapter
+
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+    (tmp_path / ".ncp").mkdir(parents=True)
+    (tmp_path / ".ncp" / "config.toml").write_text("[store]\ntype = 'sqlite'\n", encoding="utf-8")
+    native_opencode = _write_provider_script(
+        tmp_path / "providers" / "opencode",
+        "print('opencode version 1.0.0')",
+    )
+
+    monkeypatch.setattr(
+        OpenCodeSdkProviderAdapter,
+        "_run_sdk_bridge",
+        lambda self, payload, timeout_seconds: (_ for _ in ()).throw(AssertionError("SDK path should not run")),
+    )
+    monkeypatch.setattr(
+        "src.runtime.providers.opencode_sdk.dispatch_via_cli_bridge",
+        lambda **kwargs: DispatchResponse(
+            success=True,
+            outputs={
+                "work_unit_result": {
+                    "node_id": kwargs["request"].inputs["node"]["id"],
+                    "title": kwargs["request"].inputs["node"]["title"],
+                    "status": "completed",
+                    "provider": "opencode",
+                    "summary": "routed through ncp handoff",
+                }
+            },
+            evidence={"ncp_handoff_used": True},
+            artifacts={"transport_kind": "ncp_handoff"},
+        ),
+    )
+
+    _, studio_before = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    workspace_id = studio_before["task"]["workspace_id"]
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/providers/opencode/test",
+            {"path": str(native_opencode), "auth": "connected"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, scheduled_snapshot = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    running_node = scheduled_snapshot["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(app, "POST", f"/api/subtasks/{running_node['id']}/dispatch", {"provider": "opencode"})
+    )
+
+    assert status == 201
+    assert data["dispatch"]["agent_name"] == "opencode"
+    assert data["dispatch"]["metadata"]["outputs"]["work_unit_result"]["provider"] == "opencode"
+    assert data["dispatch"]["metadata"]["artifacts"]["transport_kind"] == "ncp_handoff"
 
 
 def test_native_codex_dispatch_prefers_sdk_and_records_invocation_metadata(tmp_path, monkeypatch):

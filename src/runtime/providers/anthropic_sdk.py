@@ -71,6 +71,13 @@ class AnthropicSdkProviderAdapter(ProviderAdapter):
         )
 
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
+        if request.constraints.get("ncp_handoff_enabled") and self.provider_path:
+            return dispatch_via_cli_bridge(
+                provider="claude",
+                path=self.provider_path,
+                workspace_root=self.workspace_root,
+                request=request,
+            )
         session = self.create_session(request)
         session.status = "running"
         bridge_payload = {

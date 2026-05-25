@@ -5,6 +5,11 @@ import subprocess
 
 from src.service import _provider_dispatch_command, create_app
 from src.runtime import DispatchRequest, DispatchResponse
+from src.runtime.providers.cli_bridge import (
+    _ncp_handoff_token_profile,
+    _provider_handoff_instruction,
+    _provider_prompt,
+)
 from src.runtime.providers.configured import CommandProviderAdapter
 from src.runtime.providers.local import LocalProviderAdapter
 from src.runtime.providers.base import ProviderSession
@@ -604,6 +609,62 @@ def test_cli_bridge_can_route_claude_via_ncp_handoff(tmp_path, monkeypatch):
     assert calls[1][calls[1].index("--emit-to") + 1] == "opencode"
     assert "--pipeline-id" in calls[1]
     assert calls[1][calls[1].index("--pipeline-id") + 1] == "sarathi_subtask-123"
+    assert "--instruction" in calls[1]
+    handoff_instruction = calls[1][calls[1].index("--instruction") + 1]
+    assert "Inputs:" not in handoff_instruction
+    assert "Context Pack:" not in handoff_instruction
+    assert "Use pending NCP whisper context as the primary task truth" in handoff_instruction
+    token_profile = response.artifacts["ncp_handoff_token_profile"]
+    assert token_profile["estimator"] == "chars_div_4"
+    assert token_profile["handoff_instruction_tokens"] > 0
+    assert token_profile["handoff_payload_tokens"] > 0
+
+
+def test_ncp_handoff_instruction_stays_compact_against_full_provider_prompt():
+    request = DispatchRequest(
+        mode="execute",
+        task_id="subtask-compact",
+        phase="TaskTracking",
+        prompt="Implement the pgvector write/query slice with tests.",
+        inputs={
+            "node": {"id": "node-42", "title": "pgvector slice"},
+            "large_input": {"notes": ["x" * 200, "y" * 200]},
+        },
+        expected_outputs=["summary", "files_changed", "tests_added"],
+        constraints={
+            "purpose": "child_task_execution",
+            "provider": "claude",
+            "ncp_handoff_enabled": True,
+            "ncp_pipeline_id": "sarathi_subtask-compact",
+            "extra": {"verbose": "z" * 300},
+        },
+        context_pack={
+            "agent_input": {
+                "relevant_files": [f"src/file_{index}.py" for index in range(8)],
+                "acceptance_criteria": [f"criterion {index} {'a' * 60}" for index in range(5)],
+            },
+            "history": {"messages": ["m" * 500]},
+        },
+        token_budget=2400,
+    )
+
+    full_prompt = _provider_prompt("claude", request)
+    handoff_instruction = _provider_handoff_instruction("claude", request)
+    payload = "task=subtask-compact | phase=TaskTracking | prompt=Implement the pgvector write/query slice with tests. | files=src/file_0.py,src/file_1.py | provider=claude"
+    token_profile = _ncp_handoff_token_profile(
+        provider="claude",
+        request=request,
+        payload=payload,
+        instruction=handoff_instruction,
+    )
+
+    assert "Inputs:" in full_prompt
+    assert "Context Pack:" in full_prompt
+    assert "Inputs:" not in handoff_instruction
+    assert "Context Pack:" not in handoff_instruction
+    assert "Node ID: node-42" in handoff_instruction
+    assert token_profile["handoff_total_tokens"] < token_profile["full_provider_prompt_tokens"]
+    assert 0 < token_profile["reduction_ratio"] < 1
 
 
 def test_native_copilot_dispatch_uses_github_cli_shape_and_records_invocation_metadata(tmp_path):

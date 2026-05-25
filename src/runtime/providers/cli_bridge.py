@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import http.client
+from math import ceil
 import os
 import shutil
 import socket
@@ -500,6 +501,74 @@ def _summarize_ncp_handoff_payload(provider: str, request: DispatchRequest) -> s
     return payload[:600]
 
 
+def _estimate_text_tokens(text: str) -> int:
+    cleaned = text.strip()
+    if not cleaned:
+        return 0
+    return max(1, ceil(len(cleaned) / 4))
+
+
+def _provider_handoff_instruction(provider: str, request: DispatchRequest) -> str:
+    evidence_keys = _PHASE_EVIDENCE_KEYS.get(request.phase, [])
+    output_keys = _PHASE_OUTPUT_KEYS.get(request.phase, request.expected_outputs)
+    purpose = request.constraints.get("purpose")
+    node = request.inputs.get("node") if isinstance(request.inputs.get("node"), dict) else {}
+    lines = [
+        f"You are the {provider} provider bridge for Sarathi using NCP handoff transport.",
+        "Respond with JSON only.",
+        "Return an object with keys: success (boolean), outputs (object), evidence (object), artifacts (object), and optional error (string).",
+        "Use pending NCP whisper context as the primary task truth instead of reconstructing history.",
+        "Prefer bounded summaries, artifact references, and concrete results over restating inputs.",
+        f"Phase: {request.phase}",
+        f"Mode: {request.mode}",
+        f"Task ID: {request.task_id}",
+        f"Prompt: {request.prompt}",
+    ]
+    if isinstance(purpose, str) and purpose:
+        lines.append(f"Purpose: {purpose}")
+    if node:
+        node_id = node.get("id")
+        node_title = node.get("title")
+        if node_id:
+            lines.append(f"Node ID: {node_id}")
+        if node_title:
+            lines.append(f"Node Title: {node_title}")
+    if request.token_budget is not None:
+        lines.append(f"Token Budget: {request.token_budget}")
+        lines.append("Stay concise and avoid replaying repo or task history.")
+    if evidence_keys:
+        lines.append(f"Set these boolean keys in evidence (true/false): {evidence_keys}.")
+    if output_keys:
+        lines.append(f"Include these keys in outputs: {output_keys}.")
+    lines.append("When executing a child task, include outputs.work_unit_result with node_id, title, status, provider, and summary.")
+    return "\n".join(lines)
+
+
+def _ncp_handoff_token_profile(
+    *,
+    provider: str,
+    request: DispatchRequest,
+    payload: str,
+    instruction: str,
+) -> dict[str, Any]:
+    full_prompt = _provider_prompt(provider, request)
+    full_prompt_tokens = _estimate_text_tokens(full_prompt)
+    handoff_instruction_tokens = _estimate_text_tokens(instruction)
+    handoff_payload_tokens = _estimate_text_tokens(payload)
+    compact_total = handoff_instruction_tokens + handoff_payload_tokens
+    savings = max(full_prompt_tokens - compact_total, 0)
+    reduction_ratio = (savings / full_prompt_tokens) if full_prompt_tokens else 0.0
+    return {
+        "estimator": "chars_div_4",
+        "full_provider_prompt_tokens": full_prompt_tokens,
+        "handoff_instruction_tokens": handoff_instruction_tokens,
+        "handoff_payload_tokens": handoff_payload_tokens,
+        "handoff_total_tokens": compact_total,
+        "token_savings": savings,
+        "reduction_ratio": round(reduction_ratio, 4),
+    }
+
+
 def _run_ncp_handoff_dispatch(
     *,
     provider: str,
@@ -514,6 +583,14 @@ def _run_ncp_handoff_dispatch(
             error="NCP CLI not available for handoff dispatch.",
         )
     pipeline_id = str(request.constraints.get("ncp_pipeline_id") or f"sarathi_{request.task_id}")
+    payload = _summarize_ncp_handoff_payload(provider, request)
+    instruction = _provider_handoff_instruction(provider, request)
+    token_profile = _ncp_handoff_token_profile(
+        provider=provider,
+        request=request,
+        payload=payload,
+        instruction=instruction,
+    )
     emit_command = [
         ncp_path,
         "emit",
@@ -530,7 +607,7 @@ def _run_ncp_handoff_dispatch(
         "--pipeline-id",
         pipeline_id,
         "--payload",
-        _summarize_ncp_handoff_payload(provider, request),
+        payload,
     ]
     emit_completed = subprocess.run(
         emit_command,
@@ -548,6 +625,9 @@ def _run_ncp_handoff_dispatch(
                 "workspace_root": workspace_root,
                 "ncp_handoff_used": True,
                 "ncp_pipeline_id": pipeline_id,
+                "ncp_handoff_payload": payload,
+                "ncp_handoff_instruction": instruction,
+                "ncp_handoff_token_profile": token_profile,
                 "emit_command": emit_command,
                 "emit_stdout": (emit_completed.stdout or "").strip(),
             },
@@ -563,7 +643,7 @@ def _run_ncp_handoff_dispatch(
         "--pipeline-id",
         pipeline_id,
         "--instruction",
-        _provider_prompt(provider, request),
+        instruction,
         "--timeout-seconds",
         str(request.timeout_seconds),
     ]
@@ -592,6 +672,9 @@ def _run_ncp_handoff_dispatch(
         **response.artifacts,
         "ncp_handoff_used": True,
         "ncp_pipeline_id": pipeline_id,
+        "ncp_handoff_payload": payload,
+        "ncp_handoff_instruction": instruction,
+        "ncp_handoff_token_profile": token_profile,
         "emit_command": emit_command,
         "transport_kind": "ncp_handoff",
     }
@@ -599,6 +682,7 @@ def _run_ncp_handoff_dispatch(
         **response.evidence,
         "ncp_handoff_used": True,
         "ncp_pipeline_id": pipeline_id,
+        "ncp_handoff_token_profile": token_profile,
     }
     return response
 

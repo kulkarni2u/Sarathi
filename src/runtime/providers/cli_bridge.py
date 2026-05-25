@@ -116,6 +116,7 @@ def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> 
         "-p", prompt,
         "--output-format", "json",
         "--dangerously-skip-permissions",
+        "--add-dir", workspace_root,
     ]
     completed = subprocess.run(
         command,

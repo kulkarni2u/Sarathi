@@ -17,6 +17,9 @@ def _get_field(obj: Any, field: str, default: Any = None) -> Any:
         return getattr(obj, field, default)
 
 
+_TRANSPORT_TIMEOUT = 30
+
+
 class NCPPersistenceAdapter:
     """Adapts Sarathi persistence calls to NCP write_memory and fetch."""
 
@@ -38,16 +41,19 @@ class NCPPersistenceAdapter:
 
     def save_task(self, task: Mapping[str, Any]) -> None:
         """Serialize a task and persist it via NCP write_memory."""
+        task_id = _get_field(task, "task_id")
+        if not task_id:
+            raise ValueError("task must have a non-empty 'task_id' field")
         content = json.dumps({
             "_sarathi_type": "TaskContext",
-            "task_id": _get_field(task, "task_id"),
+            "task_id": task_id,
             "description": _get_field(task, "description"),
             "complexity": _get_field(task, "complexity"),
             "current_phase": _get_field(task, "current_phase"),
             "phase_results": list(_get_field(task, "phase_results", [])),
         })
         self._call_write_memory(
-            content, "episodic", "tool_result", f"sarathi.engine.{_get_field(task, 'task_id')}",
+            content, "episodic", "tool_result", f"sarathi.engine.{task_id}",
         )
 
     def load_task(self, task_id: str) -> dict | None:
@@ -116,7 +122,7 @@ class NCPPersistenceAdapter:
         if self.mode == "direct":
             result = subprocess.run(
                 [sys.executable, str(self.run_path), "write_memory", json.dumps(args)],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=_TRANSPORT_TIMEOUT,
             )
             if result.returncode != 0:
                 raise RuntimeError(
@@ -134,7 +140,7 @@ class NCPPersistenceAdapter:
                     },
                     "id": 1,
                 }
-                resp = httpx.post(self.endpoint, json=payload, timeout=30)
+                resp = httpx.post(self.endpoint, json=payload, timeout=_TRANSPORT_TIMEOUT)
                 resp.raise_for_status()
                 result = resp.json()
                 if "error" in result:
@@ -148,7 +154,7 @@ class NCPPersistenceAdapter:
         if self.mode == "direct":
             result = subprocess.run(
                 [sys.executable, str(self.run_path), "fetch", json.dumps(args)],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=_TRANSPORT_TIMEOUT,
             )
             if result.returncode != 0:
                 return []
@@ -165,7 +171,7 @@ class NCPPersistenceAdapter:
                     },
                     "id": 1,
                 }
-                resp = httpx.post(self.endpoint, json=payload, timeout=30)
+                resp = httpx.post(self.endpoint, json=payload, timeout=_TRANSPORT_TIMEOUT)
                 resp.raise_for_status()
                 result = resp.json()
                 content_items = (

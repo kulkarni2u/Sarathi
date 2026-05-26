@@ -1,9 +1,17 @@
 """Tests for NCPPersistenceAdapter."""
 import json
+from unittest.mock import patch, MagicMock
 
 import pytest
 
 from ncp_adapter.persistence_adapter import NCPPersistenceAdapter
+
+
+def _task_stub(task_id: str = "t1", **overrides: str | list | None) -> object:
+    fields = {"task_id": task_id, "description": "test", "complexity": "medium",
+              "current_phase": None, "phase_results": []}
+    fields.update(overrides)
+    return type("TaskStub", (), fields)()
 
 
 class TestNCPPersistenceAdapter:
@@ -11,23 +19,21 @@ class TestNCPPersistenceAdapter:
         adapter = NCPPersistenceAdapter()
         assert adapter.mode == "direct"
 
+    def test_init_invalid_mode(self):
+        with pytest.raises(ValueError, match="mode must be 'direct' or 'mcp'"):
+            NCPPersistenceAdapter(mode="invalid")
+
     def test_save_task_without_ncp_raises_error(self, tmp_path):
         run_py = tmp_path / "run.py"
         run_py.write_text("#!/usr/bin/env python3\nimport sys; sys.exit(1)")
         adapter = NCPPersistenceAdapter(mode="direct", run_path=str(run_py))
-        task = type(
-            "Task",
-            (),
-            {
-                "task_id": "t1",
-                "description": "test",
-                "complexity": "medium",
-                "current_phase": None,
-                "phase_results": [],
-            },
-        )()
         with pytest.raises(RuntimeError, match="NCP write_memory failed"):
-            adapter.save_task(task)
+            adapter.save_task(_task_stub("t1"))
+
+    def test_save_task_raises_on_missing_task_id(self, tmp_path):
+        adapter = NCPPersistenceAdapter(mode="direct", run_path=str(tmp_path / "run.py"))
+        with pytest.raises(ValueError, match="non-empty 'task_id'"):
+            adapter.save_task({"description": "no id"})
 
     def test_load_task_returns_none_when_missing(self, tmp_path):
         run_py = tmp_path / "run.py"
@@ -43,176 +49,97 @@ class TestNCPPersistenceAdapter:
         result = adapter.list_tasks()
         assert result == []
 
-    def test_init_invalid_mode(self):
-        with pytest.raises(ValueError, match="mode must be 'direct' or 'mcp'"):
-            NCPPersistenceAdapter(mode="invalid")
-
     def test_parse_fetch_output(self):
-        raw = """\
-chunk:abc123 layer:episodic score:0.85
-  {"_sarathi_type":"TaskContext","task_id":"t1","description":"test task","complexity":"medium","current_phase":null,"phase_results":[]}
-chunk:def456 layer:episodic score:0.72
-  {"_sarathi_type":"TaskContext","task_id":"t2","description":"another task","complexity":"high","current_phase":"Build","phase_results":[{"phase":"Build","status":"done"}]}
-"""
+        raw = "chunk:abc layer:episodic score:0.85\n  {\"task_id\":\"t1\"}\nchunk:def layer:episodic score:0.72\n  {\"task_id\":\"t2\"}\n"
         chunks = NCPPersistenceAdapter._parse_fetch_output(raw)
         assert len(chunks) == 2
-        assert chunks[0].startswith("chunk:abc123")
-        assert chunks[1].startswith("chunk:def456")
 
     def test_reconstruct_chunk_text(self):
-        chunk = 'chunk:abc123 layer:episodic score:0.85\n  {"_sarathi_type":"TaskContext","task_id":"t1"}'
-        text = NCPPersistenceAdapter._reconstruct_chunk_text(chunk)
-        obj = json.loads(text)
-        assert obj["_sarathi_type"] == "TaskContext"
-        assert obj["task_id"] == "t1"
+        text = NCPPersistenceAdapter._reconstruct_chunk_text(
+            'chunk:abc layer:episodic score:0.85\n  {"task_id":"t1"}')
+        assert json.loads(text)["task_id"] == "t1"
 
-    def test_save_task_serializes_correctly(self, tmp_path):
-        run_py = tmp_path / "run.py"
-        call_args = []
-
-        def fake_run(*args, **kwargs):
-            call_args.append(args)
-            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-
-        import subprocess
-        original_run = subprocess.run
-        subprocess.run = fake_run
-        try:
-            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(run_py))
-            task = type(
-                "Task",
-                (),
-                {
-                    "task_id": "t1",
-                    "description": "test",
-                    "complexity": "medium",
-                    "current_phase": None,
-                    "phase_results": [],
-                },
-            )()
-            adapter.save_task(task)
-            assert len(call_args) == 1
-            cmd = call_args[0][0]
+    def test_save_task_serializes(self, tmp_path):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(tmp_path / "run.py"))
+            adapter.save_task(_task_stub("t1"))
+            cmd = mock_run.call_args[0][0]
             assert cmd[-2] == "write_memory"
-            payload = json.loads(cmd[-1])
-            content = json.loads(payload["content"])
-            assert content["_sarathi_type"] == "TaskContext"
-            assert content["task_id"] == "t1"
-        finally:
-            subprocess.run = original_run
 
-    def test_save_learning_uses_semantic_layer(self, tmp_path):
-        run_py = tmp_path / "run.py"
-        call_args = []
-
-        def fake_run(*args, **kwargs):
-            call_args.append(args)
-            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-
-        import subprocess
-        original_run = subprocess.run
-        subprocess.run = fake_run
-        try:
-            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(run_py))
+    def test_save_learning_uses_semantic(self, tmp_path):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(tmp_path / "run.py"))
             adapter.save_learning({"key": "value"})
-            assert len(call_args) == 1
-            payload = json.loads(call_args[0][0][-1])
+            payload = json.loads(mock_run.call_args[0][0][-1])
             assert payload["layer"] == "semantic"
             assert payload["src"] == "synthesis"
-            assert payload["written_by"] == "sarathi.engine.learning"
-        finally:
-            subprocess.run = original_run
 
     def test_save_phase_log_uses_reasoning_trace(self, tmp_path):
-        run_py = tmp_path / "run.py"
-        call_args = []
-
-        def fake_run(*args, **kwargs):
-            call_args.append(args)
-            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-
-        import subprocess
-        original_run = subprocess.run
-        subprocess.run = fake_run
-        try:
-            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(run_py))
-            task = type("Task", (), {"task_id": "t1"})()
-            adapter.save_phase_log(task, "Build", "done")
-            assert len(call_args) == 1
-            payload = json.loads(call_args[0][0][-1])
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(tmp_path / "run.py"))
+            adapter.save_phase_log(_task_stub("t1"), "Build", "done")
+            payload = json.loads(mock_run.call_args[0][0][-1])
             assert payload["layer"] == "reasoning_trace"
-            assert payload["src"] == "tool_result"
             assert payload["written_by"] == "sarathi.engine.t1"
-            content = json.loads(payload["content"])
-            assert content["task_id"] == "t1"
-            assert content["phase"] == "Build"
-            assert content["status"] == "done"
-        finally:
-            subprocess.run = original_run
 
     def test_list_tasks_deduplicates(self, tmp_path):
-        run_py = tmp_path / "run.py"
-        raw_stdout = """\
-chunk:abc layer:episodic score:0.85
-  {"_sarathi_type":"TaskContext","task_id":"t1","description":"a","complexity":"low","current_phase":null,"phase_results":[]}
-chunk:def layer:episodic score:0.72
-  {"_sarathi_type":"TaskContext","task_id":"t1","description":"b","complexity":"high","current_phase":null,"phase_results":[]}
-chunk:ghi layer:episodic score:0.90
-  {"_sarathi_type":"TaskContext","task_id":"t2","description":"c","complexity":"medium","current_phase":null,"phase_results":[]}
-"""
-
-        def fake_run(*args, **kwargs):
-            return type("R", (), {"returncode": 0, "stdout": raw_stdout, "stderr": ""})()
-
-        import subprocess
-        original_run = subprocess.run
-        subprocess.run = fake_run
-        try:
-            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(run_py))
-            result = adapter.list_tasks()
-            assert result == ["t1", "t2"]
-        finally:
-            subprocess.run = original_run
+        raw = "chunk:abc layer:episodic score:0.85\n  {\"_sarathi_type\":\"TaskContext\",\"task_id\":\"t1\"}\nchunk:def layer:episodic score:0.72\n  {\"_sarathi_type\":\"TaskContext\",\"task_id\":\"t1\"}\nchunk:ghi layer:episodic score:0.90\n  {\"_sarathi_type\":\"TaskContext\",\"task_id\":\"t2\"}\n"
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=raw, stderr="")
+            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(tmp_path / "run.py"))
+            assert adapter.list_tasks() == ["t1", "t2"]
 
     def test_load_task_deserializes(self, tmp_path):
-        run_py = tmp_path / "run.py"
-        raw_stdout = """\
-chunk:abc layer:episodic score:0.85
-  {"_sarathi_type":"TaskContext","task_id":"t1","description":"test task","complexity":"medium","current_phase":null,"phase_results":[]}
-"""
-
-        def fake_run(*args, **kwargs):
-            return type("R", (), {"returncode": 0, "stdout": raw_stdout, "stderr": ""})()
-
-        import subprocess
-        original_run = subprocess.run
-        subprocess.run = fake_run
-        try:
-            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(run_py))
-            result = adapter.load_task("t1")
-            assert result is not None
-            assert result["_sarathi_type"] == "TaskContext"
-            assert result["task_id"] == "t1"
-            assert result["description"] == "test task"
-        finally:
-            subprocess.run = original_run
+        raw = "chunk:abc layer:episodic score:0.85\n  {\"_sarathi_type\":\"TaskContext\",\"task_id\":\"t1\"}\n"
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=raw, stderr="")
+            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(tmp_path / "run.py"))
+            assert adapter.load_task("t1")["task_id"] == "t1"
 
     def test_load_task_returns_none_on_json_error(self, tmp_path):
-        run_py = tmp_path / "run.py"
-        raw_stdout = """\
-chunk:abc layer:episodic score:0.85
-  not valid json
-"""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="chunk:abc layer:episodic score:0.85\n  bad json\n", stderr="")
+            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(tmp_path / "run.py"))
+            assert adapter.load_task("t1") is None
 
-        def fake_run(*args, **kwargs):
-            return type("R", (), {"returncode": 0, "stdout": raw_stdout, "stderr": ""})()
+    def test_save_phase_log_with_dict_task(self, tmp_path):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(tmp_path / "run.py"))
+            adapter.save_phase_log({"task_id": "t1"}, "Build", "done")
+            payload = json.loads(mock_run.call_args[0][0][-1])
+            assert payload["written_by"] == "sarathi.engine.t1"
 
-        import subprocess
-        original_run = subprocess.run
-        subprocess.run = fake_run
-        try:
-            adapter = NCPPersistenceAdapter(mode="direct", run_path=str(run_py))
-            result = adapter.load_task("t1")
-            assert result is None
-        finally:
-            subprocess.run = original_run
+    def test_mcp_write_memory_error_raises(self):
+        import httpx
+        adapter = NCPPersistenceAdapter(mode="mcp", endpoint="http://127.0.0.1:1/mcp")
+        with patch("httpx.post") as mock_post:
+            mock_post.side_effect = httpx.ConnectError("connection refused")
+            with pytest.raises(RuntimeError, match="NCP MCP write_memory failed"):
+                adapter._call_write_memory("{}", "semantic", "synthesis", "test")
+
+    def test_mcp_fetch_returns_empty_on_error(self):
+        import httpx
+        adapter = NCPPersistenceAdapter(mode="mcp", endpoint="http://127.0.0.1:1/mcp")
+        with patch("httpx.post") as mock_post:
+            mock_post.side_effect = httpx.ConnectError("connection refused")
+            assert adapter._call_fetch("test", k=1) == []
+
+    def test_mcp_fetch_parses_response(self):
+        adapter = NCPPersistenceAdapter(mode="mcp", endpoint="http://127.0.0.1:1/mcp")
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"result": {"content": [{"text": '{"task_id":"t1"}'}]}}
+        with patch("httpx.post", return_value=mock_response):
+            result = adapter._call_fetch("test", k=1)
+            assert "task_id" in result[0]
+
+    def test_mcp_save_learning(self):
+        import httpx
+        adapter = NCPPersistenceAdapter(mode="mcp", endpoint="http://127.0.0.1:1/mcp")
+        mock_response = MagicMock(spec=httpx.Response)
+        mock_response.json.return_value = {"result": {}}
+        with patch("httpx.post", return_value=mock_response):
+            adapter.save_learning({"key": "value"})

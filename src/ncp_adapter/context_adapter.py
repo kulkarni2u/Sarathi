@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from ncp_adapter import NCPNotAvailableError
+from . import NCPNotAvailableError
 
 
 class NCPContextAdapter:

@@ -22,22 +22,22 @@ class NCPAdapterConfig:
 
 
 try:
-    from ncp_adapter.context_adapter import NCPContextAdapter  # noqa: F401
+    from .context_adapter import NCPContextAdapter  # noqa: F401
 except ImportError:
     pass
 
 try:
-    from ncp_adapter.persistence_adapter import NCPPersistenceAdapter  # noqa: F401
+    from .persistence_adapter import NCPPersistenceAdapter  # noqa: F401
 except ImportError:
     pass
 
 try:
-    from ncp_adapter.artifact_adapter import NCPArtifactAdapter  # noqa: F401
+    from .artifact_adapter import NCPArtifactAdapter  # noqa: F401
 except ImportError:
     pass
 
 try:
-    from ncp_adapter.whisper_router import NCPWhisperRouter  # noqa: F401
+    from .whisper_router import NCPWhisperRouter  # noqa: F401
 except ImportError:
     pass
 

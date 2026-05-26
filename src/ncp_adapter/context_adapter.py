@@ -107,16 +107,19 @@ class NCPContextAdapter:
             return result.stdout
         else:
             import httpx
-            payload = {
-                "jsonrpc": "2.0",
-                "method": "tools/call",
-                "params": {"name": "ncp_get_context", "arguments": args},
-                "id": 1,
-            }
-            resp = httpx.post(self.endpoint, json=payload, timeout=30)
-            resp.raise_for_status()
-            result = resp.json()
-            return result.get("result", {}).get("content", [{}])[0].get("text", "")
+            try:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": "ncp_get_context", "arguments": args},
+                    "id": 1,
+                }
+                resp = httpx.post(self.endpoint, json=payload, timeout=30)
+                resp.raise_for_status()
+                result = resp.json()
+                return result.get("result", {}).get("content", [{}])[0].get("text", "")
+            except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException) as e:
+                raise NCPNotAvailableError(f"NCP MCP get_context failed: {e}") from e
 
     def _map_to_context_pack(
         self,
@@ -128,7 +131,6 @@ class NCPContextAdapter:
     ) -> dict[str, Any]:
         """Map NCP pidgin output to ContextPack-like dict."""
         lines = ctx_text.strip().split("\n")
-        budget_section = []
         conscious_section = {}
         subconscious_chunks = []
 
@@ -147,7 +149,7 @@ class NCPContextAdapter:
                 break
 
             if current_section == "budget":
-                budget_section.append(line)
+                pass
             elif current_section == "conscious" and ":" in line:
                 key, value = line.split(":", 1)
                 conscious_section[key.strip()] = value.strip()
@@ -174,7 +176,7 @@ class NCPContextAdapter:
                 "relevant_files": [],
                 "prior_findings": prior_findings[:8],
                 "available_tools": [],
-                "token_budget": token_budget or 3000,
+                "token_budget": token_budget if token_budget is not None else 3000,
             },
             "source_artifacts": [],
             "compilation": {

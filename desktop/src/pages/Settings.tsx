@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import {
+  checkNcpAvailable,
   getSarathiApiConfig,
   getWorkspace,
   getWorkspaceOperationalViews,
@@ -243,6 +244,9 @@ export default function Settings({ workspaceId }: SettingsProps) {
   const [policyDrafts, setPolicyDrafts] = useState<Record<string, string>>({});
   const [savingPolicyFile, setSavingPolicyFile] = useState<string | null>(null);
   const [loadingPolicy, setLoadingPolicy] = useState(false);
+  const [ncpEnabled, setNcpEnabled] = useState(false);
+  const [ncpAvailable, setNcpAvailable] = useState<boolean | null>(null);
+  const [savingNcp, setSavingNcp] = useState(false);
 
   useEffect(() => {
     if (!apiConfigured) return;
@@ -274,6 +278,7 @@ export default function Settings({ workspaceId }: SettingsProps) {
           setAutoApprovePreference(normalizeAutoApprovePreference(ws.metadata.auto_approve_preference));
           setGovernance(operations.governance);
           setProviderPriority(operations.governance.policy_posture.provider_priority);
+          setNcpEnabled(ws.metadata.ncp_enabled ?? false);
           setProviderHealth(nextProviders);
           setProviderDrafts(Object.fromEntries(nextProviders.map((p) => [p.id, defaultProviderDraft(p)])));
           setSettingsStatus(`${nextProviders.length} providers loaded from workspace settings.`);
@@ -298,6 +303,13 @@ export default function Settings({ workspaceId }: SettingsProps) {
     }
     void loadSettingsProviders();
     return () => { cancelled = true; };
+  }, [apiConfigured, workspaceId]);
+
+  useEffect(() => {
+    if (!apiConfigured || !workspaceId) return;
+    checkNcpAvailable(workspaceId)
+      .then((result) => setNcpAvailable(result.ncp_available))
+      .catch(() => setNcpAvailable(false));
   }, [apiConfigured, workspaceId]);
 
   async function testProvider(provider: ProviderHealthRecord) {
@@ -416,6 +428,27 @@ export default function Settings({ workspaceId }: SettingsProps) {
       setSettingsStatus(error instanceof Error ? error.message : "Provider routing save failed.");
     } finally {
       setSavingProviderPriority(false);
+    }
+  }
+
+  async function saveNcpEnabledSetting() {
+    if (!apiConfigured || !workspaceId) {
+      setSettingsStatus("Saving NCP setting requires a selected workspace.");
+      return;
+    }
+    const ws = workspace ?? await getWorkspace(workspaceId);
+    if (!workspace) setWorkspace(ws);
+    setSavingNcp(true);
+    try {
+      const updated = await updateWorkspace(ws.id, {
+        ncp_enabled: ncpEnabled,
+      });
+      setWorkspace(updated);
+      setSettingsStatus(`NCP ${ncpEnabled ? "enabled" : "disabled"}.`);
+    } catch (error) {
+      setSettingsStatus(error instanceof Error ? error.message : "NCP save failed.");
+    } finally {
+      setSavingNcp(false);
     }
   }
 
@@ -839,6 +872,35 @@ export default function Settings({ workspaceId }: SettingsProps) {
         ) : (
           <div style={{ fontSize: "0.78rem", color: "var(--muted)" }}>No overrides recorded.</div>
         )}
+      </section>
+      <section className="panel" style={{ gridColumn: "1 / -1" }}>
+        <div className="panel-title" style={{ marginBottom: 10 }}>
+          <h2 style={{ fontSize: "0.92rem" }}>Neural Context Protocol</h2>
+          {ncpAvailable !== null && (
+            <Pill tone={ncpAvailable ? "green" : "red"}>
+              {ncpAvailable ? "Available" : "Not installed"}
+            </Pill>
+          )}
+        </div>
+        <p style={{ margin: "0 0 12px", fontSize: "0.83rem", color: "var(--muted)" }}>
+          Route context compilation, persistence, and artifacts through NCP (Neural Context
+          Protocol) for advanced context management. Requires NCP to be installed and initialized.
+        </p>
+        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: "0.85rem" }}>
+            <input
+              type="checkbox"
+              role="switch"
+              checked={ncpEnabled}
+              onChange={(e) => setNcpEnabled(e.target.checked)}
+              style={{ accentColor: "var(--accent)" }}
+            />
+            Enable NCP
+          </label>
+          <button onClick={() => void saveNcpEnabledSetting()} disabled={savingNcp || !workspace}>
+            {savingNcp ? "Saving..." : "Save"}
+          </button>
+        </div>
       </section>
       <section className="panel" style={{ gridColumn: "1 / -1" }}>
         <div className="section-header">

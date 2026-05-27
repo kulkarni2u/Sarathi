@@ -228,6 +228,24 @@ sarathi validate ./policy-pack --verbose
 sarathi run "Add OAuth2 authentication" --policy-pack ./policy-pack
 ```
 
+## NCP Integration
+
+NCP (Neural Context Protocol) provides advanced context management, replacing Sarathi's native context compilation, persistence, and artifact storage with NCP-backed runtime services.
+
+```bash
+# Bootstrap a project with NCP
+sarathi init --ncp
+
+# Run with NCP enabled
+sarathi run --ncp "task description"
+```
+
+**Options:**
+- `--ncp-mode {direct|mcp}` — transport mode (default: direct)
+- `--ncp-router` — enable whisper-based cross-phase signaling
+
+NCP can be toggled in the Settings page of the Sarathi Desktop UI.
+
 ## Repository Layout
 
 ```text

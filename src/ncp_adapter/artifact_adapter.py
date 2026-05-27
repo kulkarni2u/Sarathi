@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ncp_adapter._transport import NCPTransportMixin
+from ._transport import NCPTransportMixin
 
 
 class NCPArtifactAdapter(NCPTransportMixin):

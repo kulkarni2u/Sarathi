@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
-from ncp_adapter._transport import NCPTransportMixin
+from ._transport import NCPTransportMixin
 
 
 def _get_field(obj: Any, field: str, default: Any = None) -> Any:

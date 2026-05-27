@@ -458,18 +458,18 @@ def main() -> None:
     run_parser.add_argument(
         "--ncp",
         action="store_true",
-        help="Use NCP as context handler",
+        help="Enable NCP (Neural Context Protocol) as the context/persistence/artifact backend. Requires 'ncp init' to be run in the project directory first.",
     )
     run_parser.add_argument(
         "--ncp-mode",
         choices=["direct", "mcp"],
         default="direct",
-        help="NCP transport mode",
+        help="NCP transport mode: 'direct' (subprocess via .ncp/run.py, default) or 'mcp' (JSON-RPC over HTTP to the NCP server).",
     )
     run_parser.add_argument(
         "--ncp-router",
         action="store_true",
-        help="Enable NCP whisper-based phase routing",
+        help="Enable NCP whisper-based cross-phase signaling router for phase-to-phase context handoff.",
     )
 
     # Phase log command

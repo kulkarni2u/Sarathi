@@ -22,24 +22,36 @@ class NCPAdapterConfig:
 
 
 try:
-    from .context_adapter import NCPContextAdapter  # noqa: F401
-except ImportError:
-    pass
+    from .context_adapter import NCPContextAdapter
+except ImportError as e:
+    raise ImportError(
+        "NCPContextAdapter is not available. Ensure all ncp_adapter dependencies are "
+        f"installed. Missing dependency: {e}"
+    ) from e
 
 try:
-    from .persistence_adapter import NCPPersistenceAdapter  # noqa: F401
-except ImportError:
-    pass
+    from .persistence_adapter import NCPPersistenceAdapter
+except ImportError as e:
+    raise ImportError(
+        "NCPPersistenceAdapter is not available. Ensure all ncp_adapter dependencies are "
+        f"installed. Missing dependency: {e}"
+    ) from e
 
 try:
-    from .artifact_adapter import NCPArtifactAdapter  # noqa: F401
-except ImportError:
-    pass
+    from .artifact_adapter import NCPArtifactAdapter
+except ImportError as e:
+    raise ImportError(
+        "NCPArtifactAdapter is not available. Ensure all ncp_adapter dependencies are "
+        f"installed. Missing dependency: {e}"
+    ) from e
 
 try:
-    from .whisper_router import NCPWhisperRouter  # noqa: F401
-except ImportError:
-    pass
+    from .whisper_router import NCPWhisperRouter
+except ImportError as e:
+    raise ImportError(
+        "NCPWhisperRouter is not available. Ensure all ncp_adapter dependencies are "
+        f"installed. Missing dependency: {e}"
+    ) from e
 
 __all__ = [
     "NCPAdapterConfig",

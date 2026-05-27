@@ -116,6 +116,7 @@ export type WorkspaceMetadata = {
       filters: Record<string, unknown>;
     }>;
   };
+  ncp_enabled?: boolean;
 } & Record<string, unknown>;
 
 export type WorkspaceRecord = {

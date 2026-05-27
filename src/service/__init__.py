@@ -213,10 +213,20 @@ class ServiceApp:
                 next_metadata["reuse_preferences"] = preferences
                 changed_keys.append("reuse_preferences")
 
+            if "ncp_enabled" in raw_metadata:
+                if not isinstance(raw_metadata["ncp_enabled"], bool):
+                    raise ServiceError(
+                        "invalid_request",
+                        "Field 'ncp_enabled' must be a boolean.",
+                        400,
+                    )
+                next_metadata["ncp_enabled"] = raw_metadata["ncp_enabled"]
+                changed_keys.append("ncp_enabled")
+
             if not changed_keys:
                 raise ServiceError(
                     "invalid_request",
-                    "At least one update field is required: 'repository_action_preference', 'auto_approve_preference', 'provider_priority', or 'reuse_preferences'.",
+                    "At least one update field is required: 'repository_action_preference', 'auto_approve_preference', 'provider_priority', 'reuse_preferences', or 'ncp_enabled'.",
                     400,
                 )
 

@@ -290,6 +290,20 @@ class ServiceApp:
             }
 
         if (
+            method == "GET"
+            and len(parts) == 4
+            and parts[0] == "workspaces"
+            and parts[2] == "ncp"
+            and parts[3] == "status"
+        ):
+            workspace = storage.get_workspace(parts[1])
+            if workspace is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            import shutil
+            ncp_available = shutil.which("ncp") is not None
+            return 200, {"ncp_available": ncp_available}
+
+        if (
             method == "POST"
             and len(parts) == 3
             and parts[0] == "workspaces"

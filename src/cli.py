@@ -1,6 +1,7 @@
 """CLI implementation for Sarathi."""
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -39,6 +40,32 @@ except ImportError:
     from validate import PolicyValidator
     from engine import Engine, TaskContext, Phase, Complexity, PHASE_TRANSITIONS, PhaseResult
 import time
+
+
+def _resolve_workspace_ncp(cwd: str) -> bool:
+    """Read ncp_enabled from workspace metadata in shared storage."""
+    from pathlib import Path
+    try:
+        from src.storage import Storage, connect
+
+        # Walk up from cwd looking for .sarathi/sarathi.db
+        search = Path(cwd).resolve()
+        for parent in [search] + list(search.parents):
+            db = parent / ".sarathi" / "sarathi.db"
+            if db.exists():
+                conn = connect(db)
+                try:
+                    storage = Storage(conn)
+                    for ws in storage.list_workspaces():
+                        ws_path = ws.get("root_path", "")
+                        if ws_path and cwd.startswith(ws_path):
+                            return bool((ws.get("metadata") or {}).get("ncp_enabled", False))
+                finally:
+                    conn.close()
+                break
+    except Exception:
+        pass
+    return False
 
 
 # ============================================================================
@@ -380,6 +407,11 @@ def main() -> None:
         default="markdown",
         help="Engine to use (default: markdown)",
     )
+    init_parser.add_argument(
+        "--ncp",
+        action="store_true",
+        help="Initialize with NCP context protocol",
+    )
 
     # Validate command
     validate_parser = subparsers.add_parser("validate", help="Validate a policy pack")
@@ -420,6 +452,24 @@ def main() -> None:
         "--dry-run",
         action="store_true",
         help="Show phase sequence without executing",
+    )
+    
+    # NCP Integration
+    run_parser.add_argument(
+        "--ncp",
+        action="store_true",
+        help="Use NCP as context handler",
+    )
+    run_parser.add_argument(
+        "--ncp-mode",
+        choices=["direct", "mcp"],
+        default="direct",
+        help="NCP transport mode",
+    )
+    run_parser.add_argument(
+        "--ncp-router",
+        action="store_true",
+        help="Enable NCP whisper-based phase routing",
     )
 
     # Phase log command
@@ -580,6 +630,49 @@ def handle_init(args: argparse.Namespace) -> None:
     print("\n[5/5] Evolve: Learning from setup...")
     workflow.evolve()
 
+    # NCP Integration
+    if args.ncp:
+        print("\n[6/6] NCP: Initializing Neural Context Protocol...")
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        # Determine init target — use explicit target_path or CWD
+        init_target = Path(args.target_path)
+
+        # 1. Run ncp init to bootstrap
+        ncp_init_result = subprocess.run(
+            [sys.executable, "-m", "ncp", "init"],
+            capture_output=True, text=True, cwd=str(init_target),
+        )
+        if ncp_init_result.returncode == 0:
+            print("  ✓ NCP initialized")
+        else:
+            print(f"  ⚠ NCP init warning: {ncp_init_result.stderr.strip()}")
+
+        # 2. Write Sarathi-optimized config overrides
+        ncp_config_path = init_target / ".ncp" / "config.toml"
+        if ncp_config_path.exists():
+            config_text = ncp_config_path.read_text()
+            overrides = """
+# Sarathi-optimized overrides
+max_chunk_tokens = 400
+default_ttl_hours = 168
+"""
+            # Only append if not already present
+            if "Sarathi-optimized" not in config_text:
+                ncp_config_path.write_text(config_text.strip() + "\n" + overrides.strip() + "\n")
+                print("  ✓ Wrote Sarathi-optimized NCP config (max_chunk_tokens=400, ttl=168h)")
+
+        # 3. Write welcome note
+        welcome_path = init_target / ".ncp" / "WELCOME.md"
+        welcome_path.write_text(
+            "# NCP + Sarathi\n\n"
+            "NCP is configured as the context handler for this project.\n"
+            "Run `sarathi run --ncp \"task description\"` to use it.\n"
+        )
+        print("  ✓ Wrote .ncp/WELCOME.md")
+
     print("\n✓ Policy pack initialized successfully!")
     print(f"\nNext steps:")
     print(f"  1. Review generated files in {policy_path}/")
@@ -660,7 +753,13 @@ def handle_run(args: argparse.Namespace) -> None:
     print(f"Policy pack: {policy_pack}")
 
     # Create engine to generate task ID
-    engine = Engine(policy_pack_path=policy_pack, enforce_preflight=True)
+    engine = Engine(
+        policy_pack_path=policy_pack,
+        enforce_preflight=True,
+        ncp_enabled=args.ncp or _resolve_workspace_ncp(os.getcwd()),
+        ncp_mode=args.ncp_mode,
+        ncp_router=args.ncp_router,
+    )
 
     # Create task context with proper ID generation
     task = TaskContext(

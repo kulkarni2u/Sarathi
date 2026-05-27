@@ -793,6 +793,14 @@ export async function updateWorkspace(
   return data.workspace;
 }
 
+export async function checkNcpAvailable(
+  workspaceId: string,
+): Promise<{ ncp_available: boolean }> {
+  return getJson<{ ncp_available: boolean }>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/ncp/status`,
+  );
+}
+
 export async function ensureWorkspace(
   name: string,
   rootPath: string,

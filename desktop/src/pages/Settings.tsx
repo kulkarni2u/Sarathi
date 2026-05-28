@@ -444,7 +444,7 @@ export default function Settings({ workspaceId }: SettingsProps) {
         ncp_enabled: ncpEnabled,
       });
       setWorkspace(updated);
-      setSettingsStatus(`NCP ${ncpEnabled ? "enabled" : "disabled"}.`);
+      setSettingsStatus(ncpEnabled ? "NCP forced on." : "Auto-detect restored.");
     } catch (error) {
       setSettingsStatus(error instanceof Error ? error.message : "NCP save failed.");
     } finally {
@@ -883,8 +883,8 @@ export default function Settings({ workspaceId }: SettingsProps) {
           )}
         </div>
         <p style={{ margin: "0 0 12px", fontSize: "0.83rem", color: "var(--muted)" }}>
-          Route context compilation, persistence, and artifacts through NCP (Neural Context
-          Protocol) for advanced context management. Requires NCP to be installed and initialized.
+          NCP (Neural Context Protocol) is auto-detected at startup. Check this box to
+          force-enable NCP, or leave unchecked for auto-detect with graceful fallback to native adapters.
         </p>
         <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
           <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: "0.85rem" }}>
@@ -895,7 +895,7 @@ export default function Settings({ workspaceId }: SettingsProps) {
               onChange={(e) => setNcpEnabled(e.target.checked)}
               style={{ accentColor: "var(--accent)" }}
             />
-            Enable NCP
+            Force NCP
           </label>
           <button onClick={() => void saveNcpEnabledSetting()} disabled={savingNcp || !workspace}>
             {savingNcp ? "Saving..." : "Save"}

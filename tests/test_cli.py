@@ -79,6 +79,8 @@ def test_handle_run_dry_run_prints_phases(tmp_path, capsys):
         policy_pack=str(policy_dir),
         complexity="high",
         dry_run=True,
+        ncp_mode="direct",
+        ncp_router=False,
     )
 
     cli.handle_run(args)
@@ -96,6 +98,8 @@ def test_handle_run_blocks_on_preflight(tmp_path, capsys):
         policy_pack=str(policy_dir),
         complexity="low",
         dry_run=False,
+        ncp_mode="direct",
+        ncp_router=False,
     )
 
     cli.handle_run(args)
@@ -114,6 +118,8 @@ def test_handle_run_executes_when_preflight_passes(tmp_path, capsys):
         policy_pack=str(policy_dir),
         complexity="low",
         dry_run=False,
+        ncp_mode="direct",
+        ncp_router=False,
     )
 
     cli.handle_run(args)
@@ -136,6 +142,8 @@ def test_handle_run_reports_paused_graph_execution(tmp_path, capsys, monkeypatch
         policy_pack=str(policy_dir),
         complexity="low",
         dry_run=False,
+        ncp_mode="direct",
+        ncp_router=False,
     )
 
     cli.handle_run(args)

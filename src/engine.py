@@ -396,7 +396,7 @@ class Engine:
         dispatcher: Dispatcher | None = None,
         enforce_preflight: bool = False,
         # NCP integration params
-        ncp_enabled: bool = False,
+        ncp_enabled: bool | None = None,
         ncp_mode: str = "direct",
         ncp_router: bool = False,
         ncp_endpoint: str = "http://127.0.0.1:4242/mcp",
@@ -414,9 +414,30 @@ class Engine:
         self.phase_handlers = self._create_phase_handlers()
         
         # NCP adapter wiring
-        self.ncp_enabled = ncp_enabled
         self.ncp_mode = ncp_mode
         self.ncp_router_enabled = ncp_router
+        self.ncp_endpoint = ncp_endpoint
+        
+        # Auto-detect NCP when not explicitly enabled/disabled
+        _ncp_explicit = ncp_enabled is not None
+        if ncp_enabled is None:
+            ncp_enabled = self._probe_ncp()
+            if ncp_enabled:
+                print("[ncp] NCP detected, using NCP adapters")
+            else:
+                print("[ncp] NCP not available, using native adapters")
+        
+        # Validate NCP when enabled before creating adapters
+        if ncp_enabled:
+            try:
+                self._validate_ncp_available()
+            except NCPNotAvailableError:
+                if _ncp_explicit:
+                    raise
+                print("[ncp] NCP validation failed, falling back to native adapters")
+                ncp_enabled = False
+        
+        self.ncp_enabled = ncp_enabled
         
         if ncp_enabled:
             self.context_adapter = NCPContextAdapter(mode=ncp_mode, endpoint=ncp_endpoint)
@@ -431,10 +452,6 @@ class Engine:
             
         self.recovery_runner = RecoveryRunner(dispatcher=self.dispatcher)
         self.phases = list(Phase)
-        
-        # Validate NCP connectivity on init if enabled
-        if ncp_enabled:
-            self._validate_ncp_available()
 
     def _load_policy_section(self, policy_name: str) -> dict[str, Any]:
         """Return a parsed policy section (mirrors PhaseHandler._load_policy_section)."""
@@ -953,6 +970,18 @@ class Engine:
             return confidence >= threshold, confidence
 
         return True, 1.0
+
+    @staticmethod
+    def _probe_ncp() -> bool:
+        """Probe whether NCP is available on this system."""
+        import shutil
+        cwd = Path.cwd().resolve()
+        for parent in [cwd] + list(cwd.parents):
+            if (parent / ".ncp" / "run.py").exists():
+                return True
+        if shutil.which("ncp") is None:
+            return False
+        return True
 
     def _validate_ncp_available(self) -> None:
         """Check NCP is reachable. Raises NCPNotAvailableError if not."""

@@ -42,8 +42,20 @@ except ImportError:
 import time
 
 
-def _resolve_workspace_ncp(cwd: str) -> bool:
-    """Read ncp_enabled from workspace metadata in shared storage."""
+def _resolve_workspace_ncp(args, cwd: str) -> bool | None:
+    """Resolve ncp_enabled from CLI flags and workspace metadata.
+    
+    Returns:
+        True  → force NCP (--ncp flag or workspace metadata)
+        False → force native (--no-ncp flag)
+        None  → auto-detect (no explicit preference)
+    """
+    if getattr(args, 'no_ncp', False):
+        return False
+    if getattr(args, 'ncp', False):
+        return True
+    
+    # Check workspace metadata
     from pathlib import Path
     try:
         from src.storage import Storage, connect
@@ -59,13 +71,16 @@ def _resolve_workspace_ncp(cwd: str) -> bool:
                     for ws in storage.list_workspaces():
                         ws_path = ws.get("root_path", "")
                         if ws_path and cwd.startswith(ws_path):
-                            return bool((ws.get("metadata") or {}).get("ncp_enabled", False))
+                            meta = ws.get("metadata") or {}
+                            if "ncp_enabled" in meta:
+                                return bool(meta["ncp_enabled"])
+                            return None  # absent → auto-detect
                 finally:
                     conn.close()
                 break
     except Exception:
         pass
-    return False
+    return None  # no workspace found → auto-detect
 
 
 # ============================================================================
@@ -410,7 +425,7 @@ def main() -> None:
     init_parser.add_argument(
         "--ncp",
         action="store_true",
-        help="Initialize with NCP context protocol",
+        help="Initialize with NCP context protocol (bootstraps .ncp/ directory required for auto-detect)",
     )
 
     # Validate command
@@ -458,7 +473,12 @@ def main() -> None:
     run_parser.add_argument(
         "--ncp",
         action="store_true",
-        help="Enable NCP (Neural Context Protocol) as the context/persistence/artifact backend. Requires 'ncp init' to be run in the project directory first.",
+        help="Force NCP (Neural Context Protocol) as the context backend. Fails if NCP is unavailable.",
+    )
+    run_parser.add_argument(
+        "--no-ncp",
+        action="store_true",
+        help="Disable NCP and use native Sarathi adapters.",
     )
     run_parser.add_argument(
         "--ncp-mode",
@@ -756,7 +776,7 @@ def handle_run(args: argparse.Namespace) -> None:
     engine = Engine(
         policy_pack_path=policy_pack,
         enforce_preflight=True,
-        ncp_enabled=args.ncp or _resolve_workspace_ncp(os.getcwd()),
+        ncp_enabled=_resolve_workspace_ncp(args, os.getcwd()),
         ncp_mode=args.ncp_mode,
         ncp_router=args.ncp_router,
     )

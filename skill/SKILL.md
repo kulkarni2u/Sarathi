@@ -37,8 +37,11 @@ Use `--ncp` when the task would benefit from NCP-backed context management.
 ### Global Copilot install example
 
 ```bash
-cd /Users/sweethome/Work/Skills
-./install_global_copilot_skill.sh --target "$HOME/.copilot/skills"
+git clone https://github.com/kulkarni2u/Sarathi.git
+cd Sarathi
+python3 -m pip install -e .
+# symlink skill/ into your global Copilot skills directory
+ln -s "$(pwd)/skill" "$HOME/.copilot/skills/sarathi"
 ```
 
 Example agent entry
@@ -48,8 +51,7 @@ Example agent entry
   trigger:
     when: "the task requires a structured planning, build, verify, review, and learn workflow"
   command: |
-    cd Sarathi
-    python3 -m pip install -e .
+    cd /path/to/Sarathi
     sarathi run "{{task_description}}" --policy-pack ./policy-pack --dry-run [--ncp] [--ncp-mode direct|mcp] [--ncp-router]
 ```
 

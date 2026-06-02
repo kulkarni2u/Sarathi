@@ -14,7 +14,7 @@ A generic, tool-agnostic workflow orchestration framework for AI agents. Defines
    ```bash
    python3 -m src.service --db ~/.sarathi/sarathi.db --port 8765
    ```
-   The service writes `~/.sarathi/service.json` on start. The desktop auto-discovers it. No `sarathi-runtime.js` or token configuration required for local use.
+   The service writes `~/.sarathi/service.json` on start. No token configuration required for local connections.
 3. **Attach this skill to your agent**: copy this folder (or symlink it) into the skills directory your product expects, then invoke the skill when you want the Sarathi lifecycle.
    - **Cursor**: project `.cursor/skills/sarathi/SKILL.md` (or your global skills path).
    - **Claude Code / Claude plugins**: project `.claude/skills/sarathi/SKILL.md` or `~/.claude/skills/…`.
@@ -241,7 +241,7 @@ regardless of which provider is active (Claude, Codex, OpenCode, Copilot, or cus
 6. **Hard gate** — no transition to Plan until:
    - All four evidence dimensions covered in spec
    - Spec self-review passed (no unresolved issues)
-   - User approves (Desktop Approve button or terminal `y`)
+   - User approves (terminal `y`)
    - `POST /api/brainstorm/:id/approve` returns `{ session, task }`
    - Task record exists in SQLite
 

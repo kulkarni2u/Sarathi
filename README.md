@@ -8,8 +8,7 @@ It gives teams a consistent lifecycle for planning, building, verifying, reviewi
 - A local CLI (`sarathi`) to initialize, validate, and run workflows
 - A policy-pack model to keep behavior explicit and auditable
 - A phase-based engine that can scale from simple tasks to complex work
-- A companion standalone skill pack (in `../Sarathi-Skill` in this workspace)
-- A local desktop app (`sarathi-desktop`) with a task graph cockpit and live provider dispatch
+- A portable agent skill pack (in `skill/SKILL.md`) for Claude Code, Codex, Copilot, and OpenCode
 
 ## Quick Start
 
@@ -75,29 +74,6 @@ sarathi proposals --policy-pack ./policy-pack --accept <proposal_id>
 sarathi agents               # Show Sanskrit-inspired agent role names and phase mapping
 ```
 
-### Desktop local stack
-
-```bash
-sarathi desktop
-# or
-sarathi-desktop
-# or
-python3 -m src.service.desktop
-# or
-npm --prefix desktop run desktop
-```
-
-Useful helpers:
-
-```bash
-python3 -m src.service.desktop --print-config
-python3 -m src.service.desktop --service-port 0 --vite-port 0
-python3 -m src.service.desktop --service-timeout 30
-python3 -m src.service.desktop --service-only
-```
-
-The launcher starts the local service on `127.0.0.1`, generates a per-run token unless you provide one, writes runtime config for the UI, and restores the runtime stub on shutdown. `--service-timeout` is useful on slower machines or larger local databases where the default health-check deadline may be too short.
-
 ### Workspace Repository Bootstrap
 
 When a repository is attached to a workspace through the local service:
@@ -126,7 +102,7 @@ Task-graph snapshots exposed by the local service now also include orchestration
 - `fan_in_nodes`
 - `coordination_state`
 
-Workspace policy packs can also opt into cascade scheduling for the desktop/service task runtime:
+Workspace policy packs can also opt into cascade scheduling for the service task runtime:
 
 ```yaml
 graph_execution:
@@ -168,7 +144,7 @@ providers:
 
 The runtime also exposes `TaskScheduler` for phase-independent graph work-unit scheduling.
 
-For desktop/task dispatch, workspace provider settings now feed real service-side routing:
+Workspace provider settings feed service-side routing:
 
 - `local` — deterministic built-in (default for tests and dry-runs)
 - `claude` — native `claude -p {prompt} --output-format json --dangerously-skip-permissions` bridge; unwraps the Claude Code JSON envelope automatically
@@ -195,11 +171,11 @@ providers:
 
 Set `SARATHI_DISPATCH_TIMEOUT=300` (or higher) when running real provider dispatch to avoid the thread-level timeout firing before the subprocess completes.
 
-Native Claude/Copilot runs now execute from the workspace root and persist bridge metadata such as CLI family, invocation kind, and workspace root so Task Studio evidence can distinguish native provider behavior from generic command shims.
+Native Claude/Copilot runs execute from the workspace root and persist bridge metadata such as CLI family, invocation kind, and workspace root inside dispatch evidence.
 
-Recovery loops also carry provider context forward. When verify/review retries are triggered, Sarathi can now classify failures such as `auth`, `provider_offline`, and `native_cli_failure`, then pass that class into provider-backed recovery actions and retry guidance.
+Recovery loops carry provider context forward. When verify/review retries are triggered, Sarathi classifies failures such as `auth`, `provider_offline`, and `native_cli_failure` and passes that context into recovery actions and retry guidance.
 
-Provider-backed dispatch evidence can also carry structured `review_trace` findings. Sarathi review runs now persist those trace findings with provider/file/line metadata and surface provider trace counts in review summaries so Task Studio can reason about more than changed-file scope.
+Provider-backed dispatch evidence can also carry structured `review_trace` findings. Sarathi persists those with provider/file/line metadata and surfaces provider trace counts in review summaries.
 
 Dispatch evidence can now also carry:
 
@@ -244,7 +220,7 @@ sarathi run --ncp "task description"
 - `--ncp-mode {direct|mcp}` — transport mode (default: direct)
 - `--ncp-router` — enable whisper-based cross-phase signaling
 
-NCP can be toggled in the Settings page of the Sarathi Desktop UI.
+NCP can be toggled via `--ncp` / `--no-ncp` flags or set as the default in `model-routing.md`.
 
 ## Repository Layout
 
@@ -260,11 +236,13 @@ Sarathi/
 
 ## Companion Skill Pack
 
-This repo contains the CLI framework.  
-The standalone agent skill documentation is in the `Sarathi-Skill` package (`SKILL.md`).
-If you publish both in one repo, include `Sarathi-Skill/` at the repository root.
+This repo contains both the CLI framework and the portable skill pack.
 
-For GitHub Copilot agent-mode integration, this repo also includes a repo-local `AGENTS.md` entry that documents how to register Sarathi with Copilot.
+- `skill/SKILL.md` — attach to any agent host (Claude Code, Codex CLI, Copilot, OpenCode)
+- `skill/policy-pack/` — EXAMPLE and TEMPLATE policy packs for bootstrapping new projects
+- `skill/reference/` — policy reference docs the skill reads at runtime
+
+For GitHub Copilot agent-mode integration, see the agent entry example in `skill/SKILL.md`.
 
 ## Contributing
 

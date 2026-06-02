@@ -15,8 +15,7 @@
 6. [Policy Pack Setup](#6-policy-pack-setup)
 7. [Common Workflows](#7-common-workflows)
 8. [Task Management](#8-task-management)
-9. [Desktop Local Stack](#9-desktop-local-stack)
-10. [Troubleshooting](#10-troubleshooting)
+9. [Troubleshooting](#9-troubleshooting)
 
 ---
 
@@ -121,7 +120,7 @@ Summary: 8 PASS, 0 DRIFT, 2 TODO
 
 ### 3.3 Provider Dispatch Options
 
-Workspace provider settings are now used by the local service when a subtask is dispatched from the desktop UI:
+Workspace provider settings are used by the local service when a subtask is dispatched:
 
 - `local` uses the deterministic built-in adapter.
 - `codex` uses a native `codex exec` bridge when the Codex CLI is installed.
@@ -132,7 +131,7 @@ For native Claude/Copilot runs, Sarathi now executes the provider from the works
 
 Those provider details also feed the bounded recovery loop: verify/review retries can now carry forward provider context plus a classified recovery reason such as `auth`, `provider_offline`, or `native_cli_failure`.
 
-If a provider emits `review_trace` data inside dispatch evidence, Sarathi now lifts that into persisted review findings with provider/file/line metadata and includes provider trace counts in review summaries shown by the desktop UI.
+If a provider emits `review_trace` data inside dispatch evidence, Sarathi lifts that into persisted review findings with provider/file/line metadata and includes provider trace counts in review summaries.
 
 If a provider emits `diff_trace` or `spec_trace` data, Sarathi also persists:
 
@@ -153,7 +152,7 @@ Provider `diff_trace` hunks can now also include:
 - `confidence` as a numeric provider signal
 - `suggestion` for the likely remediation
 
-Sarathi persists those on the review findings and rolls them up into review metadata so the desktop UI can show diff blockers, average diff confidence, risk categories, and highlighted patch regions.
+Sarathi persists those on the review findings and rolls them up into review metadata including diff blockers, average diff confidence, risk categories, and highlighted patch regions.
 
 Sarathi now also clusters neighboring hunks in the same file/category into grouped patch regions and computes a final `review_confidence_verdict` plus explicit reasons such as blocker count or low average confidence. This makes the review output easier to scan than a flat list of hunk findings.
 
@@ -174,9 +173,9 @@ The current bootstrap creates or reconciles:
 - `learnings.md`
 - the full canonical `policy-pack/` file set
 
-### 3.4.1 Policy-Driven Desktop Scheduler
+### 3.4.1 Policy-Driven Cascade Scheduling
 
-The local desktop/service runtime can auto-start ready task-graph units when a workspace policy pack enables it:
+The service runtime can auto-start ready task-graph units when a workspace policy pack enables it:
 
 ```yaml
 graph_execution:
@@ -185,9 +184,9 @@ graph_execution:
 
 With that enabled:
 
-1. approving the `Task graph` gate can immediately start ready root units
-2. completing a blocker can automatically start newly unblocked downstream units
-3. manual `Schedule ready units` remains available as an explicit fallback
+1. approving the task graph gate immediately starts ready root units
+2. completing a blocker automatically starts newly unblocked downstream units
+3. manual scheduling remains available as an explicit fallback
 
 ### 3.3 Run a Task
 
@@ -209,32 +208,6 @@ sarathi run "Refactor database layer" --complexity high --policy-pack ./policy-p
 | Low | Bug fix, docs, single file | Yes |
 | Medium | Multi-file, new feature | Yes |
 | High | Architecture, security, multi-service | No |
-
-### 3.5 Start The Desktop Stack
-
-```bash
-sarathi-desktop
-# or
-python3 -m src.service.desktop
-# or
-npm --prefix desktop run desktop
-```
-
-Useful startup variants:
-
-```bash
-python3 -m src.service.desktop --print-config
-python3 -m src.service.desktop --service-port 0 --vite-port 0
-python3 -m src.service.desktop --service-only
-```
-
-What the launcher does:
-
-- starts the local Python service on `127.0.0.1`
-- generates a per-run token unless you provide one
-- writes runtime config for the desktop shell
-- starts the Vite UI with matching service config
-- restores the runtime config stub when the launcher exits
 
 ---
 
@@ -551,20 +524,7 @@ Policy Proposals: 2
 
 ---
 
-## 9. Desktop Local Stack
-
-The desktop shell now supports runtime configuration without rebuilding the UI.
-
-Runtime config source order:
-
-1. `window.__SARATHI_RUNTIME_CONFIG__` from `desktop/public/sarathi-runtime.js`
-2. Vite env vars such as `VITE_SARATHI_API_BASE_URL` and `VITE_SARATHI_API_TOKEN`
-
-This allows the Python launcher to wire the UI and local service together as one session.
-
----
-
-## 10. Troubleshooting
+## 9. Troubleshooting
 
 ### 9.1 "Command not found: sarathi"
 

@@ -10,9 +10,9 @@ def test_cli_run_ncp_dry_run(tmp_path):
     # Set up mock NCP environment so Engine._validate_ncp_available() passes
     ncp_dir = tmp_path / ".ncp"
     ncp_dir.mkdir(parents=True, exist_ok=True)
-    (ncp_dir / "run.py").write_text(
-        "#!/usr/bin/env python3\nimport sys; sys.exit(0)"
-    )
+    run_py = ncp_dir / "run.py"
+    run_py.write_text("#!/usr/bin/env python3\nimport sys; sys.exit(0)")
+    run_py.chmod(0o755)
 
     # Set up minimal policy pack (auto-discovered from cwd)
     policy_dir = tmp_path / "policy-pack"

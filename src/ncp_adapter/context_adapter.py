@@ -29,11 +29,14 @@ class NCPContextAdapter:
     def check_available(self) -> bool:
         """Validate NCP connectivity. Returns True if reachable."""
         if self.mode == "direct":
-            result = subprocess.run(
-                [sys.executable, str(self.run_path), "status"],
-                capture_output=True, text=True, timeout=5,
-            )
-            return result.returncode == 0
+            try:
+                result = subprocess.run(
+                    [str(self.run_path), "status"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                return result.returncode == 0
+            except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+                return False
         else:
             import httpx
             try:
@@ -99,7 +102,7 @@ class NCPContextAdapter:
         """Call NCP get_context via direct API or MCP."""
         if self.mode == "direct":
             result = subprocess.run(
-                [sys.executable, str(self.run_path), "get_context", json.dumps(args)],
+                [str(self.run_path), "get_context", json.dumps(args)],
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode != 0:

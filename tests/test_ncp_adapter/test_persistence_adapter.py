@@ -26,6 +26,7 @@ class TestNCPPersistenceAdapter:
     def test_save_task_without_ncp_raises_error(self, tmp_path):
         run_py = tmp_path / "run.py"
         run_py.write_text("#!/usr/bin/env python3\nimport sys; sys.exit(1)")
+        run_py.chmod(0o755)
         adapter = NCPPersistenceAdapter(mode="direct", run_path=str(run_py))
         with pytest.raises(RuntimeError, match="NCP write_memory failed"):
             adapter.save_task(_task_stub("t1"))
@@ -38,6 +39,7 @@ class TestNCPPersistenceAdapter:
     def test_load_task_returns_none_when_missing(self, tmp_path):
         run_py = tmp_path / "run.py"
         run_py.write_text("#!/usr/bin/env python3\nimport sys; sys.exit(0)")
+        run_py.chmod(0o755)
         adapter = NCPPersistenceAdapter(mode="direct", run_path=str(run_py))
         result = adapter.load_task("nonexistent")
         assert result is None
@@ -45,6 +47,7 @@ class TestNCPPersistenceAdapter:
     def test_list_tasks_returns_empty_when_no_output(self, tmp_path):
         run_py = tmp_path / "run.py"
         run_py.write_text("#!/usr/bin/env python3\nimport sys; sys.exit(0)")
+        run_py.chmod(0o755)
         adapter = NCPPersistenceAdapter(mode="direct", run_path=str(run_py))
         result = adapter.list_tasks()
         assert result == []

@@ -87,7 +87,9 @@ def test_e2e_ncp_explicit_flag(tmp_path):
     # Engine validates NCP via direct transport which needs .ncp/run.py
     ncp_dir = tmp_path / ".ncp"
     ncp_dir.mkdir(parents=True, exist_ok=True)
-    (ncp_dir / "run.py").write_text("#!/usr/bin/env python3\nimport sys; sys.exit(0)")
+    run_py = ncp_dir / "run.py"
+    run_py.write_text("#!/usr/bin/env python3\nimport sys; sys.exit(0)")
+    run_py.chmod(0o755)
     subprocess.run(["ncp", "init"], capture_output=True, cwd=str(tmp_path))
 
     result = _run_sarathi(tmp_path, "run", "--ncp", "--dry-run", "e2e explicit test")

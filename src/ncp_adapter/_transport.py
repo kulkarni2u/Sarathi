@@ -61,7 +61,7 @@ class NCPTransportMixin:
 
         if self.mode == "direct":
             result = subprocess.run(
-                [sys.executable, str(self.run_path), "log_cost", json.dumps(args)],
+                [str(self.run_path), "log_cost", json.dumps(args)],
                 capture_output=True, text=True, timeout=_TRANSPORT_TIMEOUT,
             )
             if result.returncode != 0:
@@ -100,7 +100,7 @@ class NCPTransportMixin:
         }
         if self.mode == "direct":
             result = subprocess.run(
-                [sys.executable, str(self.run_path), "write_memory", json.dumps(args)],
+                [str(self.run_path), "write_memory", json.dumps(args)],
                 capture_output=True, text=True, timeout=_TRANSPORT_TIMEOUT,
             )
             if result.returncode != 0:
@@ -132,7 +132,7 @@ class NCPTransportMixin:
         args = {"query": query, "k": k}
         if self.mode == "direct":
             result = subprocess.run(
-                [sys.executable, str(self.run_path), "fetch", json.dumps(args)],
+                [str(self.run_path), "fetch", json.dumps(args)],
                 capture_output=True, text=True, timeout=_TRANSPORT_TIMEOUT,
             )
             if result.returncode != 0:

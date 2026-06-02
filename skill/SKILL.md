@@ -18,7 +18,7 @@ A generic, tool-agnostic workflow orchestration framework for AI agents. Defines
 3. **Attach this skill to your agent**: copy this folder (or symlink it) into the skills directory your product expects, then invoke the skill when you want the Sarathi lifecycle.
    - **Cursor**: project `.cursor/skills/sarathi/SKILL.md` (or your global skills path).
    - **Claude Code / Claude plugins**: project `.claude/skills/sarathi/SKILL.md` or `~/.claude/skills/…`.
-   - **GitHub Copilot (agent mode)**: merge the workflow into repo `AGENTS.md` / agent instructions, or your org's skill bundle location. Use `Sarathi-Skill/SKILL.md` as the Copilot skill entry and register the agent in this repo's `AGENTS.md` for repo-local discovery.
+   - **GitHub Copilot (agent mode)**: merge the workflow into repo `AGENTS.md` / agent instructions, or your org's skill bundle location. Use this repo's `skill/SKILL.md` as the Copilot skill entry and register the agent in this repo's `AGENTS.md` for repo-local discovery.
    - **OpenAI Codex CLI**: `~/.codex/skills/sarathi/SKILL.md` or workspace `.codex/skills/sarathi/SKILL.md`.
    - **OpenCode**: `~/.opencode/skills/sarathi/SKILL.md` or workspace `.opencode/skills/sarathi/SKILL.md`.
 
@@ -26,10 +26,10 @@ A generic, tool-agnostic workflow orchestration framework for AI agents. Defines
 
 To add Sarathi to Copilot agent mode:
 1. Install Sarathi from the `Sarathi/` folder in the environment Copilot uses.
-2. Add `Sarathi-Skill/SKILL.md` to your Copilot skills directory, shared skill bundle, or global Copilot skills directory.
+2. Add `skill/SKILL.md` to your Copilot skills directory, shared skill bundle, or global Copilot skills directory.
    - For repo-local use: place the skill under the repo's Copilot skills path.
    - For org-wide use: add the skill to your shared agent bundle.
-   - For global Copilot use: symlink or copy `Sarathi-Skill/` into your global Copilot skills directory.
+   - For global Copilot use: symlink or copy `skill/` into your global Copilot skills directory.
 3. Register the Sarathi agent in `AGENTS.md` using the repo-local entry or your Copilot agent registry.
 
 Use `--ncp` when the task would benefit from NCP-backed context management.

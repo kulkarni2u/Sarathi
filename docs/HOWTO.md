@@ -285,7 +285,7 @@ planner = get_agent_role("planner")  # Returns Disha
 
 ### 5.1 Attach Skill to Agent
 
-Copy `Sarathi-Skill/` folder to your agent's skills directory:
+Copy the repo's `skill/` folder to your agent's skills directory:
 
 | Agent | Skill Location |
 |-------|---------------|
@@ -297,7 +297,7 @@ Copy `Sarathi-Skill/` folder to your agent's skills directory:
 ### 5.2 GitHub Copilot Setup
 
 ```bash
-./install_global_copilot_skill.sh --target "$HOME/.copilot/skills"
+ln -s "$(pwd)/skill" "$HOME/.copilot/skills/sarathi"
 ```
 
 Then in your `AGENTS.md`:
@@ -612,5 +612,5 @@ export PYTHONPATH="${PYTHONPATH}:/path/to/Sarathi/src"
 ## Support
 
 - **Issues:** https://github.com/kulkarni2u/Sarathi/issues
-- **Docs:** See `DESIGN.md`, `IMPLEMENTATION_PLAN.md`
-- **Skill:** See `Sarathi-Skill/SKILL.md`
+- **Docs:** See `README.md` and `DESIGN.md`
+- **Skill:** See `skill/SKILL.md`

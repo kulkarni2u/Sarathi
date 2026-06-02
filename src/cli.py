@@ -662,7 +662,7 @@ def handle_init(args: argparse.Namespace) -> None:
 
         # 1. Run ncp init to bootstrap
         ncp_init_result = subprocess.run(
-            [sys.executable, "-m", "ncp", "init"],
+            ["ncp", "init"],
             capture_output=True, text=True, cwd=str(init_target),
         )
         if ncp_init_result.returncode == 0:

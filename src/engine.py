@@ -344,6 +344,10 @@ class PersistenceManager:
             json.dump(log_entry, f)
             f.write('\n')
 
+    def log_cost(self, *args, **kwargs) -> None:
+        """Log cost (no-op for native PersistenceManager)."""
+        pass
+
 
 @dataclass
 class TaskContext:
@@ -803,6 +807,7 @@ class Engine:
             self._attach_agent_role(result)
             self._attach_gate_result(result)
             self._attach_artifact_refs(task, result)
+            self._log_phase_cost(result, phase)
             return result
         except Exception as e:
             result = PhaseResult(
@@ -813,6 +818,27 @@ class Engine:
             self._attach_agent_role(result)
             self._attach_artifact_refs(task, result)
             return result
+
+    def _log_phase_cost(self, result: PhaseResult, phase: Phase) -> None:
+        """Log token usage from a phase result to NCP cost log."""
+        usage = result.artifacts.get("dispatch_usage")
+        if usage is not None and hasattr(self.persistence, "log_cost"):
+            self.persistence.log_cost(usage, pipeline_id=f"sarathi.{phase.value}")
+
+        # Also extract usage from graph executor events (build phase)
+        graph_exec = result.artifacts.get("task_graph_execution", {})
+        if isinstance(graph_exec, dict):
+            for event in graph_exec.get("events", []):
+                provider_result = event.get("provider_result", {}) if isinstance(event, dict) else {}
+                if isinstance(provider_result, dict):
+                    node_usage = provider_result.get("usage")
+                    if node_usage is not None and hasattr(self.persistence, "log_cost"):
+                        node_label = provider_result.get("title") or provider_result.get("objective", "graph-node")
+                        self.persistence.log_cost(
+                            node_usage,
+                            pipeline_id=f"sarathi.{phase.value}",
+                            agent_id=node_usage.get("provider_id", "graph_executor"),
+                        )
 
     def _log_phase(self, task: TaskContext, phase: Phase, status: str) -> None:
         """Log phase transition and persist task state."""
@@ -837,7 +863,7 @@ class Engine:
         if result.phase not in {Phase.BRAINSTORM, Phase.PLAN}:
             return
 
-        threshold = 0.90
+        threshold = 0.80 if result.phase == Phase.BRAINSTORM else 0.90
         _gate_keys = {
             Phase.BRAINSTORM: {
                 "alternative_approaches_considered",
@@ -973,15 +999,38 @@ class Engine:
 
     @staticmethod
     def _probe_ncp() -> bool:
-        """Probe whether NCP is available on this system."""
+        """Probe whether NCP is available on this system (local project only)."""
         import shutil
-        cwd = Path.cwd().resolve()
-        for parent in [cwd] + list(cwd.parents):
-            if (parent / ".ncp" / "run.py").exists():
-                return True
+        import subprocess
+        from pathlib import Path
+
+        # Quick check: ncp CLI must be on PATH
         if shutil.which("ncp") is None:
             return False
-        return True
+
+        # Check for .ncp/ in CWD or up to 3 parent levels
+        cwd = Path.cwd().resolve()
+        found_local_ncp = False
+        for i, parent in enumerate([cwd] + list(cwd.parents)):
+            if i > 3:
+                break
+            ncp_dir = parent / ".ncp"
+            if ncp_dir.is_dir() and (ncp_dir / "config.toml").exists():
+                found_local_ncp = True
+                break
+
+        if not found_local_ncp:
+            return False
+
+        # Verify NCP is actually functional
+        try:
+            result = subprocess.run(
+                ["ncp", "status"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
 
     def _validate_ncp_available(self) -> None:
         """Check NCP is reachable. Raises NCPNotAvailableError if not."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from typing import Any, Mapping
 
@@ -16,6 +17,19 @@ def _get_field(obj: Any, field: str, default: Any = None) -> Any:
         return getattr(obj, field, default)
 
 
+def _to_jsonable(value: Any) -> Any:
+    """Recursively convert enums, dataclasses, and non-serializable types to JSON-safe values."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _to_jsonable(dataclasses.asdict(value))
+    if hasattr(value, "value") and not isinstance(value, (dict, list)):
+        return value.value
+    if isinstance(value, dict):
+        return {k: _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    return value
+
+
 class NCPPersistenceAdapter(NCPTransportMixin):
     """Adapts Sarathi persistence calls to NCP write_memory and fetch."""
 
@@ -23,19 +37,30 @@ class NCPPersistenceAdapter(NCPTransportMixin):
     # Public API
     # ------------------------------------------------------------------
 
+    _NCP_MAX_CONTENT = 2000
+
     def save_task(self, task: Mapping[str, Any]) -> None:
         """Serialize a task and persist it via NCP write_memory."""
         task_id = _get_field(task, "task_id")
         if not task_id:
             raise ValueError("task must have a non-empty 'task_id' field")
+        phase_results = _to_jsonable(list(_get_field(task, "phase_results", [])))
+        # Compact phase_results to just outcome summaries so content stays within NCP limit.
+        compact_results = [
+            {"phase": r.get("phase"), "outcome": r.get("outcome")}
+            if isinstance(r, dict) else r
+            for r in phase_results
+        ]
         content = json.dumps({
             "_sarathi_type": "TaskContext",
             "task_id": task_id,
             "description": _get_field(task, "description"),
-            "complexity": _get_field(task, "complexity"),
-            "current_phase": _get_field(task, "current_phase"),
-            "phase_results": list(_get_field(task, "phase_results", [])),
+            "complexity": _to_jsonable(_get_field(task, "complexity")),
+            "current_phase": _to_jsonable(_get_field(task, "current_phase")),
+            "phase_results": compact_results,
         })
+        if len(content) > self._NCP_MAX_CONTENT:
+            content = content[: self._NCP_MAX_CONTENT - 3] + "..."
         self._call_write_memory(
             content, "episodic", "tool_result", f"sarathi.engine.{task_id}",
         )
@@ -75,16 +100,55 @@ class NCPPersistenceAdapter(NCPTransportMixin):
         """Persist a phase-log entry for a task."""
         content = json.dumps({
             "task_id": _get_field(task, "task_id"),
-            "phase": phase,
-            "status": status,
+            "phase": _to_jsonable(phase),
+            "status": _to_jsonable(status),
         })
         self._call_write_memory(
             content, "reasoning_trace", "tool_result", f"sarathi.engine.{_get_field(task, 'task_id')}",
         )
 
+    def log_cost(
+        self,
+        usage_record: dict[str, Any] | None = None,
+        *,
+        agent_id: str = "sarathi",
+        model: str = "unknown",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost_usd: float = 0.0,
+        pipeline_id: str | None = None,
+        latency_ms: int = 0,
+    ) -> None:
+        """Log dispatch cost to NCP's cost log.
+
+        Accepts a usage_record dict (from ``UsageRecord.to_artifact()``) or
+        explicit keyword arguments. When *usage_record* is provided its values
+        take precedence over explicit args.
+        """
+        if usage_record is not None:
+            agent_id = usage_record.get("provider_id", agent_id) or agent_id
+            input_tokens = int(usage_record.get("input_tokens", input_tokens) or input_tokens)
+            output_tokens = int(usage_record.get("output_tokens", output_tokens) or output_tokens)
+
+        if input_tokens == 0 and output_tokens == 0:
+            return
+
+        try:
+            self._call_log_cost(
+                agent_id=agent_id,
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=cost_usd,
+                pipeline_id=pipeline_id,
+                latency_ms=latency_ms,
+            )
+        except RuntimeError:
+            pass
+
     def save_learning(self, learning_record: Mapping[str, Any]) -> None:
         """Persist a learning record to semantic memory."""
-        content = json.dumps(learning_record)
+        content = json.dumps(_to_jsonable(dict(learning_record)))
         self._call_write_memory(
             content, "semantic", "synthesis", "sarathi.engine.learning",
         )

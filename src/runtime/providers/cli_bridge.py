@@ -21,8 +21,10 @@ from typing import Any
 
 try:
     from ..contracts import DispatchRequest, DispatchResponse, build_usage_record
+    from ..agent_roles import PHASE_AGENT_ROLE_KEYS
 except ImportError:
     from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
+    from runtime.agent_roles import PHASE_AGENT_ROLE_KEYS
 
 
 def dispatch_via_cli_bridge(
@@ -49,7 +51,7 @@ def dispatch_via_cli_bridge(
 
 
 def _run_codex(*, path: str, workspace_root: str, request: DispatchRequest) -> DispatchResponse:
-    prompt = _provider_prompt("codex", request)
+    prompt = _provider_prompt("codex", request, workspace_root)
     with tempfile.NamedTemporaryFile("w+", suffix="-sarathi-codex.txt", delete=False) as handle:
         output_path = Path(handle.name)
     command = [
@@ -74,7 +76,7 @@ def _run_codex(*, path: str, workspace_root: str, request: DispatchRequest) -> D
         output_path.unlink(missing_ok=True)
     except OSError:
         pass
-    return _normalize_native_response(
+    response = _normalize_native_response(
         provider="codex",
         path=path,
         workspace_root=workspace_root,
@@ -83,10 +85,11 @@ def _run_codex(*, path: str, workspace_root: str, request: DispatchRequest) -> D
         completed=completed,
         message=message,
     )
+    return _ncp_fetch_after_dispatch(workspace_root, request, response)
 
 
 def _run_copilot(*, path: str, workspace_root: str, request: DispatchRequest) -> DispatchResponse:
-    prompt = _provider_prompt("copilot", request)
+    prompt = _provider_prompt("copilot", request, workspace_root)
     executable = Path(path).name
     if executable == "gh":
         command = [path, "copilot", "--", "-p", prompt]
@@ -101,7 +104,7 @@ def _run_copilot(*, path: str, workspace_root: str, request: DispatchRequest) ->
         check=False,
     )
     message = (completed.stdout or "").strip()
-    return _normalize_native_response(
+    response = _normalize_native_response(
         provider="copilot",
         path=path,
         workspace_root=workspace_root,
@@ -110,6 +113,7 @@ def _run_copilot(*, path: str, workspace_root: str, request: DispatchRequest) ->
         completed=completed,
         message=message,
     )
+    return _ncp_fetch_after_dispatch(workspace_root, request, response)
 
 
 def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> DispatchResponse:
@@ -119,7 +123,7 @@ def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> 
             workspace_root=workspace_root,
             request=request,
         )
-    prompt = _provider_prompt("claude", request)
+    prompt = _provider_prompt("claude", request, workspace_root)
     command = [
         path,
         "-p",
@@ -139,7 +143,7 @@ def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> 
     )
     # Unwrap the Claude Code JSON envelope: {"type":"result","result":"...","is_error":...}
     message = _extract_claude_result(completed.stdout)
-    return _normalize_native_response(
+    response = _normalize_native_response(
         provider="claude",
         path=path,
         workspace_root=workspace_root,
@@ -148,6 +152,7 @@ def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> 
         completed=completed,
         message=message,
     )
+    return _ncp_fetch_after_dispatch(workspace_root, request, response)
 
 
 def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -> DispatchResponse:
@@ -162,7 +167,7 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
             workspace_root=workspace_root,
             request=request,
         )
-    prompt = _provider_prompt("opencode", request)
+    prompt = _provider_prompt("opencode", request, workspace_root)
     command = [
         path,
         "run",
@@ -190,7 +195,7 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
         return_code = 1
 
     completed = subprocess.CompletedProcess(command, return_code, stdout=message, stderr="")
-    return _normalize_native_response(
+    response = _normalize_native_response(
         provider="opencode",
         path=path,
         workspace_root=workspace_root,
@@ -199,6 +204,7 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
         completed=completed,
         message=message,
     )
+    return _ncp_fetch_after_dispatch(workspace_root, request, response)
 
 
 def _free_port() -> int:
@@ -753,7 +759,84 @@ _PHASE_OUTPUT_KEYS: dict[str, list[str]] = {
 }
 
 
-def _provider_prompt(provider: str, request: DispatchRequest) -> str:
+# ------------------------------------------------------------------
+# NCP context helpers
+# ------------------------------------------------------------------
+
+_NCP_PROVIDERS = {"claude", "opencode"}
+
+
+def _ncp_available(workspace_root: str) -> bool:
+    """Return True when .ncp/run.py exists at workspace_root."""
+    return (Path(workspace_root) / ".ncp" / "run.py").exists()
+
+
+def _ncp_prompt_instructions(
+    provider: str,
+    request: DispatchRequest,
+    workspace_root: str | None,
+) -> list[str]:
+    """Build NCP open/close prompt lines for providers with bash access.
+
+    Returns empty list when NCP is unavailable or the provider doesn't
+    support bash execution (only claude and opencode do).
+    """
+    if workspace_root is None:
+        return []
+    if provider not in _NCP_PROVIDERS:
+        return []
+    if not _ncp_available(workspace_root):
+        return []
+
+    phase_role = PHASE_AGENT_ROLE_KEYS.get(request.phase, "pravaha")
+    task_trunc = request.prompt[:80].replace('"', "'")
+    intent = f"{request.phase} - {request.mode}"
+
+    return [
+        "",
+        "=== NCP Context Spine ===",
+        "This subagent MUST integrate with NCP (Neural Context Protocol) for cross-phase memory.",
+        "BEGIN -- Load prior context by running this command before any other work:",
+        f".ncp/run.py get_context '{{\"agent_id\":\"sarathi.{phase_role}\",\"role\":\"{phase_role}\",\"task\":\"{request.task_id}: {task_trunc}\",\"intent\":\"{intent}\"}}'",
+        "",
+        "END -- After all work is complete, persist your findings by running this command:",
+        f".ncp/run.py write_memory '{{\"content\":\"<findings summary: key decisions, file paths, evidence>\",\"layer\":\"episodic\",\"src\":\"tool_result\",\"written_by\":\"{phase_role}\"}}'",
+        "",
+        "Include your findings summary in the JSON response as outputs.ncp_findings.",
+        "========================",
+    ]
+
+
+def _ncp_fetch_after_dispatch(
+    workspace_root: str,
+    request: DispatchRequest,
+    response: DispatchResponse,
+) -> DispatchResponse:
+    """After subagent dispatch, fetch NCP findings written by the subagent.
+
+    Attaches fetch results to ``response.evidence.ncp_fetch_after_dispatch``
+    so callers can confirm the subagent's NCP memory writes persisted.
+    """
+    run_path = Path(workspace_root) / ".ncp" / "run.py"
+    if not run_path.exists():
+        return response
+
+    query = f"{request.phase} {request.prompt[:60]}"
+    try:
+        result = subprocess.run(
+            [sys.executable, str(run_path), "fetch", json.dumps({"query": query, "k": 2})],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            response.evidence["ncp_fetch_after_dispatch"] = result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    return response
+
+
+def _provider_prompt(provider: str, request: DispatchRequest, workspace_root: str | None = None) -> str:
+    ncp_lines = _ncp_prompt_instructions(provider, request, workspace_root)
     evidence_keys = _PHASE_EVIDENCE_KEYS.get(request.phase, [])
     output_keys = _PHASE_OUTPUT_KEYS.get(request.phase, request.expected_outputs)
     evidence_hint = (
@@ -783,6 +866,8 @@ def _provider_prompt(provider: str, request: DispatchRequest) -> str:
     if output_hint:
         lines.append(output_hint)
     lines.append("When executing a child task, include outputs.work_unit_result with node_id, title, status, provider, and summary.")
+    if ncp_lines:
+        lines = [*ncp_lines, *lines]
     return "\n".join(lines)
 
 

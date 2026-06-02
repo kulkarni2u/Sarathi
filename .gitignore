@@ -2,14 +2,22 @@
 __pycache__/
 *.py[cod]
 
+# Virtual environments
+.venv/
+venv/
+
 # Test/tool caches
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 
 # Local Sarathi task store
 .sarathi/
 .gstack/
 .superpowers/
+
+# NCP local store
+.ncp/
 
 # Runtime data
 data/

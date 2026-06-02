@@ -11,6 +11,7 @@ License-File: LICENSE
 Requires-Dist: PyYAML>=6.0.1
 Requires-Dist: textual>=0.90.0
 Requires-Dist: rich>=13.0.0
+Requires-Dist: httpx>=0.27.0
 Provides-Extra: dev
 Requires-Dist: pytest>=7.4; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
@@ -77,6 +78,7 @@ sarathi log <task_id>
 ```bash
 sarathi status <task_id>        # Show task status, graph progress, escalation summary
 sarathi resume <task_id>        # Resume a paused or failed task
+sarathi reuse                   # Show live workflow templates, saved views, and learned playbooks
 ```
 
 ### Policy proposals
@@ -97,6 +99,8 @@ sarathi agents               # Show Sanskrit-inspired agent role names and phase
 ### Desktop local stack
 
 ```bash
+sarathi desktop
+# or
 sarathi-desktop
 # or
 python3 -m src.service.desktop
@@ -109,10 +113,11 @@ Useful helpers:
 ```bash
 python3 -m src.service.desktop --print-config
 python3 -m src.service.desktop --service-port 0 --vite-port 0
+python3 -m src.service.desktop --service-timeout 30
 python3 -m src.service.desktop --service-only
 ```
 
-The launcher starts the local service on `127.0.0.1`, generates a per-run token unless you provide one, writes runtime config for the UI, and restores the runtime stub on shutdown.
+The launcher starts the local service on `127.0.0.1`, generates a per-run token unless you provide one, writes runtime config for the UI, and restores the runtime stub on shutdown. `--service-timeout` is useful on slower machines or larger local databases where the default health-check deadline may be too short.
 
 ### Workspace Repository Bootstrap
 
@@ -243,6 +248,24 @@ sarathi validate ./policy-pack --verbose
 # Run a task
 sarathi run "Add OAuth2 authentication" --policy-pack ./policy-pack
 ```
+
+## NCP Integration
+
+NCP (Neural Context Protocol) provides advanced context management, replacing Sarathi's native context compilation, persistence, and artifact storage with NCP-backed runtime services.
+
+```bash
+# Bootstrap a project with NCP
+sarathi init --ncp
+
+# Run with NCP enabled
+sarathi run --ncp "task description"
+```
+
+**Options:**
+- `--ncp-mode {direct|mcp}` — transport mode (default: direct)
+- `--ncp-router` — enable whisper-based cross-phase signaling
+
+NCP can be toggled in the Settings page of the Sarathi Desktop UI.
 
 ## Repository Layout
 

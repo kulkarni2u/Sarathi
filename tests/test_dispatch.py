@@ -1,3 +1,4 @@
+import json
 import sys
 
 from src.dispatch import LocalDispatcher, NullDispatcher, TaskSpec
@@ -328,6 +329,56 @@ def test_opencode_sdk_provider_falls_back_to_cli_when_sdk_bridge_fails(tmp_path,
     assert result.outputs["messages"] == ["CLI fallback executed"]
     assert result.artifacts["sdk_fallback_used"] is True
     assert result.evidence["sdk_error"] == "SDK unavailable"
+
+
+def test_opencode_sdk_provider_parses_structured_json_messages(tmp_path, monkeypatch):
+    provider = OpenCodeSdkProviderAdapter(
+        workspace_root=str(tmp_path),
+        provider_path="/usr/local/bin/opencode",
+    )
+    request = DispatchRequest(
+        mode="execute",
+        task_id="task-opencode-structured",
+        phase="TaskTracking",
+        prompt="Implement the feature",
+        inputs={"node": {"id": "node-1", "title": "Implement slice"}},
+        constraints={"purpose": "child_task_execution"},
+        expected_outputs=["work_unit_result"],
+    )
+
+    structured = {
+        "success": True,
+        "outputs": {
+            "work_unit_result": {
+                "node_id": "node-1",
+                "title": "Implement slice",
+                "status": "complete",
+                "provider": "opencode",
+                "summary": "Structured OpenCode result",
+                "files_changed": ["ncp/types.py"],
+                "tests_run": ["pytest tests/test_types.py"],
+            }
+        },
+        "evidence": {"provider_output_received": True},
+        "artifacts": {"model": "opencode/deepseek-v4-flash-free"},
+    }
+    monkeypatch.setattr(
+        provider,
+        "_run_sdk_bridge",
+        lambda payload, timeout_seconds: {
+            "success": True,
+            "outputs": {"messages": [json.dumps(structured)]},
+            "evidence": {"opencode_sdk": True},
+            "artifacts": {"invocation_kind": "sdk"},
+        },
+    )
+
+    result = provider.dispatch(request)
+
+    assert result.success is True
+    assert result.outputs["work_unit_result"]["node_id"] == "node-1"
+    assert result.outputs["work_unit_result"]["files_changed"] == ["ncp/types.py"]
+    assert result.artifacts["model"] == "opencode/deepseek-v4-flash-free"
 
 
 def test_openai_sdk_provider_exposes_sdk_capabilities(tmp_path):

@@ -68,12 +68,12 @@ def test_generates_policy_proposals_from_learning_record_signals():
         "repeated_failures",
         "escalations",
     }
-    assert proposals_by_source["iteration_hotspots"].title == "Reduce Build iteration hotspot"
-    assert proposals_by_source["iteration_hotspots"].policy_file == "commands.md"
+    assert proposals_by_source["iteration_hotspots"].title == "Add Build iteration guard skill"
+    assert proposals_by_source["iteration_hotspots"].policy_file == "skills.md"
     assert proposals_by_source["repeated_failures"].title == "Add Verify failure recovery guidance"
     assert proposals_by_source["repeated_failures"].policy_file == "commands.md"
-    assert proposals_by_source["escalations"].title == "Tighten Review escalation criteria"
-    assert proposals_by_source["escalations"].policy_file == "escalation.md"
+    assert proposals_by_source["escalations"].title == "Capture Review escalation playbook"
+    assert proposals_by_source["escalations"].policy_file == "wiki/review-loop.md"
 
 
 def test_generates_model_routing_proposal_from_provider_failures():
@@ -109,7 +109,7 @@ def test_generates_policy_proposals_from_repeated_signals_across_records():
     proposals = evolver.propose_from_learning_records(records)
 
     assert len(proposals) == 1
-    assert proposals[0].title == "Tighten Plan escalation criteria"
+    assert proposals[0].title == "Capture Plan escalation playbook"
     assert proposals[0].evidence_refs == [
         "task-1:escalations:Plan",
         "task-2:escalations:Plan",
@@ -150,7 +150,7 @@ def test_generates_policy_proposals_from_promoted_patterns_only():
 
     assert len(proposals) == 1
     assert proposals[0].title == "Promote learned pattern: verify-before-review"
-    assert proposals[0].policy_file == "conventions.md"
+    assert proposals[0].policy_file == "skills.md"
     assert proposals[0].source == "pattern"
     assert proposals[0].evidence_refs == ["task-7"]
 

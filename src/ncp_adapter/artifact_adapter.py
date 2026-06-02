@@ -11,6 +11,8 @@ from ._transport import NCPTransportMixin
 class NCPArtifactAdapter(NCPTransportMixin):
     """Stores and loads structured phase artifacts through NCP write_memory/fetch."""
 
+    _NCP_MAX_CONTENT = 2000
+
     def save_phase_artifacts(
         self, task_id: str, phase: str, artifacts: dict[str, Any], evidence: Any = None,
     ) -> str | None:
@@ -27,6 +29,16 @@ class NCPArtifactAdapter(NCPTransportMixin):
             "artifacts": artifacts,
             "evidence": evidence,
         })
+        if len(content) > self._NCP_MAX_CONTENT:
+            content = json.dumps({
+                "_sarathi_type": "PhaseArtifact",
+                "task_id": task_id,
+                "phase": phase,
+                "artifacts": {k: "[truncated]" for k in (artifacts or {})},
+                "evidence": {},
+            })
+        if len(content) > self._NCP_MAX_CONTENT:
+            content = content[: self._NCP_MAX_CONTENT - 3] + "..."
         self._call_write_memory(content, "semantic", "tool_result", f"sarathi.{task_id}.{phase}")
         return f"ncp://{task_id}/{phase}"
 

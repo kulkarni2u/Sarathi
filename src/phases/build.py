@@ -1,7 +1,11 @@
 """Build phase handler."""
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 try:
@@ -25,6 +29,29 @@ if TYPE_CHECKING:
     from src.engine import Phase, PhaseResult, TaskContext
 
 
+def _ncp_build_context(task: "TaskContext", run_path: str = ".ncp/run.py") -> str:
+    """Retrieve relevant context from NCP for the Build phase."""
+    args = {
+        "agent_id": "s.builder",
+        "role": "builder",
+        "owns": [task.task_id],
+        "must_not": [],
+        "task": task.description,
+        "slot": "Build",
+        "intent": f"build:{task.task_id}",
+    }
+    try:
+        result = subprocess.run(
+            [sys.executable, run_path, "get_context", json.dumps(args)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return ""
+
+
 class BuildHandler:
     """Build / TDD phase handler."""
 
@@ -41,7 +68,7 @@ class BuildHandler:
         )
 
     def execute(self, task: "TaskContext", phase: "Phase") -> "PhaseResult":
-        from src.engine import PhaseResult
+        from src.engine import DispatchRequest, PhaseResult
 
         plan: dict[str, Any] = {}
         for pr in reversed(task.phase_results):
@@ -65,6 +92,35 @@ class BuildHandler:
             "plan_consumed": bool(plan),
             "tdd_intent_acknowledged": True,
         }
+
+        # --- Real provider dispatch: execute the plan via configured provider ---
+        dispatch_response = None
+        if self.dispatcher is not None and plan:
+            ncp_ctx = _ncp_build_context(task)
+            dispatch_response = self.dispatcher.dispatch(
+                DispatchRequest(
+                    mode="execute",
+                    task_id=task.task_id,
+                    phase=phase.value,
+                    prompt=task.description,
+                    inputs={
+                        "task_description": task.description,
+                        "implementation_plan": plan,
+                        "complexity": task.complexity.value if hasattr(task.complexity, "value") else "medium",
+                        "ncp_context": ncp_ctx,
+                    },
+                    expected_outputs=["implementation_result", "changed_files", "test_results"],
+                    constraints={"provider": "opencode"},
+                )
+            )
+            if dispatch_response is not None and dispatch_response.success:
+                evidence["provider_dispatch"] = True
+                evidence["provider"] = dispatch_response.artifacts.get("provider", "opencode")
+            elif dispatch_response is not None:
+                evidence["provider_dispatch"] = False
+                evidence["provider_error"] = dispatch_response.error
+
+        # --- Graph execution for task tracking ---
         graph_policy = self._graph_policy()
         retryable_failed = (
             next_retryable_failed_node(task_graph, max_attempts=graph_policy.max_retries)
@@ -145,27 +201,29 @@ class BuildHandler:
             ):
                 pause_execution = True
                 next_phase_override = phase.value
+
+        artifacts: dict[str, Any] = {
+            "execution_surface": "provider",
+            "mode": "execute",
+            "plan_objective": plan.get("objective", task.description),
+            "provider_result": dispatch_response.outputs if dispatch_response and dispatch_response.success else {},
+            "dispatch_artifacts": dispatch_response.artifacts if dispatch_response else {},
+            "task_graph_state": graph_execution.graph_state if graph_execution else {},
+            "task_graph_execution": graph_execution.to_artifact() if graph_execution else {},
+            "graph_execution_mode": "incremental" if graph_policy.step_limit is not None else "complete",
+            "graph_execution_policy": graph_policy.to_artifact(),
+            "graph_retry_limit": graph_policy.max_retries,
+            "graph_failed_node": failed_node or human_attention_node,
+            "escalation_bundle": escalation_bundle,
+            "pause_execution": pause_execution,
+            "next_phase_override": next_phase_override,
+        }
+        if dispatch_response is not None and dispatch_response.usage is not None:
+            artifacts["dispatch_usage"] = dispatch_response.usage.to_artifact()
+
         return PhaseResult(
             phase=phase,
             outcome="escalate" if failed_node is not None or human_attention_node is not None else "pass",
             evidence=evidence,
-            artifacts={
-                "execution_surface": "host_agent",
-                "agent_checklist": [
-                    "Implement against the plan; keep tests green.",
-                    "Prefer the smallest diff that satisfies acceptance criteria.",
-                    "Document any plan deviation with rationale.",
-                ],
-                "mode": "execute",
-                "plan_objective": plan.get("objective", task.description),
-                "task_graph_state": graph_execution.graph_state if graph_execution else {},
-                "task_graph_execution": graph_execution.to_artifact() if graph_execution else {},
-                "graph_execution_mode": "incremental" if graph_policy.step_limit is not None else "complete",
-                "graph_execution_policy": graph_policy.to_artifact(),
-                "graph_retry_limit": graph_policy.max_retries,
-                "graph_failed_node": failed_node or human_attention_node,
-                "escalation_bundle": escalation_bundle,
-                "pause_execution": pause_execution,
-                "next_phase_override": next_phase_override,
-            },
+            artifacts=artifacts,
         )

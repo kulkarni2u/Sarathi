@@ -4,7 +4,7 @@ version = "0.2.0"
 description = "Policy-backed workflow orchestration for AI-assisted delivery (CLI + portable agent skill)."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Sarathi contributors" }]
 dependencies = [
     "PyYAML>=6.0.1",
@@ -34,6 +34,41 @@ testpaths = ["tests"]
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.data-files]
+"share/sarathi/skill" = [
+    "skill/SKILL.md",
+    "skill/sarathi-implementer-prompt.md",
+    "skill/sarathi-init.md",
+]
+"share/sarathi/skill/reference" = [
+    "skill/reference/config.md",
+    "skill/reference/required-list.md",
+    "skill/reference/workflow.md",
+]
+"share/sarathi/skill/policy-pack/EXAMPLE" = [
+    "skill/policy-pack/EXAMPLE/commands.md",
+    "skill/policy-pack/EXAMPLE/complexity.md",
+    "skill/policy-pack/EXAMPLE/conventions.md",
+    "skill/policy-pack/EXAMPLE/escalation.md",
+    "skill/policy-pack/EXAMPLE/model-routing.md",
+    "skill/policy-pack/EXAMPLE/review.md",
+    "skill/policy-pack/EXAMPLE/skills.md",
+    "skill/policy-pack/EXAMPLE/task-tracking.md",
+]
+"share/sarathi/skill/policy-pack/TEMPLATE" = [
+    "skill/policy-pack/TEMPLATE/commands.md",
+    "skill/policy-pack/TEMPLATE/complexity.md",
+    "skill/policy-pack/TEMPLATE/conventions.md",
+    "skill/policy-pack/TEMPLATE/escalation.md",
+    "skill/policy-pack/TEMPLATE/model-routing.md",
+    "skill/policy-pack/TEMPLATE/review.md",
+    "skill/policy-pack/TEMPLATE/skills.md",
+    "skill/policy-pack/TEMPLATE/task-tracking.md",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

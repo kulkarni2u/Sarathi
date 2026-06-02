@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _ncp_available() -> bool:
     return shutil.which("ncp") is not None
@@ -254,6 +256,7 @@ def test_e2e_engine_auto_detect_creates_ncp_adapters(tmp_path):
     assert (tmp_path / ".ncp" / "config.toml").exists(), "ncp init did not create config.toml"
     # Seed run.py so direct-mode validation passes (ncp init does not create it)
     (tmp_path / ".ncp" / "run.py").write_text("#!/usr/bin/env python3\nimport sys; sys.exit(0)")
+    (tmp_path / ".ncp" / "run.py").chmod(0o755)
 
     import io
     from contextlib import redirect_stdout

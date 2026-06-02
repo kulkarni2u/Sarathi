@@ -242,6 +242,8 @@ This repo contains both the CLI framework and the portable skill pack.
 - `skill/policy-pack/` — EXAMPLE and TEMPLATE policy packs for bootstrapping new projects
 - `skill/reference/` — policy reference docs the skill reads at runtime
 
+Source checkouts expose the skill pack directly at `skill/`. Published source and wheel builds now also carry the companion files so release artifacts stay aligned with the repo layout.
+
 For GitHub Copilot agent-mode integration, see the agent entry example in `skill/SKILL.md`.
 
 ## Contributing

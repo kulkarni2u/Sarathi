@@ -13,6 +13,7 @@ try:
     from src.runtime.context import ContextCompiler
     from src.runtime.contracts import DispatchRequest
     from src.runtime.output_index import build_artifact_index, normalize_agent_output
+    from src.runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
     from src.task_graph import (
         NodeType,
         fail_graph_node,
@@ -25,6 +26,7 @@ except ImportError:
     from runtime.context import ContextCompiler
     from runtime.contracts import DispatchRequest
     from runtime.output_index import build_artifact_index, normalize_agent_output
+    from runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
     from task_graph import (
         NodeType,
         fail_graph_node,
@@ -105,6 +107,7 @@ class TaskGraphExecutor:
         ncp_artifact_adapter=None,
         ncp_whisper_router=None,
         ncp_persistence_adapter=None,
+        workflow_patterns_policy: "WorkflowPatternsPolicy | None" = None,
     ):
         self.dispatcher = dispatcher
         self.dispatch_phase = dispatch_phase
@@ -113,6 +116,7 @@ class TaskGraphExecutor:
         self.ncp_artifact_adapter = ncp_artifact_adapter
         self.ncp_whisper_router = ncp_whisper_router
         self.ncp_persistence_adapter = ncp_persistence_adapter
+        self.workflow_patterns_policy = workflow_patterns_policy
 
     @staticmethod
     def _timestamp() -> str:
@@ -187,7 +191,9 @@ class TaskGraphExecutor:
             )
         else:
             updated = progress_graph(current, completed_node_id=ready["id"])
-            self._ncp_post_node_complete(ready, provider_result)
+            ncp_err = self._ncp_post_node_complete(ready, provider_result)
+            if ncp_err and isinstance(provider_result, dict):
+                provider_result.setdefault("ncp_warnings", []).append(f"write_output_failed: {ncp_err}")
             updated = self._post_execute_inject(ready, updated, provider_result)
             finished_at = self._timestamp()
             updated_node = next(
@@ -274,7 +280,9 @@ class TaskGraphExecutor:
                 break
 
             updated = progress_graph(current, completed_node_id=ready["id"])
-            self._ncp_post_node_complete(ready, provider_result)
+            ncp_err = self._ncp_post_node_complete(ready, provider_result)
+            if ncp_err and isinstance(provider_result, dict):
+                provider_result.setdefault("ncp_warnings", []).append(f"write_output_failed: {ncp_err}")
             updated = self._post_execute_inject(ready, updated, provider_result)
             updated_node = next(
                 (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
@@ -355,7 +363,9 @@ class TaskGraphExecutor:
                 current = updated
                 break
             updated = progress_graph(current, completed_node_id=ready["id"])
-            self._ncp_post_node_complete(ready, provider_result)
+            ncp_err = self._ncp_post_node_complete(ready, provider_result)
+            if ncp_err and isinstance(provider_result, dict):
+                provider_result.setdefault("ncp_warnings", []).append(f"write_output_failed: {ncp_err}")
             updated = self._post_execute_inject(ready, updated, provider_result)
             updated_node = next(
                 (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
@@ -390,6 +400,13 @@ class TaskGraphExecutor:
     # Pattern-specific post-execution injection
     # ------------------------------------------------------------------
 
+    def _pattern_allowed(self, *pattern_names: str) -> bool:
+        """Return True if any of the named patterns is enabled (or no policy is set)."""
+        pol = self.workflow_patterns_policy
+        if pol is None:
+            return True
+        return any(pol.is_enabled(p) for p in pattern_names)
+
     def _post_execute_inject(
         self, node: dict, graph: dict, provider_result: dict | None
     ) -> dict:
@@ -397,30 +414,58 @@ class TaskGraphExecutor:
         node_type = node.get("node_type", NodeType.EXECUTE)
 
         if node_type == NodeType.FANOUT:
+            if not self._pattern_allowed(WorkflowPattern.FANOUT_AND_SYNTHESIZE):
+                return graph
             updated = self._inject_fanout_children(node, graph)
-            # Whisper fanout context to every injected branch
             cfg = node.get("pattern_config", {})
             count = int(cfg.get("count", cfg.get("max_branches", 2)))
             branch_ids = [f"{node['id']}-branch-{i}" for i in range(1, count + 1)]
             synthesize_id = f"{node['id']}-synthesize"
-            self._ncp_emit_fanout_whispers(node, branch_ids, synthesize_id)
+            failed = self._ncp_emit_fanout_whispers(node, branch_ids, synthesize_id)
+            if failed:
+                updated.setdefault("_ncp_warnings", []).append(
+                    {"type": "fanout_whisper_failed", "targets": failed}
+                )
             return updated
 
         if node_type == NodeType.JUDGE:
-            return self._inject_judge_result(node, graph, provider_result)
+            if not self._pattern_allowed(
+                WorkflowPattern.ADVERSARIAL_VERIFICATION, WorkflowPattern.TOURNAMENT
+            ):
+                return graph
+            updated = self._inject_judge_result(node, graph, provider_result)
+            winner_id = f"{node['id']}-winner"
+            err = self._ncp_emit_judge_whisper(node, winner_id, provider_result)
+            if err:
+                updated.setdefault("_ncp_warnings", []).append(
+                    {"type": "judge_whisper_failed", "error": err}
+                )
+            return updated
 
         if node_type == NodeType.LOOP_GATE:
-            # Persist findings before injecting next iteration
-            self._ncp_write_loop_findings(node, provider_result)
-            return self._inject_loop_iteration(node, graph, provider_result)
+            if not self._pattern_allowed(WorkflowPattern.LOOP_UNTIL_DONE):
+                return graph
+            err = self._ncp_write_loop_findings(node, provider_result)
+            updated = self._inject_loop_iteration(node, graph, provider_result)
+            if err:
+                updated.setdefault("_ncp_warnings", []).append(
+                    {"type": "loop_write_failed", "error": err}
+                )
+            return updated
 
         if node_type == NodeType.CLASSIFY:
+            if not self._pattern_allowed(WorkflowPattern.CLASSIFY_AND_ACT):
+                return graph
             updated = self._inject_classified_branch(node, graph, provider_result)
             outputs = (provider_result or {}).get("outputs", {})
             classification = str(outputs.get("classification", outputs.get("route", "")))
             if classification:
                 branch_id = f"{node['id']}-branch-{classification}"
-                self._ncp_emit_classify_whisper(node, branch_id, classification)
+                err = self._ncp_emit_classify_whisper(node, branch_id, classification)
+                if err:
+                    updated.setdefault("_ncp_warnings", []).append(
+                        {"type": "classify_whisper_failed", "error": err}
+                    )
             return updated
 
         return graph
@@ -429,13 +474,16 @@ class TaskGraphExecutor:
     # NCP side-effect helpers
     # ------------------------------------------------------------------
 
-    def _ncp_post_node_complete(self, node: dict, provider_result: dict | None) -> None:
-        """Persist node output to NCP so SYNTHESIZE / JUDGE nodes can fetch it."""
+    def _ncp_post_node_complete(self, node: dict, provider_result: dict | None) -> "str | None":
+        """Persist node output to NCP so SYNTHESIZE / JUDGE nodes can fetch it.
+
+        Returns an error string if the write fails, None on success.
+        """
         if self.ncp_artifact_adapter is None or not isinstance(provider_result, dict):
-            return
+            return None
         outputs = provider_result.get("outputs", {})
         if not outputs:
-            return
+            return None
         import json as _json
         try:
             content = _json.dumps({
@@ -451,16 +499,21 @@ class TaskGraphExecutor:
                 f"sarathi.node.{node_id}",
                 f"sarathi.node.{node_id}",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            return str(exc)
+        return None
 
     def _ncp_emit_fanout_whispers(
         self, node: dict, branch_ids: list[str], synthesize_id: str
-    ) -> None:
-        """Whisper the fanout objective + sibling list to every branch agent."""
+    ) -> list[str]:
+        """Whisper the fanout objective + sibling list to every branch agent.
+
+        Returns list of branch_ids for which emission failed.
+        """
         if self.ncp_whisper_router is None:
-            return
+            return []
         import json as _json
+        failed: list[str] = []
         for branch_id in branch_ids:
             try:
                 payload = _json.dumps({
@@ -476,14 +529,18 @@ class TaskGraphExecutor:
                     payload=payload,
                 )
             except Exception:
-                pass
+                failed.append(branch_id)
+        return failed
 
     def _ncp_emit_classify_whisper(
         self, node: dict, branch_id: str, classification: str
-    ) -> None:
-        """Whisper why a branch was activated to the classified branch agent."""
+    ) -> "str | None":
+        """Whisper why a branch was activated to the classified branch agent.
+
+        Returns an error string if emission fails, None on success.
+        """
         if self.ncp_whisper_router is None:
-            return
+            return None
         import json as _json
         try:
             payload = _json.dumps({
@@ -497,18 +554,49 @@ class TaskGraphExecutor:
                 whisper_type="classify_context",
                 payload=payload,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            return str(exc)
+        return None
+
+    def _ncp_emit_judge_whisper(
+        self, node: dict, winner_id: str, provider_result: dict | None
+    ) -> "str | None":
+        """Whisper the judgment decision to the winner node.
+
+        Returns an error string if emission fails, None on success.
+        """
+        if self.ncp_whisper_router is None:
+            return None
+        import json as _json
+        try:
+            outputs = (provider_result or {}).get("outputs", {})
+            payload = _json.dumps({
+                "parent_id": node.get("id"),
+                "judgment": outputs,
+                "objective": node.get("title", ""),
+            })[:600]
+            self.ncp_whisper_router.emit(
+                from_agent="s.sarathi",
+                target=f"s.{winner_id}",
+                whisper_type="judge_context",
+                payload=payload,
+            )
+        except Exception as exc:
+            return str(exc)
+        return None
 
     def _ncp_write_loop_findings(
         self, node: dict, provider_result: dict | None
-    ) -> None:
-        """Write loop-gate findings to NCP episodic memory for the next iteration."""
+    ) -> "str | None":
+        """Write loop-gate findings to NCP episodic memory for the next iteration.
+
+        Returns an error string if the write fails, None on success.
+        """
         if self.ncp_persistence_adapter is None or not isinstance(provider_result, dict):
-            return
+            return None
         outputs = provider_result.get("outputs", {})
         if not outputs:
-            return
+            return None
         import json as _json
         try:
             cfg = node.get("pattern_config", {})
@@ -526,8 +614,9 @@ class TaskGraphExecutor:
                 f"sarathi.loop.{parent_id}",
                 f"sarathi.loop.{parent_id}",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            return str(exc)
+        return None
 
     def _inject_fanout_children(self, node: dict, graph: dict) -> dict:
         """FANOUT: spawn N parallel EXECUTE children + one SYNTHESIZE fan-in node."""
@@ -649,9 +738,11 @@ class TaskGraphExecutor:
         node_type = str(node.get("node_type", NodeType.EXECUTE)).lower()
         ncp = self.ncp_context_adapter
 
-        # Typed nodes get NCP-aware context (sibling artifacts, whispers, loop history).
+        # Typed nodes and EXECUTE branch nodes get NCP-aware context.
+        # Branch nodes have '-branch-' in their id and receive fanout/classify whispers.
         # Fall back to local ContextCompiler on any NCP error.
-        if ncp is not None and node_type not in (NodeType.EXECUTE, "execute"):
+        is_branch = "-branch-" in str(node.get("id", ""))
+        if ncp is not None and (node_type not in (NodeType.EXECUTE, "execute") or is_branch):
             try:
                 context_pack_artifact = ncp.compile_typed_node_context(
                     node=node, graph=graph, phase=self.dispatch_phase,

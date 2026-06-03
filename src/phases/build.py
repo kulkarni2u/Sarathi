@@ -16,6 +16,7 @@ try:
         require_human_for_graph_node,
     )
     from src.runtime import EscalationBundleBuilder, GraphExecutionPolicy, TaskGraphExecutor
+    from src.runtime.workflow_patterns import WorkflowPatternsPolicy
 except ImportError:
     from task_graph import (
         annotate_graph_for_supervision,
@@ -24,13 +25,21 @@ except ImportError:
         require_human_for_graph_node,
     )
     from runtime import EscalationBundleBuilder, GraphExecutionPolicy, TaskGraphExecutor
+    from runtime.workflow_patterns import WorkflowPatternsPolicy
 
 if TYPE_CHECKING:
     from src.engine import Phase, PhaseResult, TaskContext
 
 
-def _ncp_build_context(task: "TaskContext", run_path: str = ".ncp/run.py") -> str:
-    """Retrieve relevant context from NCP for the Build phase."""
+def _ncp_build_context(
+    task: "TaskContext",
+    ncp_adapter=None,
+    run_path: str = ".ncp/run.py",
+) -> str:
+    """Retrieve relevant context from NCP for the Build phase.
+
+    Uses the NCPContextAdapter when available; falls back to direct subprocess.
+    """
     args = {
         "agent_id": "s.builder",
         "role": "builder",
@@ -40,6 +49,11 @@ def _ncp_build_context(task: "TaskContext", run_path: str = ".ncp/run.py") -> st
         "slot": "Build",
         "intent": f"build:{task.task_id}",
     }
+    if ncp_adapter is not None and hasattr(ncp_adapter, "_call_get_context"):
+        try:
+            return ncp_adapter._call_get_context(args)
+        except Exception:
+            return ""
     try:
         result = subprocess.run(
             [sys.executable, run_path, "get_context", json.dumps(args)],
@@ -67,12 +81,16 @@ class BuildHandler:
     ):
         self.policy_pack = policy_pack
         self.dispatcher = dispatcher
+        patterns_policy = WorkflowPatternsPolicy.from_policy_section(
+            getattr(policy_pack, "workflow_patterns", {}) or {}
+        )
         self.graph_executor = graph_executor or TaskGraphExecutor(
             dispatcher=dispatcher,
             ncp_context_adapter=ncp_context_adapter,
             ncp_artifact_adapter=ncp_artifact_adapter,
             ncp_whisper_router=ncp_whisper_router,
             ncp_persistence_adapter=ncp_persistence_adapter,
+            workflow_patterns_policy=patterns_policy,
         )
         self.escalation_builder = EscalationBundleBuilder()
 
@@ -111,7 +129,7 @@ class BuildHandler:
         # --- Real provider dispatch: execute the plan via configured provider ---
         dispatch_response = None
         if self.dispatcher is not None and plan:
-            ncp_ctx = _ncp_build_context(task)
+            ncp_ctx = _ncp_build_context(task, ncp_adapter=self.graph_executor.ncp_context_adapter)
             dispatch_response = self.dispatcher.dispatch(
                 DispatchRequest(
                     mode="execute",

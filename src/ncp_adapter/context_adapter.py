@@ -195,7 +195,7 @@ class NCPContextAdapter(NCPTransportMixin):
 
     def _fetch_node_whispers(self, node_id: str) -> list[str]:
         """Poll NCP for whispers addressed to this node (fanout/classify context)."""
-        chunks = self._call_fetch(f"whisper:{node_id}", k=3)
+        chunks = self._call_fetch(f"whisper:s.{node_id}", k=3)
         findings: list[str] = []
         for chunk in chunks:
             text = self._reconstruct_chunk_text(chunk).strip()

@@ -97,10 +97,22 @@ class GraphExecutionResult:
 class TaskGraphExecutor:
     """Executes a simple dependency graph in ready-node order."""
 
-    def __init__(self, dispatcher=None, dispatch_phase: str = "Build"):
+    def __init__(
+        self,
+        dispatcher=None,
+        dispatch_phase: str = "Build",
+        ncp_context_adapter=None,
+        ncp_artifact_adapter=None,
+        ncp_whisper_router=None,
+        ncp_persistence_adapter=None,
+    ):
         self.dispatcher = dispatcher
         self.dispatch_phase = dispatch_phase
         self.context_compiler = ContextCompiler()
+        self.ncp_context_adapter = ncp_context_adapter
+        self.ncp_artifact_adapter = ncp_artifact_adapter
+        self.ncp_whisper_router = ncp_whisper_router
+        self.ncp_persistence_adapter = ncp_persistence_adapter
 
     @staticmethod
     def _timestamp() -> str:
@@ -175,6 +187,7 @@ class TaskGraphExecutor:
             )
         else:
             updated = progress_graph(current, completed_node_id=ready["id"])
+            self._ncp_post_node_complete(ready, provider_result)
             updated = self._post_execute_inject(ready, updated, provider_result)
             finished_at = self._timestamp()
             updated_node = next(
@@ -261,6 +274,7 @@ class TaskGraphExecutor:
                 break
 
             updated = progress_graph(current, completed_node_id=ready["id"])
+            self._ncp_post_node_complete(ready, provider_result)
             updated = self._post_execute_inject(ready, updated, provider_result)
             updated_node = next(
                 (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
@@ -341,6 +355,7 @@ class TaskGraphExecutor:
                 current = updated
                 break
             updated = progress_graph(current, completed_node_id=ready["id"])
+            self._ncp_post_node_complete(ready, provider_result)
             updated = self._post_execute_inject(ready, updated, provider_result)
             updated_node = next(
                 (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
@@ -378,17 +393,140 @@ class TaskGraphExecutor:
     def _post_execute_inject(
         self, node: dict, graph: dict, provider_result: dict | None
     ) -> dict:
-        """After a node completes, inject follow-on nodes based on its node_type."""
+        """After a node completes, inject follow-on nodes and emit NCP signals."""
         node_type = node.get("node_type", NodeType.EXECUTE)
+
         if node_type == NodeType.FANOUT:
-            return self._inject_fanout_children(node, graph)
+            updated = self._inject_fanout_children(node, graph)
+            # Whisper fanout context to every injected branch
+            cfg = node.get("pattern_config", {})
+            count = int(cfg.get("count", cfg.get("max_branches", 2)))
+            branch_ids = [f"{node['id']}-branch-{i}" for i in range(1, count + 1)]
+            synthesize_id = f"{node['id']}-synthesize"
+            self._ncp_emit_fanout_whispers(node, branch_ids, synthesize_id)
+            return updated
+
         if node_type == NodeType.JUDGE:
             return self._inject_judge_result(node, graph, provider_result)
+
         if node_type == NodeType.LOOP_GATE:
+            # Persist findings before injecting next iteration
+            self._ncp_write_loop_findings(node, provider_result)
             return self._inject_loop_iteration(node, graph, provider_result)
+
         if node_type == NodeType.CLASSIFY:
-            return self._inject_classified_branch(node, graph, provider_result)
+            updated = self._inject_classified_branch(node, graph, provider_result)
+            outputs = (provider_result or {}).get("outputs", {})
+            classification = str(outputs.get("classification", outputs.get("route", "")))
+            if classification:
+                branch_id = f"{node['id']}-branch-{classification}"
+                self._ncp_emit_classify_whisper(node, branch_id, classification)
+            return updated
+
         return graph
+
+    # ------------------------------------------------------------------
+    # NCP side-effect helpers
+    # ------------------------------------------------------------------
+
+    def _ncp_post_node_complete(self, node: dict, provider_result: dict | None) -> None:
+        """Persist node output to NCP so SYNTHESIZE / JUDGE nodes can fetch it."""
+        if self.ncp_artifact_adapter is None or not isinstance(provider_result, dict):
+            return
+        outputs = provider_result.get("outputs", {})
+        if not outputs:
+            return
+        import json as _json
+        try:
+            content = _json.dumps({
+                "sarathi_node": node.get("id"),
+                "node_type": node.get("node_type", "execute"),
+                "title": node.get("title"),
+                "outputs": outputs,
+            })
+            self.ncp_artifact_adapter._call_write_memory(
+                content[:2000],
+                "semantic",
+                "tool_result",
+                f"sarathi.node.{node.get('id', 'unknown')}",
+            )
+        except Exception:
+            pass
+
+    def _ncp_emit_fanout_whispers(
+        self, node: dict, branch_ids: list[str], synthesize_id: str
+    ) -> None:
+        """Whisper the fanout objective + sibling list to every branch agent."""
+        if self.ncp_whisper_router is None:
+            return
+        import json as _json
+        for branch_id in branch_ids:
+            try:
+                payload = _json.dumps({
+                    "parent_id": node.get("id"),
+                    "sibling_ids": branch_ids,
+                    "synthesize_id": synthesize_id,
+                    "objective": node.get("title", ""),
+                })[:600]
+                self.ncp_whisper_router.emit(
+                    from_agent="s.sarathi",
+                    target=f"s.{branch_id}",
+                    whisper_type="fanout_context",
+                    payload=payload,
+                )
+            except Exception:
+                pass
+
+    def _ncp_emit_classify_whisper(
+        self, node: dict, branch_id: str, classification: str
+    ) -> None:
+        """Whisper why a branch was activated to the classified branch agent."""
+        if self.ncp_whisper_router is None:
+            return
+        import json as _json
+        try:
+            payload = _json.dumps({
+                "parent_id": node.get("id"),
+                "classification": classification,
+                "objective": node.get("title", ""),
+            })[:600]
+            self.ncp_whisper_router.emit(
+                from_agent="s.sarathi",
+                target=f"s.{branch_id}",
+                whisper_type="classify_context",
+                payload=payload,
+            )
+        except Exception:
+            pass
+
+    def _ncp_write_loop_findings(
+        self, node: dict, provider_result: dict | None
+    ) -> None:
+        """Write loop-gate findings to NCP episodic memory for the next iteration."""
+        if self.ncp_persistence_adapter is None or not isinstance(provider_result, dict):
+            return
+        outputs = provider_result.get("outputs", {})
+        if not outputs:
+            return
+        import json as _json
+        try:
+            cfg = node.get("pattern_config", {})
+            iteration = int(cfg.get("iteration", 1))
+            node_id = str(node.get("id", ""))
+            parent_id = node_id.rsplit("-iter-", 1)[0] if "-iter-" in node_id else node_id
+            content = _json.dumps({
+                "sarathi_loop": parent_id,
+                "iteration": iteration,
+                "findings": outputs,
+            })
+            self.ncp_persistence_adapter._call_write_memory(
+                content[:2000],
+                "episodic",
+                "tool_result",
+                f"sarathi.loop.{parent_id}",
+            )
+        except Exception:
+            pass
 
     def _inject_fanout_children(self, node: dict, graph: dict) -> dict:
         """FANOUT: spawn N parallel EXECUTE children + one SYNTHESIZE fan-in node."""
@@ -492,17 +630,39 @@ class TaskGraphExecutor:
         }
         return inject_nodes(graph, parent_id=node["id"], new_nodes=[branch_node])
 
-    def _dispatch_node(self, node: dict, *, graph: dict | None = None) -> dict | None:
-        """Dispatch a ready node as a child work unit when a dispatcher is configured."""
-        if self.dispatcher is None:
-            return None
-        context_pack = self.context_compiler.compile_graph_node_context(
+    def _local_context(self, node: dict, graph: dict | None) -> tuple[dict, int | None]:
+        """Build a context pack using the local ContextCompiler."""
+        cp = self.context_compiler.compile_graph_node_context(
             node=node,
             graph=graph,
             phase=self.dispatch_phase,
             available_tools=["task_graph", "workspace_files", "git_diff", "test_results"],
         )
-        context_pack_artifact = context_pack.to_artifact()
+        return cp.to_artifact(), cp.agent_input.token_budget
+
+    def _dispatch_node(self, node: dict, *, graph: dict | None = None) -> dict | None:
+        """Dispatch a ready node as a child work unit when a dispatcher is configured."""
+        if self.dispatcher is None:
+            return None
+
+        node_type = str(node.get("node_type", NodeType.EXECUTE)).lower()
+        ncp = self.ncp_context_adapter
+
+        # Typed nodes get NCP-aware context (sibling artifacts, whispers, loop history).
+        # Fall back to local ContextCompiler on any NCP error.
+        if ncp is not None and node_type not in (NodeType.EXECUTE, "execute"):
+            try:
+                context_pack_artifact = ncp.compile_typed_node_context(
+                    node=node, graph=graph, phase=self.dispatch_phase,
+                )
+                token_budget = (
+                    context_pack_artifact.get("agent_input", {}).get("token_budget")
+                )
+            except Exception:
+                context_pack_artifact, token_budget = self._local_context(node, graph)
+        else:
+            context_pack_artifact, token_budget = self._local_context(node, graph)
+
         request = DispatchRequest(
             mode="execute",
             task_id=str(node.get("id", "unknown")),
@@ -516,7 +676,7 @@ class TaskGraphExecutor:
             expected_outputs=["implementation_plan", "work_unit_result", "evidence"],
             constraints={"purpose": "child_task_execution"},
             context_pack=context_pack_artifact,
-            token_budget=context_pack.agent_input.token_budget,
+            token_budget=token_budget,
             retry_budget=0,
         )
         try:
@@ -543,10 +703,10 @@ class TaskGraphExecutor:
             "artifact_index": artifact_index,
             "context_pack": context_pack_artifact,
             "context_pack_summary": {
-                "objective": context_pack.agent_input.objective,
-                "token_budget": context_pack.agent_input.token_budget,
-                "estimated_tokens": context_pack_artifact["compilation"]["estimated_tokens"],
-                "trimmed_sections": context_pack_artifact["compilation"]["trimmed_sections"],
+                "objective": context_pack_artifact.get("agent_input", {}).get("objective", ""),
+                "token_budget": token_budget,
+                "estimated_tokens": context_pack_artifact.get("compilation", {}).get("estimated_tokens"),
+                "trimmed_sections": context_pack_artifact.get("compilation", {}).get("trimmed_sections"),
             },
         }
         if response.usage:

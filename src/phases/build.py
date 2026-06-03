@@ -55,10 +55,25 @@ def _ncp_build_context(task: "TaskContext", run_path: str = ".ncp/run.py") -> st
 class BuildHandler:
     """Build / TDD phase handler."""
 
-    def __init__(self, policy_pack, dispatcher=None, graph_executor: TaskGraphExecutor | None = None):
+    def __init__(
+        self,
+        policy_pack,
+        dispatcher=None,
+        graph_executor: TaskGraphExecutor | None = None,
+        ncp_context_adapter=None,
+        ncp_artifact_adapter=None,
+        ncp_whisper_router=None,
+        ncp_persistence_adapter=None,
+    ):
         self.policy_pack = policy_pack
         self.dispatcher = dispatcher
-        self.graph_executor = graph_executor or TaskGraphExecutor(dispatcher=dispatcher)
+        self.graph_executor = graph_executor or TaskGraphExecutor(
+            dispatcher=dispatcher,
+            ncp_context_adapter=ncp_context_adapter,
+            ncp_artifact_adapter=ncp_artifact_adapter,
+            ncp_whisper_router=ncp_whisper_router,
+            ncp_persistence_adapter=ncp_persistence_adapter,
+        )
         self.escalation_builder = EscalationBundleBuilder()
 
     def _graph_policy(self) -> GraphExecutionPolicy:

@@ -5,8 +5,22 @@ Automatically generate a policy pack for a codebase via inspection, interview, g
 ## Usage
 
 ```
-sarathi init [target_path] [--engine path]
+sarathi init [target_path] [--engine path] [--ncp]
 ```
+
+### `--ncp` flag
+
+Pass `--ncp` to bootstrap NCP (Neural Context Protocol) alongside the policy pack.
+This creates a `.ncp/` directory in the target project so Sarathi can auto-detect
+NCP on subsequent runs.
+
+**Requires:** `pip install neural-context-protocol` (or `pip install sarathi[ncp]`)
+before running `sarathi init --ncp`. See [HOWTO.md §7](HOWTO.md#7-ncp-integration-optional)
+for the full NCP setup guide.
+
+When `--ncp` is passed, `sarathi init` also generates a `workflow-patterns.md`
+policy file so dynamic workflow patterns (FANOUT, CLASSIFY, LOOP, etc.) are
+available to configure.
 
 ## The --init Flow
 
@@ -119,14 +133,17 @@ sarathi init /path/to/project --engine ./sarathi/engine
 ```
 target/
 ├── policy-pack/
-│   ├── complexity.md      # Auto-generated
-│   ├── conventions.md   # Auto-generated + overrides
-│   ├── commands.md     # Auto-detected
-│   ├── review.md       # Standard + custom
-│   ├── escalation.md   # Defaults + interview
+│   ├── complexity.md        # Auto-generated
+│   ├── conventions.md       # Auto-generated + overrides
+│   ├── commands.md          # Auto-detected
+│   ├── review.md            # Standard + custom
+│   ├── escalation.md        # Defaults + interview
 │   ├── model-routing.md
 │   ├── skills.md
-│   └── task-tracking.md
+│   ├── task-tracking.md
+│   └── workflow-patterns.md # Generated when --ncp is passed
+├── .ncp/                    # Created when --ncp is passed
+│   └── run.py               # NCP sidecar entry point
 └── core-policy-interface-mapping.md  # Auto-generated validation
 ```
 

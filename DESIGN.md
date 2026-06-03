@@ -369,6 +369,94 @@ Sarathi/
 
 ---
 
+## Dynamic Workflow Patterns
+
+Sarathi supports six Anthropic-inspired dynamic workflow patterns where the task
+graph changes shape at runtime based on agent outputs, rather than being fixed at
+plan time.
+
+### Node types
+
+| NodeType | Role |
+|----------|------|
+| `execute` | Default: single work unit dispatched to a provider |
+| `fanout` | Spawns N parallel `execute` branches + a `synthesize` fan-in node |
+| `synthesize` | Merges outputs from N upstream branches into one result |
+| `judge` | Evaluates competing outputs and injects a `winner` execute node |
+| `loop_gate` | Re-runs until a condition key is falsy or max iterations is reached |
+| `classify` | Reads a classification output and injects the matching branch node |
+
+### Graph mutation
+
+`inject_nodes(graph, parent_id, new_nodes)` is a pure function that appends nodes
+to a live graph and updates the parent's `injected_children` list. All pattern
+injection runs through this function in `_post_execute_inject`, called after every
+successful node completion in `TaskGraphExecutor`.
+
+### Policy gate
+
+`WorkflowPatternsPolicy` (parsed from `policy-pack/workflow-patterns.md`) gates
+whether each pattern is allowed to inject at runtime. If no policy is set, all
+patterns run. This lets teams disable specific patterns in production without
+removing node declarations from the graph.
+
+---
+
+## NCP Integration
+
+NCP (Neural Context Protocol) is an optional sidecar that replaces Sarathi's
+native context compilation, persistence, and artifact storage with persistent,
+cross-session NCP-backed services.
+
+**Package:** `pip install neural-context-protocol` (or `pip install sarathi[ncp]`)
+**Repo:** https://github.com/kulkarni2u/neural-context-protocol
+
+### Transport
+
+Two modes, configured via `--ncp-mode`:
+
+| Mode | Mechanism |
+|------|-----------|
+| `direct` | Sarathi forks `.ncp/run.py` as a subprocess |
+| `mcp` | Sarathi sends JSON-RPC to an NCP HTTP server via `httpx` |
+
+`NCPTransportMixin` provides the shared `_call_write_memory`, `_call_fetch`,
+`_call_get_context`, and `_call_log_cost` transport primitives. All NCP adapter
+classes inherit from it.
+
+### Adapter roles
+
+| Adapter | Replaces | NCP primitive used |
+|---------|----------|--------------------|
+| `NCPContextAdapter` | `ContextCompiler` | `get_context`, `fetch` |
+| `NCPArtifactAdapter` | `ArtifactStore` | `write_memory` (semantic layer) |
+| `NCPPersistenceAdapter` | `PersistenceManager` | `write_memory` (episodic layer) |
+| `NCPWhisperRouter` | — (new capability) | `emit` whispers |
+
+### NCP + dynamic workflow patterns
+
+The two subsystems are designed to work together:
+
+- After each node completes, `_ncp_post_node_complete` writes its outputs to NCP
+  semantic memory under the key `sarathi_node:{id}`.
+- When a `synthesize` or `judge` node is dispatched, `compile_typed_node_context`
+  fetches each source/competitor node's saved output and injects it into
+  `prior_findings`.
+- After a `fanout` or `classify` node completes, whispers are emitted to each
+  branch agent (`fanout_context` / `classify_context` / `judge_context`) so they
+  know their role in the broader workflow.
+- `loop_gate` nodes write iteration findings to NCP episodic memory
+  (`sarathi_loop:{parent_id}`) so the next iteration starts with prior context.
+
+### Auto-detection
+
+`Engine.__init__` probes for `.ncp/run.py` at startup. If found, all four NCP
+adapters are instantiated and wired into `BuildHandler` → `TaskGraphExecutor`.
+If not found, native adapters are used with no change to behaviour. The
+`--ncp` / `--no-ncp` CLI flags override auto-detection.
+
+---
+
 ## Key Design Decisions
 
 | Decision | Choice | Rationale |
@@ -388,3 +476,7 @@ Sarathi/
 | Escalation model | Budget + severity (D) | Predictable for normal cases, adaptive for complex ones |
 | TDD discipline | Hard by default, policy overridable | Quality default, flexibility justified |
 | Phase log | Minimal tabular | Lightweight but reconstructable |
+| Dynamic workflow | Runtime graph mutation via inject_nodes | Graph shape driven by agent outputs, not fixed at plan time |
+| NCP integration | Sidecar, not embedded | Any NCP implementation works; zero import coupling |
+| Pattern context | NCP fetch on typed nodes only | Avoids NCP roundtrips for plain execute nodes |
+| Pattern policy gate | WorkflowPatternsPolicy at runtime | Disable patterns in production without touching graph declarations |

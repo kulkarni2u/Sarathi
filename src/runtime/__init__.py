@@ -36,6 +36,7 @@ from .quality_policy import QualityLoopPolicy, validate_quality_loop_config
 from .recovery import RecoveryAction, RecoveryRunner
 from .review import ReviewFinding, ReviewRunner, ReviewVerdict
 from .scheduler import SchedulerRun, TaskScheduler
+from .workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
 
 __all__ = [
     "AgentRole",
@@ -89,4 +90,6 @@ __all__ = [
     "list_phase_agent_roles",
     "phase_agent_role_artifact",
     "validate_quality_loop_config",
+    "WorkflowPattern",
+    "WorkflowPatternsPolicy",
 ]

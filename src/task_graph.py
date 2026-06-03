@@ -4,7 +4,19 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import Enum
 from typing import Any
+
+
+class NodeType(str, Enum):
+    """Typed workflow node categories enabling the six Anthropic workflow patterns."""
+
+    EXECUTE = "execute"       # standard work unit — runs a task directly
+    FANOUT = "fanout"         # spawns N parallel child nodes at runtime
+    SYNTHESIZE = "synthesize" # fan-in: waits for a sibling group, merges results
+    JUDGE = "judge"           # tournament: compares competing outputs, picks winner
+    LOOP_GATE = "loop_gate"   # loops until a stop condition is met
+    CLASSIFY = "classify"     # routes to typed downstream branches
 
 
 @dataclass
@@ -14,6 +26,7 @@ class TaskNode:
     id: str
     title: str
     status: str = "pending"
+    node_type: str = NodeType.EXECUTE
     depends_on: list[str] = field(default_factory=list)
     parent_task_id: str | None = None
     child_task_ids: list[str] = field(default_factory=list)
@@ -26,12 +39,15 @@ class TaskNode:
     blocked_at: str | None = None
     last_error: str | None = None
     last_touched_at: str | None = None
+    pattern_config: dict[str, Any] = field(default_factory=dict)
+    injected_children: list[str] = field(default_factory=list)
 
     def to_artifact(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "title": self.title,
             "status": self.status,
+            "node_type": self.node_type,
             "depends_on": self.depends_on,
             "parent_task_id": self.parent_task_id,
             "child_task_ids": self.child_task_ids,
@@ -44,6 +60,8 @@ class TaskNode:
             "blocked_at": self.blocked_at,
             "last_error": self.last_error,
             "last_touched_at": self.last_touched_at,
+            "pattern_config": self.pattern_config,
+            "injected_children": self.injected_children,
         }
 
 
@@ -83,6 +101,78 @@ def graph_from_plan(plan: dict[str, Any]) -> TaskGraph:
         if index + 1 < len(nodes):
             node.child_task_ids = [nodes[index + 1].id]
     return TaskGraph(nodes=nodes)
+
+
+def graph_from_workflow(workflow: dict[str, Any]) -> TaskGraph:
+    """Build a typed workflow graph from a workflow declaration with node types.
+
+    If the workflow has no ``nodes`` key, falls back to ``graph_from_plan``.
+    """
+    nodes_spec = workflow.get("nodes", [])
+    if not nodes_spec:
+        return graph_from_plan(workflow)
+
+    nodes: list[TaskNode] = []
+    for spec in nodes_spec:
+        node_id = spec.get("id") or f"node-{len(nodes) + 1}"
+        nodes.append(
+            TaskNode(
+                id=node_id,
+                title=spec.get("title", node_id),
+                node_type=spec.get("node_type", spec.get("type", NodeType.EXECUTE)),
+                depends_on=list(spec.get("depends_on", [])),
+                parent_task_id=workflow.get("task_id"),
+                pattern_config=dict(spec.get("pattern_config", spec.get("config", {}))),
+            )
+        )
+
+    id_to_node = {n.id: n for n in nodes}
+    for node in nodes:
+        for dep in node.depends_on:
+            parent = id_to_node.get(dep)
+            if parent is not None and node.id not in parent.child_task_ids:
+                parent.child_task_ids.append(node.id)
+    return TaskGraph(nodes=nodes)
+
+
+def inject_nodes(
+    graph: dict[str, Any],
+    parent_id: str,
+    new_nodes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Inject new nodes into a live graph, each depending on parent_id.
+
+    Nodes whose ``id`` already exists in the graph are silently skipped.
+    Updates the parent node's ``injected_children`` tracking list.
+    """
+    existing_ids = {node.get("id") for node in graph.get("nodes", [])}
+    nodes = [dict(n) for n in graph.get("nodes", [])]
+    injected_ids: list[str] = []
+
+    for spec in new_nodes:
+        node_id = spec.get("id")
+        if not node_id or node_id in existing_ids:
+            continue
+        new_node = dict(spec)
+        deps = list(new_node.get("depends_on", []))
+        if parent_id not in deps:
+            deps.insert(0, parent_id)
+        new_node["depends_on"] = deps
+        new_node.setdefault("status", "pending")
+        new_node.setdefault("node_type", NodeType.EXECUTE)
+        nodes.append(new_node)
+        injected_ids.append(node_id)
+        existing_ids.add(node_id)
+
+    updated_nodes = []
+    for node in nodes:
+        n = dict(node)
+        if n.get("id") == parent_id and injected_ids:
+            existing = list(n.get("injected_children", []))
+            n["injected_children"] = existing + [i for i in injected_ids if i not in existing]
+        updated_nodes.append(n)
+
+    return _recompute_graph_state({"nodes": updated_nodes})
 
 
 def graph_summary(graph: dict[str, Any]) -> dict[str, int]:

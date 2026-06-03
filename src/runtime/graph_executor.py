@@ -9,12 +9,26 @@ try:
     from src.runtime.context import ContextCompiler
     from src.runtime.contracts import DispatchRequest
     from src.runtime.output_index import build_artifact_index, normalize_agent_output
-    from src.task_graph import fail_graph_node, next_ready_node, progress_graph, retry_graph_node
+    from src.task_graph import (
+        NodeType,
+        fail_graph_node,
+        inject_nodes,
+        next_ready_node,
+        progress_graph,
+        retry_graph_node,
+    )
 except ImportError:
     from runtime.context import ContextCompiler
     from runtime.contracts import DispatchRequest
     from runtime.output_index import build_artifact_index, normalize_agent_output
-    from task_graph import fail_graph_node, next_ready_node, progress_graph, retry_graph_node
+    from task_graph import (
+        NodeType,
+        fail_graph_node,
+        inject_nodes,
+        next_ready_node,
+        progress_graph,
+        retry_graph_node,
+    )
 
 
 _GRAPH_STATE_KEYS = (
@@ -157,6 +171,7 @@ class TaskGraphExecutor:
             )
         else:
             updated = progress_graph(current, completed_node_id=ready["id"])
+            updated = self._post_execute_inject(ready, updated, provider_result)
             finished_at = self._timestamp()
             updated_node = next(
                 (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
@@ -242,6 +257,7 @@ class TaskGraphExecutor:
                 break
 
             updated = progress_graph(current, completed_node_id=ready["id"])
+            updated = self._post_execute_inject(ready, updated, provider_result)
             updated_node = next(
                 (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
                 {},
@@ -321,6 +337,7 @@ class TaskGraphExecutor:
                 current = updated
                 break
             updated = progress_graph(current, completed_node_id=ready["id"])
+            updated = self._post_execute_inject(ready, updated, provider_result)
             updated_node = next(
                 (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
                 {},
@@ -345,6 +362,131 @@ class TaskGraphExecutor:
     def retry_failed_node(self, graph: dict, node_id: str) -> dict:
         """Reset a failed node so it can be executed again."""
         return retry_graph_node(graph, node_id=node_id)
+
+    def inject_nodes(self, graph: dict, parent_id: str, new_nodes: list[dict]) -> dict:
+        """Inject new nodes into a live graph depending on parent_id."""
+        return inject_nodes(graph, parent_id=parent_id, new_nodes=new_nodes)
+
+    # ------------------------------------------------------------------
+    # Pattern-specific post-execution injection
+    # ------------------------------------------------------------------
+
+    def _post_execute_inject(
+        self, node: dict, graph: dict, provider_result: dict | None
+    ) -> dict:
+        """After a node completes, inject follow-on nodes based on its node_type."""
+        node_type = node.get("node_type", NodeType.EXECUTE)
+        if node_type == NodeType.FANOUT:
+            return self._inject_fanout_children(node, graph)
+        if node_type == NodeType.JUDGE:
+            return self._inject_judge_result(node, graph, provider_result)
+        if node_type == NodeType.LOOP_GATE:
+            return self._inject_loop_iteration(node, graph, provider_result)
+        if node_type == NodeType.CLASSIFY:
+            return self._inject_classified_branch(node, graph, provider_result)
+        return graph
+
+    def _inject_fanout_children(self, node: dict, graph: dict) -> dict:
+        """FANOUT: spawn N parallel EXECUTE children + one SYNTHESIZE fan-in node."""
+        cfg = node.get("pattern_config", {})
+        count = int(cfg.get("count", cfg.get("max_branches", 2)))
+        title_template = cfg.get("title_template", "Branch {i}: " + node.get("title", "work"))
+        synthesize_title = cfg.get("synthesize_title", f"Synthesize: {node.get('title', 'results')}")
+        parent_id = node["id"]
+
+        branch_ids = [f"{parent_id}-branch-{i}" for i in range(1, count + 1)]
+        synthesize_id = f"{parent_id}-synthesize"
+
+        children = [
+            {
+                "id": bid,
+                "title": title_template.replace("{i}", str(i)),
+                "node_type": NodeType.EXECUTE,
+                "depends_on": [parent_id],
+                "pattern_config": {},
+            }
+            for i, bid in enumerate(branch_ids, start=1)
+        ]
+        children.append(
+            {
+                "id": synthesize_id,
+                "title": synthesize_title,
+                "node_type": NodeType.SYNTHESIZE,
+                "depends_on": branch_ids,
+                "pattern_config": {"source_ids": branch_ids},
+            }
+        )
+        return inject_nodes(graph, parent_id=parent_id, new_nodes=children)
+
+    def _inject_judge_result(
+        self, node: dict, graph: dict, provider_result: dict | None
+    ) -> dict:
+        """JUDGE: inject a winner-propagation EXECUTE node after judgment."""
+        cfg = node.get("pattern_config", {})
+        winner_title = cfg.get("winner_title", f"Apply winner: {node.get('title', 'result')}")
+        winner_id = f"{node['id']}-winner"
+        winner_node = {
+            "id": winner_id,
+            "title": winner_title,
+            "node_type": NodeType.EXECUTE,
+            "depends_on": [node["id"]],
+            "pattern_config": {
+                "winner_from": node["id"],
+                "judge_output": (provider_result or {}).get("outputs", {}),
+            },
+        }
+        return inject_nodes(graph, parent_id=node["id"], new_nodes=[winner_node])
+
+    def _inject_loop_iteration(
+        self, node: dict, graph: dict, provider_result: dict | None
+    ) -> dict:
+        """LOOP_GATE: inject next iteration node if condition is met, else done."""
+        cfg = node.get("pattern_config", {})
+        max_iterations = int(cfg.get("max_iterations", 5))
+        iteration = int(cfg.get("iteration", 1))
+        condition_key = cfg.get("condition_key", "new_findings")
+
+        outputs = (provider_result or {}).get("outputs", {})
+        condition_met = bool(outputs.get(condition_key, False))
+        already_done = iteration >= max_iterations
+
+        if condition_met and not already_done:
+            next_id = f"{node['id']}-iter-{iteration + 1}"
+            next_node = {
+                "id": next_id,
+                "title": f"{cfg.get('loop_title', node.get('title', 'Loop'))} (iteration {iteration + 1})",
+                "node_type": NodeType.LOOP_GATE,
+                "depends_on": [node["id"]],
+                "pattern_config": {
+                    **cfg,
+                    "iteration": iteration + 1,
+                },
+            }
+            return inject_nodes(graph, parent_id=node["id"], new_nodes=[next_node])
+        return graph
+
+    def _inject_classified_branch(
+        self, node: dict, graph: dict, provider_result: dict | None
+    ) -> dict:
+        """CLASSIFY: activate the branch matching the classification output."""
+        cfg = node.get("pattern_config", {})
+        branches = cfg.get("branches", {})
+        outputs = (provider_result or {}).get("outputs", {})
+        classification = str(outputs.get("classification", outputs.get("route", "")))
+
+        branch_spec = branches.get(classification)
+        if not branch_spec:
+            return graph
+
+        branch_id = f"{node['id']}-branch-{classification}"
+        branch_node = {
+            "id": branch_id,
+            "title": branch_spec if isinstance(branch_spec, str) else branch_spec.get("title", classification),
+            "node_type": NodeType.EXECUTE,
+            "depends_on": [node["id"]],
+            "pattern_config": {"classification": classification},
+        }
+        return inject_nodes(graph, parent_id=node["id"], new_nodes=[branch_node])
 
     def _dispatch_node(self, node: dict, *, graph: dict | None = None) -> dict | None:
         """Dispatch a ready node as a child work unit when a dispatcher is configured."""

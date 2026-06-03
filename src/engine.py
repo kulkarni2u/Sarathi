@@ -143,6 +143,7 @@ class PolicyPack:
     skills: dict[str, Any] = field(default_factory=dict)
     task_tracking: dict[str, Any] = field(default_factory=dict)
     learning_feedback: dict[str, Any] = field(default_factory=dict)
+    workflow_patterns: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

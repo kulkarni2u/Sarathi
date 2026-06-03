@@ -4,9 +4,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 try:
-    from src.task_graph import graph_from_plan
+    from src.task_graph import graph_from_plan, graph_from_workflow
 except ImportError:
-    from task_graph import graph_from_plan
+    from task_graph import graph_from_plan, graph_from_workflow
 
 if TYPE_CHECKING:
     from src.engine import Phase, PhaseResult, TaskContext
@@ -40,28 +40,37 @@ class PlanHandler:
                         "risks": prev_artifacts.get("risks", []),
                         "success_criteria": prev_artifacts.get("success_criteria", []),
                     },
-                    expected_outputs=["implementation_plan", "effort_estimate"],
+                    expected_outputs=["implementation_plan", "workflow_graph", "effort_estimate"],
                 )
             )
 
         if response is not None and response.success:
             plan = response.outputs.get("implementation_plan", {})
+            workflow = response.outputs.get("workflow_graph", {})
             effort_estimate = int(response.outputs.get("effort_estimate", 0))
             evidence = {
-                "implementation_plan_created": bool(plan.get("steps")),
+                "implementation_plan_created": bool(plan.get("steps") or workflow.get("nodes")),
                 "effort_estimated": effort_estimate > 0,
                 "dependencies_identified": len(plan.get("dependencies", [])) > 0,
                 "timeline_defined": "timeline" in plan,
                 "checkpoint_list": response.evidence.get("checkpoint_list", False),
                 "dependency_map": response.evidence.get("dependency_map", False),
                 "rollback_plan": response.evidence.get("rollback_plan", False),
+                "workflow_typed": bool(workflow.get("nodes")),
             }
+            task_graph = (
+                graph_from_workflow(workflow).to_artifact()
+                if workflow.get("nodes")
+                else graph_from_plan(plan).to_artifact()
+            )
             artifacts = {
                 "implementation_plan": plan,
                 "effort_estimate": effort_estimate,
-                "task_graph": graph_from_plan(plan).to_artifact(),
+                "task_graph": task_graph,
                 "dispatch_artifacts": response.artifacts,
             }
+            if workflow.get("nodes"):
+                artifacts["workflow_graph"] = workflow
             if response.usage is not None:
                 artifacts["dispatch_usage"] = response.usage.to_artifact()
         else:

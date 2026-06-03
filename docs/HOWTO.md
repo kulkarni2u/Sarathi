@@ -13,9 +13,10 @@
 4. [Using as a Python API](#4-using-as-a-python-api)
 5. [Using with AI Agents](#5-using-with-ai-agents)
 6. [Policy Pack Setup](#6-policy-pack-setup)
-7. [Common Workflows](#7-common-workflows)
-8. [Task Management](#8-task-management)
-9. [Troubleshooting](#9-troubleshooting)
+7. [NCP Integration (optional)](#7-ncp-integration-optional)
+8. [Common Workflows](#8-common-workflows)
+9. [Task Management](#9-task-management)
+10. [Troubleshooting](#10-troubleshooting)
 
 ---
 
@@ -386,7 +387,85 @@ sarathi validate ./policy-pack --verbose
 
 ---
 
-## 7. Common Workflows
+## 7. NCP Integration (optional)
+
+Sarathi works fully without NCP. This section is for teams that want persistent cross-session memory, cross-agent context passing for dynamic workflow patterns, and pipeline cost tracking.
+
+### 7.1 What is NCP?
+
+NCP (Neural Context Protocol) is a **separate tool** — a sidecar process or server that Sarathi calls out to. It is not bundled with Sarathi. You must install it independently.
+
+**PyPI:** `neural-context-protocol` — **[kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)**
+
+Without NCP, Sarathi uses native local adapters for context compilation, persistence, and artifact storage. These work for most tasks. NCP adds value when:
+
+- Tasks span multiple sessions and agents need to remember prior findings
+- You use dynamic workflow patterns (FANOUT, CLASSIFY, LOOP) and want branch agents to receive context from their parent automatically
+- You want per-node token cost logged back to a central store
+
+### 7.2 Checking NCP availability
+
+```bash
+# Check if ncp is on PATH
+ncp --version
+
+# Check whether Sarathi detects NCP in your project
+sarathi run --dry-run "test" --policy-pack ./policy-pack
+# Look for: "[ncp] NCP detected" or "[ncp] NCP not available"
+```
+
+If you see `[ncp] NCP not available, using native adapters` — Sarathi checked for `.ncp/run.py`
+in your project root and didn't find it. That is fine; native adapters are used automatically.
+
+### 7.3 Setting up NCP
+
+Once `ncp` is on your PATH:
+
+```bash
+# 1. Bootstrap NCP into your project (creates .ncp/ directory)
+sarathi init --ncp
+
+# 2. Verify Sarathi detects it
+sarathi run --dry-run "test" --policy-pack ./policy-pack
+# Expect: "[ncp] NCP detected, using NCP adapters"
+
+# 3. Run a task with NCP active (auto-detected, no flag needed)
+sarathi run "Add authentication" --policy-pack ./policy-pack
+```
+
+To force NCP on or off regardless of auto-detect:
+
+```bash
+sarathi run --ncp "task"       # force NCP, fail if unavailable
+sarathi run --no-ncp "task"    # force native adapters
+```
+
+### 7.4 NCP transport modes
+
+| Mode | How it works | When to use |
+|------|-------------|-------------|
+| `direct` (default) | Sarathi forks `.ncp/run.py` as subprocess | Local dev, single machine |
+| `mcp` | Sarathi sends JSON-RPC to an NCP HTTP server | Remote NCP server, team shared instance |
+
+```bash
+# MCP mode — NCP server must be running at the endpoint
+sarathi run --ncp --ncp-mode mcp --ncp-endpoint http://ncp.internal:4242/mcp "task"
+```
+
+### 7.5 Dynamic workflow patterns without NCP
+
+If you enable dynamic workflow patterns (`workflow-patterns.md`) but NCP is not active:
+
+- FANOUT/CLASSIFY branch agents still execute, but receive no whisper context from the parent
+- SYNTHESIZE nodes dispatch without pre-fetched branch outputs in their context
+- LOOP_GATE iterations start without prior-iteration findings in memory
+- Node outputs are not persisted across sessions
+
+For single-session tasks this is usually acceptable. For long-running or multi-session workflows, NCP is strongly recommended when patterns are enabled.
+
+---
+
+## 8. Common Workflows
 
 ### 7.1 Bug Fix Workflow
 
@@ -451,7 +530,7 @@ sarathi run "Quick test" --policy-pack ./policy-pack --dry-run
 
 ---
 
-## 8. Task Management
+## 9. Task Management
 
 ### 8.1 List All Tasks
 
@@ -524,9 +603,9 @@ Policy Proposals: 2
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
-### 9.1 "Command not found: sarathi"
+### 10.1 "Command not found: sarathi"
 
 ```bash
 # Reinstall
@@ -536,7 +615,7 @@ python3 -m pip install -e /path/to/Sarathi
 python3 -m src.cli --help
 ```
 
-### 9.2 "No policy pack found"
+### 10.2 "No policy pack found"
 
 ```bash
 # Initialize first
@@ -546,7 +625,7 @@ sarathi init .
 sarathi run "Task" --policy-pack ./policy-pack
 ```
 
-### 9.3 Validation fails
+### 10.3 Validation fails
 
 ```bash
 # Check with verbose
@@ -558,7 +637,7 @@ sarathi validate ./policy-pack --verbose
 # - Missing required sections
 ```
 
-### 9.4 Task hangs at a phase
+### 10.4 Task hangs at a phase
 
 ```bash
 # Check status
@@ -568,7 +647,7 @@ sarathi status <task-id>
 sarathi resume <task-id>
 ```
 
-### 9.5 Python API ImportError
+### 10.5 Python API ImportError
 
 ```bash
 # Use virtual environment
@@ -578,6 +657,45 @@ source .venv/bin/activate
 export PYTHONPATH="${PYTHONPATH}:/path/to/Sarathi/src"
 ```
 
+### 10.6 "[ncp] NCP not available, using native adapters"
+
+This message means Sarathi checked for `.ncp/run.py` and didn't find it. **This is not an error** — Sarathi automatically falls back to native adapters.
+
+If you want NCP:
+```bash
+# 1. Install NCP
+pip install neural-context-protocol   # or: pip install sarathi[ncp]
+ncp --version                          # verify it's on your PATH
+
+# 2. Bootstrap NCP into your project
+sarathi init --ncp
+
+# 3. Re-run — Sarathi should now detect .ncp/run.py automatically
+```
+
+If you don't need NCP, suppress the message:
+```bash
+sarathi run --no-ncp "task"
+```
+
+### 10.7 "NCP get_context failed" or "NCP write_memory failed"
+
+NCP is installed but failing. Diagnose:
+```bash
+# Check NCP server status
+.ncp/run.py status
+
+# Test a direct NCP call
+.ncp/run.py get_context '{"agent_id":"s.test","role":"test","owns":[],"must_not":[],"task":"ping","slot":"Build","intent":"ping"}'
+```
+
+Common causes:
+- NCP process crashed — restart it
+- Permissions on `.ncp/run.py` — needs execute bit: `chmod +x .ncp/run.py`
+- MCP mode but server not running — start the NCP MCP server first
+
+Sarathi will fall back to native adapters automatically if NCP errors occur mid-run, but the `compilation.ncp_fallback: true` flag will appear in the context pack summary for affected nodes.
+
 ---
 
 ## Quick Reference
@@ -585,8 +703,11 @@ export PYTHONPATH="${PYTHONPATH}:/path/to/Sarathi/src"
 | Command | Description |
 |---------|-------------|
 | `sarathi init <path>` | Initialize policy pack |
+| `sarathi init <path> --ncp` | Initialize with NCP (requires `ncp` on PATH) |
 | `sarathi validate <path>` | Validate policy pack |
-| `sarathi run "task" --policy-pack <path>` | Run a task |
+| `sarathi run "task" --policy-pack <path>` | Run a task (NCP auto-detected) |
+| `sarathi run "task" --ncp` | Force NCP on (fails if unavailable) |
+| `sarathi run "task" --no-ncp` | Force native adapters |
 | `sarathi list` | List saved tasks |
 | `sarathi log <id>` | Show task log |
 | `sarathi status <id>` | Show task status |

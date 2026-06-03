@@ -639,6 +639,14 @@ def handle_init(args: argparse.Namespace) -> None:
     print("\n[3/5] Generate: Creating policy pack...")
     policy_path = workflow.generate(inspection, interview)
     print(f"  Created: {policy_path}")
+    # Write provider-native permission config files from the generated permissions.md
+    try:
+        from .runtime.providers.cli_bridge import ensure_provider_permissions
+    except ImportError:
+        from runtime.providers.cli_bridge import ensure_provider_permissions
+    written = ensure_provider_permissions(args.target_path)
+    for provider, config_path in written.items():
+        print(f"  Wrote {provider} permissions → {config_path}")
 
     # Phase 4: Validate
     print("\n[4/5] Validate: Checking policy pack...")

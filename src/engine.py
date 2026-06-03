@@ -143,6 +143,7 @@ class PolicyPack:
     skills: dict[str, Any] = field(default_factory=dict)
     task_tracking: dict[str, Any] = field(default_factory=dict)
     learning_feedback: dict[str, Any] = field(default_factory=dict)
+    workflow_patterns: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -415,22 +416,25 @@ class Engine:
         self.dispatcher = dispatcher or LocalDispatcher(provider_config=provider_config)
         self.enforce_preflight = enforce_preflight
         self.preflight_policy = PreflightPolicy()
-        self.phase_handlers = self._create_phase_handlers()
-        
+
         # NCP adapter wiring
         self.ncp_mode = ncp_mode
         self.ncp_router_enabled = ncp_router
         self.ncp_endpoint = ncp_endpoint
-        
+
         # Auto-detect NCP when not explicitly enabled/disabled
         _ncp_explicit = ncp_enabled is not None
         if ncp_enabled is None:
             ncp_enabled = self._probe_ncp()
             if ncp_enabled:
-                print("[ncp] NCP detected, using NCP adapters")
+                print("[ncp] NCP detected — using NCP adapters for context, memory, and cost tracking")
             else:
-                print("[ncp] NCP not available, using native adapters")
-        
+                print(
+                    "[ncp] NCP not found — using native adapters. "
+                    "To enable: `pip install neural-context-protocol` then `sarathi init --ncp`. "
+                    "Pass --no-ncp to silence this message."
+                )
+
         # Validate NCP when enabled before creating adapters
         if ncp_enabled:
             try:
@@ -440,9 +444,9 @@ class Engine:
                     raise
                 print("[ncp] NCP validation failed, falling back to native adapters")
                 ncp_enabled = False
-        
+
         self.ncp_enabled = ncp_enabled
-        
+
         if ncp_enabled:
             self.context_adapter = NCPContextAdapter(mode=ncp_mode, endpoint=ncp_endpoint)
             self.persistence = NCPPersistenceAdapter(mode=ncp_mode, endpoint=ncp_endpoint)
@@ -453,7 +457,8 @@ class Engine:
             self.persistence = PersistenceManager()
             self.artifact_store = ArtifactStore()
             self.whisper_router = None
-            
+
+        self.phase_handlers = self._create_phase_handlers()
         self.recovery_runner = RecoveryRunner(dispatcher=self.dispatcher)
         self.phases = list(Phase)
 
@@ -474,6 +479,8 @@ class Engine:
             "skills",
             "task_tracking",
             "learning_feedback",
+            "workflow_patterns",
+            "permissions",
         ):
             setattr(pack, attr, self.compiled_policy.get(attr))
 
@@ -500,12 +507,23 @@ class Engine:
 
     def _create_phase_handlers(self) -> dict[Phase, PhaseHandler]:
         """Create phase handler instances."""
+        ncp_ctx = self.context_adapter if self.ncp_enabled else None
+        ncp_art = self.artifact_store if self.ncp_enabled else None
+        ncp_per = self.persistence if self.ncp_enabled else None
+        ncp_whi = self.whisper_router  # already None when disabled
         return {
             Phase.ROUTE: RouteHandler(self.policy_pack, self.dispatcher),
             Phase.BRAINSTORM: BrainstormHandler(self.policy_pack, self.dispatcher),
             Phase.PLANNING_ADVISOR: PlanningAdvisorHandler(self.policy_pack, self.dispatcher),
             Phase.PLAN: PlanHandler(self.policy_pack, self.dispatcher),
-            Phase.BUILD: BuildHandler(self.policy_pack, self.dispatcher),
+            Phase.BUILD: BuildHandler(
+                self.policy_pack,
+                self.dispatcher,
+                ncp_context_adapter=ncp_ctx,
+                ncp_artifact_adapter=ncp_art,
+                ncp_whisper_router=ncp_whi,
+                ncp_persistence_adapter=ncp_per,
+            ),
             Phase.VERIFY: VerifyHandler(self.policy_pack, self.dispatcher),
             Phase.REVIEW: ReviewHandler(self.policy_pack, self.dispatcher),
             Phase.TASK_TRACKING: TaskTrackingHandler(self.policy_pack, self.dispatcher),

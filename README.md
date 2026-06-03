@@ -147,11 +147,13 @@ The runtime also exposes `TaskScheduler` for phase-independent graph work-unit s
 Workspace provider settings feed service-side routing:
 
 - `local` — deterministic built-in (default for tests and dry-runs)
-- `claude` — native `claude -p {prompt} --output-format json --dangerously-skip-permissions` bridge; unwraps the Claude Code JSON envelope automatically
-- `codex` — native `codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -o {file} {prompt}` bridge
+- `claude` — native `claude -p {prompt} --output-format json` bridge; unwraps the Claude Code JSON envelope automatically
+- `codex` — native `codex exec --skip-git-repo-check -o {file} {prompt}` bridge
 - `copilot` — `gh copilot -- -p {prompt}` bridge (requires `gh auth login`)
 - `opencode` — HTTP bridge via `opencode serve`; starts a local server, creates a session, and reads the SSE stream for the response
 - Any provider can also point at a custom executable that reads Sarathi JSON from stdin and returns a normalized JSON result on stdout
+
+Provider tool permissions are declared in `policy-pack/permissions.md` and written as native config files by `sarathi init` (`.claude/settings.json`, `~/.codex/config.yaml`, `opencode.json`). No runtime permission-bypass flags are used.
 
 To wire real CLI providers in a policy pack:
 
@@ -206,18 +208,51 @@ sarathi run "Add OAuth2 authentication" --policy-pack ./policy-pack
 
 ## NCP Integration
 
-NCP (Neural Context Protocol) provides advanced context management, replacing Sarathi's native context compilation, persistence, and artifact storage with NCP-backed runtime services.
+> **Sarathi works without NCP.** Native adapters handle context compilation, persistence, and artifact storage locally. NCP is an optional enhancement, not a requirement.
+
+NCP (Neural Context Protocol) is a **separate tool** that Sarathi integrates with as a sidecar. When present, it replaces Sarathi's native adapters with NCP-backed services that add:
+
+- **Persistent cross-session memory** — agents recall findings from prior runs
+- **Cross-agent whispers** — fanout/classify branches receive context from their parent
+- **Pattern-aware context** — SYNTHESIZE and JUDGE nodes fetch sibling outputs automatically
+- **Pipeline cost tracking** — per-node token spend logged back to NCP
+
+### Getting NCP
+
+NCP is available on PyPI — **[kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)**
 
 ```bash
-# Bootstrap a project with NCP
+# Install NCP alongside Sarathi (recommended)
+pip install sarathi[ncp]
+
+# Or install NCP separately
+pip install neural-context-protocol
+
+# Bootstrap NCP into your project (creates .ncp/ directory)
 sarathi init --ncp
 
 # Run with NCP enabled
 sarathi run --ncp "task description"
+
+# Run without NCP (explicit, uses native adapters)
+sarathi run --no-ncp "task description"
 ```
 
-**Options:**
-- `--ncp-mode {direct|mcp}` — transport mode (default: direct)
+Sarathi auto-detects NCP on startup by checking for `.ncp/run.py` in the project root. If found, NCP adapters are used automatically — no flag needed.
+
+### When you need NCP
+
+| Scenario | Without NCP | With NCP |
+|----------|-------------|----------|
+| Single-session tasks | Full functionality | Same |
+| Dynamic workflow patterns (FANOUT, CLASSIFY, LOOP) | No cross-node context, no whispers | Branch agents receive parent context |
+| Multi-session tasks | Each session starts cold | Prior findings persist across sessions |
+| Cost reporting | Local estimates only | Per-node actuals logged |
+
+### Transport modes
+
+- `--ncp-mode direct` (default) — Sarathi forks `.ncp/run.py` as a subprocess
+- `--ncp-mode mcp` — Sarathi sends JSON-RPC to an NCP server at `--ncp-endpoint`
 - `--ncp-router` — enable whisper-based cross-phase signaling
 
 NCP can be toggled via `--ncp` / `--no-ncp` flags or set as the default in `model-routing.md`.

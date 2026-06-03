@@ -21,6 +21,9 @@ sarathi-desktop = "src.service.desktop:main"
 Homepage = "https://github.com/kulkarni2u/Sarathi"
 
 [project.optional-dependencies]
+ncp = [
+    "neural-context-protocol",
+]
 dev = [
     "pytest>=7.4",
     "pytest-asyncio>=0.23",

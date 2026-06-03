@@ -147,7 +147,7 @@ The runtime also exposes `TaskScheduler` for phase-independent graph work-unit s
 Workspace provider settings feed service-side routing:
 
 - `local` — deterministic built-in (default for tests and dry-runs)
-- `claude` — native `claude -p {prompt} --output-format json --dangerously-skip-permissions` bridge; unwraps the Claude Code JSON envelope automatically
+- `claude` — native `claude -p {prompt} --output-format json` bridge; unwraps the Claude Code JSON envelope automatically
 - `codex` — native `codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -o {file} {prompt}` bridge
 - `copilot` — `gh copilot -- -p {prompt}` bridge (requires `gh auth login`)
 - `opencode` — HTTP bridge via `opencode serve`; starts a local server, creates a session, and reads the SSE stream for the response

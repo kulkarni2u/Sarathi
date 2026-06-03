@@ -128,7 +128,6 @@ def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> 
         path,
         "-p",
         "--output-format", "json",
-        "--dangerously-skip-permissions",
         "--add-dir", workspace_root,
         "--",
         prompt,

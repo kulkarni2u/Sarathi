@@ -217,15 +217,16 @@ NCP (Neural Context Protocol) is a **separate tool** that Sarathi integrates wit
 
 ### Getting NCP
 
-NCP is a separate project: **[kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)**
-
-Install it and ensure `ncp` is on your PATH before using `sarathi init --ncp`:
+NCP is available on PyPI — **[kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)**
 
 ```bash
-# Check if NCP is already available
-ncp --version
+# Install NCP alongside Sarathi (recommended)
+pip install sarathi[ncp]
 
-# Bootstrap a project with NCP (requires ncp on PATH)
+# Or install NCP separately
+pip install neural-context-protocol
+
+# Bootstrap NCP into your project (creates .ncp/ directory)
 sarathi init --ncp
 
 # Run with NCP enabled

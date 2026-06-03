@@ -431,7 +431,7 @@ class Engine:
             else:
                 print(
                     "[ncp] NCP not found — using native adapters. "
-                    "To enable: github.com/kulkarni2u/neural-context-protocol, then `sarathi init --ncp`. "
+                    "To enable: `pip install neural-context-protocol` then `sarathi init --ncp`. "
                     "Pass --no-ncp to silence this message."
                 )
 

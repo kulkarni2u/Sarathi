@@ -395,7 +395,7 @@ Sarathi works fully without NCP. This section is for teams that want persistent 
 
 NCP (Neural Context Protocol) is a **separate tool** — a sidecar process or server that Sarathi calls out to. It is not bundled with Sarathi. You must install it independently.
 
-**Repository:** [kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)
+**PyPI:** `neural-context-protocol` — **[kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)**
 
 Without NCP, Sarathi uses native local adapters for context compilation, persistence, and artifact storage. These work for most tasks. NCP adds value when:
 
@@ -663,8 +663,9 @@ This message means Sarathi checked for `.ncp/run.py` and didn't find it. **This 
 
 If you want NCP:
 ```bash
-# 1. Install NCP from https://github.com/kulkarni2u/neural-context-protocol
-ncp --version   # verify it's on your PATH
+# 1. Install NCP
+pip install neural-context-protocol   # or: pip install sarathi[ncp]
+ncp --version                          # verify it's on your PATH
 
 # 2. Bootstrap NCP into your project
 sarathi init --ncp

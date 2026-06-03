@@ -427,9 +427,13 @@ class Engine:
         if ncp_enabled is None:
             ncp_enabled = self._probe_ncp()
             if ncp_enabled:
-                print("[ncp] NCP detected, using NCP adapters")
+                print("[ncp] NCP detected — using NCP adapters for context, memory, and cost tracking")
             else:
-                print("[ncp] NCP not available, using native adapters")
+                print(
+                    "[ncp] NCP not found — using native adapters. "
+                    "To enable NCP: install the NCP tool, run `sarathi init --ncp`. "
+                    "See docs/HOWTO.md §7, or pass --no-ncp to silence this."
+                )
 
         # Validate NCP when enabled before creating adapters
         if ncp_enabled:

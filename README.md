@@ -206,18 +206,48 @@ sarathi run "Add OAuth2 authentication" --policy-pack ./policy-pack
 
 ## NCP Integration
 
-NCP (Neural Context Protocol) provides advanced context management, replacing Sarathi's native context compilation, persistence, and artifact storage with NCP-backed runtime services.
+> **Sarathi works without NCP.** Native adapters handle context compilation, persistence, and artifact storage locally. NCP is an optional enhancement, not a requirement.
+
+NCP (Neural Context Protocol) is a **separate tool** that Sarathi integrates with as a sidecar. When present, it replaces Sarathi's native adapters with NCP-backed services that add:
+
+- **Persistent cross-session memory** — agents recall findings from prior runs
+- **Cross-agent whispers** — fanout/classify branches receive context from their parent
+- **Pattern-aware context** — SYNTHESIZE and JUDGE nodes fetch sibling outputs automatically
+- **Pipeline cost tracking** — per-node token spend logged back to NCP
+
+### Getting NCP
+
+NCP is a separate project. Install it and ensure `ncp` is on your PATH before using `sarathi init --ncp`:
 
 ```bash
-# Bootstrap a project with NCP
+# Check if NCP is already available
+ncp --version
+
+# Bootstrap a project with NCP (requires ncp on PATH)
 sarathi init --ncp
 
 # Run with NCP enabled
 sarathi run --ncp "task description"
+
+# Run without NCP (explicit, uses native adapters)
+sarathi run --no-ncp "task description"
 ```
 
-**Options:**
-- `--ncp-mode {direct|mcp}` — transport mode (default: direct)
+Sarathi auto-detects NCP on startup by checking for `.ncp/run.py` in the project root. If found, NCP adapters are used automatically — no flag needed.
+
+### When you need NCP
+
+| Scenario | Without NCP | With NCP |
+|----------|-------------|----------|
+| Single-session tasks | Full functionality | Same |
+| Dynamic workflow patterns (FANOUT, CLASSIFY, LOOP) | No cross-node context, no whispers | Branch agents receive parent context |
+| Multi-session tasks | Each session starts cold | Prior findings persist across sessions |
+| Cost reporting | Local estimates only | Per-node actuals logged |
+
+### Transport modes
+
+- `--ncp-mode direct` (default) — Sarathi forks `.ncp/run.py` as a subprocess
+- `--ncp-mode mcp` — Sarathi sends JSON-RPC to an NCP server at `--ncp-endpoint`
 - `--ncp-router` — enable whisper-based cross-phase signaling
 
 NCP can be toggled via `--ncp` / `--no-ncp` flags or set as the default in `model-routing.md`.

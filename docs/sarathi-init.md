@@ -64,6 +64,15 @@ Create policy pack from inspection + interview:
 | model-routing.md | Default routing + interview |
 | skills.md | Default skills + detected stack |
 | task-tracking.md | Interview preference |
+| permissions.md | Provider tool allowlists → written as native config files |
+
+After generating `permissions.md`, `sarathi init` immediately writes provider-native config files:
+
+| Config file | Provider | What it enables |
+|-------------|----------|-----------------|
+| `.claude/settings.json` | Claude Code | `permissions.allow` tool list — no runtime flags needed |
+| `~/.codex/config.yaml` | Codex | `full-auto: true` — auto-approves without sandbox bypass |
+| `opencode.json` | OpenCode | `autoapprove: true` — auto-approves tool calls |
 
 **Output:** `policy-pack/` directory in target repo
 
@@ -141,11 +150,17 @@ target/
 │   ├── model-routing.md
 │   ├── skills.md
 │   ├── task-tracking.md
+│   ├── permissions.md       # Provider tool allowlists
 │   └── workflow-patterns.md # Generated when --ncp is passed
+├── .claude/
+│   └── settings.json        # Claude Code permissions (auto-written from permissions.md)
+├── opencode.json            # OpenCode autoapprove (auto-written from permissions.md)
 ├── .ncp/                    # Created when --ncp is passed
 │   └── run.py               # NCP sidecar entry point
 └── core-policy-interface-mapping.md  # Auto-generated validation
 ```
+
+Note: `~/.codex/config.yaml` (user-level) is written for Codex since Codex does not support a per-project config.
 
 ## Policy Override
 

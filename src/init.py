@@ -462,6 +462,44 @@ background_unblock:
 """
         (policy_path / "task-tracking.md").write_text(task_tracking_md)
 
+        # Generate permissions.md
+        permissions_md = """# Permissions
+
+Declares the tool allowlist for each provider Sarathi invokes as a subprocess.
+`sarathi init` writes these as provider-native config files so no runtime
+permission-bypass flags are needed.
+
+## Provider tool grants
+
+```yaml
+permissions:
+  # Claude Code: written to .claude/settings.json (permissions.allow)
+  claude:
+    allowed_tools:
+      - Bash
+      - Read
+      - Write
+      - Edit
+      - Glob
+      - Grep
+      - LS
+      - WebFetch
+      - WebSearch
+      - TodoRead
+      - TodoWrite
+
+  # Codex: written to ~/.codex/config.yaml
+  codex:
+    full_auto: true
+    disable_sandbox: false
+
+  # OpenCode: written to opencode.json at workspace root
+  opencode:
+    auto_approve: true
+```
+"""
+        (policy_path / "permissions.md").write_text(permissions_md)
+
         return policy_path
 
     def validate(self, policy_pack_path: Path | None = None) -> list[Any]:

@@ -42,6 +42,7 @@ A directory of markdown files, each named by concern:
 | `model-routing.md` | Complexity-to-model mapping table |
 | `skills.md` | Skill registry and routing rules |
 | `task-tracking.md` | Task tracking configuration |
+| `permissions.md` | Provider tool allowlists; `sarathi init` writes these as native config files |
 | `learnings.md` | Project-specific learnings (per-workspace) |
 
 ### Learn-Evolve Loop
@@ -357,7 +358,8 @@ Sarathi/
 │   ├── escalation.md
 │   ├── model-routing.md
 │   ├── skills.md
-│   └── task-tracking.md
+│   ├── task-tracking.md
+│   └── permissions.md
 ├── docs/
 │   └── specs/
 │       └── 2026-04-14-sarathi-design.md
@@ -480,3 +482,4 @@ If not found, native adapters are used with no change to behaviour. The
 | NCP integration | Sidecar, not embedded | Any NCP implementation works; zero import coupling |
 | Pattern context | NCP fetch on typed nodes only | Avoids NCP roundtrips for plain execute nodes |
 | Pattern policy gate | WorkflowPatternsPolicy at runtime | Disable patterns in production without touching graph declarations |
+| Provider permissions | Policy-declared, written at init | No runtime bypass flags; explicit allowlist per provider, auditable in policy-pack |

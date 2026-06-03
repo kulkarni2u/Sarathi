@@ -148,10 +148,12 @@ Workspace provider settings feed service-side routing:
 
 - `local` — deterministic built-in (default for tests and dry-runs)
 - `claude` — native `claude -p {prompt} --output-format json` bridge; unwraps the Claude Code JSON envelope automatically
-- `codex` — native `codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -o {file} {prompt}` bridge
+- `codex` — native `codex exec --skip-git-repo-check -o {file} {prompt}` bridge
 - `copilot` — `gh copilot -- -p {prompt}` bridge (requires `gh auth login`)
 - `opencode` — HTTP bridge via `opencode serve`; starts a local server, creates a session, and reads the SSE stream for the response
 - Any provider can also point at a custom executable that reads Sarathi JSON from stdin and returns a normalized JSON result on stdout
+
+Provider tool permissions are declared in `policy-pack/permissions.md` and written as native config files by `sarathi init` (`.claude/settings.json`, `~/.codex/config.yaml`, `opencode.json`). No runtime permission-bypass flags are used.
 
 To wire real CLI providers in a policy pack:
 

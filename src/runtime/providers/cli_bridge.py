@@ -7,6 +7,7 @@ import json
 import http.client
 from math import ceil
 import os
+import re
 import shutil
 import socket
 import time
@@ -18,6 +19,11 @@ import subprocess
 import sys
 import tempfile
 from typing import Any
+
+try:
+    import yaml as _yaml
+except ImportError:
+    _yaml = None  # type: ignore[assignment]
 
 try:
     from ..contracts import DispatchRequest, DispatchResponse, build_usage_record
@@ -57,7 +63,6 @@ def _run_codex(*, path: str, workspace_root: str, request: DispatchRequest) -> D
     command = [
         path,
         "exec",
-        "--dangerously-bypass-approvals-and-sandbox",
         "--skip-git-repo-check",
         "-o", str(output_path),
         prompt,
@@ -157,8 +162,8 @@ def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> 
 def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -> DispatchResponse:
     """Bridge for OpenCode via CLI (`opencode run`).
 
-    Uses `opencode run -c --dangerously-skip-permissions --dir <workspace> -- <prompt>`
-    which is the recommended way to invoke OpenCode from scripts.
+    Uses `opencode run -c --dir <workspace> -- <prompt>`.
+    Tool approvals are pre-granted via opencode.json written by `sarathi init`.
     """
     if _should_use_ncp_handoff(provider="opencode", workspace_root=workspace_root, request=request):
         return _run_ncp_handoff_dispatch(
@@ -171,7 +176,6 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
         path,
         "run",
         "-c",
-        "--dangerously-skip-permissions",
         "--dir", workspace_root,
         "--",
         prompt,
@@ -868,6 +872,101 @@ def _provider_prompt(provider: str, request: DispatchRequest, workspace_root: st
     if ncp_lines:
         lines = [*ncp_lines, *lines]
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# Provider permission config helpers
+# ------------------------------------------------------------------
+
+_DEFAULT_CLAUDE_TOOLS = [
+    "Bash", "Read", "Write", "Edit", "Glob", "Grep", "LS",
+    "WebFetch", "WebSearch", "TodoRead", "TodoWrite",
+]
+
+
+def _load_permissions_policy(workspace_root: str) -> dict[str, Any]:
+    """Parse permissions.yaml from policy-pack/permissions.md, if present."""
+    policy_path = Path(workspace_root) / "policy-pack" / "permissions.md"
+    if not policy_path.exists() or _yaml is None:
+        return {}
+    try:
+        content = policy_path.read_text(encoding="utf-8")
+        blocks = re.findall(r"```yaml\s*(.*?)\s*```", content, re.DOTALL)
+        for block in blocks:
+            parsed = _yaml.safe_load(block)
+            if isinstance(parsed, dict) and "permissions" in parsed:
+                return parsed["permissions"]
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _write_claude_settings(workspace_root: str, policy: dict[str, Any]) -> None:
+    """Merge allowed_tools into .claude/settings.json (permissions.allow)."""
+    tools = policy.get("allowed_tools") or _DEFAULT_CLAUDE_TOOLS
+    # Claude Code permission patterns use glob suffix, e.g. "Bash(*)"
+    allow = [f"{t}(*)" if "(" not in t else t for t in tools]
+    settings_dir = Path(workspace_root) / ".claude"
+    settings_dir.mkdir(exist_ok=True)
+    settings_path = settings_dir / "settings.json"
+    existing: dict[str, Any] = {}
+    if settings_path.exists():
+        try:
+            existing = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    existing.setdefault("permissions", {})
+    existing["permissions"]["allow"] = allow
+    existing["permissions"].setdefault("deny", [])
+    settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_codex_config(workspace_root: str, policy: dict[str, Any]) -> None:
+    """Write ~/.codex/config.yaml from policy, creating parent dirs if needed."""
+    codex_dir = Path.home() / ".codex"
+    codex_dir.mkdir(exist_ok=True)
+    config_path = codex_dir / "config.yaml"
+    lines: list[str] = ["# Sarathi-managed Codex permission config\n"]
+    if policy.get("full_auto", True):
+        lines.append("full-auto: true\n")
+    if policy.get("disable_sandbox", False):
+        lines.append("disable-sandbox: true\n")
+    config_path.write_text("".join(lines), encoding="utf-8")
+
+
+def _write_opencode_config(workspace_root: str, policy: dict[str, Any]) -> None:
+    """Merge auto_approve into opencode.json at workspace root."""
+    config_path = Path(workspace_root) / "opencode.json"
+    existing: dict[str, Any] = {}
+    if config_path.exists():
+        try:
+            existing = json.loads(config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    if policy.get("auto_approve", True):
+        existing["autoapprove"] = True
+    config_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+
+
+def ensure_provider_permissions(workspace_root: str) -> dict[str, str]:
+    """
+    Read policy-pack/permissions.md and write provider-native config files.
+
+    Returns a dict mapping provider name → config path written (for status reporting).
+    Silently skips any provider whose section is absent from the policy.
+    """
+    policy = _load_permissions_policy(workspace_root)
+    written: dict[str, str] = {}
+    if "claude" in policy:
+        _write_claude_settings(workspace_root, policy["claude"])
+        written["claude"] = str(Path(workspace_root) / ".claude" / "settings.json")
+    if "codex" in policy:
+        _write_codex_config(workspace_root, policy["codex"])
+        written["codex"] = str(Path.home() / ".codex" / "config.yaml")
+    if "opencode" in policy:
+        _write_opencode_config(workspace_root, policy["opencode"])
+        written["opencode"] = str(Path(workspace_root) / "opencode.json")
+    return written
 
 
 def _parse_json_dict(text: str) -> dict[str, Any] | None:

@@ -20,6 +20,7 @@ POLICY_FILES = {
     "model_routing": "model-routing.md",
     "skills": "skills.md",
     "task_tracking": "task-tracking.md",
+    "permissions": "permissions.md",
 }
 
 

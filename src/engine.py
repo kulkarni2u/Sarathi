@@ -480,6 +480,7 @@ class Engine:
             "task_tracking",
             "learning_feedback",
             "workflow_patterns",
+            "permissions",
         ):
             setattr(pack, attr, self.compiled_policy.get(attr))
 

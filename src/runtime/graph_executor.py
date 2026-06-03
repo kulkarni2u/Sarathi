@@ -444,11 +444,12 @@ class TaskGraphExecutor:
                 "title": node.get("title"),
                 "outputs": outputs,
             })
+            node_id = node.get("id", "unknown")
             self.ncp_artifact_adapter._call_write_memory(
                 content[:2000],
                 "semantic",
-                "tool_result",
-                f"sarathi.node.{node.get('id', 'unknown')}",
+                f"sarathi.node.{node_id}",
+                f"sarathi.node.{node_id}",
             )
         except Exception:
             pass
@@ -522,7 +523,7 @@ class TaskGraphExecutor:
             self.ncp_persistence_adapter._call_write_memory(
                 content[:2000],
                 "episodic",
-                "tool_result",
+                f"sarathi.loop.{parent_id}",
                 f"sarathi.loop.{parent_id}",
             )
         except Exception:
@@ -660,6 +661,7 @@ class TaskGraphExecutor:
                 )
             except Exception:
                 context_pack_artifact, token_budget = self._local_context(node, graph)
+                context_pack_artifact.setdefault("compilation", {})["ncp_fallback"] = True
         else:
             context_pack_artifact, token_budget = self._local_context(node, graph)
 
@@ -711,6 +713,18 @@ class TaskGraphExecutor:
         }
         if response.usage:
             result["usage"] = response.usage.to_artifact()
+            ncp = self.ncp_context_adapter
+            if ncp is not None and hasattr(ncp, "_call_log_cost"):
+                try:
+                    ncp._call_log_cost(
+                        agent_id=f"s.sarathi.node.{node.get('id', 'unknown')}",
+                        model=response.usage.provider_id or "unknown",
+                        input_tokens=response.usage.input_tokens,
+                        output_tokens=response.usage.output_tokens,
+                        pipeline_id=str(node.get("id")),
+                    )
+                except Exception:
+                    pass
         if response.error:
             result["error"] = response.error
         if response.raw_transcript_ref:

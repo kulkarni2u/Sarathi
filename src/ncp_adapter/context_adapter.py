@@ -97,6 +97,8 @@ class NCPContextAdapter(NCPTransportMixin):
             "slot": phase,
             "intent": f"execute_node:{node_id}",
         }
+        if token_budget is not None:
+            args["token_budget"] = token_budget
         ctx = self._call_get_context(args)
         return self._map_to_context_pack(ctx, role, phase, task_packet, token_budget)
 
@@ -142,8 +144,9 @@ class NCPContextAdapter(NCPTransportMixin):
                 additional.extend(self._fetch_loop_history(parent_id, max_items=iteration - 1))
 
         elif node_type == "execute":
-            # Classified branches or fanout branches receive whispers from parent
-            additional.extend(self._fetch_node_whispers(node_id))
+            # Only branch nodes (fanout/classify children) receive whispers from a parent
+            if "-branch-" in node_id:
+                additional.extend(self._fetch_node_whispers(node_id))
 
         if additional:
             ai = base.setdefault("agent_input", {})

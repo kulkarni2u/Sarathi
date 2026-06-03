@@ -431,8 +431,8 @@ class Engine:
             else:
                 print(
                     "[ncp] NCP not found — using native adapters. "
-                    "To enable NCP: install the NCP tool, run `sarathi init --ncp`. "
-                    "See docs/HOWTO.md §7, or pass --no-ncp to silence this."
+                    "To enable: github.com/kulkarni2u/neural-context-protocol, then `sarathi init --ncp`. "
+                    "Pass --no-ncp to silence this message."
                 )
 
         # Validate NCP when enabled before creating adapters

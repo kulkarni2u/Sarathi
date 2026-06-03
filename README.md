@@ -217,7 +217,9 @@ NCP (Neural Context Protocol) is a **separate tool** that Sarathi integrates wit
 
 ### Getting NCP
 
-NCP is a separate project. Install it and ensure `ncp` is on your PATH before using `sarathi init --ncp`:
+NCP is a separate project: **[kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)**
+
+Install it and ensure `ncp` is on your PATH before using `sarathi init --ncp`:
 
 ```bash
 # Check if NCP is already available

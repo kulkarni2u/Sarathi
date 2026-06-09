@@ -109,11 +109,22 @@ class HarnessConfig:
         task_class: TaskClass,
         task_id: str,
         ncp_enabled: bool = False,
+        available_providers: list[str] | None = None,
+        health_scores: dict[str, float] | None = None,
     ) -> HarnessConfig:
         """Build a HarnessConfig from TaskClass defaults."""
         defaults = TASK_CLASS_DEFAULTS[task_class]
         signals = [QualitySignalDef(name=name) for name in defaults.quality_signals]
-        primary_agent = resolve_agent_binding(defaults.agent_preference)
+        primary_agent = resolve_agent_binding(
+            defaults.agent_preference,
+            available_providers=available_providers,
+            health_scores=health_scores,
+        )
+        fallback_agents = _build_fallback_agents(
+            primary_agent.agent_id,
+            available_providers=available_providers,
+            health_scores=health_scores,
+        )
         return cls(
             task_id=task_id,
             task_class=task_class,
@@ -124,6 +135,7 @@ class HarnessConfig:
             quality_signals=signals,
             defaults=defaults,
             primary_agent=primary_agent,
+            fallback_agents=fallback_agents,
         )
 
 
@@ -134,16 +146,50 @@ _PREFERENCE_TO_PROVIDER: dict[str, str] = {
     "sarathi_native":     "local",
 }
 
+# Static preference order for fallback candidates when a primary agent fails.
+_FALLBACK_PROVIDER_ORDER: list[str] = ["claude", "codex", "opencode"]
+
 
 def resolve_agent_binding(
     agent_preference: str,
     available_providers: list[str] | None = None,
+    health_scores: dict[str, float] | None = None,
 ) -> AgentBinding:
     """Map an AssemblyDefaults.agent_preference string to a concrete AgentBinding."""
     provider_id = _PREFERENCE_TO_PROVIDER.get(agent_preference, "local")
     if available_providers and provider_id not in available_providers:
         provider_id = available_providers[0] if available_providers else "local"
-    return AgentBinding(agent_id=provider_id)
+    binding = AgentBinding(agent_id=provider_id)
+    if health_scores and provider_id in health_scores:
+        binding.health_score = health_scores[provider_id]
+    return binding
+
+
+def _build_fallback_agents(
+    primary_provider_id: str,
+    available_providers: list[str] | None = None,
+    health_scores: dict[str, float] | None = None,
+) -> list[AgentBinding]:
+    """Build the ordered fallback agent list for a resolved primary agent.
+
+    Fallbacks are the OTHER distinct providers from ``_FALLBACK_PROVIDER_ORDER``,
+    minus the primary, filtered to ``available_providers``. When
+    ``available_providers`` is None we don't fabricate availability — the
+    fallback list stays empty.
+    """
+    if not available_providers:
+        return []
+    fallbacks: list[AgentBinding] = []
+    for provider_id in _FALLBACK_PROVIDER_ORDER:
+        if provider_id == primary_provider_id:
+            continue
+        if provider_id not in available_providers:
+            continue
+        binding = AgentBinding(agent_id=provider_id)
+        if health_scores and provider_id in health_scores:
+            binding.health_score = health_scores[provider_id]
+        fallbacks.append(binding)
+    return fallbacks
 
 
 @dataclass

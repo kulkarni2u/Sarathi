@@ -17,11 +17,12 @@ if TYPE_CHECKING:
 class LearnHandler:
     """Extract lessons learned from task execution."""
 
-    def __init__(self, policy_pack, dispatcher=None):
+    def __init__(self, policy_pack, dispatcher=None, provider_health=None):
         self.policy_pack = policy_pack
         self.dispatcher = dispatcher
         self.learning_store = LearningStore()
         self.evolver = Evolver()
+        self.provider_health = provider_health
 
     def execute(self, task: "TaskContext", phase: "Phase") -> "PhaseResult":
         from src.engine import PhaseResult
@@ -66,6 +67,18 @@ class LearnHandler:
             except ImportError:
                 from harness import measure_outcome
             outcome = measure_outcome(task, harness_config)
+            self._record_provider_health(task, outcome)
             return self.evolver.ingest_harness_outcome(outcome)
         except Exception:
             return []
+
+    def _record_provider_health(self, task: "TaskContext", outcome) -> None:
+        """Record success/failure of the agent that did the work for health tracking."""
+        if self.provider_health is None:
+            return
+        phase_results = getattr(task, "phase_results", []) or []
+        success = not any(getattr(pr, "outcome", "") == "fail" for pr in phase_results)
+        try:
+            self.provider_health.record(outcome.agent_used, success)
+        except Exception:
+            pass

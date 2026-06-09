@@ -18,6 +18,7 @@ from .graph_policy import GraphExecutionPolicy, validate_graph_execution_config
 from .learning import LearningRecord, LearningStore
 from .output_index import build_artifact_index, normalize_agent_output
 from .preflight import PreflightPolicy
+from .provider_health import ProviderHealthStore
 from .providers import (
     apply_learning_feedback_to_provider_routing,
     AnthropicSdkProviderAdapter,
@@ -64,6 +65,7 @@ __all__ = [
     "TaskGraphExecutor",
     "validate_graph_execution_config",
     "PreflightPolicy",
+    "ProviderHealthStore",
     "ConfiguredProviderAdapter",
     "AnthropicSdkProviderAdapter",
     "CommandProviderAdapter",

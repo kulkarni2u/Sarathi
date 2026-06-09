@@ -49,6 +49,7 @@ try:
         DispatchRequest,
         GateResult,
         PreflightPolicy,
+        ProviderHealthStore,
         RecoveryRunner,
         phase_agent_role_artifact,
         ContextCompiler,
@@ -76,6 +77,7 @@ except ImportError:
         DispatchRequest,
         GateResult,
         PreflightPolicy,
+        ProviderHealthStore,
         RecoveryRunner,
         phase_agent_role_artifact,
         ContextCompiler,
@@ -485,30 +487,100 @@ class _HarnessAwareDispatcher:
         self._base = base
         self.preferred_agent: str | None = None
         self.claude_session_id: str | None = None
+        self.fallback_agents: list[str] = []
 
     def reset_task_state(self) -> None:
         """Clear per-task routing/session state before a new task starts."""
         self.preferred_agent = None
         self.claude_session_id = None
+        self.fallback_agents = []
 
     def dispatch(self, request: DispatchRequest) -> Any:
+        injected_provider = False
         if self.preferred_agent and not request.constraints.get("provider"):
             request = _dc_replace(
                 request,
                 constraints={**request.constraints, "provider": self.preferred_agent},
             )
+            injected_provider = True
         if self.claude_session_id and not request.constraints.get("claude_session_id"):
             request = _dc_replace(
                 request,
                 constraints={**request.constraints, "claude_session_id": self.claude_session_id},
             )
+        # CLI-backed providers flake more than the deterministic local one —
+        # give a non-local provider one retry inside LocalDispatcher when the
+        # caller didn't already set a retry budget.
+        provider = request.constraints.get("provider")
+        if request.retry_budget == 0 and provider and provider != "local":
+            request = _dc_replace(request, retry_budget=1)
+
         response = self._base.dispatch(request)
+        self._track_session(response)
+
+        if (
+            not getattr(response, "success", True)
+            and self.fallback_agents
+            and injected_provider
+        ):
+            response = self._attempt_failover(request, response)
+
+        return response
+
+    def _attempt_failover(self, request: DispatchRequest, response: Any) -> Any:
+        """Retry a failed primary-agent dispatch against fallback providers.
+
+        Only called when the failure belongs to the agent this wrapper chose
+        (``injected_provider``), never when the caller pinned a provider
+        explicitly. Skips failover entirely if the failed attempt already
+        mutated the workspace.
+        """
+        evidence = getattr(response, "evidence", None) or {}
+        change_count = (evidence.get("workspace_delta") or {}).get("change_count", 0)
+        if change_count > 0:
+            response.artifacts["failover_skipped"] = "workspace_already_modified"
+            return response
+
+        failed_provider = request.constraints.get("provider")
+        attempted = [failed_provider]
+        last_response = response
+        last_error = response.error
+
+        for fallback_agent in self.fallback_agents:
+            fallback_request = _dc_replace(
+                request,
+                constraints={**request.constraints, "provider": fallback_agent},
+            )
+            attempted.append(fallback_agent)
+            fallback_response = self._base.dispatch(fallback_request)
+            self._track_session(fallback_response)
+
+            if getattr(fallback_response, "success", False):
+                fallback_response.artifacts["failover"] = {
+                    "failed_provider": failed_provider,
+                    "fallback_used": fallback_agent,
+                    "attempted": attempted,
+                }
+                return fallback_response
+
+            last_response = fallback_response
+            last_error = fallback_response.error
+
+        last_response.artifacts["failover"] = {
+            "failed_provider": failed_provider,
+            "fallback_used": None,
+            "attempted": attempted,
+        }
+        if last_error is not None:
+            last_response.error = last_error
+        return last_response
+
+    def _track_session(self, response: Any) -> None:
         artifacts = getattr(response, "artifacts", None)
         if isinstance(artifacts, dict):
             session_id = artifacts.get("claude_session_id")
             if isinstance(session_id, str) and session_id:
                 self.claude_session_id = session_id
-        return response
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)
@@ -625,6 +697,12 @@ class Engine:
             self.artifact_store = ArtifactStore()
             self.whisper_router = None
 
+        # Provider health tracking — same base directory PersistenceManager
+        # uses by default (".sarathi/tasks" -> ".sarathi"), independent of
+        # whether NCP persistence is active.
+        health_base_dir = getattr(self.persistence, "storage_path", Path(".sarathi/tasks")).parent
+        self.provider_health = ProviderHealthStore(health_base_dir)
+
         self.phase_handlers = self._create_phase_handlers()
         self.recovery_runner = RecoveryRunner(dispatcher=self.dispatcher)
         self.phases = list(Phase)
@@ -697,7 +775,7 @@ class Engine:
             Phase.RISK_CHECK: RiskCheckHandler(self.policy_pack, self.dispatcher),
             Phase.ELEGANCE: EleganceHandler(self.policy_pack, self.dispatcher),
             Phase.PHASE_LOG: PhaseLogHandler(self.policy_pack, self.dispatcher),
-            Phase.LEARN: LearnHandler(self.policy_pack, self.dispatcher),
+            Phase.LEARN: LearnHandler(self.policy_pack, self.dispatcher, provider_health=self.provider_health),
         }
 
     def generate_task_id(self, description: str) -> str:
@@ -1122,6 +1200,10 @@ class Engine:
                     if hasattr(self.dispatcher, "preferred_agent"):
                         agent_id = task.harness_config.primary_agent.agent_id
                         self.dispatcher.preferred_agent = agent_id if agent_id != "local" else None
+                    if hasattr(self.dispatcher, "fallback_agents"):
+                        self.dispatcher.fallback_agents = [
+                            b.agent_id for b in task.harness_config.fallback_agents
+                        ]
                 except Exception:
                     logger.exception(
                         "Failed to restore harness_config for task %s; "

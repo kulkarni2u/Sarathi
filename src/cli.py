@@ -351,6 +351,30 @@ def _format_token_count(value: int) -> str:
     return str(value)
 
 
+def _budget_summary_line(task: TaskContext) -> str | None:
+    """Render the policy-enforced per-task budget snapshot, if any."""
+    snapshot = getattr(task, "budget_snapshot", None)
+    if not isinstance(snapshot, dict):
+        for pr in reversed(task.phase_results):
+            exhausted = pr.artifacts.get("budget_exhausted")
+            if isinstance(exhausted, dict):
+                snapshot = exhausted
+                break
+    if not isinstance(snapshot, dict):
+        return None
+    if snapshot.get("enforcement") != "enabled":
+        return None
+
+    consumed = _format_token_count(snapshot.get("consumed_tokens", 0) or 0)
+    max_tokens = snapshot.get("max_total_tokens")
+    max_text = _format_token_count(max_tokens) if max_tokens is not None else "unbounded"
+    return (
+        "Budget:"
+        f" {consumed} / {max_text}"
+        f" | state: {snapshot.get('state', 'unknown')}"
+    )
+
+
 # ============================================================================
 # CLI handlers
 # ============================================================================
@@ -1205,6 +1229,9 @@ def _print_task_status(task: TaskContext, *, stale_after_seconds: int = 300) -> 
     usage_line = _usage_summary_line(task)
     if usage_line is not None:
         print(usage_line)
+    budget_line = _budget_summary_line(task)
+    if budget_line is not None:
+        print(budget_line)
     if task.task_graph_state:
         summary = graph_summary(task.task_graph_state)
         print(

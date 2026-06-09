@@ -51,6 +51,7 @@ try:
         PreflightPolicy,
         ProviderHealthStore,
         RecoveryRunner,
+        TaskBudget,
         phase_agent_role_artifact,
         ContextCompiler,
     )
@@ -79,6 +80,7 @@ except ImportError:
         PreflightPolicy,
         ProviderHealthStore,
         RecoveryRunner,
+        TaskBudget,
         phase_agent_role_artifact,
         ContextCompiler,
     )
@@ -325,6 +327,7 @@ class PersistenceManager:
             "complexity": task.complexity.value,
             "complexity_evidence": task.complexity_evidence,
             "preflight_validation": task.preflight_validation,
+            "budget_snapshot": task.budget_snapshot,
             "task_graph_state": task.task_graph_state,
             "current_phase": task.current_phase.value if task.current_phase else None,
             "task_class": getattr(task, "task_class", TaskClass.ANALYSIS).value,
@@ -374,6 +377,7 @@ class PersistenceManager:
                 preflight_validation=task_data.get("preflight_validation", {}),
                 task_graph_state=task_data.get("task_graph_state", {}),
                 task_class=restored_task_class,
+                budget_snapshot=task_data.get("budget_snapshot"),
             )
 
             task.current_phase = Phase(task_data["current_phase"]) if task_data.get("current_phase") else None
@@ -447,6 +451,7 @@ class TaskContext:
     task_class: TaskClass = TaskClass.ANALYSIS
     harness_config: HarnessConfig | None = None
     gate_retry_hint: dict | None = field(default=None)
+    budget_snapshot: dict[str, Any] | None = None
 
     def get_completed_phases(self) -> set[Phase]:
         """Get set of phases that have been completed."""
@@ -803,6 +808,9 @@ class Engine:
             self.persistence.save_task(task)
             return task
 
+        budget = TaskBudget.from_escalation(self.policy_pack.escalation)
+        budget_warned = False
+
         task.current_phase = Phase.ROUTE
 
         while task.current_phase is not None and task.current_phase != Phase.LEARN:
@@ -829,7 +837,9 @@ class Engine:
             for phase_result in phase_results:
                 task.phase_results.append(phase_result)
                 self._sync_task_state(task, phase_result)
+                budget.add_phase_result_usage(phase_result.artifacts)
             result = phase_results[-1]
+            task.budget_snapshot = budget.to_artifact()
 
             # Trust gate handshake after ROUTE (NCP mode only — degrades gracefully when NCP is off)
             if phase == Phase.ROUTE and task.harness_config is not None and self.ncp_enabled:
@@ -859,6 +869,29 @@ class Engine:
             else:
                 self._log_phase(task, phase, "completed")
             task.current_phase = PHASE_TRANSITIONS.get(phase, Phase.LEARN)
+
+            budget_state = budget.state()
+            if budget_state == "warning" and not budget_warned:
+                budget_warned = True
+                logger.warning(
+                    "Task %s budget warning: consumed %s/%s tokens",
+                    task.task_id,
+                    budget.consumed_tokens,
+                    budget.max_total_tokens,
+                )
+            elif budget_state == "exhausted":
+                result.artifacts["budget_exhausted"] = budget.to_artifact()
+                logger.warning(
+                    "Task %s budget exhausted: consumed %s/%s tokens (on_exhausted=%s)",
+                    task.task_id,
+                    budget.consumed_tokens,
+                    budget.max_total_tokens,
+                    budget.on_exhausted,
+                )
+                if budget.on_exhausted == "pause":
+                    self.persistence.save_task(task)
+                    return task
+
             self.persistence.save_task(task)
 
         # Execute final Learn phase

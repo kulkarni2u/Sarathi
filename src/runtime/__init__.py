@@ -9,6 +9,7 @@ from .agent_roles import (
     phase_agent_role_artifact,
 )
 from .artifacts import ArtifactStore
+from .budget import TaskBudget
 from .commands import CommandResult, CommandRunner
 from .contracts import DispatchRequest, DispatchResponse, GateResult, UsageRecord, build_usage_record
 from .context import AgentInputContract, AgentOutputContract, ContextCompiler, ContextPack
@@ -42,6 +43,7 @@ from .workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
 __all__ = [
     "AgentRole",
     "ArtifactStore",
+    "TaskBudget",
     "CommandResult",
     "CommandRunner",
     "AgentInputContract",

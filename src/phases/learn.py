@@ -30,6 +30,11 @@ class LearnHandler:
         proposals = self.evolver.generate_policy_proposals(
             learning_records=[artifacts["learning_record"]],
         )
+
+        # Wire HarnessOutcome into Evolver when harness_config is available (Piece 5)
+        harness_proposals = self._ingest_harness_outcome(task)
+        proposals.extend(harness_proposals)
+
         artifacts["policy_proposals"] = [proposal.to_artifact() for proposal in proposals]
         artifacts["proposal_count"] = len(proposals)
         lessons = artifacts["lessons_learned"]
@@ -40,6 +45,7 @@ class LearnHandler:
             "execution_analyzed": True,
             "insights_generated": len(lessons) > 0,
             "policy_proposals_generated": len(proposals),
+            "harness_outcome_ingested": harness_proposals is not None,
         }
 
         return PhaseResult(
@@ -48,3 +54,18 @@ class LearnHandler:
             evidence=evidence,
             artifacts=artifacts,
         )
+
+    def _ingest_harness_outcome(self, task: "TaskContext") -> list:
+        """Build a measured HarnessOutcome from phase_results and feed it into Evolver."""
+        harness_config = getattr(task, "harness_config", None)
+        if harness_config is None:
+            return []
+        try:
+            try:
+                from src.harness import measure_outcome
+            except ImportError:
+                from harness import measure_outcome
+            outcome = measure_outcome(task, harness_config)
+            return self.evolver.ingest_harness_outcome(outcome)
+        except Exception:
+            return []

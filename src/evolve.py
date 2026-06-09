@@ -103,6 +103,59 @@ class Evolver:
     PASS_GATE = 0.8
     PROPOSAL_GATE = 2
 
+    def ingest_harness_outcome(self, outcome: Any) -> list[PolicyProposal]:
+        """
+        Score a HarnessOutcome against the per-TaskClass baseline.
+        Generates proposals when quality signals deviate by more than 10%.
+        """
+        proposals: list[PolicyProposal] = []
+        baseline = self._get_or_create_baseline(outcome.task_class.value)
+
+        for signal_name, measured_value in outcome.quality_signals.items():
+            expected = baseline.get(signal_name)
+            if expected is None:
+                baseline[signal_name] = measured_value
+                continue
+            delta = measured_value - expected
+            if abs(delta) > 0.1:
+                proposals.extend(
+                    self._proposals_for_quality_deviation(outcome, signal_name, delta)
+                )
+
+        return proposals
+
+    def _get_or_create_baseline(self, task_class_value: str) -> dict[str, float]:
+        if not hasattr(self, "_harness_baselines"):
+            self._harness_baselines: dict[str, dict[str, float]] = {}
+        return self._harness_baselines.setdefault(task_class_value, {})
+
+    def _proposals_for_quality_deviation(
+        self,
+        outcome: Any,
+        signal_name: str,
+        delta: float,
+    ) -> list[PolicyProposal]:
+        direction = "degraded" if delta < 0 else "improved"
+        task_class_value = outcome.task_class.value
+        return [
+            PolicyProposal(
+                title=f"Quality signal '{signal_name}' {direction} for {task_class_value}",
+                policy_file="wiki/harness-quality.md",
+                rationale=(
+                    f"Signal '{signal_name}' deviated by {delta:+.2f} from baseline "
+                    f"for task class {task_class_value} "
+                    f"(harness {outcome.harness_id}, task {outcome.task_id})."
+                ),
+                suggested_change=(
+                    f"Review {'assembly defaults' if delta < 0 else 'routing strategy'} for "
+                    f"{task_class_value} tasks, focusing on {signal_name} optimization."
+                ),
+                evidence_refs=[f"{outcome.task_id}:quality:{signal_name}"],
+                confidence=min(1.0, 0.5 + abs(delta)),
+                source="harness_outcome",
+            )
+        ]
+
     def detect_pattern(self, baseline: EvolveBaseline, pattern_name: str) -> Pattern | None:
         for pattern in baseline.patterns:
             if pattern.name == pattern_name:

@@ -1,7 +1,7 @@
 # Sarathi
 
-Sarathi is a policy-backed workflow orchestration framework for AI-assisted software delivery.
-It gives teams a consistent lifecycle for planning, building, verifying, reviewing, and learning.
+Sarathi is a **Harness Engine** for AI-assisted software delivery — a policy-backed framework that certifies context, pre-declares permissions, and measures outcomes before and after every model call.
+It gives teams a consistent, auditable lifecycle for planning, building, verifying, reviewing, and learning, with a self-improvement loop that evolves policy from measured execution data.
 
 ## What You Get
 
@@ -191,6 +191,173 @@ If structured provider `spec_trace` data is partial or explicitly failing, Sarat
 Provider `diff_trace` hunks can also carry reviewer-grade metadata such as `category`, `confidence`, and `suggestion`. Sarathi persists those fields on review findings and synthesizes review-level diff summaries including blocker counts, average confidence, risk categories, and patch-region highlights.
 
 Those diff summaries now also cluster related hunks into grouped patch regions and emit a `review_confidence_verdict` with explicit reasons, so downstream review surfaces can show both the risky regions and the overall trust level of the provider-backed patch analysis.
+
+## Lifecycle Architecture
+
+### Static outer spine
+
+Every task walks the same 12-phase chain in order:
+
+```
+ROUTE → BRAINSTORM → PLANNING_ADVISOR → PLAN → BUILD → VERIFY
+      → REVIEW → TASK_TRACKING → RISK_CHECK → ELEGANCE → PHASE_LOG → LEARN
+```
+
+The sequence is fixed. The only static variation is **complexity-based skipping** — PLANNING_ADVISOR is dropped for LOW and MEDIUM tasks. Two runtime escape hatches exist: a phase can emit `next_phase_override` to redirect the chain, or `pause_execution` to suspend for human approval. If the NCP Trust Gate blocks the task after ROUTE, the engine jumps straight to LEARN.
+
+### Dynamic inner graph
+
+The PLAN phase generates a **task graph** of typed nodes; BUILD executes it. Six `NodeType` patterns drive how nodes are wired at plan time:
+
+| Pattern | `NodeType` | What happens |
+|---------|-----------|--------------|
+| Classify-and-Act | `CLASSIFY` | Routes to typed downstream branches at runtime |
+| Fanout-and-Synthesize | `FANOUT` / `SYNTHESIZE` | Spawns N parallel child nodes, merges results |
+| Adversarial Verification | `JUDGE` | Independent verifier nodes vote on output quality |
+| Generate-and-Filter | `EXECUTE` + `JUDGE` | N generators scored and filtered |
+| Tournament | `JUDGE` | Best-of-N selection with judge rounds |
+| Loop-Until-Done | `LOOP_GATE` | Retries until a stop condition is met |
+
+Enabled patterns and their parameters are declared in `policy-pack/workflow-patterns.md`:
+
+```yaml
+patterns:
+  classify_and_act:          { enabled: true }
+  fanout_and_synthesize:     { enabled: true, max_branches: 3 }
+  adversarial_verification:  { enabled: true, verifier_count: 2, pass_threshold: 2 }
+  loop_until_done:           { enabled: true, max_iterations: 5 }
+```
+
+**In short:** the phase *order* is static and policy-auditable; the *work inside each phase* is dynamically composed from typed graph nodes at plan time.
+
+---
+
+## Harness Engine
+
+Sarathi is a Harness Engine, not just a workflow runner. At ROUTE time it compiles a `HarnessConfig` — a serializable, diffable, versionable artifact that pre-declares context scope, permission surface, agent assignment, and quality targets *before* any model call is made.
+
+### TaskClass taxonomy
+
+The ROUTE phase classifies every task into one of 12 classes that drive all assembly defaults:
+
+| Family | Classes |
+|--------|---------|
+| Read-only | `query`, `analysis` |
+| Code changes | `codegen/greenfield`, `codegen/refactor`, `codegen/patch` |
+| Mutations | `mutation/config`, `mutation/infra`, `mutation/data` |
+| Orchestration | `orchestration/pipeline`, `orchestration/delegation` |
+| Self-improvement | `evolution/harness`, `evolution/context` |
+
+```python
+from src.task_class import TaskClass, classify_task_class
+
+tc = classify_task_class("deploy infra with terraform")
+# → TaskClass.MUTATION_INFRA
+```
+
+### HarnessConfig
+
+A compiled harness carries the full execution contract for one task:
+
+```python
+from src.harness import HarnessConfig
+from src.task_class import TaskClass
+
+hc = HarnessConfig.from_task_class(TaskClass.CODEGEN_PATCH, task_id="task-001")
+print(hc.context_scope)           # "targeted"
+print(hc.permission_scope)        # "repo_write_scoped"
+print(hc.primary_agent.agent_id)  # "local"
+print(hc.quality_signals)         # [QualitySignalDef("test_pass_rate"), ...]
+print(hc.assembly_mode)           # "STANDARD"
+
+# Serialise / restore / diff
+json_str = hc.to_json()
+restored = HarnessConfig.from_json(json_str)
+delta = hc.diff(restored)
+```
+
+**Assembly modes** — the engine caches harness configs by TaskClass to avoid redundant assembly:
+
+| Mode | When | Behaviour |
+|------|------|-----------|
+| `STANDARD` | First task of a given class | Full build; stored in cache |
+| `FAST` | Cache hit for same class | Skeleton reused; only identity fields (`harness_id`, `task_id`, `assembled_at`, `trace_id`) are refreshed |
+| `DEEP` | Any `mutation/*` or `evolution/*` | Always rebuilds — irreversible side-effects demand a fresh context assessment |
+
+### Agent selection
+
+`agent_preference` in each TaskClass's defaults resolves to a concrete provider at assembly time:
+
+| Preference | Resolved agent | Typical classes |
+|-----------|---------------|-----------------|
+| `fastest` | `local` | `query` |
+| `balanced` | `local` | `analysis`, `codegen/patch`, `codegen/refactor` |
+| `highest_capability` | `claude` | `codegen/greenfield`, `mutation/*`, `evolution/*` |
+| `sarathi_native` | `local` | `orchestration/*` |
+
+After ROUTE, the engine's `_HarnessAwareDispatcher` injects the resolved provider into every subsequent dispatch request (when no explicit `constraints["provider"]` is already set). `balanced`/`fastest` → `local` means "no strong preference — let provider-config routing decide."
+
+```python
+from src.harness import resolve_agent_binding
+
+binding = resolve_agent_binding("highest_capability")
+# → AgentBinding(agent_id="claude")
+```
+
+### PermissionScope
+
+Every TaskClass carries a pre-declared permission surface:
+
+```python
+from src.permissions import build_permission_scope
+from src.task_class import TaskClass
+
+scope = build_permission_scope(TaskClass.MUTATION_INFRA)
+print(scope.requires_human_approval)  # True
+print(scope.side_effect_class)        # "IRREVERSIBLE"
+```
+
+Mutation and evolution classes auto-require human approval. `IRREVERSIBLE` operations auto-require confirmation before dispatch.
+
+### TrustGate (NCP mode)
+
+When NCP is enabled, Sarathi runs a formal context handshake after ROUTE. The gate returns PASS / WARN / BLOCK and the engine applies an arbitration matrix:
+
+| Gate result | Task class | Engine action |
+|-------------|-----------|---------------|
+| `PASS` | any | Execute normally |
+| `WARN` | `query` / `analysis` | Execute flagged (`stale_keys` recorded in harness) |
+| `WARN` | `mutation/*` / `evolution/*` | Block until NCP refreshes stale context |
+| `BLOCK` | any | Abort and escalate directly to LEARN |
+
+### HarnessOutcome and quality signals
+
+After every task, `measure_outcome()` extracts real quality signals from phase artifacts — no mock values:
+
+```python
+from src.harness import measure_outcome
+
+outcome = measure_outcome(task, harness_config)
+print(outcome.quality_signals)    # {"test_pass_rate": 0.95, "blast_radius": 0.05, ...}
+print(outcome.token_cost_actual)  # 1840
+print(outcome.latency_ms)         # 3200
+print(outcome.agent_used)         # "claude"
+```
+
+Signal sources:
+
+| Signal | Extracted from |
+|--------|---------------|
+| `test_pass_rate` | VERIFY `command_succeeded`; falls back to `coverage / 100` |
+| `blast_radius` | `1.0 − review_score` from REVIEW `review_verdict` |
+| `accuracy` / `relevance` | REVIEW `review_verdict.score` |
+| `token_cost` | Sum of `dispatch_usage.total_tokens` across all phases |
+| `latency` | `assembled_at → now` in milliseconds |
+| `rollback_triggered` | Any phase with `recovery_actions` or `rollback_triggered` artifact |
+
+The LEARN phase feeds `HarnessOutcome` into the Evolver, which compares signals against per-TaskClass baselines and generates `PolicyProposal` records when a signal deviates by more than 10%.
+
+---
 
 ## Common Commands
 

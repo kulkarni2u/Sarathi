@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -201,26 +201,51 @@ class PhaseHandler:
 class RouteHandler(PhaseHandler):
     """Handler for the ROUTE phase."""
 
-    def __init__(self, policy_pack: PolicyPack, dispatcher: Dispatcher | None = None, ncp_enabled: bool = False):
+    def __init__(
+        self,
+        policy_pack: PolicyPack,
+        dispatcher: Dispatcher | None = None,
+        ncp_enabled: bool = False,
+        harness_cache: dict | None = None,
+    ):
         super().__init__(policy_pack, dispatcher)
         self.ncp_enabled = ncp_enabled
+        self._harness_cache: dict[str, HarnessConfig] = harness_cache if harness_cache is not None else {}
 
     def execute(self, task: TaskContext, phase: Phase) -> PhaseResult:
-        """Route the task — classify TaskClass, emit HarnessConfig."""
-        # Classify via new TaskClass taxonomy
+        """Route the task — classify TaskClass, select assembly mode, emit HarnessConfig."""
         task_class = classify_task_class(task.description)
-
-        # Legacy string type (preserved for backward-compat evidence)
         legacy_type = self._classify_task_type(task.description)
         workflow_path = self._select_workflow_path(task, legacy_type)
 
-        # Build the HarnessConfig artifact
-        harness = HarnessConfig.from_task_class(task_class, task.task_id, ncp_enabled=self.ncp_enabled)
-        harness_dict = json.loads(harness.to_json())
+        # Assembly mode: DEEP for mutation/evolution, FAST for cache hit, STANDARD otherwise
+        is_deep = task_class.value.startswith(("mutation/", "evolution/"))
+        cache_hit = None if is_deep else self._harness_cache.get(task_class.value)
 
-        # Build PermissionScope and propagate human_in_loop flag
-        perm_scope = build_permission_scope(task_class)
-        harness.requires_human_approval = perm_scope.requires_human_approval
+        if is_deep:
+            assembly_mode = "DEEP"
+        elif cache_hit is not None:
+            assembly_mode = "FAST"
+        else:
+            assembly_mode = "STANDARD"
+
+        if assembly_mode == "FAST":
+            # Reuse cached config skeleton — freshen identity fields only
+            harness = HarnessConfig.from_json(cache_hit.to_json())
+            harness.harness_id = str(uuid.uuid4())[:8]
+            harness.task_id = task.task_id
+            harness.assembled_at = datetime.utcnow().isoformat()
+            harness.trace_id = str(uuid.uuid4())
+            harness.assembly_mode = "FAST"
+        else:
+            harness = HarnessConfig.from_task_class(task_class, task.task_id, ncp_enabled=self.ncp_enabled)
+            harness.assembly_mode = assembly_mode
+            perm_scope = build_permission_scope(task_class)
+            harness.requires_human_approval = perm_scope.requires_human_approval
+            if assembly_mode == "STANDARD":
+                self._harness_cache[task_class.value] = harness
+
+        harness_dict = json.loads(harness.to_json())
 
         evidence = {
             "task_type": legacy_type,
@@ -229,6 +254,8 @@ class RouteHandler(PhaseHandler):
             "complexity_assessed": True,
             "harness_assembled": True,
             "requires_human_approval": harness.requires_human_approval,
+            "assembly_mode": assembly_mode,
+            "cache_hit": assembly_mode == "FAST",
         }
 
         return PhaseResult(
@@ -240,6 +267,7 @@ class RouteHandler(PhaseHandler):
                 "task_class": task_class.value,
                 "harness_config": harness_dict,
                 "permission_scope": task_class.value,
+                "assembly_mode": assembly_mode,
             },
         )
 
@@ -437,6 +465,29 @@ class TaskContext:
         return datetime.now().isoformat()
 
 
+class _HarnessAwareDispatcher:
+    """Wraps any dispatcher and injects the harness-resolved preferred agent.
+
+    Reads preferred_agent at dispatch time so RouteHandler can set it after
+    the ROUTE phase without needing to rebuild phase handlers.
+    """
+
+    def __init__(self, base: Any) -> None:
+        self._base = base
+        self.preferred_agent: str | None = None
+
+    def dispatch(self, request: DispatchRequest) -> Any:
+        if self.preferred_agent and not request.constraints.get("provider"):
+            request = _dc_replace(
+                request,
+                constraints={**request.constraints, "provider": self.preferred_agent},
+            )
+        return self._base.dispatch(request)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
 class Engine:
     """
     Core Sarathi engine.
@@ -465,7 +516,9 @@ class Engine:
             self.compiled_policy.get("model_routing"),
             self.compiled_policy.get("learning_feedback"),
         )
-        self.dispatcher = dispatcher or LocalDispatcher(provider_config=provider_config)
+        base_dispatcher = dispatcher or LocalDispatcher(provider_config=provider_config)
+        self.dispatcher = _HarnessAwareDispatcher(base_dispatcher)
+        self._harness_cache: dict[str, HarnessConfig] = {}
         self.enforce_preflight = enforce_preflight
         self.preflight_policy = PreflightPolicy()
 
@@ -564,7 +617,7 @@ class Engine:
         ncp_per = self.persistence if self.ncp_enabled else None
         ncp_whi = self.whisper_router  # already None when disabled
         return {
-            Phase.ROUTE: RouteHandler(self.policy_pack, self.dispatcher, ncp_enabled=self.ncp_enabled),
+            Phase.ROUTE: RouteHandler(self.policy_pack, self.dispatcher, ncp_enabled=self.ncp_enabled, harness_cache=self._harness_cache),
             Phase.BRAINSTORM: BrainstormHandler(self.policy_pack, self.dispatcher),
             Phase.PLANNING_ADVISOR: PlanningAdvisorHandler(self.policy_pack, self.dispatcher),
             Phase.PLAN: PlanHandler(self.policy_pack, self.dispatcher),
@@ -940,6 +993,12 @@ class Engine:
                 try:
                     task.harness_config = HarnessConfig.from_json(json.dumps(harness_dict))
                     task.task_class = task.harness_config.task_class
+                    # Wire the resolved primary_agent into the harness-aware dispatcher.
+                    # Only inject when a specific non-local agent was chosen; "local" means
+                    # "no strong preference — let provider-config routing decide."
+                    if hasattr(self.dispatcher, "preferred_agent"):
+                        agent_id = task.harness_config.primary_agent.agent_id
+                        self.dispatcher.preferred_agent = agent_id if agent_id != "local" else None
                 except Exception:
                     pass
 

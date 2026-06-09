@@ -43,6 +43,7 @@ class HarnessConfig:
     task_class: TaskClass = TaskClass.ANALYSIS
     assembled_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     assembler_version: str = "sarathi-0.2.0"
+    assembly_mode: str = "STANDARD"  # FAST | STANDARD | DEEP
 
     # Execution plan
     primary_agent: AgentBinding = field(default_factory=lambda: AgentBinding("local"))
@@ -81,6 +82,7 @@ class HarnessConfig:
         """Reconstruct from JSON produced by to_json()."""
         d = json.loads(data)
         d["task_class"] = TaskClass(d["task_class"])
+        d.setdefault("assembly_mode", "STANDARD")
 
         if d.get("primary_agent"):
             d["primary_agent"] = AgentBinding(**d["primary_agent"])
@@ -111,6 +113,7 @@ class HarnessConfig:
         """Build a HarnessConfig from TaskClass defaults."""
         defaults = TASK_CLASS_DEFAULTS[task_class]
         signals = [QualitySignalDef(name=name) for name in defaults.quality_signals]
+        primary_agent = resolve_agent_binding(defaults.agent_preference)
         return cls(
             task_id=task_id,
             task_class=task_class,
@@ -120,7 +123,27 @@ class HarnessConfig:
             ncp_enabled=ncp_enabled,
             quality_signals=signals,
             defaults=defaults,
+            primary_agent=primary_agent,
         )
+
+
+_PREFERENCE_TO_PROVIDER: dict[str, str] = {
+    "fastest":            "local",
+    "balanced":           "local",
+    "highest_capability": "claude",
+    "sarathi_native":     "local",
+}
+
+
+def resolve_agent_binding(
+    agent_preference: str,
+    available_providers: list[str] | None = None,
+) -> AgentBinding:
+    """Map an AssemblyDefaults.agent_preference string to a concrete AgentBinding."""
+    provider_id = _PREFERENCE_TO_PROVIDER.get(agent_preference, "local")
+    if available_providers and provider_id not in available_providers:
+        provider_id = available_providers[0] if available_providers else "local"
+    return AgentBinding(agent_id=provider_id)
 
 
 @dataclass

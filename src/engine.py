@@ -12,6 +12,18 @@ from typing import Any
 
 import yaml
 
+# Harness Engine imports
+try:
+    from .task_class import TaskClass, classify_task_class, from_legacy_type
+    from .harness import HarnessConfig, HarnessOutcome
+    from .permissions import PermissionScope, build_permission_scope
+    from .trust_gate import TrustGate, TrustGateResult, arbitrate
+except ImportError:
+    from task_class import TaskClass, classify_task_class, from_legacy_type
+    from harness import HarnessConfig, HarnessOutcome
+    from permissions import PermissionScope, build_permission_scope
+    from trust_gate import TrustGate, TrustGateResult, arbitrate
+
 try:
     from .dispatch import Dispatcher, LocalDispatcher
     from .phases import (
@@ -189,32 +201,50 @@ class PhaseHandler:
 class RouteHandler(PhaseHandler):
     """Handler for the ROUTE phase."""
 
+    def __init__(self, policy_pack: PolicyPack, dispatcher: Dispatcher | None = None, ncp_enabled: bool = False):
+        super().__init__(policy_pack, dispatcher)
+        self.ncp_enabled = ncp_enabled
+
     def execute(self, task: TaskContext, phase: Phase) -> PhaseResult:
-        """Route the task based on description and complexity."""
-        # Load complexity policy
-        complexity_policy = self._load_policy_section('complexity')
+        """Route the task — classify TaskClass, emit HarnessConfig."""
+        # Classify via new TaskClass taxonomy
+        task_class = classify_task_class(task.description)
 
-        # Classify task type from description
-        task_type = self._classify_task_type(task.description)
+        # Legacy string type (preserved for backward-compat evidence)
+        legacy_type = self._classify_task_type(task.description)
+        workflow_path = self._select_workflow_path(task, legacy_type)
 
-        # Determine workflow path
-        workflow_path = self._select_workflow_path(task, task_type)
+        # Build the HarnessConfig artifact
+        harness = HarnessConfig.from_task_class(task_class, task.task_id, ncp_enabled=self.ncp_enabled)
+        harness_dict = json.loads(harness.to_json())
+
+        # Build PermissionScope and propagate human_in_loop flag
+        perm_scope = build_permission_scope(task_class)
+        harness.requires_human_approval = perm_scope.requires_human_approval
 
         evidence = {
-            "task_type": task_type,
+            "task_type": legacy_type,
+            "task_class": task_class.value,
             "workflow_path": workflow_path,
             "complexity_assessed": True,
+            "harness_assembled": True,
+            "requires_human_approval": harness.requires_human_approval,
         }
 
         return PhaseResult(
             phase=phase,
             outcome="pass",
             evidence=evidence,
-            artifacts={"routing_decision": workflow_path}
+            artifacts={
+                "routing_decision": workflow_path,
+                "task_class": task_class.value,
+                "harness_config": harness_dict,
+                "permission_scope": task_class.value,
+            },
         )
 
     def _classify_task_type(self, description: str) -> str:
-        """Classify task type from description."""
+        """Legacy ad-hoc task type string (preserved for backward compatibility)."""
         desc_lower = description.lower()
 
         if any(word in desc_lower for word in ['bug', 'fix', 'error', 'issue']):
@@ -252,6 +282,10 @@ class PersistenceManager:
         task_file = self.storage_path / f"{task.task_id}.json"
 
         # Convert task to serializable format
+        harness_dict = None
+        if getattr(task, "harness_config", None) is not None:
+            harness_dict = json.loads(task.harness_config.to_json())
+
         task_data = {
             "task_id": task.task_id,
             "description": task.description,
@@ -260,6 +294,8 @@ class PersistenceManager:
             "preflight_validation": task.preflight_validation,
             "task_graph_state": task.task_graph_state,
             "current_phase": task.current_phase.value if task.current_phase else None,
+            "task_class": getattr(task, "task_class", TaskClass.ANALYSIS).value,
+            "harness_config": harness_dict,
             "phase_results": [
                 {
                     "phase": pr.phase.value,
@@ -291,6 +327,12 @@ class PersistenceManager:
                 task_data = json.load(f)
 
             # Reconstruct TaskContext
+            raw_task_class = task_data.get("task_class", "analysis")
+            try:
+                restored_task_class = TaskClass(raw_task_class)
+            except ValueError:
+                restored_task_class = TaskClass.ANALYSIS
+
             task = TaskContext(
                 task_id=task_data["task_id"],
                 description=task_data["description"],
@@ -298,9 +340,17 @@ class PersistenceManager:
                 complexity_evidence=task_data.get("complexity_evidence", {}),
                 preflight_validation=task_data.get("preflight_validation", {}),
                 task_graph_state=task_data.get("task_graph_state", {}),
+                task_class=restored_task_class,
             )
 
             task.current_phase = Phase(task_data["current_phase"]) if task_data.get("current_phase") else None
+
+            harness_raw = task_data.get("harness_config")
+            if isinstance(harness_raw, dict):
+                try:
+                    task.harness_config = HarnessConfig.from_json(json.dumps(harness_raw))
+                except Exception:
+                    task.harness_config = None
 
             # Reconstruct phase results
             for pr_data in task_data.get("phase_results", []):
@@ -361,6 +411,8 @@ class TaskContext:
     task_graph_state: dict[str, Any] = field(default_factory=dict)
     phase_results: list[PhaseResult] = field(default_factory=list)
     current_phase: Phase | None = None
+    task_class: TaskClass = TaskClass.ANALYSIS
+    harness_config: HarnessConfig | None = None
 
     def get_completed_phases(self) -> set[Phase]:
         """Get set of phases that have been completed."""
@@ -512,7 +564,7 @@ class Engine:
         ncp_per = self.persistence if self.ncp_enabled else None
         ncp_whi = self.whisper_router  # already None when disabled
         return {
-            Phase.ROUTE: RouteHandler(self.policy_pack, self.dispatcher),
+            Phase.ROUTE: RouteHandler(self.policy_pack, self.dispatcher, ncp_enabled=self.ncp_enabled),
             Phase.BRAINSTORM: BrainstormHandler(self.policy_pack, self.dispatcher),
             Phase.PLANNING_ADVISOR: PlanningAdvisorHandler(self.policy_pack, self.dispatcher),
             Phase.PLAN: PlanHandler(self.policy_pack, self.dispatcher),
@@ -581,6 +633,15 @@ class Engine:
                 task.phase_results.append(phase_result)
                 self._sync_task_state(task, phase_result)
             result = phase_results[-1]
+
+            # Trust gate handshake after ROUTE (NCP mode only — degrades gracefully when NCP is off)
+            if phase == Phase.ROUTE and task.harness_config is not None and self.ncp_enabled:
+                gate_action = self._run_trust_gate(task)
+                if gate_action == "ABORT_AND_ESCALATE":
+                    self._log_phase(task, phase, "trust_gate_abort")
+                    task.current_phase = Phase.LEARN
+                    self.persistence.save_task(task)
+                    break
 
             # Check for early exit conditions
             if result.outcome == "fail":
@@ -872,6 +933,16 @@ class Engine:
         if isinstance(task_graph_state, dict) and task_graph_state:
             task.task_graph_state = annotate_graph_for_supervision(task_graph_state, parent_task_id=task.task_id)
 
+        # Promote HarnessConfig from ROUTE phase into task state
+        if result.phase == Phase.ROUTE:
+            harness_dict = result.artifacts.get("harness_config")
+            if isinstance(harness_dict, dict):
+                try:
+                    task.harness_config = HarnessConfig.from_json(json.dumps(harness_dict))
+                    task.task_class = task.harness_config.task_class
+                except Exception:
+                    pass
+
         # Save updated task state
         self.persistence.save_task(task)
 
@@ -1014,6 +1085,49 @@ class Engine:
             return confidence >= threshold, confidence
 
         return True, 1.0
+
+    def _run_trust_gate(self, task: TaskContext) -> str:
+        """
+        Run NCP trust gate evaluation after ROUTE phase.
+        Updates task.harness_config.trust_gate_result and returns the arbitration action.
+        Degrades gracefully — never raises.
+        """
+        try:
+            gate = TrustGate(ncp_mcp_url=self.ncp_endpoint)
+            response = gate.evaluate(
+                task_class_value=task.task_class.value,
+                required_context_keys=[],
+                pipeline_id=task.task_id,
+            )
+            action = arbitrate(response.result, task.task_class.value)
+
+            if task.harness_config is not None:
+                if action == "ABORT_AND_ESCALATE":
+                    task.harness_config.trust_gate_result = "BLOCK"
+                    task.harness_config.stale_keys = response.stale_keys
+                elif action in ("EXECUTE_FLAGGED", "REFRESH_THEN_EXECUTE",
+                                "BLOCK_UNTIL_REFRESH", "PAUSE_AND_NOTIFY"):
+                    task.harness_config.trust_gate_result = "WARN"
+                    task.harness_config.stale_keys = response.stale_keys
+                else:
+                    task.harness_config.trust_gate_result = "PASS"
+
+            if action == "BLOCK_UNTIL_REFRESH":
+                refreshed = gate.refresh(response.stale_keys, task.task_id)
+                if refreshed:
+                    response2 = gate.evaluate(task.task_class.value, [], task.task_id)
+                    action = arbitrate(response2.result, task.task_class.value)
+                    if task.harness_config is not None:
+                        if action == "EXECUTE":
+                            task.harness_config.trust_gate_result = "PASS"
+                            task.harness_config.stale_keys = []
+                        else:
+                            task.harness_config.trust_gate_result = "WARN"
+
+            return action
+        except Exception as exc:
+            print(f"[trust_gate] Degraded (error): {exc}")
+            return "EXECUTE"
 
     @staticmethod
     def _probe_ncp() -> bool:

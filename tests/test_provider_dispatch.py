@@ -571,6 +571,11 @@ def test_cli_bridge_can_route_claude_via_ncp_handoff(tmp_path, monkeypatch):
     calls: list[list[str]] = []
 
     def _fake_run(command, **kwargs):
+        # Workspace-evidence snapshots also shell out via subprocess.run (mocked
+        # globally below); ignore those so call ordering reflects only the NCP
+        # emit/handoff invocations this test cares about.
+        if command[0] == "git":
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         calls.append(list(command))
         if len(calls) == 1:
             return subprocess.CompletedProcess(command, 0, stdout="Whisper emitted.\n", stderr="")

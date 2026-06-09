@@ -17,6 +17,7 @@ except ImportError:
 
 from .base import ProviderAdapter, ProviderCapabilities, ProviderSession
 from .cli_bridge import dispatch_via_cli_bridge
+from ..workspace_evidence import attach_workspace_evidence, snapshot_workspace
 
 
 class OpenAISdkProviderAdapter(ProviderAdapter):
@@ -77,6 +78,7 @@ class OpenAISdkProviderAdapter(ProviderAdapter):
             request = _dc_replace(
                 request, constraints={**request.constraints, "model": self.model}
             )
+        before = snapshot_workspace(self.workspace_root)
         session = self.create_session(request)
         session.status = "running"
         bridge_payload = {
@@ -106,7 +108,8 @@ class OpenAISdkProviderAdapter(ProviderAdapter):
 
         if bool(result.get("success")):
             session.status = "closed"
-            return self._response_from_sdk_result(request, session, result)
+            response = self._response_from_sdk_result(request, session, result)
+            return attach_workspace_evidence(response, before, self.workspace_root, request)
 
         session.status = "failed"
         sdk_error = str(result.get("error") or "OpenAI SDK dispatch failed")
@@ -128,9 +131,9 @@ class OpenAISdkProviderAdapter(ProviderAdapter):
                 "sdk_error": sdk_error,
                 "sdk_fallback_used": True,
             }
-            return fallback
+            return attach_workspace_evidence(fallback, before, self.workspace_root, request)
 
-        return DispatchResponse(
+        response = DispatchResponse(
             success=False,
             artifacts={
                 "provider": self.name,
@@ -141,6 +144,7 @@ class OpenAISdkProviderAdapter(ProviderAdapter):
             },
             error=sdk_error,
         )
+        return attach_workspace_evidence(response, before, self.workspace_root, request)
 
     def _response_from_sdk_result(
         self,

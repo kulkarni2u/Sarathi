@@ -30,9 +30,11 @@ except ImportError:
 try:
     from ..contracts import DispatchRequest, DispatchResponse, build_usage_record
     from ..agent_roles import PHASE_AGENT_ROLE_KEYS
+    from ..workspace_evidence import attach_workspace_evidence, snapshot_workspace
 except ImportError:
     from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
     from runtime.agent_roles import PHASE_AGENT_ROLE_KEYS
+    from runtime.workspace_evidence import attach_workspace_evidence, snapshot_workspace
 
 logger = logging.getLogger("sarathi.cli_bridge")
 
@@ -113,19 +115,22 @@ def dispatch_via_cli_bridge(
     request: DispatchRequest,
 ) -> DispatchResponse:
     provider_name = provider.strip().lower()
+    before = snapshot_workspace(workspace_root)
     if provider_name == "codex":
-        return _run_codex(path=path, workspace_root=workspace_root, request=request)
-    if provider_name == "copilot":
-        return _run_copilot(path=path, workspace_root=workspace_root, request=request)
-    if provider_name == "claude":
-        return _run_claude(path=path, workspace_root=workspace_root, request=request)
-    if provider_name == "opencode":
-        return _run_opencode(path=path, workspace_root=workspace_root, request=request)
-    return DispatchResponse(
-        success=False,
-        artifacts={"provider": provider_name, "path": path},
-        error=f"Native provider bridge is not implemented for '{provider_name}'",
-    )
+        response = _run_codex(path=path, workspace_root=workspace_root, request=request)
+    elif provider_name == "copilot":
+        response = _run_copilot(path=path, workspace_root=workspace_root, request=request)
+    elif provider_name == "claude":
+        response = _run_claude(path=path, workspace_root=workspace_root, request=request)
+    elif provider_name == "opencode":
+        response = _run_opencode(path=path, workspace_root=workspace_root, request=request)
+    else:
+        return DispatchResponse(
+            success=False,
+            artifacts={"provider": provider_name, "path": path},
+            error=f"Native provider bridge is not implemented for '{provider_name}'",
+        )
+    return attach_workspace_evidence(response, before, workspace_root, request, logger=logger)
 
 
 def _run_codex(*, path: str, workspace_root: str, request: DispatchRequest) -> DispatchResponse:

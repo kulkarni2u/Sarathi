@@ -473,11 +473,22 @@ class _HarnessAwareDispatcher:
 
     Reads preferred_agent at dispatch time so RouteHandler can set it after
     the ROUTE phase without needing to rebuild phase handlers.
+
+    Also threads provider session continuity across phases: when a Claude CLI
+    dispatch returns a session_id, later dispatches in the same task resume it
+    (--resume) so the provider keeps its working context instead of replaying
+    the full context pack from scratch each phase.
     """
 
     def __init__(self, base: Any) -> None:
         self._base = base
         self.preferred_agent: str | None = None
+        self.claude_session_id: str | None = None
+
+    def reset_task_state(self) -> None:
+        """Clear per-task routing/session state before a new task starts."""
+        self.preferred_agent = None
+        self.claude_session_id = None
 
     def dispatch(self, request: DispatchRequest) -> Any:
         if self.preferred_agent and not request.constraints.get("provider"):
@@ -485,7 +496,18 @@ class _HarnessAwareDispatcher:
                 request,
                 constraints={**request.constraints, "provider": self.preferred_agent},
             )
-        return self._base.dispatch(request)
+        if self.claude_session_id and not request.constraints.get("claude_session_id"):
+            request = _dc_replace(
+                request,
+                constraints={**request.constraints, "claude_session_id": self.claude_session_id},
+            )
+        response = self._base.dispatch(request)
+        artifacts = getattr(response, "artifacts", None)
+        if isinstance(artifacts, dict):
+            session_id = artifacts.get("claude_session_id")
+            if isinstance(session_id, str) and session_id:
+                self.claude_session_id = session_id
+        return response
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)
@@ -656,6 +678,8 @@ class Engine:
 
     def run_task(self, task: TaskContext) -> TaskContext:
         """Run a task through the full lifecycle."""
+        if hasattr(self.dispatcher, "reset_task_state"):
+            self.dispatcher.reset_task_state()
         if not task.preflight_validation:
             task.preflight_validation = self.preflight_validate_policy(task.task_id)
         self.persistence.save_task(task)

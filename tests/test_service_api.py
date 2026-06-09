@@ -904,15 +904,14 @@ def test_callable_api_requires_token_when_configured(tmp_path):
     assert data == {"status": "ok"}
 
 
-def test_http_server_loopback_bypasses_token(tmp_path):
-    # Loopback connections (127.0.0.1) bypass token auth — no token needed locally.
-    # Token auth only applies to non-loopback (remote) connections.
+def test_http_server_requires_token_even_on_loopback(tmp_path):
+    # No loopback bypass: on shared machines any local process can reach
+    # 127.0.0.1, so the bearer token is required for every connection.
     with running_server(tmp_path / "sarathi.db", token="secret") as base_url:
-        # No token — succeeds because connection is from 127.0.0.1
         status, payload = http_json("GET", f"{base_url}/api/health")
-        assert status == 200
-        assert payload["ok"] is True
-        assert payload["data"] == {"status": "ok"}
+        assert status == 401
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "unauthorized"
 
         # Token also works
         status, payload = http_json(

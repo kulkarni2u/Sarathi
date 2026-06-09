@@ -1,6 +1,8 @@
 """Task graph execution helpers."""
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -108,6 +110,7 @@ class TaskGraphExecutor:
         ncp_whisper_router=None,
         ncp_persistence_adapter=None,
         workflow_patterns_policy: "WorkflowPatternsPolicy | None" = None,
+        max_parallel: int | None = None,
     ):
         self.dispatcher = dispatcher
         self.dispatch_phase = dispatch_phase
@@ -117,6 +120,12 @@ class TaskGraphExecutor:
         self.ncp_whisper_router = ncp_whisper_router
         self.ncp_persistence_adapter = ncp_persistence_adapter
         self.workflow_patterns_policy = workflow_patterns_policy
+        if max_parallel is None:
+            try:
+                max_parallel = int(os.environ.get("SARATHI_GRAPH_MAX_PARALLEL", "4"))
+            except ValueError:
+                max_parallel = 4
+        self.max_parallel = max(1, max_parallel)
 
     @staticmethod
     def _timestamp() -> str:
@@ -153,63 +162,9 @@ class TaskGraphExecutor:
             return GraphExecutionResult(graph_state=current, events=[])
 
         provider_result = self._dispatch_node(ready, graph=current)
-        if provider_result is not None and not provider_result.get("success", False):
-            updated = fail_graph_node(
-                current,
-                node_id=ready["id"],
-                error=provider_result.get("error") or "Provider-backed node execution failed",
-            )
-            updated_node = next(
-                (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
-                {},
-            )
-            updated = self._annotate_node_result(updated, ready["id"], provider_result)
-            event = GraphExecutionEvent(
-                node_id=ready["id"],
-                title=ready.get("title", ready["id"]),
-                action="failed",
-                started_at=updated_node.get("started_at"),
-                finished_at=updated_node.get("failed_at"),
-                attempt=updated_node.get("attempts"),
-                provider_result=provider_result,
-            )
-        elif fail_node_id is not None and ready["id"] == fail_node_id:
-            updated = fail_graph_node(current, node_id=ready["id"], error=fail_error or "Node execution failed")
-            updated_node = next(
-                (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
-                {},
-            )
-            updated = self._annotate_node_result(updated, ready["id"], provider_result)
-            event = GraphExecutionEvent(
-                node_id=ready["id"],
-                title=ready.get("title", ready["id"]),
-                action="failed",
-                started_at=updated_node.get("started_at"),
-                finished_at=updated_node.get("failed_at"),
-                attempt=updated_node.get("attempts"),
-                provider_result=provider_result,
-            )
-        else:
-            updated = progress_graph(current, completed_node_id=ready["id"])
-            ncp_err = self._ncp_post_node_complete(ready, provider_result)
-            if ncp_err and isinstance(provider_result, dict):
-                provider_result.setdefault("ncp_warnings", []).append(f"write_output_failed: {ncp_err}")
-            updated = self._post_execute_inject(ready, updated, provider_result)
-            finished_at = self._timestamp()
-            updated_node = next(
-                (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
-                {},
-            )
-            updated = self._annotate_node_result(updated, ready["id"], provider_result)
-            event = GraphExecutionEvent(
-                node_id=ready["id"],
-                title=ready.get("title", ready["id"]),
-                action="completed",
-                started_at=updated_node.get("started_at"),
-                finished_at=finished_at,
-                attempt=updated_node.get("attempts"),
-                provider_result=provider_result,
-            )
+        updated, event, _failed = self._apply_node_result(
+            current, ready, provider_result, fail_node_id=fail_node_id, fail_error=fail_error
+        )
         return GraphExecutionResult(graph_state=updated, events=[event])
 
     def execute_some(
@@ -225,86 +180,7 @@ class TaskGraphExecutor:
         if max_nodes <= 0:
             current = _copy_graph_state(graph)
             return GraphExecutionResult(graph_state=current, events=[])
-
-        current = _copy_graph_state(graph)
-        events: list[GraphExecutionEvent] = []
-        executed = 0
-
-        ready = next_ready_node(current)
-        while ready is not None and executed < max_nodes:
-            provider_result = self._dispatch_node(ready, graph=current)
-            if provider_result is not None and not provider_result.get("success", False):
-                updated = fail_graph_node(
-                    current,
-                    node_id=ready["id"],
-                    error=provider_result.get("error") or "Provider-backed node execution failed",
-                )
-                updated_node = next(
-                    (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
-                    {},
-                )
-                updated = self._annotate_node_result(updated, ready["id"], provider_result)
-                events.append(
-                    GraphExecutionEvent(
-                        node_id=ready["id"],
-                        title=ready.get("title", ready["id"]),
-                        action="failed",
-                        started_at=updated_node.get("started_at"),
-                        finished_at=updated_node.get("failed_at"),
-                        attempt=updated_node.get("attempts"),
-                        provider_result=provider_result,
-                    )
-                )
-                current = updated
-                break
-
-            if fail_node_id is not None and ready["id"] == fail_node_id:
-                updated = fail_graph_node(current, node_id=ready["id"], error=fail_error or "Node execution failed")
-                updated_node = next(
-                    (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
-                    {},
-                )
-                updated = self._annotate_node_result(updated, ready["id"], provider_result)
-                events.append(
-                    GraphExecutionEvent(
-                        node_id=ready["id"],
-                        title=ready.get("title", ready["id"]),
-                        action="failed",
-                        started_at=updated_node.get("started_at"),
-                        finished_at=updated_node.get("failed_at"),
-                        attempt=updated_node.get("attempts"),
-                        provider_result=provider_result,
-                    )
-                )
-                current = updated
-                break
-
-            updated = progress_graph(current, completed_node_id=ready["id"])
-            ncp_err = self._ncp_post_node_complete(ready, provider_result)
-            if ncp_err and isinstance(provider_result, dict):
-                provider_result.setdefault("ncp_warnings", []).append(f"write_output_failed: {ncp_err}")
-            updated = self._post_execute_inject(ready, updated, provider_result)
-            updated_node = next(
-                (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
-                {},
-            )
-            updated = self._annotate_node_result(updated, ready["id"], provider_result)
-            events.append(
-                GraphExecutionEvent(
-                    node_id=ready["id"],
-                    title=ready.get("title", ready["id"]),
-                    action="completed",
-                    started_at=updated_node.get("started_at"),
-                    finished_at=updated_node.get("completed_at"),
-                    attempt=updated_node.get("attempts"),
-                    provider_result=provider_result,
-                )
-            )
-            current = updated
-            executed += 1
-            ready = next_ready_node(current)
-
-        return GraphExecutionResult(graph_state=current, events=events)
+        return self._execute_loop(graph, max_nodes=max_nodes, fail_node_id=fail_node_id, fail_error=fail_error)
 
     def execute_all(
         self,
@@ -312,81 +188,126 @@ class TaskGraphExecutor:
         fail_node_id: str | None = None,
         fail_error: str | None = None,
     ) -> GraphExecutionResult:
+        return self._execute_loop(graph, max_nodes=None, fail_node_id=fail_node_id, fail_error=fail_error)
+
+    def _execute_loop(
+        self,
+        graph: dict,
+        *,
+        max_nodes: int | None,
+        fail_node_id: str | None,
+        fail_error: str | None,
+    ) -> GraphExecutionResult:
+        """Drive the graph to completion in batches of independent ready nodes.
+
+        Nodes that are simultaneously ready depend only on already-completed
+        work, so each batch is dispatched concurrently (bounded by
+        ``max_parallel``). Graph mutations stay on this thread: results are
+        applied sequentially, in deterministic graph order, after the batch
+        returns. On a failure the already-dispatched batch results are still
+        recorded (the work really ran), but no further batches are scheduled.
+        """
         current = _copy_graph_state(graph)
         events: list[GraphExecutionEvent] = []
+        executed = 0
+        stop = False
 
-        ready = next_ready_node(current)
-        while ready is not None:
-            provider_result = self._dispatch_node(ready, graph=current)
-            if provider_result is not None and not provider_result.get("success", False):
-                updated = fail_graph_node(
-                    current,
-                    node_id=ready["id"],
-                    error=provider_result.get("error") or "Provider-backed node execution failed",
-                )
-                updated_node = next(
-                    (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
-                    {},
-                )
-                updated = self._annotate_node_result(updated, ready["id"], provider_result)
-                events.append(
-                    GraphExecutionEvent(
-                        node_id=ready["id"],
-                        title=ready.get("title", ready["id"]),
-                        action="failed",
-                        started_at=updated_node.get("started_at"),
-                        finished_at=updated_node.get("failed_at"),
-                        attempt=updated_node.get("attempts"),
-                        provider_result=provider_result,
-                    )
-                )
-                current = updated
+        while not stop:
+            remaining = None if max_nodes is None else max_nodes - executed
+            if remaining is not None and remaining <= 0:
                 break
-            if fail_node_id is not None and ready["id"] == fail_node_id:
-                updated = fail_graph_node(current, node_id=ready["id"], error=fail_error or "Node execution failed")
-                updated_node = next(
-                    (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
-                    {},
-                )
-                updated = self._annotate_node_result(updated, ready["id"], provider_result)
-                events.append(
-                    GraphExecutionEvent(
-                        node_id=ready["id"],
-                        title=ready.get("title", ready["id"]),
-                        action="failed",
-                        started_at=updated_node.get("started_at"),
-                        finished_at=updated_node.get("failed_at"),
-                        attempt=updated_node.get("attempts"),
-                        provider_result=provider_result,
-                    )
-                )
-                current = updated
+            batch = self._ready_batch(current, limit=remaining)
+            if not batch:
                 break
-            updated = progress_graph(current, completed_node_id=ready["id"])
+            for ready, provider_result in self._dispatch_batch(batch, current):
+                current, event, failed = self._apply_node_result(
+                    current, ready, provider_result, fail_node_id=fail_node_id, fail_error=fail_error
+                )
+                events.append(event)
+                executed += 1
+                if failed:
+                    stop = True
+
+        return GraphExecutionResult(graph_state=current, events=events)
+
+    def _ready_batch(self, graph: dict, limit: int | None = None) -> list[dict]:
+        """All pending nodes whose dependencies are completed, in graph order."""
+        nodes = {node.get("id"): node for node in graph.get("nodes", [])}
+        batch: list[dict] = []
+        for node in graph.get("nodes", []):
+            if node.get("status", "pending") != "pending":
+                continue
+            deps = node.get("depends_on", [])
+            if all(nodes.get(dep, {}).get("status") == "completed" for dep in deps):
+                batch.append(node)
+                if limit is not None and len(batch) >= limit:
+                    break
+        return batch
+
+    def _dispatch_batch(
+        self, batch: list[dict], graph: dict
+    ) -> list[tuple[dict, dict | None]]:
+        """Dispatch a batch of independent ready nodes, concurrently when possible.
+
+        Provider calls dominate wall-clock time (minutes per CLI agent call);
+        the dispatcher and providers run subprocesses/network calls, so threads
+        parallelize them effectively. Results are returned in batch order.
+        """
+        if len(batch) == 1 or self.max_parallel <= 1 or self.dispatcher is None:
+            return [(node, self._dispatch_node(node, graph=graph)) for node in batch]
+        with ThreadPoolExecutor(max_workers=min(self.max_parallel, len(batch))) as pool:
+            futures = [pool.submit(self._dispatch_node, node, graph=graph) for node in batch]
+            return [(node, future.result()) for node, future in zip(batch, futures)]
+
+    def _apply_node_result(
+        self,
+        current: dict,
+        ready: dict,
+        provider_result: dict | None,
+        *,
+        fail_node_id: str | None,
+        fail_error: str | None,
+    ) -> tuple[dict, GraphExecutionEvent, bool]:
+        """Apply one node's execution result to the graph. Returns (graph, event, failed)."""
+        node_id = ready["id"]
+        provider_failed = provider_result is not None and not provider_result.get("success", False)
+        injected_failure = fail_node_id is not None and node_id == fail_node_id
+
+        if provider_failed or injected_failure:
+            error = (
+                (provider_result or {}).get("error") or "Provider-backed node execution failed"
+                if provider_failed
+                else (fail_error or "Node execution failed")
+            )
+            updated = fail_graph_node(current, node_id=node_id, error=error)
+            action = "failed"
+            finished_key = "failed_at"
+            failed = True
+        else:
+            updated = progress_graph(current, completed_node_id=node_id)
             ncp_err = self._ncp_post_node_complete(ready, provider_result)
             if ncp_err and isinstance(provider_result, dict):
                 provider_result.setdefault("ncp_warnings", []).append(f"write_output_failed: {ncp_err}")
             updated = self._post_execute_inject(ready, updated, provider_result)
-            updated_node = next(
-                (node for node in updated.get("nodes", []) if node.get("id") == ready["id"]),
-                {},
-            )
-            updated = self._annotate_node_result(updated, ready["id"], provider_result)
-            events.append(
-                GraphExecutionEvent(
-                    node_id=ready["id"],
-                    title=ready.get("title", ready["id"]),
-                    action="completed",
-                    started_at=updated_node.get("started_at"),
-                    finished_at=updated_node.get("completed_at"),
-                    attempt=updated_node.get("attempts"),
-                    provider_result=provider_result,
-                )
-            )
-            current = updated
-            ready = next_ready_node(current)
+            action = "completed"
+            finished_key = "completed_at"
+            failed = False
 
-        return GraphExecutionResult(graph_state=current, events=events)
+        updated_node = next(
+            (node for node in updated.get("nodes", []) if node.get("id") == node_id),
+            {},
+        )
+        updated = self._annotate_node_result(updated, node_id, provider_result)
+        event = GraphExecutionEvent(
+            node_id=node_id,
+            title=ready.get("title", node_id),
+            action=action,
+            started_at=updated_node.get("started_at"),
+            finished_at=updated_node.get(finished_key) or self._timestamp(),
+            attempt=updated_node.get("attempts"),
+            provider_result=provider_result,
+        )
+        return updated, event, failed
 
     def retry_failed_node(self, graph: dict, node_id: str) -> dict:
         """Reset a failed node so it can be executed again."""

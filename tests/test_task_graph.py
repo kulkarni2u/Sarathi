@@ -291,3 +291,74 @@ def test_supervision_manifest_includes_parent_child_links_and_block_reasons():
     assert manifest[1]["block_reason"] == "needs external input"
     assert manifest[1]["context_pack_summary"]["objective"] == "Review child"
     assert supervision_summary(annotated)["done"] == 1
+
+
+def test_independent_ready_nodes_dispatch_in_parallel():
+    import threading
+    import time as _time
+
+    graph = {
+        "nodes": [
+            {"id": "root", "title": "Root", "status": "completed", "depends_on": []},
+            {"id": "branch-a", "title": "Branch A", "status": "pending", "depends_on": ["root"]},
+            {"id": "branch-b", "title": "Branch B", "status": "pending", "depends_on": ["root"]},
+            {"id": "join", "title": "Join", "status": "pending", "depends_on": ["branch-a", "branch-b"]},
+        ],
+    }
+
+    in_flight = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class SlowDispatcher:
+        def dispatch(self, request):
+            nonlocal in_flight, peak
+            with lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+            _time.sleep(0.05)
+            with lock:
+                in_flight -= 1
+            return DispatchResponse(success=True, outputs={"messages": ["ok"]})
+
+    executor = TaskGraphExecutor(dispatcher=SlowDispatcher(), max_parallel=4)
+    result = executor.execute_all(graph).to_artifact()
+
+    assert sorted(result["graph_state"]["completed_nodes"]) == ["branch-a", "branch-b", "join", "root"]
+    assert peak >= 2  # branch-a and branch-b overlapped
+    # join only ran after both branches: it is the last event
+    assert result["events"][-1]["node_id"] == "join"
+
+
+def test_max_parallel_one_keeps_sequential_dispatch():
+    import threading
+    import time as _time
+
+    graph = {
+        "nodes": [
+            {"id": "root", "title": "Root", "status": "completed", "depends_on": []},
+            {"id": "branch-a", "title": "Branch A", "status": "pending", "depends_on": ["root"]},
+            {"id": "branch-b", "title": "Branch B", "status": "pending", "depends_on": ["root"]},
+        ],
+    }
+
+    in_flight = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class SlowDispatcher:
+        def dispatch(self, request):
+            nonlocal in_flight, peak
+            with lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+            _time.sleep(0.02)
+            with lock:
+                in_flight -= 1
+            return DispatchResponse(success=True, outputs={"messages": ["ok"]})
+
+    executor = TaskGraphExecutor(dispatcher=SlowDispatcher(), max_parallel=1)
+    result = executor.execute_all(graph).to_artifact()
+
+    assert sorted(result["graph_state"]["completed_nodes"]) == ["branch-a", "branch-b", "root"]
+    assert peak == 1

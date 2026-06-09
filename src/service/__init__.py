@@ -1368,10 +1368,11 @@ def create_http_server(
             return
 
         def _handle(self) -> None:
-            is_loopback = self.client_address[0] in ("127.0.0.1", "::1", "localhost")
-
+            # No loopback auth bypass: on shared machines or containers any
+            # local process (or a browser via a permitted localhost origin)
+            # can reach 127.0.0.1, so the bearer token is always required.
             if self.command == "GET" and _path_parts(self.path) == ["api", "events", "stream"]:
-                self._handle_sse(skip_auth=is_loopback)
+                self._handle_sse()
                 return
 
             body, error = self._read_json_body()
@@ -1385,15 +1386,13 @@ def create_http_server(
                 self.path,
                 body=body,
                 headers=dict(self.headers.items()),
-                skip_auth=is_loopback,
             )
             self._write_json(status, payload)
 
-        def _handle_sse(self, skip_auth: bool = False) -> None:
+        def _handle_sse(self) -> None:
             correlation_id = _correlation_id(self.headers)
             try:
-                if not skip_auth:
-                    app._authorize_stream(dict(self.headers.items()), _query(self.path))
+                app._authorize_stream(dict(self.headers.items()), _query(self.path))
                 status, data = app._route("GET", ["api", "events"], _query(self.path), {})
                 payload = json.dumps(data, sort_keys=True)
                 self.send_response(status, HTTPStatus(status).phrase)

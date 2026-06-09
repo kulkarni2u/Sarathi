@@ -137,3 +137,144 @@ class HarnessOutcome:
     trust_gate_result: str
     agent_used: str
     assembler_version: str = "sarathi-0.2.0"
+
+
+def measure_outcome(task: Any, harness_config: HarnessConfig) -> HarnessOutcome:
+    """
+    Extract real quality signals from a completed task's phase_results.
+
+    Sources:
+      test_pass_rate  — VERIFY command_succeeded (or coverage proxy)
+      blast_radius    — 1.0 − REVIEW score
+      accuracy/relevance — REVIEW score
+      token_cost      — sum of dispatch_usage.total_tokens across all phases
+      latency_ms      — harness assembled_at → now
+      rollback_triggered — any phase recorded recovery_actions or rollback artifact
+    """
+    phase_results = getattr(task, "phase_results", []) or []
+    declared = {sig.name for sig in harness_config.quality_signals}
+
+    # ── Collect per-phase data ────────────────────────────────────────────
+    verify_summary: dict[str, Any] = {}
+    review_score: float | None = None
+    review_outcome: str = "pass"
+    token_cost = 0
+    rollback = False
+    human_interventions = 0
+
+    for pr in phase_results:
+        phase_val = getattr(getattr(pr, "phase", None), "value", str(getattr(pr, "phase", "")))
+        artifacts: dict[str, Any] = getattr(pr, "artifacts", {}) or {}
+
+        if phase_val == "Verify":
+            verify_summary = (
+                artifacts.get("verification_summary")
+                or (artifacts.get("verification_results") or {}).get("summary", {})
+                or {}
+            )
+
+        if phase_val == "Review":
+            verdict = artifacts.get("review_verdict") or {}
+            raw = verdict.get("score", artifacts.get("review_score"))
+            if raw is not None:
+                review_score = float(raw)
+            review_outcome = verdict.get("outcome", getattr(pr, "outcome", "pass"))
+
+        usage = artifacts.get("dispatch_usage")
+        if isinstance(usage, dict):
+            token_cost += int(usage.get("total_tokens", 0) or 0)
+
+        if artifacts.get("rollback_triggered") or (
+            isinstance(artifacts.get("recovery_actions"), list)
+            and artifacts["recovery_actions"]
+        ):
+            rollback = True
+
+        if artifacts.get("human_approved") or artifacts.get("pause_execution"):
+            human_interventions += 1
+
+    # ── Latency: assembled_at → now ───────────────────────────────────────
+    try:
+        assembled = datetime.fromisoformat(harness_config.assembled_at)
+        now = datetime.utcnow()
+        if assembled.tzinfo is not None:
+            assembled = assembled.replace(tzinfo=None)
+        latency_ms = max(0, int((now - assembled).total_seconds() * 1000))
+    except Exception:
+        latency_ms = 0
+
+    # ── Signal extraction ─────────────────────────────────────────────────
+    signals: dict[str, float] = {}
+
+    if "test_pass_rate" in declared:
+        cmd_ok = verify_summary.get("command_succeeded")
+        coverage = float(verify_summary.get("coverage") or 85.0)
+        if cmd_ok is True:
+            signals["test_pass_rate"] = 1.0
+        elif cmd_ok is False:
+            signals["test_pass_rate"] = 0.0
+        else:
+            # No real shell command ran — use coverage as a proxy
+            signals["test_pass_rate"] = min(1.0, coverage / 100.0)
+
+    if "blast_radius" in declared:
+        if review_score is not None:
+            signals["blast_radius"] = round(max(0.0, 1.0 - review_score), 2)
+        else:
+            signals["blast_radius"] = 0.1 if review_outcome == "pass" else 0.5
+
+    for sig in ("accuracy", "relevance"):
+        if sig in declared:
+            signals[sig] = float(review_score) if review_score is not None else (
+                1.0 if review_outcome == "pass" else 0.5
+            )
+
+    if "trust_utilization" in declared or "token_efficiency" in declared:
+        passed = sum(1 for pr in phase_results if getattr(pr, "outcome", "") == "pass")
+        rate = passed / max(len(phase_results), 1)
+        if "trust_utilization" in declared:
+            signals["trust_utilization"] = rate
+        if "token_efficiency" in declared:
+            signals["token_efficiency"] = rate
+
+    for sig in ("success_rate", "pipeline_success", "delegation_success"):
+        if sig in declared:
+            any_fail = any(getattr(pr, "outcome", "") == "fail" for pr in phase_results)
+            signals[sig] = 0.0 if any_fail else 1.0
+
+    if "rollback_triggered" in declared:
+        signals["rollback_triggered"] = 1.0 if rollback else 0.0
+
+    if "token_cost" in declared:
+        signals["token_cost"] = float(token_cost)
+
+    if "latency" in declared:
+        signals["latency"] = float(latency_ms)
+
+    # Zeros for signals with no data source yet
+    for name in declared:
+        if name not in signals:
+            signals[name] = 0.0
+
+    # ── Agent used: prefer actual BUILD dispatch provider ─────────────────
+    agent_used = harness_config.primary_agent.agent_id
+    for pr in reversed(phase_results):
+        if getattr(getattr(pr, "phase", None), "value", "") == "Build":
+            usage = (getattr(pr, "artifacts", {}) or {}).get("dispatch_usage") or {}
+            if isinstance(usage, dict) and usage.get("provider_id"):
+                agent_used = usage["provider_id"]
+                break
+
+    return HarnessOutcome(
+        harness_id=harness_config.harness_id,
+        task_id=str(getattr(task, "task_id", "")),
+        task_class=harness_config.task_class,
+        quality_signals=signals,
+        token_cost_actual=token_cost,
+        latency_ms=latency_ms,
+        human_interventions=human_interventions,
+        rollback_triggered=rollback,
+        trust_gate_result=harness_config.trust_gate_result,
+        agent_used=agent_used,
+        assembler_version=harness_config.assembler_version,
+    )

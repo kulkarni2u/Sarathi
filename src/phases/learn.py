@@ -56,29 +56,16 @@ class LearnHandler:
         )
 
     def _ingest_harness_outcome(self, task: "TaskContext") -> list:
-        """Build a HarnessOutcome from the completed task and feed it into Evolver."""
+        """Build a measured HarnessOutcome from phase_results and feed it into Evolver."""
         harness_config = getattr(task, "harness_config", None)
         if harness_config is None:
             return []
         try:
             try:
-                from src.harness import HarnessOutcome
+                from src.harness import measure_outcome
             except ImportError:
-                from harness import HarnessOutcome
-
-            outcome = HarnessOutcome(
-                harness_id=harness_config.harness_id,
-                task_id=task.task_id,
-                task_class=harness_config.task_class,
-                quality_signals={sig.name: 0.0 for sig in harness_config.quality_signals},
-                token_cost_actual=0,
-                latency_ms=0,
-                human_interventions=0,
-                rollback_triggered=False,
-                trust_gate_result=harness_config.trust_gate_result,
-                agent_used=harness_config.primary_agent.agent_id,
-                assembler_version=harness_config.assembler_version,
-            )
+                from harness import measure_outcome
+            outcome = measure_outcome(task, harness_config)
             return self.evolver.ingest_harness_outcome(outcome)
         except Exception:
             return []

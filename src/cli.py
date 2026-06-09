@@ -238,6 +238,26 @@ def phase_agent_name(result: PhaseResult) -> str:
     return "-"
 
 
+def _gate_status_label(result: PhaseResult) -> str:
+    """Return a Gate column label for a phase result.
+
+    ok       — gate present and passed on first attempt
+    retry    — gate passed after one retry
+    advisory — gate failed on both attempts, task continued
+    -        — no gate for this phase
+    """
+    gate = result.artifacts.get("gate_result")
+    if not isinstance(gate, dict):
+        return "-"
+    retry = result.artifacts.get("gate_retry")
+    if isinstance(retry, dict):
+        chosen_passed = gate.get("passed", False)
+        if chosen_passed:
+            return "retry"
+        return "advisory"
+    return "ok" if gate.get("passed", False) else "advisory"
+
+
 def _task_usage_records(task: TaskContext) -> list[UsageRecord]:
     records: list[UsageRecord] = []
     for phase_result in task.phase_results:
@@ -829,13 +849,14 @@ def handle_run(args: argparse.Namespace) -> None:
 
     # Show phase log
     print("\nPhase Log:")
-    print("-" * 75)
-    print(f"| {'Phase':<20} | {'Agent':<12} | {'Outcome':<10} | {'Iterations':<10} |")
-    print("|" + "-" * 21 + "+" + "-" * 14 + "+" + "-" * 12 + "+" + "-" * 12 + "|")
+    print("-" * 85)
+    print(f"| {'Phase':<20} | {'Agent':<12} | {'Outcome':<10} | {'Iterations':<10} | {'Gate':<8} |")
+    print("|" + "-" * 21 + "+" + "-" * 14 + "+" + "-" * 12 + "+" + "-" * 12 + "+" + "-" * 10 + "|")
     for pr in result.phase_results:
+        gate_status = _gate_status_label(pr)
         print(
             f"| {pr.phase.value:<20} | {phase_agent_name(pr):<12} |"
-            f" {pr.outcome:<10} | {pr.iterations:<10} |"
+            f" {pr.outcome:<10} | {pr.iterations:<10} | {gate_status:<8} |"
         )
 
 

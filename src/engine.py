@@ -444,6 +444,7 @@ class TaskContext:
     current_phase: Phase | None = None
     task_class: TaskClass = TaskClass.ANALYSIS
     harness_config: HarnessConfig | None = None
+    gate_retry_hint: dict | None = field(default=None)
 
     def get_completed_phases(self) -> set[Phase]:
         """Get set of phases that have been completed."""
@@ -511,6 +512,42 @@ class _HarnessAwareDispatcher:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)
+
+
+# Human-readable explanation and remedy for each gate evidence key.
+_GATE_EVIDENCE_REMEDIATION: dict[str, str] = {
+    "alternative_approaches_considered": (
+        "Brainstorm did not evaluate multiple approaches; ask the provider to set "
+        "evidence.alternative_approaches_considered after considering at least three alternatives."
+    ),
+    "risks_identified": (
+        "Brainstorm did not identify risks; ask the provider to set evidence.risks_identified "
+        "after enumerating potential failure modes or concerns."
+    ),
+    "success_criteria_defined": (
+        "Brainstorm has no explicit success criteria; ask the provider to set "
+        "evidence.success_criteria_defined after articulating measurable acceptance conditions."
+    ),
+    "reversibility_assessed": (
+        "Brainstorm did not assess how the change could be rolled back; ask the provider to set "
+        "evidence.reversibility_assessed after considering reversibility."
+    ),
+    "checkpoint_list": (
+        "Plan has no checkpoint list; the provider should return a sequenced step list and set "
+        "evidence.checkpoint_list."
+    ),
+    "dependency_map": (
+        "Plan has no dependency map; the provider should return outputs.checkpoints/dependencies "
+        "and set evidence.dependency_map."
+    ),
+    "rollback_plan": (
+        "Plan has no rollback plan; the provider should document a recovery procedure and set "
+        "evidence.rollback_plan."
+    ),
+}
+
+# Phases for which the engine runs the bounded gate-retry loop.
+_GATE_RETRY_PHASES = {Phase.BRAINSTORM, Phase.PLAN}
 
 
 class Engine:
@@ -709,6 +746,8 @@ class Engine:
                 continue
 
             phase_results = self._execute_phase_with_recovery(task, phase)
+            # Bounded gate retry for Brainstorm/Plan — runs at most once, advisory on double fail.
+            phase_results[-1] = self._maybe_gate_retry(task, phase, phase_results[-1])
             for phase_result in phase_results:
                 task.phase_results.append(phase_result)
                 self._sync_task_state(task, phase_result)
@@ -981,6 +1020,60 @@ class Engine:
             self._attach_artifact_refs(task, result)
             return result
 
+    def _maybe_gate_retry(self, task: TaskContext, phase: Phase, first: PhaseResult) -> PhaseResult:
+        """Attempt exactly one gate retry when the first result fails the gate.
+
+        Returns the result to use (whichever has the higher gate score).
+        Gate failures after retry are advisory — the task continues regardless.
+        """
+        if phase not in _GATE_RETRY_PHASES:
+            return first
+        if first.outcome == "fail":
+            # Recovery machinery owns hard failures; don't interfere.
+            return first
+        gate = first.artifacts.get("gate_result")
+        if not isinstance(gate, dict) or gate.get("passed", True):
+            return first
+
+        first_score = gate.get("score", 0.0)
+        missing = gate.get("missing_evidence", [])
+        remediation = gate.get("remediation", {})
+
+        task.gate_retry_hint = {
+            "phase": phase.value,
+            "missing_evidence": missing,
+            "remediation": remediation,
+        }
+        try:
+            retry = self._execute_phase(task, phase)
+        finally:
+            task.gate_retry_hint = None
+
+        retry_gate = retry.artifacts.get("gate_result", {})
+        retry_score = retry_gate.get("score", 0.0) if isinstance(retry_gate, dict) else 0.0
+
+        kept = "retry" if retry_score >= first_score else "first"
+        chosen = retry if kept == "retry" else first
+        chosen.artifacts["gate_retry"] = {
+            "attempted": True,
+            "first_score": first_score,
+            "retry_score": retry_score,
+            "kept": kept,
+        }
+
+        # If the chosen result still fails the gate, demote to advisory.
+        chosen_gate = chosen.artifacts.get("gate_result", {})
+        if isinstance(chosen_gate, dict) and not chosen_gate.get("passed", True):
+            logger.warning(
+                "Gate advisory phase=%s score=%.4f threshold=%.2f — retry did not resolve missing evidence %s; proceeding",
+                phase.value,
+                chosen_gate.get("score", 0.0),
+                chosen_gate.get("threshold", 0.0),
+                chosen_gate.get("missing_evidence", []),
+            )
+
+        return chosen
+
     def _log_phase_cost(self, result: PhaseResult, phase: Phase) -> None:
         """Log token usage from a phase result to NCP cost log."""
         usage = result.artifacts.get("dispatch_usage")
@@ -1041,10 +1134,10 @@ class Engine:
 
     def _attach_gate_result(self, result: PhaseResult) -> None:
         """Persist gate evaluation details for phases with confidence thresholds."""
-        passed, score = self.check_gate(result.phase, result.evidence)
-        if result.phase not in {Phase.BRAINSTORM, Phase.PLAN}:
+        if result.phase not in _GATE_RETRY_PHASES:
             return
 
+        passed, score = self.check_gate(result.phase, result.evidence)
         threshold = 0.80 if result.phase == Phase.BRAINSTORM else 0.90
         _gate_keys = {
             Phase.BRAINSTORM: {
@@ -1056,15 +1149,13 @@ class Engine:
             Phase.PLAN: {"checkpoint_list", "dependency_map", "rollback_plan"},
         }
         expected = _gate_keys.get(result.phase, set())
-        missing = [
-            key for key in expected
-            if not result.evidence.get(key)
-        ]
+        missing = [key for key in expected if not result.evidence.get(key)]
+        remediation = {key: _GATE_EVIDENCE_REMEDIATION[key] for key in missing if key in _GATE_EVIDENCE_REMEDIATION}
         if not passed:
-            import logging
-            logging.getLogger(__name__).warning(
-                "Gate FAILED phase=%s score=%.2f threshold=%.2f missing=%s",
-                result.phase.value, score, threshold, missing,
+            remedy_lines = "".join(f"\n  [{key}] {msg}" for key, msg in remediation.items())
+            logger.warning(
+                "Gate FAILED phase=%s score=%.4f threshold=%.2f missing=%s%s",
+                result.phase.value, score, threshold, missing, remedy_lines,
             )
         gate_result = GateResult(
             passed=passed,
@@ -1079,6 +1170,7 @@ class Engine:
             "threshold": gate_result.threshold,
             "missing_evidence": gate_result.missing_evidence,
             "decision": gate_result.decision,
+            "remediation": remediation,
         }
 
     def _attach_agent_role(self, result: PhaseResult) -> None:
@@ -1142,10 +1234,15 @@ class Engine:
         self,
         phase: Phase,
         evidence: dict[str, Any],
-        threshold: float = 0.90,
+        threshold: float | None = None,
+        _epsilon: float = 1e-9,
     ) -> tuple[bool, float]:
         """
         Check if evidence meets the confidence gate for a phase.
+
+        When threshold is None the per-phase default applies (Brainstorm 0.80,
+        Plan 0.90). The epsilon absorbs float accumulation error so a score
+        exactly at threshold passes (0.3 + 0.3 + 0.2 < 0.8 in float math).
 
         Returns (passed, actual_confidence).
         """
@@ -1157,12 +1254,13 @@ class Engine:
                 "success_criteria_defined": 0.2,
                 "reversibility_assessed": 0.2,
             }
+            gate_threshold = 0.80 if threshold is None else threshold
             confidence = 0.0
             for key, weight in weights.items():
                 if key in evidence and evidence[key]:
                     confidence += weight
 
-            return confidence >= threshold, confidence
+            return confidence >= gate_threshold - _epsilon, confidence
 
         elif phase == Phase.PLAN:
             weights = {
@@ -1170,12 +1268,13 @@ class Engine:
                 "dependency_map": 0.3,
                 "rollback_plan": 0.3,
             }
+            gate_threshold = 0.90 if threshold is None else threshold
             confidence = 0.0
             for key, weight in weights.items():
                 if key in evidence and evidence[key]:
                     confidence += weight
 
-            return confidence >= threshold, confidence
+            return confidence >= gate_threshold - _epsilon, confidence
 
         return True, 1.0
 

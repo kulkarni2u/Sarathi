@@ -35,7 +35,7 @@ python3 -m pip install -e .
 
 ### Optional: run real tests during Verify
 
-By default Verify uses safe synthetic signals. To execute the `test.command` from `commands.md`:
+By default Verify does not execute shell commands and reports the phase as `unverified` — it never fabricates pass/fail signals. To execute the `test.command` from `commands.md` and get real, measured results:
 
 ```bash
 export SARATHI_EXEC_COMMANDS=1

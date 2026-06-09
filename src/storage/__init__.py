@@ -20,6 +20,14 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        # WAL lets reader threads proceed during writes; the busy timeout
+        # avoids immediate "database is locked" errors under concurrent load.
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
+    except sqlite3.OperationalError:
+        # e.g. read-only or network filesystems that cannot support WAL
+        pass
     return conn
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass, field, replace as _dc_replace
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger("sarathi.engine")
 
 # Harness Engine imports
 try:
@@ -942,10 +945,13 @@ class Engine:
             self._log_phase_cost(result, phase)
             return result
         except Exception as e:
+            logger.exception(
+                "Phase %s handler raised for task %s", phase.value, task.task_id
+            )
             result = PhaseResult(
                 phase=phase,
                 outcome="fail",
-                error=f"Phase execution failed: {str(e)}",
+                error=f"Phase execution failed: {type(e).__name__}: {e}",
             )
             self._attach_agent_role(result)
             self._attach_artifact_refs(task, result)
@@ -1000,7 +1006,11 @@ class Engine:
                         agent_id = task.harness_config.primary_agent.agent_id
                         self.dispatcher.preferred_agent = agent_id if agent_id != "local" else None
                 except Exception:
-                    pass
+                    logger.exception(
+                        "Failed to restore harness_config for task %s; "
+                        "harness routing will fall back to provider-config defaults",
+                        task.task_id,
+                    )
 
         # Save updated task state
         self.persistence.save_task(task)
@@ -1185,7 +1195,7 @@ class Engine:
 
             return action
         except Exception as exc:
-            print(f"[trust_gate] Degraded (error): {exc}")
+            logger.warning("Trust gate degraded (error): %s", exc, exc_info=True)
             return "EXECUTE"
 
     @staticmethod

@@ -510,10 +510,11 @@ def test_native_claude_dispatch_runs_in_workspace_and_records_invocation_metadat
         tmp_path / "providers" / "claude",
         (
             "import json, os, sys;"
+            "prompt = sys.stdin.read();"
             "print(json.dumps({"
             "'success': True,"
             "'outputs': {'messages': ['Claude native bridge executed']},"
-            "'evidence': {'cwd': os.getcwd(), 'argv': sys.argv[1:]},"
+            "'evidence': {'cwd': os.getcwd(), 'argv': sys.argv[1:], 'stdin_prompt': prompt},"
             "'artifacts': {'script': 'claude'}"
             "}))"
         ),
@@ -552,9 +553,9 @@ def test_native_claude_dispatch_runs_in_workspace_and_records_invocation_metadat
     assert response_evidence["argv"][0] == "-p"
     assert "--add-dir" in response_evidence["argv"]
     assert response_evidence["argv"][response_evidence["argv"].index("--add-dir") + 1] == workspace_root
-    assert "--" in response_evidence["argv"]
-    assert "Prompt:" in response_evidence["argv"][-1]
-    assert "Task ID:" in response_evidence["argv"][-1]
+    # The prompt travels over stdin, not argv (argv has an ARG_MAX limit).
+    assert "Prompt:" in response_evidence["stdin_prompt"]
+    assert "Task ID:" in response_evidence["stdin_prompt"]
     assert response_evidence["native_cli_family"] == "claude"
     assert response_evidence["workspace_root_used"] == workspace_root
     assert dispatch_artifacts["script"] == "claude"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace as _dc_replace
 import json
 from pathlib import Path
 import subprocess
@@ -71,6 +72,11 @@ class OpenAISdkProviderAdapter(ProviderAdapter):
         )
 
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
+        # Make the configured model visible to the CLI bridge fallback paths.
+        if self.model and not request.constraints.get("model"):
+            request = _dc_replace(
+                request, constraints={**request.constraints, "model": self.model}
+            )
         session = self.create_session(request)
         session.status = "running"
         bridge_payload = {

@@ -13,7 +13,14 @@ if TYPE_CHECKING:
 
 
 class VerifyHandler:
-    """Run verification checks and tests."""
+    """Run verification checks and tests.
+
+    Outcomes are derived only from real signals:
+      pass        — the declared test command executed and succeeded
+      fail        — the declared test command executed and failed (or errored)
+      unverified  — no test command is declared (or execution is disabled),
+                    so nothing was actually verified
+    """
 
     def __init__(self, policy_pack, dispatcher=None, command_runner: CommandRunner | None = None):
         self.policy_pack = policy_pack
@@ -24,31 +31,35 @@ class VerifyHandler:
         from src.engine import PhaseResult
 
         verification_results = self._run_verification()
-        coverage_ok = self._check_coverage(verification_results)
-        quality_ok = self._check_code_quality(verification_results)
+        command_result = verification_results.get("command_result", {}) or {}
+        command_executed = command_result.get("source") == "shell"
+        command_succeeded = command_result.get("succeeded")
+
+        if command_executed:
+            outcome = "pass" if command_succeeded else "fail"
+        elif verification_results.get("verification_source") == "shell_error":
+            outcome = "fail"
+        else:
+            outcome = "unverified"
+
         quality_policy = QualityLoopPolicy.from_escalation(
             getattr(self.policy_pack, "escalation", {}) or {},
             learning_feedback=getattr(self.policy_pack, "learning_feedback", {}) or {},
         )
-        retry_recommended = (not coverage_ok or not quality_ok) and quality_policy.verify_retry_budget > 0
+        retry_recommended = outcome == "fail" and quality_policy.verify_retry_budget > 0
 
         evidence = {
-            "tests_executed": len(verification_results.get("tests", [])) > 0,
-            "coverage_adequate": coverage_ok,
-            "code_quality_passed": quality_ok,
-            "integration_tests_run": "integration" in str(verification_results),
+            "tests_executed": command_executed,
+            "verified": outcome == "pass",
             "verification_source": verification_results.get("verification_source"),
             "verification_summary": verification_results.get("summary", {}),
             "command_declared": bool(verification_results.get("declared_test_command")),
-            "command_executed": verification_results.get("command_result", {}).get("source") == "shell",
-            "command_succeeded": verification_results.get("command_result", {}).get("succeeded"),
-            "command_duration_seconds": verification_results.get("command_result", {}).get(
-                "duration_seconds"
-            ),
+            "command_executed": command_executed,
+            "command_succeeded": command_succeeded,
+            "command_duration_seconds": command_result.get("duration_seconds"),
             "retry_recommended": retry_recommended,
             "auto_fix_allowed": retry_recommended and quality_policy.auto_fix_attempts > 0,
         }
-        outcome = "pass" if coverage_ok and quality_ok else "fail"
 
         return PhaseResult(
             phase=phase,
@@ -70,39 +81,34 @@ class VerifyHandler:
         if isinstance(test_cfg, dict):
             cmd = test_cfg.get("command")
 
+        # No fabricated numbers: coverage/lint stay None unless a real tool
+        # produced them. verification_source records what actually happened.
         base: dict[str, Any] = {
             "declared_test_command": cmd,
-            "tests": ["unit_tests", "integration_tests"],
-            "coverage": 85.0,
-            "lint_results": {"errors": 0, "warnings": 2},
-            "security_scan": {"vulnerabilities": 0},
-            "verification_source": "synthetic",
+            "tests": [],
+            "coverage": None,
+            "lint_results": None,
+            "security_scan": None,
+            "verification_source": "none",
         }
 
         if cmd:
             command_result = self.command_runner.run(cmd)
             base["command_result"] = command_result.to_artifact()
             if command_result.source == "declared_not_executed":
+                base["verification_source"] = "declared_not_executed"
                 base["note"] = command_result.error
             elif command_result.source == "shell":
                 base["verification_source"] = "shell"
                 base["exit_code"] = command_result.exit_code
                 base["tests"] = ["declared_command"]
-                base["coverage"] = 85.0 if command_result.succeeded else 55.0
-                base["lint_results"] = {
-                    "errors": 0 if command_result.succeeded else 1,
-                    "warnings": base["lint_results"]["warnings"],
-                }
                 base["output_tail"] = command_result.output_tail
             elif command_result.source == "shell_error":
                 base["verification_source"] = "shell_error"
                 base["shell_error"] = command_result.error
                 base["tests"] = []
-                base["coverage"] = 0.0
 
         command_artifact = base.get("command_result", {})
-        lint_results = base.get("lint_results", {})
-        security_scan = base.get("security_scan", {})
         base["summary"] = {
             "generated_at": command_artifact.get("finished_at") or command_artifact.get("started_at"),
             "verification_source": base["verification_source"],
@@ -111,17 +117,7 @@ class VerifyHandler:
             "command_succeeded": command_artifact.get("succeeded"),
             "tests_count": len(base.get("tests", [])),
             "coverage": base.get("coverage"),
-            "lint_errors": lint_results.get("errors", 0),
-            "lint_warnings": lint_results.get("warnings", 0),
-            "security_vulnerabilities": security_scan.get("vulnerabilities", 0),
             "duration_seconds": command_artifact.get("duration_seconds", 0.0),
         }
 
         return base
-
-    def _check_coverage(self, results: dict) -> bool:
-        return results.get("coverage", 0) >= 80
-
-    def _check_code_quality(self, results: dict) -> bool:
-        lint_results = results.get("lint_results", {})
-        return lint_results.get("errors", 0) == 0

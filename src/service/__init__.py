@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import shutil
@@ -1298,8 +1299,11 @@ class ServiceApp:
     def _authorize(self, headers: Mapping[str, str] | None) -> None:
         if self.token is None:
             return
+        expected = f"Bearer {self.token}"
         for key, value in (headers or {}).items():
-            if key.lower() == "authorization" and value == f"Bearer {self.token}":
+            if key.lower() == "authorization" and hmac.compare_digest(
+                str(value).encode(), expected.encode()
+            ):
                 return
         raise ServiceError("unauthorized", "Missing or invalid authorization token.", 401)
 
@@ -1315,7 +1319,10 @@ class ServiceApp:
             return
         except ServiceError:
             pass
-        if _first_query(query, "token") == self.token:
+        candidate = _first_query(query, "token")
+        if candidate is not None and hmac.compare_digest(
+            str(candidate).encode(), str(self.token).encode()
+        ):
             return
         raise ServiceError("unauthorized", "Missing or invalid authorization token.", 401)
 

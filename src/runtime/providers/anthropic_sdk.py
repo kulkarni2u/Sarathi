@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace as _dc_replace
 import json
 from pathlib import Path
 import subprocess
@@ -71,6 +72,11 @@ class AnthropicSdkProviderAdapter(ProviderAdapter):
         )
 
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
+        # Make the configured model visible to the CLI bridge fallback paths.
+        if self.model and not request.constraints.get("model"):
+            request = _dc_replace(
+                request, constraints={**request.constraints, "model": self.model}
+            )
         if request.constraints.get("ncp_handoff_enabled") and self.provider_path:
             return dispatch_via_cli_bridge(
                 provider="claude",

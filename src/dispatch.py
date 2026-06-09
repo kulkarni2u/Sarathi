@@ -134,12 +134,21 @@ class LocalDispatcher(Dispatcher):
         )
 
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future: Future[DispatchResponse] = pool.submit(self.provider.dispatch, request)
-            try:
-                return future.result(timeout=_DISPATCH_TIMEOUT)
-            except FuturesTimeoutError:
-                raise DispatchTimeoutError(
-                    f"Provider dispatch timed out after {_DISPATCH_TIMEOUT}s "
-                    f"(task={request.task_id}, phase={request.phase})"
-                )
+        # The provider's own subprocess timeout (request.timeout_seconds) is the
+        # primary budget and should fire first, returning a structured failure.
+        # This outer guard only catches providers that ignore their budget, so
+        # give it headroom above the request budget.
+        timeout = max(_DISPATCH_TIMEOUT, request.timeout_seconds + 30)
+        pool = ThreadPoolExecutor(max_workers=1)
+        future: Future[DispatchResponse] = pool.submit(self.provider.dispatch, request)
+        try:
+            return future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            raise DispatchTimeoutError(
+                f"Provider dispatch timed out after {timeout}s "
+                f"(task={request.task_id}, phase={request.phase})"
+            )
+        finally:
+            # wait=False: a `with` block (shutdown(wait=True)) would block here
+            # until the hung provider call returned, making the timeout cosmetic.
+            pool.shutdown(wait=False, cancel_futures=True)

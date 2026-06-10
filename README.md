@@ -61,6 +61,22 @@ export SARATHI_COMMAND_TIMEOUT=600     # optional; seconds
 sarathi run "…" --policy-pack ./policy-pack
 ```
 
+### Optional: live provider smoke tests
+
+`tests/live/` exercises the real provider CLIs (e.g. `claude -p --output-format json`)
+end to end — it is opt-in and skipped by default since it makes real, billed
+API calls (a couple of dollars worth at most per run). To run it:
+
+```bash
+SARATHI_LIVE_TESTS=1 python3 -m pytest tests/live -q
+```
+
+Each provider's tests additionally skip if that provider's CLI is not on
+`PATH`. The suite validates Sarathi's side of the integration — envelope
+parsing, reported token usage capture, cost/session-id artifacts, workspace
+delta measurement, and `--resume` session continuity — not whether the
+agent obeys every instruction.
+
 ### Task history
 
 ```bash

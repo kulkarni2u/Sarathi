@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 
-LATEST_SCHEMA_VERSION = 6
+LATEST_SCHEMA_VERSION = 7
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -85,6 +85,13 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
             (6, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 7:
+        conn.executescript(_MIGRATION_007)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (7, _utc_now()),
         )
         conn.commit()
 
@@ -615,7 +622,8 @@ class Storage:
     def get_subtask(self, subtask_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             """
-            SELECT id, workspace_id, task_id, title, status, metadata, created_at, updated_at
+            SELECT id, workspace_id, task_id, title, status, metadata, created_at, updated_at,
+                   claimed_by, claimed_at, heartbeat_at
             FROM subtasks
             WHERE id = ?
             """,
@@ -652,7 +660,8 @@ class Storage:
     def list_subtasks_for_task(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             """
-            SELECT id, workspace_id, task_id, title, status, metadata, created_at, updated_at
+            SELECT id, workspace_id, task_id, title, status, metadata, created_at, updated_at,
+                   claimed_by, claimed_at, heartbeat_at
             FROM subtasks
             WHERE task_id = ?
             ORDER BY created_at, id
@@ -660,6 +669,91 @@ class Storage:
             (task_id,),
         ).fetchall()
         return [_subtask_from_row(row) for row in rows]
+
+    def list_claimable_subtasks(self, *, status: str = "in_progress") -> list[dict[str, Any]]:
+        """List subtasks in ``status`` with no active claim, oldest first."""
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, task_id, title, status, metadata, created_at, updated_at,
+                   claimed_by, claimed_at, heartbeat_at
+            FROM subtasks
+            WHERE status = ? AND claimed_by IS NULL
+            ORDER BY created_at, id
+            """,
+            (status,),
+        ).fetchall()
+        return [_subtask_from_row(row) for row in rows]
+
+    def list_stale_claimed_subtasks(
+        self, *, status: str = "in_progress", before: str
+    ) -> list[dict[str, Any]]:
+        """List subtasks in ``status`` whose claim heartbeat is older than ``before``."""
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, task_id, title, status, metadata, created_at, updated_at,
+                   claimed_by, claimed_at, heartbeat_at
+            FROM subtasks
+            WHERE status = ?
+              AND claimed_by IS NOT NULL
+              AND heartbeat_at IS NOT NULL
+              AND heartbeat_at < ?
+            ORDER BY heartbeat_at, id
+            """,
+            (status, before),
+        ).fetchall()
+        return [_subtask_from_row(row) for row in rows]
+
+    def claim_subtask(
+        self,
+        subtask_id: str,
+        *,
+        worker_id: str,
+        status: str = "in_progress",
+    ) -> bool:
+        """Atomically claim a subtask for ``worker_id``.
+
+        Returns True if this call won the claim (rowcount == 1), False if the
+        subtask was already claimed or no longer in ``status`` (lost the race
+        or already moved on).
+        """
+        now = _utc_now()
+        cursor = self.conn.execute(
+            """
+            UPDATE subtasks
+            SET claimed_by = ?, claimed_at = ?, heartbeat_at = ?
+            WHERE id = ? AND status = ? AND claimed_by IS NULL
+            """,
+            (worker_id, now, now, subtask_id, status),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def heartbeat_subtask_claim(self, subtask_id: str, *, worker_id: str) -> bool:
+        """Refresh the heartbeat for a subtask claimed by ``worker_id``."""
+        now = _utc_now()
+        cursor = self.conn.execute(
+            """
+            UPDATE subtasks
+            SET heartbeat_at = ?
+            WHERE id = ? AND claimed_by = ?
+            """,
+            (now, subtask_id, worker_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def clear_subtask_claim(self, subtask_id: str) -> dict[str, Any] | None:
+        """Clear claim bookkeeping columns for a subtask."""
+        self.conn.execute(
+            """
+            UPDATE subtasks
+            SET claimed_by = NULL, claimed_at = NULL, heartbeat_at = NULL
+            WHERE id = ?
+            """,
+            (subtask_id,),
+        )
+        self.conn.commit()
+        return self.get_subtask(subtask_id)
 
     def create_message(
         self,
@@ -1385,6 +1479,7 @@ def _task_from_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _subtask_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    columns = row.keys()
     return {
         "id": row["id"],
         "workspace_id": row["workspace_id"],
@@ -1394,6 +1489,9 @@ def _subtask_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "metadata": _load_json(row["metadata"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "claimed_by": row["claimed_by"] if "claimed_by" in columns else None,
+        "claimed_at": row["claimed_at"] if "claimed_at" in columns else None,
+        "heartbeat_at": row["heartbeat_at"] if "heartbeat_at" in columns else None,
     }
 
 
@@ -2016,4 +2114,14 @@ CREATE INDEX IF NOT EXISTS idx_brainstorm_sessions_status
 
 _MIGRATION_006 = """
 ALTER TABLE brainstorm_sessions ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';
+"""
+
+
+_MIGRATION_007 = """
+ALTER TABLE subtasks ADD COLUMN claimed_by TEXT;
+ALTER TABLE subtasks ADD COLUMN claimed_at TEXT;
+ALTER TABLE subtasks ADD COLUMN heartbeat_at TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_subtasks_claim
+    ON subtasks(status, claimed_by);
 """

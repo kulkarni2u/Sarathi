@@ -225,6 +225,25 @@ Provider `diff_trace` hunks can also carry reviewer-grade metadata such as `cate
 
 Those diff summaries now also cluster related hunks into grouped patch regions and emit a `review_confidence_verdict` with explicit reasons, so downstream review surfaces can show both the risky regions and the overall trust level of the provider-backed patch analysis.
 
+### Multi-worker execution
+
+Scale subtask dispatch across N processes (or machines sharing the DB and workspace):
+
+```bash
+# Start the service as usual, then in N separate terminals:
+python -m src.service.worker --db .sarathi/sarathi.db
+```
+
+Each worker polls for subtasks that `_schedule_ready_subtasks` made ready
+(`in_progress` with no claim), atomically claims one (a single guarded SQLite
+`UPDATE`, so claims never double up), dispatches it through the same provider
+machinery the HTTP API uses, and records the result.
+
+A worker that crashes mid-dispatch leaves its claim's heartbeat stale; the
+next poll by any worker requeues that subtask (default lease: 600s, `--lease`
+to tune). Use `--once` for a single pass (e.g. CI) and `--worker-id` to set
+a stable identity.
+
 ## Lifecycle Architecture
 
 ### Static outer spine

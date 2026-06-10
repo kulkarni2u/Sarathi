@@ -81,7 +81,13 @@ def semantic_issues(policy_pack_path: str) -> dict[str, str]:
     compiled = compile_policy_pack(policy_pack_path)
     issues: dict[str, str] = dict(compiled.parse_errors)
     section_checks = {
-        "complexity": ("classification_thresholds", "skip_rules"),
+        "complexity": (
+            "classification_thresholds",
+            "classification thresholds",
+            "complexity_triggers",
+            "complexity triggers",
+            "skip_rules",
+        ),
         "commands": ("build", "test"),
         "review": ("max_rounds", "min_coverage"),
         "escalation": ("auto_fix", "review"),

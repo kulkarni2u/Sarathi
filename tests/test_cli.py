@@ -605,11 +605,21 @@ def test_handle_reuse_requires_running_service(monkeypatch, capsys):
     assert "Sarathi desktop service not running" in output
 
 
+def test_service_get_json_uses_discovered_bearer_token(tmp_path):
+    from tests.test_service_api import running_server
+
+    with running_server(tmp_path / "sarathi.db", token="secret") as base_url:
+        data = cli._service_get_json(base_url, "/api/health", token="secret")
+
+    assert data == {"status": "ok"}
+
+
 def test_handle_reuse_prints_workspace_kit(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_read_service_discovery", lambda: {"url": "http://127.0.0.1:8765"})
 
-    def fake_service_get_json(service_url, path):
+    def fake_service_get_json(service_url, path, *, token=None):
         assert service_url == "http://127.0.0.1:8765"
+        assert token is None
         if path == "/api/workspaces":
             return {
                 "workspaces": [

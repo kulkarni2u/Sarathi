@@ -1,4 +1,5 @@
 from pathlib import Path
+import tomllib
 
 from src.dispatch import LocalDispatcher
 from src.engine import Complexity, Engine, Phase, TaskContext
@@ -37,6 +38,18 @@ test:
 
     compiled = compile_policy_pack(str(policy_dir))
     assert compiled.get("commands") == {"test": {"command": "pytest -q"}}
+
+
+def test_packaged_skill_policy_files_include_current_templates():
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    data_files = pyproject["tool"]["setuptools"]["data-files"]
+
+    example_files = set(data_files["share/sarathi/skill/policy-pack/EXAMPLE"])
+    template_files = set(data_files["share/sarathi/skill/policy-pack/TEMPLATE"])
+
+    assert "skill/policy-pack/EXAMPLE/workflow-patterns.md" in example_files
+    assert "skill/policy-pack/TEMPLATE/permissions.md" in template_files
+    assert "skill/policy-pack/TEMPLATE/workflow-patterns.md" in template_files
 
 
 def test_compile_policy_pack_loads_accepted_proposal_feedback(tmp_path: Path):

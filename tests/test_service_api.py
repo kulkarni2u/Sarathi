@@ -1,5 +1,6 @@
 import http.client
 import json
+import stat
 import uuid
 import threading
 from urllib.parse import urlparse
@@ -923,6 +924,24 @@ def test_http_server_requires_token_even_on_loopback(tmp_path):
         assert status == 200
         assert payload["ok"] is True
         assert payload["correlation_id"] == "corr-http"
+
+
+def test_http_server_discovery_includes_auth_and_db_metadata(tmp_path, monkeypatch):
+    discovery_path = tmp_path / "home" / ".sarathi" / "service.json"
+    db_path = tmp_path / "state" / "sarathi.db"
+    monkeypatch.setattr("src.service.http._service_discovery_path", lambda: discovery_path)
+
+    with running_server(db_path, token="secret") as base_url:
+        payload = json.loads(discovery_path.read_text(encoding="utf-8"))
+
+        assert payload["url"] == base_url
+        assert payload["host"] == "127.0.0.1"
+        assert payload["port"]
+        assert payload["auth"] == {"type": "bearer", "token": "secret"}
+        assert payload["db_path"] == str(db_path.resolve())
+        assert stat.S_IMODE(discovery_path.stat().st_mode) == 0o600
+
+    assert not discovery_path.exists()
 
 
 def test_http_server_rejects_invalid_json(tmp_path):

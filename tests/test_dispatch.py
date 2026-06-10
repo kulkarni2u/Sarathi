@@ -360,7 +360,7 @@ def test_opencode_sdk_provider_parses_structured_json_messages(tmp_path, monkeyp
             }
         },
         "evidence": {"provider_output_received": True},
-        "artifacts": {"model": "opencode/deepseek-v4-flash-free"},
+        "artifacts": {"model": "user-configured-opencode-default"},
     }
     monkeypatch.setattr(
         provider,
@@ -378,7 +378,7 @@ def test_opencode_sdk_provider_parses_structured_json_messages(tmp_path, monkeyp
     assert result.success is True
     assert result.outputs["work_unit_result"]["node_id"] == "node-1"
     assert result.outputs["work_unit_result"]["files_changed"] == ["ncp/types.py"]
-    assert result.artifacts["model"] == "opencode/deepseek-v4-flash-free"
+    assert result.artifacts["model"] == "user-configured-opencode-default"
 
 
 def test_openai_sdk_provider_exposes_sdk_capabilities(tmp_path):

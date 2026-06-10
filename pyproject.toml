@@ -65,6 +65,7 @@ include-package-data = true
     "skill/policy-pack/EXAMPLE/review.md",
     "skill/policy-pack/EXAMPLE/skills.md",
     "skill/policy-pack/EXAMPLE/task-tracking.md",
+    "skill/policy-pack/EXAMPLE/workflow-patterns.md",
 ]
 "share/sarathi/skill/policy-pack/TEMPLATE" = [
     "skill/policy-pack/TEMPLATE/commands.md",
@@ -72,9 +73,11 @@ include-package-data = true
     "skill/policy-pack/TEMPLATE/conventions.md",
     "skill/policy-pack/TEMPLATE/escalation.md",
     "skill/policy-pack/TEMPLATE/model-routing.md",
+    "skill/policy-pack/TEMPLATE/permissions.md",
     "skill/policy-pack/TEMPLATE/review.md",
     "skill/policy-pack/TEMPLATE/skills.md",
     "skill/policy-pack/TEMPLATE/task-tracking.md",
+    "skill/policy-pack/TEMPLATE/workflow-patterns.md",
 ]
 
 [tool.setuptools.packages.find]

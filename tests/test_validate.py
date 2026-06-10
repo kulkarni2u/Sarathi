@@ -28,6 +28,33 @@ def test_validation_detects_semantic_drift(tmp_path: Path):
     assert result[0].status == ValidationStatus.DRIFT
 
 
+def test_validation_accepts_human_readable_complexity_policy(tmp_path: Path):
+    policy_dir = tmp_path / "policy-pack"
+    policy_dir.mkdir()
+    (policy_dir / "complexity.md").write_text(
+        """# Policy Pack: Complexity Classification
+
+## Complexity Triggers
+
+### Low Complexity Indicators
+- Single file change
+
+## Classification Thresholds
+
+| Complexity | Max Files |
+|------------|-----------|
+| Low        | 1         |
+"""
+    )
+
+    validator = PolicyValidator(engine_path="engine", policy_pack_path=str(policy_dir))
+    result = validator.validate(
+        required_list={"Route": ["complexity_triggers", "classification_thresholds"]},
+    )
+
+    assert [item.status for item in result] == [ValidationStatus.PASS, ValidationStatus.PASS]
+
+
 def test_compiled_policy_sections_keep_typed_and_legacy_access_in_sync(tmp_path: Path):
     policy_dir = tmp_path / "policy-pack"
     policy_dir.mkdir()

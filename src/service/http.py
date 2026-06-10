@@ -32,7 +32,8 @@ def create_http_server(
     host: str = "127.0.0.1",
     port: int = 0,
 ) -> ThreadingHTTPServer:
-    app = create_app(db_path, token=token)
+    resolved_db_path = Path(db_path).expanduser().resolve()
+    app = create_app(resolved_db_path, token=token)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -173,7 +174,12 @@ def create_http_server(
             host, bound_port = self.server_address[:2]
             self.server_name = str(host)
             self.server_port = int(bound_port)
-            _write_service_discovery(str(host), int(bound_port))
+            _write_service_discovery(
+                str(host),
+                int(bound_port),
+                token=token,
+                db_path=resolved_db_path,
+            )
 
         def server_close(self) -> None:
             super().server_close()
@@ -193,14 +199,24 @@ def _service_discovery_path() -> Path:
     return Path.home() / ".sarathi" / "service.json"
 
 
-def _write_service_discovery(host: str, port: int) -> None:
+def _write_service_discovery(host: str, port: int, *, token: str, db_path: Path) -> None:
     try:
         discovery = _service_discovery_path()
         discovery.parent.mkdir(parents=True, exist_ok=True)
         discovery.write_text(
-            json.dumps({"url": f"http://{host}:{port}", "host": host, "port": port}, indent=2),
+            json.dumps(
+                {
+                    "url": f"http://{host}:{port}",
+                    "host": host,
+                    "port": port,
+                    "auth": {"type": "bearer", "token": token},
+                    "db_path": str(db_path),
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
+        discovery.chmod(0o600)
     except Exception:
         pass
 

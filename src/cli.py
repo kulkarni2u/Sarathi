@@ -426,9 +426,10 @@ def _show_home() -> None:
     info = _read_service_discovery()
     if info is not None:
         service_url = info.get("url")
+    service_token = _service_auth_token(info)
     if service_url:
         try:
-            data = _service_get_json(service_url, "/api/workspaces")
+            data = _service_get_json(service_url, "/api/workspaces", token=service_token)
             workspace_count = len(data.get("workspaces", []))
         except Exception:
             pass
@@ -948,8 +949,21 @@ def _read_service_discovery() -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _service_get_json(service_url: str, path: str) -> dict[str, Any]:
-    with urllib.request.urlopen(f"{service_url.rstrip('/')}{path}", timeout=2) as response:
+def _service_auth_token(info: dict[str, Any] | None) -> str | None:
+    if not isinstance(info, dict):
+        return None
+    auth = info.get("auth")
+    if not isinstance(auth, dict) or auth.get("type") != "bearer":
+        return None
+    token = auth.get("token")
+    return token if isinstance(token, str) and token else None
+
+
+def _service_get_json(service_url: str, path: str, *, token: str | None = None) -> dict[str, Any]:
+    request = urllib.request.Request(f"{service_url.rstrip('/')}{path}")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(request, timeout=2) as response:
         payload = json.loads(response.read().decode("utf-8"))
     if not isinstance(payload, dict):
         raise RuntimeError("Unexpected service response.")
@@ -985,12 +999,13 @@ def handle_reuse(args: argparse.Namespace) -> None:
     """Show the live reusable workflow kit from the running Sarathi local service."""
     info = _read_service_discovery()
     service_url = info.get("url") if isinstance(info, dict) else None
+    service_token = _service_auth_token(info)
     if not service_url:
         print("Sarathi desktop service not running — start it with: sarathi desktop")
         return
 
     try:
-        workspaces = _service_get_json(service_url, "/api/workspaces").get("workspaces", [])
+        workspaces = _service_get_json(service_url, "/api/workspaces", token=service_token).get("workspaces", [])
     except Exception as error:
         print(f"Failed to read Sarathi workspaces: {error}")
         return
@@ -1031,6 +1046,7 @@ def handle_reuse(args: argparse.Namespace) -> None:
         reuse_kit = _service_get_json(
             service_url,
             f"/api/workspaces/{workspace_id}/reuse-kit",
+            token=service_token,
         )
     except Exception as error:
         print(f"Failed to read workspace reuse kit: {error}")

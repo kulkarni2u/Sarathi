@@ -931,6 +931,11 @@ def test_http_server_discovery_includes_auth_and_db_metadata(tmp_path, monkeypat
     db_path = tmp_path / "state" / "sarathi.db"
     monkeypatch.setattr("src.service.http._service_discovery_path", lambda: discovery_path)
 
+    # A stale discovery file with loose permissions must be replaced, not reused.
+    discovery_path.parent.mkdir(parents=True)
+    discovery_path.write_text("{}", encoding="utf-8")
+    discovery_path.chmod(0o644)
+
     with running_server(db_path, token="secret") as base_url:
         payload = json.loads(discovery_path.read_text(encoding="utf-8"))
 
@@ -940,6 +945,7 @@ def test_http_server_discovery_includes_auth_and_db_metadata(tmp_path, monkeypat
         assert payload["auth"] == {"type": "bearer", "token": "secret"}
         assert payload["db_path"] == str(db_path.resolve())
         assert stat.S_IMODE(discovery_path.stat().st_mode) == 0o600
+        assert not discovery_path.with_name(discovery_path.name + ".tmp").exists()
 
     assert not discovery_path.exists()
 

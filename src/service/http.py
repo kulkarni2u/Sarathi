@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socketserver
 import time
 from http import HTTPStatus
@@ -203,20 +204,27 @@ def _write_service_discovery(host: str, port: int, *, token: str, db_path: Path)
     try:
         discovery = _service_discovery_path()
         discovery.parent.mkdir(parents=True, exist_ok=True)
-        discovery.write_text(
-            json.dumps(
-                {
-                    "url": f"http://{host}:{port}",
-                    "host": host,
-                    "port": port,
-                    "auth": {"type": "bearer", "token": token},
-                    "db_path": str(db_path),
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
+        payload = json.dumps(
+            {
+                "url": f"http://{host}:{port}",
+                "host": host,
+                "port": port,
+                "auth": {"type": "bearer", "token": token},
+                "db_path": str(db_path),
+            },
+            indent=2,
         )
-        discovery.chmod(0o600)
+        # The file holds the bearer token: create it 0600 from the start and
+        # rename into place so it is never readable by others or seen partial.
+        staging = discovery.with_name(discovery.name + ".tmp")
+        staging.unlink(missing_ok=True)
+        fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            os.replace(staging, discovery)
+        finally:
+            staging.unlink(missing_ok=True)
     except Exception:
         pass
 

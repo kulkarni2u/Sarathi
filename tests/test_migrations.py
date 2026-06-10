@@ -238,3 +238,60 @@ def test_connect_creates_missing_parent_directories(tmp_path):
         run_migrations(conn)
 
     assert db_path.exists()
+
+
+def test_migration_7_adds_subtask_claim_columns_on_fresh_db(tmp_path):
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        assert LATEST_SCHEMA_VERSION == 7
+
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(subtasks)")}
+        assert {"claimed_by", "claimed_at", "heartbeat_at"} <= columns
+
+
+def test_migration_7_applies_on_top_of_v6_db(tmp_path):
+    from src.storage import (
+        _MIGRATION_001,
+        _MIGRATION_002,
+        _MIGRATION_003,
+        _MIGRATION_004,
+        _MIGRATION_005,
+        _MIGRATION_006,
+        _utc_now,
+    )
+
+    db_path = tmp_path / "sarathi.db"
+    with connect(db_path) as conn:
+        for version, script in (
+            (1, _MIGRATION_001),
+            (2, _MIGRATION_002),
+            (3, _MIGRATION_003),
+            (4, _MIGRATION_004),
+            (5, _MIGRATION_005),
+            (6, _MIGRATION_006),
+        ):
+            conn.executescript(script)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, _utc_now()),
+            )
+            conn.commit()
+
+        assert current_schema_version(conn) == 6
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(subtasks)")}
+        assert "claimed_by" not in columns
+
+    with connect(db_path) as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(subtasks)")}
+        assert {"claimed_by", "claimed_at", "heartbeat_at"} <= columns
+
+        versions = [
+            row["version"]
+            for row in conn.execute("SELECT version FROM schema_version ORDER BY version")
+        ]
+        assert versions == list(range(1, LATEST_SCHEMA_VERSION + 1))

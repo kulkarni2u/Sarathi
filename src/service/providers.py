@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -26,6 +27,30 @@ from .preferences import (
     _required_text,
 )
 from .scheduling import _service_now
+
+
+# Default worker claim lease window, in seconds. A claim older than this is
+# considered stale and may be requeued or re-dispatched by another worker.
+DEFAULT_CLAIM_LEASE_SECONDS = 600
+
+
+def _claim_is_fresh(
+    subtask: Mapping[str, Any], *, lease_seconds: int = DEFAULT_CLAIM_LEASE_SECONDS
+) -> bool:
+    """Return True if ``subtask`` has an active, non-expired worker claim."""
+    if not subtask.get("claimed_by"):
+        return False
+    heartbeat_at = subtask.get("heartbeat_at") or subtask.get("claimed_at")
+    if not heartbeat_at:
+        return True
+    try:
+        heartbeat = datetime.fromisoformat(str(heartbeat_at))
+    except ValueError:
+        return True
+    if heartbeat.tzinfo is None:
+        heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - heartbeat
+    return age <= timedelta(seconds=lease_seconds)
 
 
 def _dispatch_subtask(

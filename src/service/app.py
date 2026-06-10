@@ -48,6 +48,7 @@ from .preferences import (
     _required_text,
 )
 from .providers import (
+    _claim_is_fresh,
     _dispatch_subtask,
     _handle_chat,
     _provider_health,
@@ -1197,6 +1198,18 @@ class ServiceApp:
             subtask = storage.get_subtask(parts[1])
             if subtask is None:
                 raise ServiceError("not_found", "Subtask not found.", 404)
+            requester = _optional_text(body, "worker_id")
+            claimed_by = subtask.get("claimed_by")
+            if (
+                claimed_by
+                and claimed_by != requester
+                and _claim_is_fresh(subtask)
+            ):
+                raise ServiceError(
+                    "conflict",
+                    f"Subtask is claimed by worker '{claimed_by}'.",
+                    409,
+                )
             return 201, _dispatch_subtask(storage, subtask, body)
 
         if method == "GET" and parts == ["providers"]:

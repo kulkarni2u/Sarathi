@@ -375,6 +375,22 @@ def _budget_summary_line(task: TaskContext) -> str | None:
     )
 
 
+def _crash_recovery_summary_line(task: TaskContext) -> str | None:
+    """Render a summary of any in-flight dispatches reconciled on resume."""
+    reconciliations = getattr(task, "crash_reconciliation", None)
+    if not reconciliations:
+        return None
+
+    count = len(reconciliations)
+    changed = any(not r.get("safe_to_rerun") for r in reconciliations)
+    status = "workspace changes detected" if changed else "no workspace changes detected"
+    return (
+        "Crash recovery:"
+        f" {count} interrupted dispatch{'es' if count != 1 else ''}"
+        f" | {status}"
+    )
+
+
 # ============================================================================
 # CLI handlers
 # ============================================================================
@@ -1232,6 +1248,9 @@ def _print_task_status(task: TaskContext, *, stale_after_seconds: int = 300) -> 
     budget_line = _budget_summary_line(task)
     if budget_line is not None:
         print(budget_line)
+    crash_line = _crash_recovery_summary_line(task)
+    if crash_line is not None:
+        print(crash_line)
     if task.task_graph_state:
         summary = graph_summary(task.task_graph_state)
         print(

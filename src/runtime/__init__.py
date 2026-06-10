@@ -13,6 +13,7 @@ from .budget import TaskBudget
 from .commands import CommandResult, CommandRunner
 from .contracts import DispatchRequest, DispatchResponse, GateResult, UsageRecord, build_usage_record
 from .context import AgentInputContract, AgentOutputContract, ContextCompiler, ContextPack
+from .dispatch_journal import DispatchJournal
 from .escalation import EscalationBundle, EscalationBundleBuilder
 from .graph_executor import GraphExecutionEvent, GraphExecutionResult, TaskGraphExecutor
 from .graph_policy import GraphExecutionPolicy, validate_graph_execution_config
@@ -50,6 +51,7 @@ __all__ = [
     "AgentOutputContract",
     "ContextCompiler",
     "ContextPack",
+    "DispatchJournal",
     "DispatchRequest",
     "DispatchResponse",
     "UsageRecord",

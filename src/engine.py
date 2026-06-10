@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import uuid
 from dataclasses import dataclass, field, replace as _dc_replace
@@ -46,6 +47,7 @@ try:
     from .runtime import (
         ArtifactStore,
         apply_learning_feedback_to_provider_routing,
+        DispatchJournal,
         DispatchRequest,
         GateResult,
         PreflightPolicy,
@@ -75,6 +77,7 @@ except ImportError:
     from runtime import (
         ArtifactStore,
         apply_learning_feedback_to_provider_routing,
+        DispatchJournal,
         DispatchRequest,
         GateResult,
         PreflightPolicy,
@@ -328,6 +331,7 @@ class PersistenceManager:
             "complexity_evidence": task.complexity_evidence,
             "preflight_validation": task.preflight_validation,
             "budget_snapshot": task.budget_snapshot,
+            "crash_reconciliation": task.crash_reconciliation,
             "task_graph_state": task.task_graph_state,
             "current_phase": task.current_phase.value if task.current_phase else None,
             "task_class": getattr(task, "task_class", TaskClass.ANALYSIS).value,
@@ -378,6 +382,7 @@ class PersistenceManager:
                 task_graph_state=task_data.get("task_graph_state", {}),
                 task_class=restored_task_class,
                 budget_snapshot=task_data.get("budget_snapshot"),
+                crash_reconciliation=task_data.get("crash_reconciliation"),
             )
 
             task.current_phase = Phase(task_data["current_phase"]) if task_data.get("current_phase") else None
@@ -452,6 +457,7 @@ class TaskContext:
     harness_config: HarnessConfig | None = None
     gate_retry_hint: dict | None = field(default=None)
     budget_snapshot: dict[str, Any] | None = None
+    crash_reconciliation: list[dict[str, Any]] | None = None
 
     def get_completed_phases(self) -> set[Phase]:
         """Get set of phases that have been completed."""
@@ -493,6 +499,8 @@ class _HarnessAwareDispatcher:
         self.preferred_agent: str | None = None
         self.claude_session_id: str | None = None
         self.fallback_agents: list[str] = []
+        self.journal: Any | None = None
+        self.workspace_root: str | None = None
 
     def reset_task_state(self) -> None:
         """Clear per-task routing/session state before a new task starts."""
@@ -520,7 +528,17 @@ class _HarnessAwareDispatcher:
         if request.retry_budget == 0 and provider and provider != "local":
             request = _dc_replace(request, retry_budget=1)
 
-        response = self._base.dispatch(request)
+        journal_id = self._journal_begin(request)
+        try:
+            response = self._base.dispatch(request)
+        except Exception as exc:
+            self._journal_complete(journal_id, success=False, error=str(exc))
+            raise
+        self._journal_complete(
+            journal_id,
+            success=bool(getattr(response, "success", False)),
+            error=getattr(response, "error", None),
+        )
         self._track_session(response)
 
         if (
@@ -531,6 +549,34 @@ class _HarnessAwareDispatcher:
             response = self._attempt_failover(request, response)
 
         return response
+
+    def _journal_begin(self, request: DispatchRequest) -> str | None:
+        """Record dispatch intent in the write-ahead journal, if configured.
+
+        Never raises — journal failures must never block a dispatch.
+        """
+        if self.journal is None or not self.workspace_root:
+            return None
+        try:
+            return self.journal.begin(
+                task_id=request.task_id,
+                phase=request.phase,
+                provider=request.constraints.get("provider"),
+                prompt=request.prompt,
+                workspace_root=self.workspace_root,
+            )
+        except Exception:
+            logger.exception("dispatch journal begin() failed for task %s", request.task_id)
+            return None
+
+    def _journal_complete(self, journal_id: str | None, *, success: bool, error: str | None) -> None:
+        """Record dispatch completion in the write-ahead journal, if configured."""
+        if self.journal is None or journal_id is None:
+            return
+        try:
+            self.journal.complete(journal_id, success=success, error=error)
+        except Exception:
+            logger.exception("dispatch journal complete() failed for journal_id %s", journal_id)
 
     def _attempt_failover(self, request: DispatchRequest, response: Any) -> Any:
         """Retry a failed primary-agent dispatch against fallback providers.
@@ -708,6 +754,14 @@ class Engine:
         health_base_dir = getattr(self.persistence, "storage_path", Path(".sarathi/tasks")).parent
         self.provider_health = ProviderHealthStore(health_base_dir)
 
+        # Crash-safe dispatch journal — same base directory as provider health.
+        self.dispatch_journal = DispatchJournal(health_base_dir)
+        self.workspace_root = os.environ.get("SARATHI_WORKDIR", os.getcwd())
+        if hasattr(self.dispatcher, "journal"):
+            self.dispatcher.journal = self.dispatch_journal
+        if hasattr(self.dispatcher, "workspace_root"):
+            self.dispatcher.workspace_root = self.workspace_root
+
         self.phase_handlers = self._create_phase_handlers()
         self.recovery_runner = RecoveryRunner(dispatcher=self.dispatcher)
         self.phases = list(Phase)
@@ -796,10 +850,74 @@ class Engine:
 
         return f"{prefix}-{timestamp}-{unique_part}"
 
+    def _reconcile_inflight_dispatches(self, task: TaskContext) -> None:
+        """Reconcile any in-flight (intent-without-completion) journal entries.
+
+        Called at the start of ``run_task``/``resume_task`` for a task_id that
+        may have crashed mid-dispatch. For each unmatched intent, measures the
+        current workspace against the snapshot taken before the dispatch and
+        marks the entry reconciled so it isn't re-reported.
+
+        If any reconciliation reveals a measured, non-empty workspace delta,
+        attaches a ``crash_reconciliation`` list to the task (and to the most
+        recent phase result's artifacts, if any). Never raises.
+        """
+        try:
+            incomplete_entries = self.dispatch_journal.incomplete(task_id=task.task_id)
+        except Exception:
+            logger.exception("Failed to query incomplete dispatch journal entries for task %s", task.task_id)
+            return
+        if not incomplete_entries:
+            return
+
+        reconciliations: list[dict[str, Any]] = []
+        for entry in incomplete_entries:
+            try:
+                result = self.dispatch_journal.reconcile(entry, self.workspace_root)
+                self.dispatch_journal.mark_reconciled(entry.get("journal_id"))
+            except Exception:
+                logger.exception(
+                    "Failed to reconcile in-flight dispatch journal entry for task %s", task.task_id
+                )
+                continue
+            reconciliations.append(result)
+
+        if not reconciliations:
+            return
+
+        unsafe = [r for r in reconciliations if not r.get("safe_to_rerun")]
+        if unsafe:
+            for r in unsafe:
+                files = (r.get("workspace_delta") or {}).get("files_changed", [])
+                logger.warning(
+                    "Task %s: in-flight dispatch (phase=%s, provider=%s) crashed mid-run and "
+                    "left measured workspace changes: %s",
+                    task.task_id,
+                    r.get("phase"),
+                    r.get("provider"),
+                    files,
+                )
+        else:
+            logger.info(
+                "Task %s: %d in-flight dispatch(es) found on resume; workspace unchanged for all (safe to rerun)",
+                task.task_id,
+                len(reconciliations),
+            )
+
+        task.crash_reconciliation = reconciliations
+        if task.phase_results:
+            task.phase_results[-1].artifacts["crash_reconciliation"] = reconciliations
+
+        try:
+            self.persistence.save_task(task)
+        except Exception:
+            logger.exception("Failed to persist task %s after dispatch journal reconciliation", task.task_id)
+
     def run_task(self, task: TaskContext) -> TaskContext:
         """Run a task through the full lifecycle."""
         if hasattr(self.dispatcher, "reset_task_state"):
             self.dispatcher.reset_task_state()
+        self._reconcile_inflight_dispatches(task)
         if not task.preflight_validation:
             task.preflight_validation = self.preflight_validate_policy(task.task_id)
         self.persistence.save_task(task)
@@ -908,6 +1026,8 @@ class Engine:
         """Resume a previously saved task from the next unresolved phase."""
         if not task.phase_results:
             return self.run_task(task)
+
+        self._reconcile_inflight_dispatches(task)
 
         if Phase.LEARN in task.get_completed_phases():
             task.current_phase = None

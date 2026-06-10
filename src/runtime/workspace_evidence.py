@@ -24,6 +24,7 @@ except ImportError:
 
 
 _SNAPSHOT_TIMEOUT_SECONDS = 10
+_DIFF_TIMEOUT_SECONDS = 10
 
 
 def snapshot_workspace(workspace_root: str) -> dict[str, Any]:
@@ -249,3 +250,99 @@ def attach_workspace_evidence(
             )
 
     return response
+
+
+def collect_review_context(workspace_root: str, max_diff_bytes: int = 30000) -> dict[str, Any]:
+    """Collect a real ``git diff`` for the Review phase to evaluate.
+
+    Runs ``git -C <workspace_root> diff HEAD --stat`` and
+    ``git -C <workspace_root> diff HEAD`` against the working tree, truncating
+    the diff at ``max_diff_bytes`` (on a line boundary, with a trailing
+    marker) so large diffs stay bounded. Untracked files are pulled from
+    :func:`snapshot_workspace`.
+
+    Returns ``{"measured": True, "diff_stat": str, "diff": str,
+    "diff_truncated": bool, "untracked_files": [...]}`` on success, or
+    ``{"measured": False, "reason": "..."}`` on any failure (not a git repo,
+    git missing, timeout, ...) without raising.
+    """
+    try:
+        stat_completed = subprocess.run(
+            ["git", "-C", workspace_root, "diff", "HEAD", "--stat"],
+            capture_output=True,
+            text=True,
+            timeout=_DIFF_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"measured": False, "reason": "git_unavailable"}
+    except subprocess.TimeoutExpired:
+        return {"measured": False, "reason": "error: git diff --stat timed out"}
+    except OSError as exc:
+        return {"measured": False, "reason": f"error: {exc}"}
+
+    if stat_completed.returncode != 0:
+        stderr = (stat_completed.stderr or "").strip()
+        if "not a git repository" in stderr.lower():
+            return {"measured": False, "reason": "not_a_git_repo"}
+        return {"measured": False, "reason": f"error: {stderr or f'git diff --stat exited {stat_completed.returncode}'}"}
+
+    try:
+        diff_completed = subprocess.run(
+            ["git", "-C", workspace_root, "diff", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=_DIFF_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"measured": False, "reason": "git_unavailable"}
+    except subprocess.TimeoutExpired:
+        return {"measured": False, "reason": "error: git diff timed out"}
+    except OSError as exc:
+        return {"measured": False, "reason": f"error: {exc}"}
+
+    if diff_completed.returncode != 0:
+        stderr = (diff_completed.stderr or "").strip()
+        if "not a git repository" in stderr.lower():
+            return {"measured": False, "reason": "not_a_git_repo"}
+        return {"measured": False, "reason": f"error: {stderr or f'git diff exited {diff_completed.returncode}'}"}
+
+    diff_text = diff_completed.stdout or ""
+    diff, truncated = _truncate_diff(diff_text, max_diff_bytes)
+
+    snapshot = snapshot_workspace(workspace_root)
+    untracked_files: list[str] = []
+    if snapshot.get("measured"):
+        untracked_files = sorted(
+            path for path, code in snapshot.get("status", {}).items() if code == "??"
+        )
+
+    return {
+        "measured": True,
+        "diff_stat": stat_completed.stdout or "",
+        "diff": diff,
+        "diff_truncated": truncated,
+        "untracked_files": untracked_files,
+    }
+
+
+def _truncate_diff(diff_text: str, max_diff_bytes: int) -> tuple[str, bool]:
+    """Truncate ``diff_text`` to at most ``max_diff_bytes`` bytes on a line boundary.
+
+    Returns ``(diff, truncated)``. When truncation occurs, a trailing marker
+    line is appended (counted separately from ``max_diff_bytes``).
+    """
+    encoded = diff_text.encode("utf-8")
+    if len(encoded) <= max_diff_bytes:
+        return diff_text, False
+
+    truncated_bytes = encoded[:max_diff_bytes]
+    # Back off to the last newline so we don't split a line mid-way.
+    last_newline = truncated_bytes.rfind(b"\n")
+    if last_newline > 0:
+        truncated_bytes = truncated_bytes[:last_newline]
+
+    truncated_text = truncated_bytes.decode("utf-8", errors="ignore")
+    marker = f"\n... [diff truncated at {max_diff_bytes} bytes]"
+    return truncated_text + marker, True

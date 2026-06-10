@@ -33,6 +33,23 @@ python3 -m pip install /path/to/Sarathi
 python3 -m pip install -e .
 ```
 
+## MCP Server
+
+Expose Sarathi as an MCP stdio server so MCP clients (Claude Code, Codex, etc.) can run tasks, check status, resume, browse history, and manage policy proposals natively:
+
+```bash
+python3 -m pip install -e ".[mcp]"
+sarathi-mcp
+```
+
+Register it with Claude Code:
+
+```bash
+claude mcp add sarathi -- sarathi-mcp
+```
+
+Tools exposed: `run_task`, `task_status`, `resume_task`, `list_tasks`, `task_log`, `list_proposals`, `accept_proposal`, `reject_proposal`, `validate_policy_pack`.
+
 ### Optional: run real tests during Verify
 
 By default Verify does not execute shell commands and reports the phase as `unverified` — it never fabricates pass/fail signals. To execute the `test.command` from `commands.md` and get real, measured results:

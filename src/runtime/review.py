@@ -247,6 +247,50 @@ class ReviewRunner:
                 )
             )
 
+        measured_changes = evidence.get("measured_changes")
+        if isinstance(measured_changes, dict):
+            findings.extend(self._measured_changes_findings(measured_changes))
+
         if not findings:
             return self.review()
         return ReviewVerdict(findings=findings)
+
+    @staticmethod
+    def _measured_changes_findings(measured_changes: dict[str, object]) -> list[ReviewFinding]:
+        """Findings derived from measured workspace evidence (delta/reconciliation).
+
+        Divergence between what the builder claimed and what was actually
+        measured in the workspace is treated as a critical (blocking) finding
+        so it cannot be masked by an otherwise-high review score.
+        """
+        findings: list[ReviewFinding] = []
+
+        claim_reconciliation = measured_changes.get("claim_reconciliation")
+        if isinstance(claim_reconciliation, dict) and claim_reconciliation.get("divergence") is True:
+            claimed_but_unchanged = claim_reconciliation.get("claimed_but_unchanged", [])
+            findings.append(
+                ReviewFinding(
+                    check="workspace_claim_divergence",
+                    passed=False,
+                    severity="critical",
+                    message=(
+                        "builder claimed changes that were not measured in the workspace: "
+                        f"{claimed_but_unchanged}"
+                    ),
+                )
+            )
+
+        if measured_changes.get("workspace_unchanged_on_success") is True:
+            findings.append(
+                ReviewFinding(
+                    check="workspace_unchanged_on_success",
+                    passed=False,
+                    severity="critical",
+                    message=(
+                        "build dispatch reported success but the workspace shows no "
+                        "measured file changes"
+                    ),
+                )
+            )
+
+        return findings

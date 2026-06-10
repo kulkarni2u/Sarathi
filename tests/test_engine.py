@@ -39,7 +39,7 @@ def test_phase_log_format():
     assert skipped[0].phase == Phase.PLANNING_ADVISOR
     for pr in task.phase_results:
         assert pr.phase in Phase
-        assert pr.outcome in {"pass", "skip", "fail", "escalate"}
+        assert pr.outcome in {"pass", "skip", "fail", "escalate", "unverified"}
 
 
 def test_engine_preflight_records_summary_without_blocking(tmp_path: Path):

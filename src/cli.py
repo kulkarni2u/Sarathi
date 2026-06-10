@@ -238,6 +238,26 @@ def phase_agent_name(result: PhaseResult) -> str:
     return "-"
 
 
+def _gate_status_label(result: PhaseResult) -> str:
+    """Return a Gate column label for a phase result.
+
+    ok       — gate present and passed on first attempt
+    retry    — gate passed after one retry
+    advisory — gate failed on both attempts, task continued
+    -        — no gate for this phase
+    """
+    gate = result.artifacts.get("gate_result")
+    if not isinstance(gate, dict):
+        return "-"
+    retry = result.artifacts.get("gate_retry")
+    if isinstance(retry, dict):
+        chosen_passed = gate.get("passed", False)
+        if chosen_passed:
+            return "retry"
+        return "advisory"
+    return "ok" if gate.get("passed", False) else "advisory"
+
+
 def _task_usage_records(task: TaskContext) -> list[UsageRecord]:
     records: list[UsageRecord] = []
     for phase_result in task.phase_results:
@@ -329,6 +349,46 @@ def _format_token_count(value: int) -> str:
         scaled = value / 1000
         return f"{scaled:.1f}".rstrip("0").rstrip(".") + "k"
     return str(value)
+
+
+def _budget_summary_line(task: TaskContext) -> str | None:
+    """Render the policy-enforced per-task budget snapshot, if any."""
+    snapshot = getattr(task, "budget_snapshot", None)
+    if not isinstance(snapshot, dict):
+        for pr in reversed(task.phase_results):
+            exhausted = pr.artifacts.get("budget_exhausted")
+            if isinstance(exhausted, dict):
+                snapshot = exhausted
+                break
+    if not isinstance(snapshot, dict):
+        return None
+    if snapshot.get("enforcement") != "enabled":
+        return None
+
+    consumed = _format_token_count(snapshot.get("consumed_tokens", 0) or 0)
+    max_tokens = snapshot.get("max_total_tokens")
+    max_text = _format_token_count(max_tokens) if max_tokens is not None else "unbounded"
+    return (
+        "Budget:"
+        f" {consumed} / {max_text}"
+        f" | state: {snapshot.get('state', 'unknown')}"
+    )
+
+
+def _crash_recovery_summary_line(task: TaskContext) -> str | None:
+    """Render a summary of any in-flight dispatches reconciled on resume."""
+    reconciliations = getattr(task, "crash_reconciliation", None)
+    if not reconciliations:
+        return None
+
+    count = len(reconciliations)
+    changed = any(not r.get("safe_to_rerun") for r in reconciliations)
+    status = "workspace changes detected" if changed else "no workspace changes detected"
+    return (
+        "Crash recovery:"
+        f" {count} interrupted dispatch{'es' if count != 1 else ''}"
+        f" | {status}"
+    )
 
 
 # ============================================================================
@@ -829,13 +889,14 @@ def handle_run(args: argparse.Namespace) -> None:
 
     # Show phase log
     print("\nPhase Log:")
-    print("-" * 75)
-    print(f"| {'Phase':<20} | {'Agent':<12} | {'Outcome':<10} | {'Iterations':<10} |")
-    print("|" + "-" * 21 + "+" + "-" * 14 + "+" + "-" * 12 + "+" + "-" * 12 + "|")
+    print("-" * 85)
+    print(f"| {'Phase':<20} | {'Agent':<12} | {'Outcome':<10} | {'Iterations':<10} | {'Gate':<8} |")
+    print("|" + "-" * 21 + "+" + "-" * 14 + "+" + "-" * 12 + "+" + "-" * 12 + "+" + "-" * 10 + "|")
     for pr in result.phase_results:
+        gate_status = _gate_status_label(pr)
         print(
             f"| {pr.phase.value:<20} | {phase_agent_name(pr):<12} |"
-            f" {pr.outcome:<10} | {pr.iterations:<10} |"
+            f" {pr.outcome:<10} | {pr.iterations:<10} | {gate_status:<8} |"
         )
 
 
@@ -1184,6 +1245,12 @@ def _print_task_status(task: TaskContext, *, stale_after_seconds: int = 300) -> 
     usage_line = _usage_summary_line(task)
     if usage_line is not None:
         print(usage_line)
+    budget_line = _budget_summary_line(task)
+    if budget_line is not None:
+        print(budget_line)
+    crash_line = _crash_recovery_summary_line(task)
+    if crash_line is not None:
+        print(crash_line)
     if task.task_graph_state:
         summary = graph_summary(task.task_graph_state)
         print(

@@ -1,15 +1,18 @@
 """Review phase handler."""
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import TYPE_CHECKING, Any
 
 try:
     from src.task_graph import graph_summary
     from src.runtime import QualityLoopPolicy, ReviewRunner
+    from src.runtime.workspace_evidence import collect_review_context
 except ImportError:
     from task_graph import graph_summary
     from runtime import QualityLoopPolicy, ReviewRunner
+    from runtime.workspace_evidence import collect_review_context
 
 if TYPE_CHECKING:
     from src.engine import Phase, PhaseResult, TaskContext
@@ -29,6 +32,20 @@ class ReviewHandler:
         review_inputs = self._review_inputs(task)
         diff_summary = review_inputs.get("diff_summary")
 
+        measured_changes = self._collect_build_workspace_evidence(task)
+        workspace_root = os.environ.get("SARATHI_WORKDIR", os.getcwd())
+        workspace_diff = collect_review_context(workspace_root)
+        if measured_changes:
+            review_inputs["measured_changes"] = measured_changes
+        if workspace_diff.get("measured"):
+            review_inputs["workspace_diff"] = workspace_diff
+
+        review_inputs_summary = {
+            "measured_changes_present": bool(measured_changes),
+            "diff_bytes": len((workspace_diff.get("diff") or "").encode("utf-8")),
+            "diff_truncated": bool(workspace_diff.get("diff_truncated", False)),
+        }
+
         # Attempt a provider-backed review dispatch if dispatcher is available
         dispatch_response = None
         if self.dispatcher is not None:
@@ -41,13 +58,20 @@ class ReviewHandler:
                     prompt=(
                         f"Review the implementation for task: {task.description}\n\n"
                         "Evaluate against acceptance criteria, code quality, security, "
-                        "and spec compliance. Provide structured findings."
+                        "and spec compliance. Provide structured findings.\n\n"
+                        "Review the MEASURED diff (workspace_diff) and measured_changes "
+                        "(workspace_delta / claim_reconciliation), not the builder's "
+                        "self-reported summary. Set evidence.spec_met, "
+                        "evidence.code_quality_acceptable, and evidence.no_blocking_issues "
+                        "based on what was actually measured in the workspace."
                     ),
                     inputs={
                         "task_description": task.description,
                         "build_result": build_artifact,
                         "diff_summary": diff_summary or {},
                         "acceptance_criteria": review_inputs.get("acceptance_criteria", []),
+                        "measured_changes": measured_changes,
+                        "workspace_diff": workspace_diff,
                     },
                     expected_outputs=["findings", "score", "outcome", "summary"],
                     constraints={"provider": "claude"},
@@ -103,6 +127,7 @@ class ReviewHandler:
             "quality_loop_policy": quality_policy.to_artifact(),
             "retry_recommended": retry_recommended,
             "auto_fix_allowed": auto_fix_allowed,
+            "review_inputs_summary": review_inputs_summary,
         }
         if dispatch_response is not None and dispatch_response.usage is not None:
             artifacts["dispatch_usage"] = dispatch_response.usage.to_artifact()
@@ -124,6 +149,70 @@ class ReviewHandler:
                     "graph_summary": pr.artifacts.get("task_graph_execution", {}),
                 }
         return {}
+
+    def _collect_build_workspace_evidence(self, task: "TaskContext") -> dict[str, Any]:
+        """Collect measured workspace evidence from the most recent Build phase result.
+
+        Searches the Build phase result's artifacts for dispatch-attached
+        ``workspace_delta`` / ``claim_reconciliation`` /
+        ``workspace_unchanged_on_success`` evidence (top-level dispatch
+        evidence first, then per-node ``provider_result.evidence`` entries
+        from ``task_graph_execution.events``, most recent first).
+
+        Returns ``{}`` when no Build phase result or no measured evidence is
+        found. Never raises — defensive about missing/unexpected shapes.
+        """
+        if task is None:
+            return {}
+        phase_results = getattr(task, "phase_results", None)
+        if not phase_results:
+            return {}
+
+        for pr in reversed(phase_results):
+            phase = getattr(pr, "phase", None)
+            phase_value = getattr(phase, "value", phase)
+            if phase_value != "Build":
+                continue
+
+            artifacts = getattr(pr, "artifacts", None)
+            if not isinstance(artifacts, dict):
+                return {}
+
+            collected: dict[str, Any] = {}
+
+            # Top-level dispatch evidence, if ever attached directly to the
+            # Build phase result's artifacts.
+            top_level_evidence = artifacts.get("dispatch_evidence")
+            if isinstance(top_level_evidence, dict):
+                self._merge_workspace_evidence(collected, top_level_evidence)
+
+            # Per-node provider results from graph execution, most recent first.
+            graph_execution = artifacts.get("task_graph_execution")
+            if isinstance(graph_execution, dict):
+                events = graph_execution.get("events")
+                if isinstance(events, list):
+                    for event in reversed(events):
+                        if not isinstance(event, dict):
+                            continue
+                        provider_result = event.get("provider_result")
+                        if not isinstance(provider_result, dict):
+                            continue
+                        node_evidence = provider_result.get("evidence")
+                        if isinstance(node_evidence, dict):
+                            self._merge_workspace_evidence(collected, node_evidence)
+                        if collected:
+                            break
+
+            return collected
+
+        return {}
+
+    @staticmethod
+    def _merge_workspace_evidence(collected: dict[str, Any], evidence: dict[str, Any]) -> None:
+        """Copy known workspace-evidence keys from ``evidence`` into ``collected``."""
+        for key in ("workspace_delta", "claim_reconciliation", "workspace_unchanged_on_success"):
+            if key in evidence and key not in collected:
+                collected[key] = evidence[key]
 
     def _dispatch_to_review_artifact(self, response) -> dict[str, Any]:
         """Convert a raw dispatch response into a review artifact dict."""

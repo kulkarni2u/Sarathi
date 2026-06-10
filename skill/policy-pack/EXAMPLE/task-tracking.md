@@ -170,7 +170,7 @@ task_states:
   - "failed"
   - "skipped"
 
-  transitions:
+transitions:
     created -> queued:
       trigger: "task_queued"
       guard: "dependencies_met"
@@ -205,7 +205,7 @@ task_states:
     queued -> skipped:
       trigger: "user_cancelled"
 
-  final_states:
+final_states:
     - "completed"
     - "failed"
     - "skipped"

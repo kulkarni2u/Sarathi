@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import secrets
 from pathlib import Path
 
 from . import create_http_server
@@ -20,8 +21,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--token",
-        default="dev",
-        help="Bearer token expected from the desktop UI.",
+        default=None,
+        help="Bearer token expected from the desktop UI. Defaults to a random per-run token printed at startup.",
     )
     parser.add_argument(
         "--host",
@@ -36,14 +37,18 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    token = args.token or secrets.token_urlsafe(18)
     server = create_http_server(
         db_path=Path(args.db),
-        token=args.token,
+        token=token,
         host=args.host,
         port=args.port,
     )
     host, port = server.server_address[:2]
     print(f"Sarathi local service listening on http://{host}:{port}", flush=True)
+    if not args.token:
+        print(f"Session token: {token}", flush=True)
+        print("Pass it as 'Authorization: Bearer <token>' (or rerun with --token).", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

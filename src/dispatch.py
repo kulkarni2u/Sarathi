@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
@@ -11,9 +12,50 @@ from typing import Any
 
 _DISPATCH_TIMEOUT = int(os.environ.get("SARATHI_DISPATCH_TIMEOUT", "300"))
 
+# Module-level so tests can monkeypatch the backoff sleep.
+_sleep = time.sleep
+
+# Substrings (case-insensitive) that indicate a transient provider failure
+# worth retrying — rate limits, overload, and transport hiccups.
+_TRANSIENT_ERROR_PATTERNS = (
+    "rate limit",
+    "rate_limit",
+    "overloaded",
+    "429",
+    "529",
+    "connection reset",
+    "temporarily unavailable",
+)
+
 
 class DispatchTimeoutError(Exception):
     """Raised when a provider dispatch call exceeds the configured timeout."""
+
+
+def _is_transient_failure(
+    response_or_none: "DispatchResponse | None",
+    exc_or_none: Exception | None,
+) -> bool:
+    """Return True when a failed dispatch looks retriable.
+
+    Transient: a DispatchTimeoutError was raised, the response has
+    ``artifacts["timed_out"] is True``, or ``response.error`` matches a
+    known rate-limit/overload/transport pattern.
+    """
+    if isinstance(exc_or_none, DispatchTimeoutError):
+        return True
+    if response_or_none is None:
+        return False
+    if response_or_none.success:
+        return False
+    if response_or_none.artifacts.get("timed_out") is True:
+        return True
+    error = response_or_none.error
+    if isinstance(error, str):
+        lowered = error.lower()
+        if any(pattern in lowered for pattern in _TRANSIENT_ERROR_PATTERNS):
+            return True
+    return False
 
 try:
     from .runtime import DispatchRequest, DispatchResponse
@@ -134,12 +176,56 @@ class LocalDispatcher(Dispatcher):
         )
 
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future: Future[DispatchResponse] = pool.submit(self.provider.dispatch, request)
+        retry_budget = max(0, request.retry_budget)
+        transient_failures: list[str] = []
+
+        for attempt in range(retry_budget + 1):
+            response: DispatchResponse | None = None
+            exc: Exception | None = None
             try:
-                return future.result(timeout=_DISPATCH_TIMEOUT)
-            except FuturesTimeoutError:
-                raise DispatchTimeoutError(
-                    f"Provider dispatch timed out after {_DISPATCH_TIMEOUT}s "
-                    f"(task={request.task_id}, phase={request.phase})"
-                )
+                response = self._dispatch_once(request)
+            except DispatchTimeoutError as timeout_exc:
+                exc = timeout_exc
+
+            transient = _is_transient_failure(response, exc)
+            if not transient or attempt == retry_budget:
+                if exc is not None:
+                    raise exc
+                if transient_failures:
+                    response.artifacts["dispatch_retries"] = {
+                        "attempts": attempt + 1,
+                        "transient_failures": transient_failures,
+                    }
+                return response
+
+            # Record what happened and back off before retrying.
+            if exc is not None:
+                transient_failures.append(str(exc))
+            else:
+                transient_failures.append(response.error or "transient failure")
+
+            backoff = min(2 ** attempt, 8)
+            _sleep(backoff)
+
+        # Unreachable: the loop always returns or raises on its last iteration.
+        raise AssertionError("LocalDispatcher.dispatch: retry loop exited without returning")
+
+    def _dispatch_once(self, request: DispatchRequest) -> DispatchResponse:
+        # The provider's own subprocess timeout (request.timeout_seconds) is the
+        # primary budget and should fire first, returning a structured failure.
+        # This outer guard only catches providers that ignore their budget, so
+        # give it headroom above the request budget.
+        timeout = max(_DISPATCH_TIMEOUT, request.timeout_seconds + 30)
+        pool = ThreadPoolExecutor(max_workers=1)
+        future: Future[DispatchResponse] = pool.submit(self.provider.dispatch, request)
+        try:
+            return future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            raise DispatchTimeoutError(
+                f"Provider dispatch timed out after {timeout}s "
+                f"(task={request.task_id}, phase={request.phase})"
+            )
+        finally:
+            # wait=False: a `with` block (shutdown(wait=True)) would block here
+            # until the hung provider call returned, making the timeout cosmetic.
+            pool.shutdown(wait=False, cancel_futures=True)

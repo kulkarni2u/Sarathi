@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import http.client
+import logging
 from math import ceil
 import os
 import re
 import shutil
+import signal
 import socket
 import time
 import urllib.error
@@ -28,9 +30,81 @@ except ImportError:
 try:
     from ..contracts import DispatchRequest, DispatchResponse, build_usage_record
     from ..agent_roles import PHASE_AGENT_ROLE_KEYS
+    from ..workspace_evidence import attach_workspace_evidence, snapshot_workspace
 except ImportError:
     from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
     from runtime.agent_roles import PHASE_AGENT_ROLE_KEYS
+    from runtime.workspace_evidence import attach_workspace_evidence, snapshot_workspace
+
+logger = logging.getLogger("sarathi.cli_bridge")
+
+
+def _run_cli_process(
+    command: list[str],
+    *,
+    cwd: str,
+    timeout: int,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a provider CLI in its own process group.
+
+    Provider CLIs spawn children (node helpers, MCP servers, shells); a plain
+    subprocess timeout kills only the direct child and leaves the rest of the
+    tree running — potentially still mutating the workspace after we reported
+    a timeout. On POSIX, kill the whole group instead.
+    """
+    popen_kwargs: dict[str, Any] = {}
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+        **popen_kwargs,
+    )
+    try:
+        stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.kill()
+        else:
+            proc.kill()
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except Exception:  # noqa: BLE001 — best-effort reap after kill
+            stdout, stderr = "", ""
+        raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(command, proc.returncode, stdout=stdout or "", stderr=stderr or "")
+
+
+def _cli_failure_response(
+    *,
+    provider: str,
+    path: str,
+    workspace_root: str,
+    command: list[str],
+    error: str,
+    timed_out: bool = False,
+) -> DispatchResponse:
+    logger.warning("%s CLI dispatch failed: %s", provider, error)
+    return DispatchResponse(
+        success=False,
+        artifacts={
+            "provider": provider,
+            "path": path,
+            "command": command,
+            "invocation_kind": "native_cli",
+            "workspace_root": workspace_root,
+            "timed_out": timed_out,
+        },
+        error=error,
+    )
 
 
 def dispatch_via_cli_bridge(
@@ -41,19 +115,22 @@ def dispatch_via_cli_bridge(
     request: DispatchRequest,
 ) -> DispatchResponse:
     provider_name = provider.strip().lower()
+    before = snapshot_workspace(workspace_root)
     if provider_name == "codex":
-        return _run_codex(path=path, workspace_root=workspace_root, request=request)
-    if provider_name == "copilot":
-        return _run_copilot(path=path, workspace_root=workspace_root, request=request)
-    if provider_name == "claude":
-        return _run_claude(path=path, workspace_root=workspace_root, request=request)
-    if provider_name == "opencode":
-        return _run_opencode(path=path, workspace_root=workspace_root, request=request)
-    return DispatchResponse(
-        success=False,
-        artifacts={"provider": provider_name, "path": path},
-        error=f"Native provider bridge is not implemented for '{provider_name}'",
-    )
+        response = _run_codex(path=path, workspace_root=workspace_root, request=request)
+    elif provider_name == "copilot":
+        response = _run_copilot(path=path, workspace_root=workspace_root, request=request)
+    elif provider_name == "claude":
+        response = _run_claude(path=path, workspace_root=workspace_root, request=request)
+    elif provider_name == "opencode":
+        response = _run_opencode(path=path, workspace_root=workspace_root, request=request)
+    else:
+        return DispatchResponse(
+            success=False,
+            artifacts={"provider": provider_name, "path": path},
+            error=f"Native provider bridge is not implemented for '{provider_name}'",
+        )
+    return attach_workspace_evidence(response, before, workspace_root, request, logger=logger)
 
 
 def _run_codex(*, path: str, workspace_root: str, request: DispatchRequest) -> DispatchResponse:
@@ -65,22 +142,34 @@ def _run_codex(*, path: str, workspace_root: str, request: DispatchRequest) -> D
         "exec",
         "--skip-git-repo-check",
         "-o", str(output_path),
-        prompt,
     ]
-    completed = subprocess.run(
-        command,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        cwd=workspace_root,
-        timeout=request.timeout_seconds,
-        check=False,
-    )
-    message = _read_text(output_path)
+    model = _requested_model(request)
+    if model:
+        command.extend(["--model", model])
+    command.append(prompt)
     try:
-        output_path.unlink(missing_ok=True)
-    except OSError:
-        pass
+        completed = _run_cli_process(
+            command,
+            cwd=workspace_root,
+            timeout=request.timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return _cli_failure_response(
+            provider="codex", path=path, workspace_root=workspace_root, command=command,
+            error=f"codex CLI timed out after {request.timeout_seconds}s; process group killed.",
+            timed_out=True,
+        )
+    except OSError as exc:
+        return _cli_failure_response(
+            provider="codex", path=path, workspace_root=workspace_root, command=command,
+            error=f"codex CLI could not be started: {exc}",
+        )
+    finally:
+        message = _read_text(output_path)
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     response = _normalize_native_response(
         provider="codex",
         path=path,
@@ -100,14 +189,23 @@ def _run_copilot(*, path: str, workspace_root: str, request: DispatchRequest) ->
         command = [path, "copilot", "--", "-p", prompt]
     else:
         command = [path, "-p", prompt]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        cwd=workspace_root,
-        timeout=request.timeout_seconds,
-        check=False,
-    )
+    try:
+        completed = _run_cli_process(
+            command,
+            cwd=workspace_root,
+            timeout=request.timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return _cli_failure_response(
+            provider="copilot", path=path, workspace_root=workspace_root, command=command,
+            error=f"copilot CLI timed out after {request.timeout_seconds}s; process group killed.",
+            timed_out=True,
+        )
+    except OSError as exc:
+        return _cli_failure_response(
+            provider="copilot", path=path, workspace_root=workspace_root, command=command,
+            error=f"copilot CLI could not be started: {exc}",
+        )
     message = (completed.stdout or "").strip()
     response = _normalize_native_response(
         provider="copilot",
@@ -129,24 +227,77 @@ def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> 
             request=request,
         )
     prompt = _provider_prompt("claude", request, workspace_root)
+    # Prompt goes over stdin: argv has a hard size limit (ARG_MAX) and the
+    # prompt embeds the full context pack JSON.
     command = [
         path,
         "-p",
         "--output-format", "json",
         "--add-dir", workspace_root,
-        "--",
-        prompt,
     ]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        cwd=workspace_root,
-        timeout=request.timeout_seconds,
-        check=False,
-    )
+    model = _requested_model(request)
+    if model:
+        command.extend(["--model", model])
+    session_id = request.constraints.get("claude_session_id")
+    if isinstance(session_id, str) and session_id:
+        command.extend(["--resume", session_id])
+    try:
+        completed = _run_cli_process(
+            command,
+            cwd=workspace_root,
+            timeout=request.timeout_seconds,
+            input_text=prompt,
+        )
+    except subprocess.TimeoutExpired:
+        return _cli_failure_response(
+            provider="claude", path=path, workspace_root=workspace_root, command=command,
+            error=f"claude CLI timed out after {request.timeout_seconds}s; process group killed.",
+            timed_out=True,
+        )
+    except OSError as exc:
+        return _cli_failure_response(
+            provider="claude", path=path, workspace_root=workspace_root, command=command,
+            error=f"claude CLI could not be started: {exc}",
+        )
     # Unwrap the Claude Code JSON envelope: {"type":"result","result":"...","is_error":...}
-    message = _extract_claude_result(completed.stdout)
+    envelope = _parse_claude_envelope(completed.stdout)
+    reported_usage: dict[str, Any] | None = None
+    envelope_artifacts: dict[str, Any] = {}
+    if envelope is not None:
+        message = envelope["message"]
+        reported_usage = envelope.get("usage")
+        for env_key, artifact_key in (
+            ("session_id", "claude_session_id"),
+            ("total_cost_usd", "total_cost_usd"),
+            ("num_turns", "num_turns"),
+            ("duration_ms", "provider_duration_ms"),
+        ):
+            if envelope.get(env_key) is not None:
+                envelope_artifacts[artifact_key] = envelope[env_key]
+        if envelope.get("is_error"):
+            return DispatchResponse(
+                success=False,
+                artifacts={
+                    "provider": "claude",
+                    "path": path,
+                    "command": command,
+                    "return_code": completed.returncode,
+                    "invocation_kind": "native_cli",
+                    "workspace_root": workspace_root,
+                    **envelope_artifacts,
+                },
+                usage=build_usage_record(
+                    provider_id="claude",
+                    provider_family="claude",
+                    dispatch_id=request.task_id,
+                    prompt=request.prompt,
+                    response_text=message,
+                    reported_usage=reported_usage,
+                ),
+                error=message or (completed.stderr or "").strip() or "Claude reported an error result.",
+            )
+    else:
+        message = (completed.stdout or "").strip()
     response = _normalize_native_response(
         provider="claude",
         path=path,
@@ -155,6 +306,8 @@ def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> 
         command=command,
         completed=completed,
         message=message,
+        reported_usage=reported_usage,
+        extra_artifacts=envelope_artifacts,
     )
     return _ncp_fetch_after_dispatch(workspace_root, request, response)
 
@@ -181,19 +334,17 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
         prompt,
     ]
     try:
-        result = subprocess.run(
+        result = _run_cli_process(
             command,
-            capture_output=True,
-            text=True,
-            timeout=request.timeout_seconds,
             cwd=workspace_root,
+            timeout=request.timeout_seconds,
         )
         message = result.stdout if result.returncode == 0 else f"Error: {result.stderr}"
         return_code = result.returncode
     except subprocess.TimeoutExpired:
-        message = f"Timeout after {request.timeout_seconds}s"
+        message = f"Timeout after {request.timeout_seconds}s; process group killed"
         return_code = 124
-    except Exception as exc:  # noqa: BLE001
+    except OSError as exc:
         message = str(exc)
         return_code = 1
 
@@ -208,6 +359,11 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
         message=message,
     )
     return _ncp_fetch_after_dispatch(workspace_root, request, response)
+
+
+def _requested_model(request: DispatchRequest) -> str | None:
+    model = request.constraints.get("model")
+    return model if isinstance(model, str) and model.strip() else None
 
 
 def _free_port() -> int:
@@ -236,7 +392,13 @@ def _opencode_http(method: str, url: str, body: dict | None = None) -> Any:
         method=method,
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read())
+        raw = resp.read()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"OpenCode server returned non-JSON from {method} {url}: {raw[:200]!r}"
+        ) from exc
 
 
 def _opencode_create_session(base_url: str) -> str:
@@ -321,26 +483,34 @@ def _opencode_poll_reply(base_url: str, session_id: str, timeout: int = 30) -> s
     raise TimeoutError(f"No assistant reply within {timeout}s")
 
 
-def _extract_claude_result(raw_output: str) -> str:
-    """Extract the inner response from a Claude Code --output-format json envelope.
+def _parse_claude_envelope(raw_output: str) -> dict[str, Any] | None:
+    """Parse a Claude Code --output-format json envelope into normalized fields.
 
-    Claude Code wraps output in {"type":"result","result":"...","is_error":...}.
-    If the output is not a Claude envelope (e.g. a mock or older version), pass through.
+    Claude Code wraps output in {"type":"result","result":"...","is_error":...,
+    "usage":{...},"total_cost_usd":...,"session_id":...}. Returns None when the
+    output is not a Claude envelope (plain text, a mock, or a structured bridge
+    response) so callers can fall back to pass-through handling.
+
+    The usage/cost/session fields are real provider telemetry — far more
+    accurate than character-count estimates — so they must not be discarded.
     """
     raw = raw_output.strip()
     if not raw:
-        return ""
+        return None
     envelope = _parse_json_dict(raw)
-    if envelope is None:
-        return raw  # plain text — return as-is
-    # Only unwrap if it looks like a Claude Code envelope
-    if envelope.get("type") == "result" and "result" in envelope:
-        if envelope.get("is_error"):
-            return ""
-        result = envelope.get("result", "")
-        return str(result).strip() if result is not None else ""
-    # Raw JSON from provider (mock or structured response) — pass through as-is
-    return raw
+    if envelope is None or envelope.get("type") != "result" or "result" not in envelope:
+        return None
+    result = envelope.get("result")
+    usage = envelope.get("usage")
+    return {
+        "message": str(result).strip() if result is not None else "",
+        "is_error": bool(envelope.get("is_error")),
+        "usage": usage if isinstance(usage, dict) else None,
+        "session_id": envelope.get("session_id"),
+        "total_cost_usd": envelope.get("total_cost_usd"),
+        "num_turns": envelope.get("num_turns"),
+        "duration_ms": envelope.get("duration_ms"),
+    }
 
 
 def _normalize_native_response(
@@ -352,9 +522,12 @@ def _normalize_native_response(
     command: list[str],
     completed: subprocess.CompletedProcess[str],
     message: str,
+    reported_usage: dict[str, Any] | None = None,
+    extra_artifacts: dict[str, Any] | None = None,
 ) -> DispatchResponse:
     parsed = _parse_json_dict(message)
     cli_family = _native_cli_family(provider, path)
+    extra_artifacts = extra_artifacts or {}
     if parsed is not None:
         outputs = parsed.get("outputs") if isinstance(parsed.get("outputs"), dict) else {}
         evidence = parsed.get("evidence") if isinstance(parsed.get("evidence"), dict) else {}
@@ -384,6 +557,7 @@ def _normalize_native_response(
             "invocation_kind": "native_cli",
             "native_cli_family": cli_family,
             "workspace_root": workspace_root,
+            **extra_artifacts,
             **artifacts,
         }
         usage = build_usage_record(
@@ -392,7 +566,9 @@ def _normalize_native_response(
             dispatch_id=request.task_id,
             prompt=request.prompt,
             response_text=message,
-            reported_usage=parsed.get("usage") if isinstance(parsed.get("usage"), dict) else None,
+            reported_usage=(
+                parsed.get("usage") if isinstance(parsed.get("usage"), dict) else reported_usage
+            ),
         )
         return DispatchResponse(
             success=success,
@@ -413,6 +589,7 @@ def _normalize_native_response(
                 "command": command,
                 "return_code": completed.returncode,
                 "stdout": (completed.stdout or "").strip(),
+                **extra_artifacts,
             },
             error=(completed.stderr or message or "Provider CLI failed.").strip(),
         )
@@ -431,6 +608,7 @@ def _normalize_native_response(
         dispatch_id=request.task_id,
         prompt=request.prompt,
         response_text=summary,
+        reported_usage=reported_usage,
     )
     return DispatchResponse(
         success=True,
@@ -449,6 +627,7 @@ def _normalize_native_response(
             "invocation_kind": "native_cli",
             "native_cli_family": cli_family,
             "workspace_root": workspace_root,
+            **extra_artifacts,
         },
         usage=usage,
     )
@@ -618,14 +797,32 @@ def _run_ncp_handoff_dispatch(
         "--payload",
         payload,
     ]
-    emit_completed = subprocess.run(
-        emit_command,
-        capture_output=True,
-        text=True,
-        cwd=workspace_root,
-        timeout=request.timeout_seconds,
-        check=False,
-    )
+    # The emit is bookkeeping before the real handoff — cap it so it cannot
+    # consume the budget the provider call needs.
+    emit_timeout = min(60, request.timeout_seconds)
+    emit_started = time.monotonic()
+    try:
+        emit_completed = subprocess.run(
+            emit_command,
+            capture_output=True,
+            text=True,
+            cwd=workspace_root,
+            timeout=emit_timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return DispatchResponse(
+            success=False,
+            artifacts={
+                "provider": provider,
+                "workspace_root": workspace_root,
+                "ncp_handoff_used": True,
+                "ncp_pipeline_id": pipeline_id,
+                "emit_command": emit_command,
+                "timed_out": True,
+            },
+            error=f"ncp emit timed out after {emit_timeout}s",
+        )
     if emit_completed.returncode != 0:
         return DispatchResponse(
             success=False,
@@ -643,6 +840,7 @@ def _run_ncp_handoff_dispatch(
             error=(emit_completed.stderr or emit_completed.stdout or "ncp emit failed").strip(),
         )
 
+    handoff_timeout = max(30, request.timeout_seconds - int(time.monotonic() - emit_started))
     handoff_command = [
         ncp_path,
         "handoff",
@@ -654,19 +852,33 @@ def _run_ncp_handoff_dispatch(
         "--instruction",
         instruction,
         "--timeout-seconds",
-        str(request.timeout_seconds),
+        str(handoff_timeout),
     ]
     emit_to = _ncp_handoff_counterpart(provider, request)
     if emit_to:
         handoff_command.extend(["--emit-to", emit_to])
-    completed = subprocess.run(
-        handoff_command,
-        capture_output=True,
-        text=True,
-        cwd=workspace_root,
-        timeout=request.timeout_seconds,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            handoff_command,
+            capture_output=True,
+            text=True,
+            cwd=workspace_root,
+            timeout=handoff_timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return DispatchResponse(
+            success=False,
+            artifacts={
+                "provider": provider,
+                "workspace_root": workspace_root,
+                "ncp_handoff_used": True,
+                "ncp_pipeline_id": pipeline_id,
+                "emit_command": emit_command,
+                "timed_out": True,
+            },
+            error=f"ncp handoff timed out after {handoff_timeout}s",
+        )
     message = (completed.stdout or "").strip()
     response = _normalize_native_response(
         provider=provider,
@@ -904,8 +1116,9 @@ def _load_permissions_policy(workspace_root: str) -> dict[str, Any]:
 def _write_claude_settings(workspace_root: str, policy: dict[str, Any]) -> None:
     """Merge allowed_tools into .claude/settings.json (permissions.allow)."""
     tools = policy.get("allowed_tools") or _DEFAULT_CLAUDE_TOOLS
-    # Claude Code permission patterns use glob suffix, e.g. "Bash(*)"
-    allow = [f"{t}(*)" if "(" not in t else t for t in tools]
+    # A bare tool name allows all uses of that tool; "Tool(pattern)" scopes it.
+    # ("Bash(*)" is NOT a match-everything rule in Claude Code's rule syntax.)
+    allow = list(tools)
     settings_dir = Path(workspace_root) / ".claude"
     settings_dir.mkdir(exist_ok=True)
     settings_path = settings_dir / "settings.json"
@@ -921,12 +1134,31 @@ def _write_claude_settings(workspace_root: str, policy: dict[str, Any]) -> None:
     settings_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
 
 
+_CODEX_CONFIG_MARKER = "# Sarathi-managed Codex permission config"
+
+
 def _write_codex_config(workspace_root: str, policy: dict[str, Any]) -> None:
-    """Write ~/.codex/config.yaml from policy, creating parent dirs if needed."""
+    """Write ~/.codex/config.yaml from policy, creating parent dirs if needed.
+
+    Refuses to overwrite a config file Sarathi did not create — clobbering the
+    user's global Codex settings is worse than skipping the policy write.
+    """
     codex_dir = Path.home() / ".codex"
     codex_dir.mkdir(exist_ok=True)
     config_path = codex_dir / "config.yaml"
-    lines: list[str] = ["# Sarathi-managed Codex permission config\n"]
+    if config_path.exists():
+        try:
+            first_line = config_path.read_text(encoding="utf-8").splitlines()[:1]
+        except OSError:
+            first_line = []
+        if first_line and first_line[0].strip() != _CODEX_CONFIG_MARKER:
+            logger.warning(
+                "Refusing to overwrite user-managed Codex config at %s; "
+                "apply the Sarathi permission policy manually or remove the file.",
+                config_path,
+            )
+            return
+    lines: list[str] = [_CODEX_CONFIG_MARKER + "\n"]
     if policy.get("full_auto", True):
         lines.append("full-auto: true\n")
     if policy.get("disable_sandbox", False):
@@ -993,18 +1225,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workspace-root", required=True)
     args = parser.parse_args(argv)
 
-    payload = json.load(sys.stdin)
-    request = DispatchRequest(
-        mode=payload["mode"],
-        task_id=payload["task_id"],
-        phase=payload["phase"],
-        prompt=payload["prompt"],
-        inputs=payload.get("inputs", {}),
-        expected_outputs=payload.get("expected_outputs", []),
-        constraints=payload.get("constraints", {}),
-        timeout_seconds=int(payload.get("timeout_seconds", 300) or 300),
-        retry_budget=int(payload.get("retry_budget", 0) or 0),
-    )
+    try:
+        payload = json.load(sys.stdin)
+        request = DispatchRequest(
+            mode=payload["mode"],
+            task_id=payload["task_id"],
+            phase=payload["phase"],
+            prompt=payload["prompt"],
+            inputs=payload.get("inputs", {}),
+            expected_outputs=payload.get("expected_outputs", []),
+            constraints=payload.get("constraints", {}),
+            timeout_seconds=int(payload.get("timeout_seconds", 300) or 300),
+            retry_budget=int(payload.get("retry_budget", 0) or 0),
+        )
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        # Emit a structured failure instead of a stack trace so the caller can
+        # surface the error as a normal dispatch failure.
+        print(json.dumps({
+            "success": False,
+            "outputs": {},
+            "evidence": {},
+            "artifacts": {"provider": args.provider},
+            "error": f"Invalid bridge payload on stdin: {type(exc).__name__}: {exc}",
+        }))
+        return 1
     response = dispatch_via_cli_bridge(
         provider=args.provider,
         path=args.path,

@@ -9,15 +9,18 @@ from .agent_roles import (
     phase_agent_role_artifact,
 )
 from .artifacts import ArtifactStore
+from .budget import TaskBudget
 from .commands import CommandResult, CommandRunner
 from .contracts import DispatchRequest, DispatchResponse, GateResult, UsageRecord, build_usage_record
 from .context import AgentInputContract, AgentOutputContract, ContextCompiler, ContextPack
+from .dispatch_journal import DispatchJournal
 from .escalation import EscalationBundle, EscalationBundleBuilder
 from .graph_executor import GraphExecutionEvent, GraphExecutionResult, TaskGraphExecutor
 from .graph_policy import GraphExecutionPolicy, validate_graph_execution_config
 from .learning import LearningRecord, LearningStore
 from .output_index import build_artifact_index, normalize_agent_output
-from .preflight import PreflightPolicy
+from .preflight import PreflightPolicy, provider_cli_versions
+from .provider_health import ProviderHealthStore
 from .providers import (
     apply_learning_feedback_to_provider_routing,
     AnthropicSdkProviderAdapter,
@@ -41,12 +44,14 @@ from .workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
 __all__ = [
     "AgentRole",
     "ArtifactStore",
+    "TaskBudget",
     "CommandResult",
     "CommandRunner",
     "AgentInputContract",
     "AgentOutputContract",
     "ContextCompiler",
     "ContextPack",
+    "DispatchJournal",
     "DispatchRequest",
     "DispatchResponse",
     "UsageRecord",
@@ -64,6 +69,8 @@ __all__ = [
     "TaskGraphExecutor",
     "validate_graph_execution_config",
     "PreflightPolicy",
+    "provider_cli_versions",
+    "ProviderHealthStore",
     "ConfiguredProviderAdapter",
     "AnthropicSdkProviderAdapter",
     "CommandProviderAdapter",

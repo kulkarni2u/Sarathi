@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import uuid
 from dataclasses import dataclass, field, replace as _dc_replace
@@ -11,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger("sarathi.engine")
 
 # Harness Engine imports
 try:
@@ -43,10 +47,13 @@ try:
     from .runtime import (
         ArtifactStore,
         apply_learning_feedback_to_provider_routing,
+        DispatchJournal,
         DispatchRequest,
         GateResult,
         PreflightPolicy,
+        ProviderHealthStore,
         RecoveryRunner,
+        TaskBudget,
         phase_agent_role_artifact,
         ContextCompiler,
     )
@@ -70,10 +77,13 @@ except ImportError:
     from runtime import (
         ArtifactStore,
         apply_learning_feedback_to_provider_routing,
+        DispatchJournal,
         DispatchRequest,
         GateResult,
         PreflightPolicy,
+        ProviderHealthStore,
         RecoveryRunner,
+        TaskBudget,
         phase_agent_role_artifact,
         ContextCompiler,
     )
@@ -320,6 +330,8 @@ class PersistenceManager:
             "complexity": task.complexity.value,
             "complexity_evidence": task.complexity_evidence,
             "preflight_validation": task.preflight_validation,
+            "budget_snapshot": task.budget_snapshot,
+            "crash_reconciliation": task.crash_reconciliation,
             "task_graph_state": task.task_graph_state,
             "current_phase": task.current_phase.value if task.current_phase else None,
             "task_class": getattr(task, "task_class", TaskClass.ANALYSIS).value,
@@ -369,6 +381,8 @@ class PersistenceManager:
                 preflight_validation=task_data.get("preflight_validation", {}),
                 task_graph_state=task_data.get("task_graph_state", {}),
                 task_class=restored_task_class,
+                budget_snapshot=task_data.get("budget_snapshot"),
+                crash_reconciliation=task_data.get("crash_reconciliation"),
             )
 
             task.current_phase = Phase(task_data["current_phase"]) if task_data.get("current_phase") else None
@@ -441,6 +455,9 @@ class TaskContext:
     current_phase: Phase | None = None
     task_class: TaskClass = TaskClass.ANALYSIS
     harness_config: HarnessConfig | None = None
+    gate_retry_hint: dict | None = field(default=None)
+    budget_snapshot: dict[str, Any] | None = None
+    crash_reconciliation: list[dict[str, Any]] | None = None
 
     def get_completed_phases(self) -> set[Phase]:
         """Get set of phases that have been completed."""
@@ -470,22 +487,190 @@ class _HarnessAwareDispatcher:
 
     Reads preferred_agent at dispatch time so RouteHandler can set it after
     the ROUTE phase without needing to rebuild phase handlers.
+
+    Also threads provider session continuity across phases: when a Claude CLI
+    dispatch returns a session_id, later dispatches in the same task resume it
+    (--resume) so the provider keeps its working context instead of replaying
+    the full context pack from scratch each phase.
     """
 
     def __init__(self, base: Any) -> None:
         self._base = base
         self.preferred_agent: str | None = None
+        self.claude_session_id: str | None = None
+        self.fallback_agents: list[str] = []
+        self.journal: Any | None = None
+        self.workspace_root: str | None = None
+
+    def reset_task_state(self) -> None:
+        """Clear per-task routing/session state before a new task starts."""
+        self.preferred_agent = None
+        self.claude_session_id = None
+        self.fallback_agents = []
 
     def dispatch(self, request: DispatchRequest) -> Any:
+        injected_provider = False
         if self.preferred_agent and not request.constraints.get("provider"):
             request = _dc_replace(
                 request,
                 constraints={**request.constraints, "provider": self.preferred_agent},
             )
-        return self._base.dispatch(request)
+            injected_provider = True
+        if self.claude_session_id and not request.constraints.get("claude_session_id"):
+            request = _dc_replace(
+                request,
+                constraints={**request.constraints, "claude_session_id": self.claude_session_id},
+            )
+        # CLI-backed providers flake more than the deterministic local one —
+        # give a non-local provider one retry inside LocalDispatcher when the
+        # caller didn't already set a retry budget.
+        provider = request.constraints.get("provider")
+        if request.retry_budget == 0 and provider and provider != "local":
+            request = _dc_replace(request, retry_budget=1)
+
+        journal_id = self._journal_begin(request)
+        try:
+            response = self._base.dispatch(request)
+        except Exception as exc:
+            self._journal_complete(journal_id, success=False, error=str(exc))
+            raise
+        self._journal_complete(
+            journal_id,
+            success=bool(getattr(response, "success", False)),
+            error=getattr(response, "error", None),
+        )
+        self._track_session(response)
+
+        if (
+            not getattr(response, "success", True)
+            and self.fallback_agents
+            and injected_provider
+        ):
+            response = self._attempt_failover(request, response)
+
+        return response
+
+    def _journal_begin(self, request: DispatchRequest) -> str | None:
+        """Record dispatch intent in the write-ahead journal, if configured.
+
+        Never raises — journal failures must never block a dispatch.
+        """
+        if self.journal is None or not self.workspace_root:
+            return None
+        try:
+            return self.journal.begin(
+                task_id=request.task_id,
+                phase=request.phase,
+                provider=request.constraints.get("provider"),
+                prompt=request.prompt,
+                workspace_root=self.workspace_root,
+            )
+        except Exception:
+            logger.exception("dispatch journal begin() failed for task %s", request.task_id)
+            return None
+
+    def _journal_complete(self, journal_id: str | None, *, success: bool, error: str | None) -> None:
+        """Record dispatch completion in the write-ahead journal, if configured."""
+        if self.journal is None or journal_id is None:
+            return
+        try:
+            self.journal.complete(journal_id, success=success, error=error)
+        except Exception:
+            logger.exception("dispatch journal complete() failed for journal_id %s", journal_id)
+
+    def _attempt_failover(self, request: DispatchRequest, response: Any) -> Any:
+        """Retry a failed primary-agent dispatch against fallback providers.
+
+        Only called when the failure belongs to the agent this wrapper chose
+        (``injected_provider``), never when the caller pinned a provider
+        explicitly. Skips failover entirely if the failed attempt already
+        mutated the workspace.
+        """
+        evidence = getattr(response, "evidence", None) or {}
+        change_count = (evidence.get("workspace_delta") or {}).get("change_count", 0)
+        if change_count > 0:
+            response.artifacts["failover_skipped"] = "workspace_already_modified"
+            return response
+
+        failed_provider = request.constraints.get("provider")
+        attempted = [failed_provider]
+        last_response = response
+        last_error = response.error
+
+        for fallback_agent in self.fallback_agents:
+            fallback_request = _dc_replace(
+                request,
+                constraints={**request.constraints, "provider": fallback_agent},
+            )
+            attempted.append(fallback_agent)
+            fallback_response = self._base.dispatch(fallback_request)
+            self._track_session(fallback_response)
+
+            if getattr(fallback_response, "success", False):
+                fallback_response.artifacts["failover"] = {
+                    "failed_provider": failed_provider,
+                    "fallback_used": fallback_agent,
+                    "attempted": attempted,
+                }
+                return fallback_response
+
+            last_response = fallback_response
+            last_error = fallback_response.error
+
+        last_response.artifacts["failover"] = {
+            "failed_provider": failed_provider,
+            "fallback_used": None,
+            "attempted": attempted,
+        }
+        if last_error is not None:
+            last_response.error = last_error
+        return last_response
+
+    def _track_session(self, response: Any) -> None:
+        artifacts = getattr(response, "artifacts", None)
+        if isinstance(artifacts, dict):
+            session_id = artifacts.get("claude_session_id")
+            if isinstance(session_id, str) and session_id:
+                self.claude_session_id = session_id
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)
+
+
+# Human-readable explanation and remedy for each gate evidence key.
+_GATE_EVIDENCE_REMEDIATION: dict[str, str] = {
+    "alternative_approaches_considered": (
+        "Brainstorm did not evaluate multiple approaches; ask the provider to set "
+        "evidence.alternative_approaches_considered after considering at least three alternatives."
+    ),
+    "risks_identified": (
+        "Brainstorm did not identify risks; ask the provider to set evidence.risks_identified "
+        "after enumerating potential failure modes or concerns."
+    ),
+    "success_criteria_defined": (
+        "Brainstorm has no explicit success criteria; ask the provider to set "
+        "evidence.success_criteria_defined after articulating measurable acceptance conditions."
+    ),
+    "reversibility_assessed": (
+        "Brainstorm did not assess how the change could be rolled back; ask the provider to set "
+        "evidence.reversibility_assessed after considering reversibility."
+    ),
+    "checkpoint_list": (
+        "Plan has no checkpoint list; the provider should return a sequenced step list and set "
+        "evidence.checkpoint_list."
+    ),
+    "dependency_map": (
+        "Plan has no dependency map; the provider should return outputs.checkpoints/dependencies "
+        "and set evidence.dependency_map."
+    ),
+    "rollback_plan": (
+        "Plan has no rollback plan; the provider should document a recovery procedure and set "
+        "evidence.rollback_plan."
+    ),
+}
+
+# Phases for which the engine runs the bounded gate-retry loop.
+_GATE_RETRY_PHASES = {Phase.BRAINSTORM, Phase.PLAN}
 
 
 class Engine:
@@ -563,6 +748,20 @@ class Engine:
             self.artifact_store = ArtifactStore()
             self.whisper_router = None
 
+        # Provider health tracking — same base directory PersistenceManager
+        # uses by default (".sarathi/tasks" -> ".sarathi"), independent of
+        # whether NCP persistence is active.
+        health_base_dir = getattr(self.persistence, "storage_path", Path(".sarathi/tasks")).parent
+        self.provider_health = ProviderHealthStore(health_base_dir)
+
+        # Crash-safe dispatch journal — same base directory as provider health.
+        self.dispatch_journal = DispatchJournal(health_base_dir)
+        self.workspace_root = os.environ.get("SARATHI_WORKDIR", os.getcwd())
+        if hasattr(self.dispatcher, "journal"):
+            self.dispatcher.journal = self.dispatch_journal
+        if hasattr(self.dispatcher, "workspace_root"):
+            self.dispatcher.workspace_root = self.workspace_root
+
         self.phase_handlers = self._create_phase_handlers()
         self.recovery_runner = RecoveryRunner(dispatcher=self.dispatcher)
         self.phases = list(Phase)
@@ -635,7 +834,7 @@ class Engine:
             Phase.RISK_CHECK: RiskCheckHandler(self.policy_pack, self.dispatcher),
             Phase.ELEGANCE: EleganceHandler(self.policy_pack, self.dispatcher),
             Phase.PHASE_LOG: PhaseLogHandler(self.policy_pack, self.dispatcher),
-            Phase.LEARN: LearnHandler(self.policy_pack, self.dispatcher),
+            Phase.LEARN: LearnHandler(self.policy_pack, self.dispatcher, provider_health=self.provider_health),
         }
 
     def generate_task_id(self, description: str) -> str:
@@ -651,8 +850,74 @@ class Engine:
 
         return f"{prefix}-{timestamp}-{unique_part}"
 
+    def _reconcile_inflight_dispatches(self, task: TaskContext) -> None:
+        """Reconcile any in-flight (intent-without-completion) journal entries.
+
+        Called at the start of ``run_task``/``resume_task`` for a task_id that
+        may have crashed mid-dispatch. For each unmatched intent, measures the
+        current workspace against the snapshot taken before the dispatch and
+        marks the entry reconciled so it isn't re-reported.
+
+        If any reconciliation reveals a measured, non-empty workspace delta,
+        attaches a ``crash_reconciliation`` list to the task (and to the most
+        recent phase result's artifacts, if any). Never raises.
+        """
+        try:
+            incomplete_entries = self.dispatch_journal.incomplete(task_id=task.task_id)
+        except Exception:
+            logger.exception("Failed to query incomplete dispatch journal entries for task %s", task.task_id)
+            return
+        if not incomplete_entries:
+            return
+
+        reconciliations: list[dict[str, Any]] = []
+        for entry in incomplete_entries:
+            try:
+                result = self.dispatch_journal.reconcile(entry, self.workspace_root)
+                self.dispatch_journal.mark_reconciled(entry.get("journal_id"))
+            except Exception:
+                logger.exception(
+                    "Failed to reconcile in-flight dispatch journal entry for task %s", task.task_id
+                )
+                continue
+            reconciliations.append(result)
+
+        if not reconciliations:
+            return
+
+        unsafe = [r for r in reconciliations if not r.get("safe_to_rerun")]
+        if unsafe:
+            for r in unsafe:
+                files = (r.get("workspace_delta") or {}).get("files_changed", [])
+                logger.warning(
+                    "Task %s: in-flight dispatch (phase=%s, provider=%s) crashed mid-run and "
+                    "left measured workspace changes: %s",
+                    task.task_id,
+                    r.get("phase"),
+                    r.get("provider"),
+                    files,
+                )
+        else:
+            logger.info(
+                "Task %s: %d in-flight dispatch(es) found on resume; workspace unchanged for all (safe to rerun)",
+                task.task_id,
+                len(reconciliations),
+            )
+
+        task.crash_reconciliation = reconciliations
+        if task.phase_results:
+            task.phase_results[-1].artifacts["crash_reconciliation"] = reconciliations
+
+        try:
+            self.persistence.save_task(task)
+        except Exception:
+            logger.exception("Failed to persist task %s after dispatch journal reconciliation", task.task_id)
+
     def run_task(self, task: TaskContext) -> TaskContext:
         """Run a task through the full lifecycle."""
+        if hasattr(self.dispatcher, "reset_task_state"):
+            self.dispatcher.reset_task_state()
+        self._reconcile_inflight_dispatches(task)
         if not task.preflight_validation:
             task.preflight_validation = self.preflight_validate_policy(task.task_id)
         self.persistence.save_task(task)
@@ -660,6 +925,9 @@ class Engine:
             task.current_phase = None
             self.persistence.save_task(task)
             return task
+
+        budget = TaskBudget.from_escalation(self.policy_pack.escalation)
+        budget_warned = False
 
         task.current_phase = Phase.ROUTE
 
@@ -682,10 +950,14 @@ class Engine:
                 continue
 
             phase_results = self._execute_phase_with_recovery(task, phase)
+            # Bounded gate retry for Brainstorm/Plan — runs at most once, advisory on double fail.
+            phase_results[-1] = self._maybe_gate_retry(task, phase, phase_results[-1])
             for phase_result in phase_results:
                 task.phase_results.append(phase_result)
                 self._sync_task_state(task, phase_result)
+                budget.add_phase_result_usage(phase_result.artifacts)
             result = phase_results[-1]
+            task.budget_snapshot = budget.to_artifact()
 
             # Trust gate handshake after ROUTE (NCP mode only — degrades gracefully when NCP is off)
             if phase == Phase.ROUTE and task.harness_config is not None and self.ncp_enabled:
@@ -715,6 +987,29 @@ class Engine:
             else:
                 self._log_phase(task, phase, "completed")
             task.current_phase = PHASE_TRANSITIONS.get(phase, Phase.LEARN)
+
+            budget_state = budget.state()
+            if budget_state == "warning" and not budget_warned:
+                budget_warned = True
+                logger.warning(
+                    "Task %s budget warning: consumed %s/%s tokens",
+                    task.task_id,
+                    budget.consumed_tokens,
+                    budget.max_total_tokens,
+                )
+            elif budget_state == "exhausted":
+                result.artifacts["budget_exhausted"] = budget.to_artifact()
+                logger.warning(
+                    "Task %s budget exhausted: consumed %s/%s tokens (on_exhausted=%s)",
+                    task.task_id,
+                    budget.consumed_tokens,
+                    budget.max_total_tokens,
+                    budget.on_exhausted,
+                )
+                if budget.on_exhausted == "pause":
+                    self.persistence.save_task(task)
+                    return task
+
             self.persistence.save_task(task)
 
         # Execute final Learn phase
@@ -731,6 +1026,8 @@ class Engine:
         """Resume a previously saved task from the next unresolved phase."""
         if not task.phase_results:
             return self.run_task(task)
+
+        self._reconcile_inflight_dispatches(task)
 
         if Phase.LEARN in task.get_completed_phases():
             task.current_phase = None
@@ -942,14 +1239,71 @@ class Engine:
             self._log_phase_cost(result, phase)
             return result
         except Exception as e:
+            logger.exception(
+                "Phase %s handler raised for task %s", phase.value, task.task_id
+            )
             result = PhaseResult(
                 phase=phase,
                 outcome="fail",
-                error=f"Phase execution failed: {str(e)}",
+                error=f"Phase execution failed: {type(e).__name__}: {e}",
             )
             self._attach_agent_role(result)
             self._attach_artifact_refs(task, result)
             return result
+
+    def _maybe_gate_retry(self, task: TaskContext, phase: Phase, first: PhaseResult) -> PhaseResult:
+        """Attempt exactly one gate retry when the first result fails the gate.
+
+        Returns the result to use (whichever has the higher gate score).
+        Gate failures after retry are advisory — the task continues regardless.
+        """
+        if phase not in _GATE_RETRY_PHASES:
+            return first
+        if first.outcome == "fail":
+            # Recovery machinery owns hard failures; don't interfere.
+            return first
+        gate = first.artifacts.get("gate_result")
+        if not isinstance(gate, dict) or gate.get("passed", True):
+            return first
+
+        first_score = gate.get("score", 0.0)
+        missing = gate.get("missing_evidence", [])
+        remediation = gate.get("remediation", {})
+
+        task.gate_retry_hint = {
+            "phase": phase.value,
+            "missing_evidence": missing,
+            "remediation": remediation,
+        }
+        try:
+            retry = self._execute_phase(task, phase)
+        finally:
+            task.gate_retry_hint = None
+
+        retry_gate = retry.artifacts.get("gate_result", {})
+        retry_score = retry_gate.get("score", 0.0) if isinstance(retry_gate, dict) else 0.0
+
+        kept = "retry" if retry_score >= first_score else "first"
+        chosen = retry if kept == "retry" else first
+        chosen.artifacts["gate_retry"] = {
+            "attempted": True,
+            "first_score": first_score,
+            "retry_score": retry_score,
+            "kept": kept,
+        }
+
+        # If the chosen result still fails the gate, demote to advisory.
+        chosen_gate = chosen.artifacts.get("gate_result", {})
+        if isinstance(chosen_gate, dict) and not chosen_gate.get("passed", True):
+            logger.warning(
+                "Gate advisory phase=%s score=%.4f threshold=%.2f — retry did not resolve missing evidence %s; proceeding",
+                phase.value,
+                chosen_gate.get("score", 0.0),
+                chosen_gate.get("threshold", 0.0),
+                chosen_gate.get("missing_evidence", []),
+            )
+
+        return chosen
 
     def _log_phase_cost(self, result: PhaseResult, phase: Phase) -> None:
         """Log token usage from a phase result to NCP cost log."""
@@ -999,18 +1353,26 @@ class Engine:
                     if hasattr(self.dispatcher, "preferred_agent"):
                         agent_id = task.harness_config.primary_agent.agent_id
                         self.dispatcher.preferred_agent = agent_id if agent_id != "local" else None
+                    if hasattr(self.dispatcher, "fallback_agents"):
+                        self.dispatcher.fallback_agents = [
+                            b.agent_id for b in task.harness_config.fallback_agents
+                        ]
                 except Exception:
-                    pass
+                    logger.exception(
+                        "Failed to restore harness_config for task %s; "
+                        "harness routing will fall back to provider-config defaults",
+                        task.task_id,
+                    )
 
         # Save updated task state
         self.persistence.save_task(task)
 
     def _attach_gate_result(self, result: PhaseResult) -> None:
         """Persist gate evaluation details for phases with confidence thresholds."""
-        passed, score = self.check_gate(result.phase, result.evidence)
-        if result.phase not in {Phase.BRAINSTORM, Phase.PLAN}:
+        if result.phase not in _GATE_RETRY_PHASES:
             return
 
+        passed, score = self.check_gate(result.phase, result.evidence)
         threshold = 0.80 if result.phase == Phase.BRAINSTORM else 0.90
         _gate_keys = {
             Phase.BRAINSTORM: {
@@ -1022,15 +1384,13 @@ class Engine:
             Phase.PLAN: {"checkpoint_list", "dependency_map", "rollback_plan"},
         }
         expected = _gate_keys.get(result.phase, set())
-        missing = [
-            key for key in expected
-            if not result.evidence.get(key)
-        ]
+        missing = [key for key in expected if not result.evidence.get(key)]
+        remediation = {key: _GATE_EVIDENCE_REMEDIATION[key] for key in missing if key in _GATE_EVIDENCE_REMEDIATION}
         if not passed:
-            import logging
-            logging.getLogger(__name__).warning(
-                "Gate FAILED phase=%s score=%.2f threshold=%.2f missing=%s",
-                result.phase.value, score, threshold, missing,
+            remedy_lines = "".join(f"\n  [{key}] {msg}" for key, msg in remediation.items())
+            logger.warning(
+                "Gate FAILED phase=%s score=%.4f threshold=%.2f missing=%s%s",
+                result.phase.value, score, threshold, missing, remedy_lines,
             )
         gate_result = GateResult(
             passed=passed,
@@ -1045,6 +1405,7 @@ class Engine:
             "threshold": gate_result.threshold,
             "missing_evidence": gate_result.missing_evidence,
             "decision": gate_result.decision,
+            "remediation": remediation,
         }
 
     def _attach_agent_role(self, result: PhaseResult) -> None:
@@ -1108,10 +1469,15 @@ class Engine:
         self,
         phase: Phase,
         evidence: dict[str, Any],
-        threshold: float = 0.90,
+        threshold: float | None = None,
+        _epsilon: float = 1e-9,
     ) -> tuple[bool, float]:
         """
         Check if evidence meets the confidence gate for a phase.
+
+        When threshold is None the per-phase default applies (Brainstorm 0.80,
+        Plan 0.90). The epsilon absorbs float accumulation error so a score
+        exactly at threshold passes (0.3 + 0.3 + 0.2 < 0.8 in float math).
 
         Returns (passed, actual_confidence).
         """
@@ -1123,12 +1489,13 @@ class Engine:
                 "success_criteria_defined": 0.2,
                 "reversibility_assessed": 0.2,
             }
+            gate_threshold = 0.80 if threshold is None else threshold
             confidence = 0.0
             for key, weight in weights.items():
                 if key in evidence and evidence[key]:
                     confidence += weight
 
-            return confidence >= threshold, confidence
+            return confidence >= gate_threshold - _epsilon, confidence
 
         elif phase == Phase.PLAN:
             weights = {
@@ -1136,12 +1503,13 @@ class Engine:
                 "dependency_map": 0.3,
                 "rollback_plan": 0.3,
             }
+            gate_threshold = 0.90 if threshold is None else threshold
             confidence = 0.0
             for key, weight in weights.items():
                 if key in evidence and evidence[key]:
                     confidence += weight
 
-            return confidence >= threshold, confidence
+            return confidence >= gate_threshold - _epsilon, confidence
 
         return True, 1.0
 
@@ -1185,7 +1553,7 @@ class Engine:
 
             return action
         except Exception as exc:
-            print(f"[trust_gate] Degraded (error): {exc}")
+            logger.warning("Trust gate degraded (error): %s", exc, exc_info=True)
             return "EXECUTE"
 
     @staticmethod

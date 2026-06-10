@@ -33,9 +33,26 @@ python3 -m pip install /path/to/Sarathi
 python3 -m pip install -e .
 ```
 
+## MCP Server
+
+Expose Sarathi as an MCP stdio server so MCP clients (Claude Code, Codex, etc.) can run tasks, check status, resume, browse history, and manage policy proposals natively:
+
+```bash
+python3 -m pip install -e ".[mcp]"
+sarathi-mcp
+```
+
+Register it with Claude Code:
+
+```bash
+claude mcp add sarathi -- sarathi-mcp
+```
+
+Tools exposed: `run_task`, `task_status`, `resume_task`, `list_tasks`, `task_log`, `list_proposals`, `accept_proposal`, `reject_proposal`, `validate_policy_pack`.
+
 ### Optional: run real tests during Verify
 
-By default Verify uses safe synthetic signals. To execute the `test.command` from `commands.md`:
+By default Verify does not execute shell commands and reports the phase as `unverified` — it never fabricates pass/fail signals. To execute the `test.command` from `commands.md` and get real, measured results:
 
 ```bash
 export SARATHI_EXEC_COMMANDS=1
@@ -43,6 +60,22 @@ export SARATHI_WORKDIR=/path/to/repo   # optional; defaults to cwd
 export SARATHI_COMMAND_TIMEOUT=600     # optional; seconds
 sarathi run "…" --policy-pack ./policy-pack
 ```
+
+### Optional: live provider smoke tests
+
+`tests/live/` exercises the real provider CLIs (e.g. `claude -p --output-format json`)
+end to end — it is opt-in and skipped by default since it makes real, billed
+API calls (a couple of dollars worth at most per run). To run it:
+
+```bash
+SARATHI_LIVE_TESTS=1 python3 -m pytest tests/live -q
+```
+
+Each provider's tests additionally skip if that provider's CLI is not on
+`PATH`. The suite validates Sarathi's side of the integration — envelope
+parsing, reported token usage capture, cost/session-id artifacts, workspace
+delta measurement, and `--resume` session continuity — not whether the
+agent obeys every instruction.
 
 ### Task history
 

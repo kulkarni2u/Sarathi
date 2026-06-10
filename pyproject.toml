@@ -16,6 +16,7 @@ dependencies = [
 [project.scripts]
 sarathi = "src.cli:main"
 sarathi-desktop = "src.service.desktop:main"
+sarathi-mcp = "src.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/kulkarni2u/Sarathi"
@@ -23,6 +24,9 @@ Homepage = "https://github.com/kulkarni2u/Sarathi"
 [project.optional-dependencies]
 ncp = [
     "neural-context-protocol",
+]
+mcp = [
+    "mcp>=1.0",
 ]
 dev = [
     "pytest>=7.4",

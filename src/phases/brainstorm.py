@@ -58,6 +58,10 @@ class BrainstormHandler:
         # Offline path — dispatcher-based approach (works without desktop service)
         response = None
         if self.dispatcher is not None:
+            hint = getattr(task, "gate_retry_hint", None)
+            extra_constraints: dict = {}
+            if isinstance(hint, dict) and hint.get("phase") == phase.value:
+                extra_constraints["gate_retry"] = hint
             response = self.dispatcher.dispatch(
                 DispatchRequest(
                     mode="explore",
@@ -69,6 +73,7 @@ class BrainstormHandler:
                         "complexity": task.complexity.value,
                     },
                     expected_outputs=["approaches", "risks", "success_criteria"],
+                    constraints=extra_constraints,
                 )
             )
 

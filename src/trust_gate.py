@@ -54,6 +54,13 @@ class TrustGate:
         """
         try:
             import httpx
+        except ImportError:
+            return TrustGateResponse(
+                TrustGateResult.PASS,
+                message="NCP unavailable (httpx not installed) — degraded mode",
+            )
+
+        try:
             resp = httpx.post(
                 self.ncp_mcp_url,
                 json={
@@ -66,6 +73,13 @@ class TrustGate:
                 },
                 timeout=10.0,
             )
+        except (httpx.HTTPError, OSError):
+            return TrustGateResponse(
+                TrustGateResult.PASS,
+                message="NCP unavailable — degraded mode",
+            )
+
+        try:
             if resp.status_code != 200:
                 return TrustGateResponse(
                     TrustGateResult.PASS,
@@ -95,9 +109,11 @@ class TrustGate:
             return TrustGateResponse(TrustGateResult.PASS, drift)
 
         except Exception as exc:
+            # NCP responded but evaluation failed — the gate itself is broken,
+            # not merely absent. Fail toward caution instead of silently passing.
             return TrustGateResponse(
-                TrustGateResult.PASS,
-                message=f"Trust gate error (degraded): {exc}",
+                TrustGateResult.WARN,
+                message=f"Trust gate evaluation error: {exc}",
             )
 
     def refresh(self, stale_keys: list[str], pipeline_id: str) -> bool:

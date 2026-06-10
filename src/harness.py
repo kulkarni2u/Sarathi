@@ -109,11 +109,22 @@ class HarnessConfig:
         task_class: TaskClass,
         task_id: str,
         ncp_enabled: bool = False,
+        available_providers: list[str] | None = None,
+        health_scores: dict[str, float] | None = None,
     ) -> HarnessConfig:
         """Build a HarnessConfig from TaskClass defaults."""
         defaults = TASK_CLASS_DEFAULTS[task_class]
         signals = [QualitySignalDef(name=name) for name in defaults.quality_signals]
-        primary_agent = resolve_agent_binding(defaults.agent_preference)
+        primary_agent = resolve_agent_binding(
+            defaults.agent_preference,
+            available_providers=available_providers,
+            health_scores=health_scores,
+        )
+        fallback_agents = _build_fallback_agents(
+            primary_agent.agent_id,
+            available_providers=available_providers,
+            health_scores=health_scores,
+        )
         return cls(
             task_id=task_id,
             task_class=task_class,
@@ -124,6 +135,7 @@ class HarnessConfig:
             quality_signals=signals,
             defaults=defaults,
             primary_agent=primary_agent,
+            fallback_agents=fallback_agents,
         )
 
 
@@ -134,16 +146,50 @@ _PREFERENCE_TO_PROVIDER: dict[str, str] = {
     "sarathi_native":     "local",
 }
 
+# Static preference order for fallback candidates when a primary agent fails.
+_FALLBACK_PROVIDER_ORDER: list[str] = ["claude", "codex", "opencode"]
+
 
 def resolve_agent_binding(
     agent_preference: str,
     available_providers: list[str] | None = None,
+    health_scores: dict[str, float] | None = None,
 ) -> AgentBinding:
     """Map an AssemblyDefaults.agent_preference string to a concrete AgentBinding."""
     provider_id = _PREFERENCE_TO_PROVIDER.get(agent_preference, "local")
     if available_providers and provider_id not in available_providers:
         provider_id = available_providers[0] if available_providers else "local"
-    return AgentBinding(agent_id=provider_id)
+    binding = AgentBinding(agent_id=provider_id)
+    if health_scores and provider_id in health_scores:
+        binding.health_score = health_scores[provider_id]
+    return binding
+
+
+def _build_fallback_agents(
+    primary_provider_id: str,
+    available_providers: list[str] | None = None,
+    health_scores: dict[str, float] | None = None,
+) -> list[AgentBinding]:
+    """Build the ordered fallback agent list for a resolved primary agent.
+
+    Fallbacks are the OTHER distinct providers from ``_FALLBACK_PROVIDER_ORDER``,
+    minus the primary, filtered to ``available_providers``. When
+    ``available_providers`` is None we don't fabricate availability — the
+    fallback list stays empty.
+    """
+    if not available_providers:
+        return []
+    fallbacks: list[AgentBinding] = []
+    for provider_id in _FALLBACK_PROVIDER_ORDER:
+        if provider_id == primary_provider_id:
+            continue
+        if provider_id not in available_providers:
+            continue
+        binding = AgentBinding(agent_id=provider_id)
+        if health_scores and provider_id in health_scores:
+            binding.health_score = health_scores[provider_id]
+        fallbacks.append(binding)
+    return fallbacks
 
 
 @dataclass
@@ -160,6 +206,9 @@ class HarnessOutcome:
     trust_gate_result: str
     agent_used: str
     assembler_version: str = "sarathi-0.2.0"
+    # Per declared signal: "measured" (real data), "derived" (computed from
+    # other real phase data), or "missing" (no data source — not fabricated).
+    signal_provenance: dict[str, str] = field(default_factory=dict)
 
 
 def measure_outcome(task: Any, harness_config: HarnessConfig) -> HarnessOutcome:
@@ -167,7 +216,7 @@ def measure_outcome(task: Any, harness_config: HarnessConfig) -> HarnessOutcome:
     Extract real quality signals from a completed task's phase_results.
 
     Sources:
-      test_pass_rate  — VERIFY command_succeeded (or coverage proxy)
+      test_pass_rate  — VERIFY command_succeeded (absent when no command ran)
       blast_radius    — 1.0 − REVIEW score
       accuracy/relevance — REVIEW score
       token_cost      — sum of dispatch_usage.total_tokens across all phases
@@ -227,57 +276,78 @@ def measure_outcome(task: Any, harness_config: HarnessConfig) -> HarnessOutcome:
         latency_ms = 0
 
     # ── Signal extraction ─────────────────────────────────────────────────
+    # A declared signal with no real data source stays absent from the dict
+    # (provenance "missing") rather than being filled with a flattering or
+    # punishing default — fabricated values would poison the learning loop.
     signals: dict[str, float] = {}
+    provenance: dict[str, str] = {}
 
     if "test_pass_rate" in declared:
         cmd_ok = verify_summary.get("command_succeeded")
-        coverage = float(verify_summary.get("coverage") or 85.0)
         if cmd_ok is True:
             signals["test_pass_rate"] = 1.0
+            provenance["test_pass_rate"] = "measured"
         elif cmd_ok is False:
             signals["test_pass_rate"] = 0.0
+            provenance["test_pass_rate"] = "measured"
         else:
-            # No real shell command ran — use coverage as a proxy
-            signals["test_pass_rate"] = min(1.0, coverage / 100.0)
+            provenance["test_pass_rate"] = "missing"
+
+    review_seen = review_score is not None or any(
+        getattr(getattr(pr, "phase", None), "value", "") == "Review" for pr in phase_results
+    )
 
     if "blast_radius" in declared:
         if review_score is not None:
             signals["blast_radius"] = round(max(0.0, 1.0 - review_score), 2)
-        else:
+            provenance["blast_radius"] = "measured"
+        elif review_seen:
             signals["blast_radius"] = 0.1 if review_outcome == "pass" else 0.5
+            provenance["blast_radius"] = "derived"
+        else:
+            provenance["blast_radius"] = "missing"
 
     for sig in ("accuracy", "relevance"):
         if sig in declared:
-            signals[sig] = float(review_score) if review_score is not None else (
-                1.0 if review_outcome == "pass" else 0.5
-            )
+            if review_score is not None:
+                signals[sig] = float(review_score)
+                provenance[sig] = "measured"
+            elif review_seen:
+                signals[sig] = 1.0 if review_outcome == "pass" else 0.5
+                provenance[sig] = "derived"
+            else:
+                provenance[sig] = "missing"
 
     if "trust_utilization" in declared or "token_efficiency" in declared:
         passed = sum(1 for pr in phase_results if getattr(pr, "outcome", "") == "pass")
         rate = passed / max(len(phase_results), 1)
         if "trust_utilization" in declared:
             signals["trust_utilization"] = rate
+            provenance["trust_utilization"] = "derived"
         if "token_efficiency" in declared:
             signals["token_efficiency"] = rate
+            provenance["token_efficiency"] = "derived"
 
     for sig in ("success_rate", "pipeline_success", "delegation_success"):
         if sig in declared:
             any_fail = any(getattr(pr, "outcome", "") == "fail" for pr in phase_results)
             signals[sig] = 0.0 if any_fail else 1.0
+            provenance[sig] = "derived"
 
     if "rollback_triggered" in declared:
         signals["rollback_triggered"] = 1.0 if rollback else 0.0
+        provenance["rollback_triggered"] = "measured"
 
     if "token_cost" in declared:
         signals["token_cost"] = float(token_cost)
+        provenance["token_cost"] = "measured"
 
     if "latency" in declared:
         signals["latency"] = float(latency_ms)
+        provenance["latency"] = "measured"
 
-    # Zeros for signals with no data source yet
     for name in declared:
-        if name not in signals:
-            signals[name] = 0.0
+        provenance.setdefault(name, "missing")
 
     # ── Agent used: prefer actual BUILD dispatch provider ─────────────────
     agent_used = harness_config.primary_agent.agent_id
@@ -300,4 +370,5 @@ def measure_outcome(task: Any, harness_config: HarnessConfig) -> HarnessOutcome:
         trust_gate_result=harness_config.trust_gate_result,
         agent_used=agent_used,
         assembler_version=harness_config.assembler_version,
+        signal_provenance=provenance,
     )

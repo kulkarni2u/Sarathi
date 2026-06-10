@@ -140,7 +140,7 @@ task_states:
   - "failed"
   - "skipped"
 
-  transitions:
+transitions:
     created -> queued: "task_queued"
     created -> blocked: "dependency_not_met"
     queued -> in_progress: "agent_started"

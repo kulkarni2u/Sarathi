@@ -61,25 +61,29 @@ def test_test_pass_rate_from_command_succeeded_false():
     assert outcome.quality_signals["test_pass_rate"] == 0.0
 
 
-def test_test_pass_rate_falls_back_to_coverage_proxy():
+def test_test_pass_rate_absent_when_no_command_ran():
+    # Coverage alone is not evidence that tests ran — no proxy, no fabrication.
     verify = _phase("Verify", artifacts={
         "verification_summary": {"coverage": 92.0},
     })
     outcome = measure_outcome(_task([verify]), _harness(TaskClass.CODEGEN_PATCH))
-    assert abs(outcome.quality_signals["test_pass_rate"] - 0.92) < 0.001
+    assert "test_pass_rate" not in outcome.quality_signals
+    assert outcome.signal_provenance["test_pass_rate"] == "missing"
 
 
-def test_test_pass_rate_coverage_capped_at_1():
+def test_test_pass_rate_absent_when_verify_never_ran():
+    outcome = measure_outcome(_task([]), _harness(TaskClass.CODEGEN_PATCH))
+    assert "test_pass_rate" not in outcome.quality_signals
+    assert outcome.signal_provenance["test_pass_rate"] == "missing"
+
+
+def test_measured_signals_marked_in_provenance():
     verify = _phase("Verify", artifacts={
-        "verification_summary": {"coverage": 120.0},
+        "verification_summary": {"command_succeeded": True},
     })
     outcome = measure_outcome(_task([verify]), _harness(TaskClass.CODEGEN_PATCH))
     assert outcome.quality_signals["test_pass_rate"] == 1.0
-
-
-def test_test_pass_rate_missing_verify_defaults_to_coverage_85():
-    outcome = measure_outcome(_task([]), _harness(TaskClass.CODEGEN_PATCH))
-    assert outcome.quality_signals["test_pass_rate"] == pytest.approx(0.85)
+    assert outcome.signal_provenance["test_pass_rate"] == "measured"
 
 
 def test_verify_summary_also_readable_from_nested_results():
@@ -110,9 +114,17 @@ def test_blast_radius_high_when_review_score_low():
     assert outcome.quality_signals["blast_radius"] == pytest.approx(0.7, abs=0.01)
 
 
-def test_blast_radius_fallback_pass():
-    outcome = measure_outcome(_task([]), _harness(TaskClass.CODEGEN_PATCH))
+def test_blast_radius_derived_from_review_outcome_without_score():
+    review = _phase("Review", artifacts={"review_verdict": {"outcome": "pass"}})
+    outcome = measure_outcome(_task([review]), _harness(TaskClass.CODEGEN_PATCH))
     assert outcome.quality_signals["blast_radius"] == 0.1
+    assert outcome.signal_provenance["blast_radius"] == "derived"
+
+
+def test_blast_radius_absent_when_review_never_ran():
+    outcome = measure_outcome(_task([]), _harness(TaskClass.CODEGEN_PATCH))
+    assert "blast_radius" not in outcome.quality_signals
+    assert outcome.signal_provenance["blast_radius"] == "missing"
 
 
 # ── accuracy / relevance ─────────────────────────────────────────────────────
@@ -235,11 +247,15 @@ def test_agent_used_falls_back_to_primary_agent():
 
 # ── declared signals get zeros not KeyError ──────────────────────────────────
 
-def test_undiscovered_signals_get_zero_not_missing():
+def test_signals_without_data_are_marked_missing_not_zero_filled():
+    # Fabricated zeros would poison the learning loop; absent signals must be
+    # absent from quality_signals but accounted for in provenance.
     hc = _harness(TaskClass.EVOLUTION_HARNESS)
     outcome = measure_outcome(_task([]), hc)
     for sig in hc.quality_signals:
-        assert sig.name in outcome.quality_signals
+        assert sig.name in outcome.signal_provenance
+        if outcome.signal_provenance[sig.name] == "missing":
+            assert sig.name not in outcome.quality_signals
 
 
 # ── human_interventions ───────────────────────────────────────────────────────

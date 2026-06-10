@@ -21,6 +21,7 @@ from .cli_bridge import (
     _provider_prompt,
     dispatch_via_cli_bridge,
 )
+from ..workspace_evidence import attach_workspace_evidence, snapshot_workspace
 
 
 class OpenCodeSdkProviderAdapter(ProviderAdapter):
@@ -70,13 +71,15 @@ class OpenCodeSdkProviderAdapter(ProviderAdapter):
         )
 
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
+        before = snapshot_workspace(self.workspace_root)
         if request.constraints.get("ncp_handoff_enabled") and self.provider_path:
-            return dispatch_via_cli_bridge(
+            response = dispatch_via_cli_bridge(
                 provider="opencode",
                 path=self.provider_path,
                 workspace_root=self.workspace_root,
                 request=request,
             )
+            return attach_workspace_evidence(response, before, self.workspace_root, request)
         session = self.create_session(request)
         session.status = "running"
         bridge_payload = {
@@ -103,7 +106,8 @@ class OpenCodeSdkProviderAdapter(ProviderAdapter):
 
         if bool(result.get("success")):
             session.status = "closed"
-            return self._response_from_sdk_result(request, session, result)
+            response = self._response_from_sdk_result(request, session, result)
+            return attach_workspace_evidence(response, before, self.workspace_root, request)
 
         session.status = "failed"
         sdk_error = str(result.get("error") or "OpenCode SDK dispatch failed")
@@ -125,9 +129,9 @@ class OpenCodeSdkProviderAdapter(ProviderAdapter):
                 "sdk_error": sdk_error,
                 "sdk_fallback_used": True,
             }
-            return fallback
+            return attach_workspace_evidence(fallback, before, self.workspace_root, request)
 
-        return DispatchResponse(
+        response = DispatchResponse(
             success=False,
             artifacts={
                 "provider": self.name,
@@ -138,6 +142,7 @@ class OpenCodeSdkProviderAdapter(ProviderAdapter):
             },
             error=sdk_error,
         )
+        return attach_workspace_evidence(response, before, self.workspace_root, request)
 
     def _response_from_sdk_result(
         self,

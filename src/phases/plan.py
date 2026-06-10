@@ -28,6 +28,10 @@ class PlanHandler:
 
         response = None
         if self.dispatcher is not None:
+            hint = getattr(task, "gate_retry_hint", None)
+            extra_constraints: dict = {}
+            if isinstance(hint, dict) and hint.get("phase") == phase.value:
+                extra_constraints["gate_retry"] = hint
             response = self.dispatcher.dispatch(
                 DispatchRequest(
                     mode="execute",
@@ -41,6 +45,7 @@ class PlanHandler:
                         "success_criteria": prev_artifacts.get("success_criteria", []),
                     },
                     expected_outputs=["implementation_plan", "workflow_graph", "effort_estimate"],
+                    constraints=extra_constraints,
                 )
             )
 

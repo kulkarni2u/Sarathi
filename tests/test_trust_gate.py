@@ -86,3 +86,21 @@ def test_ncp_event_values_are_strings():
 def test_trust_gate_result_roundtrip():
     for result in TrustGateResult:
         assert TrustGateResult(result.value) == result
+
+
+def test_evaluate_warns_when_gate_evaluation_itself_breaks(monkeypatch):
+    # NCP responded, but processing the response failed — the gate is broken,
+    # not absent, so it must flag (WARN) instead of silently passing.
+    httpx = pytest.importorskip("httpx")
+
+    class _BadResponse:
+        status_code = 200
+
+        def json(self):
+            raise ValueError("malformed NCP payload")
+
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: _BadResponse())
+    gate = TrustGate(ncp_mcp_url="http://127.0.0.1:4242/mcp")
+    response = gate.evaluate("analysis", [], "task-test")
+    assert response.result == TrustGateResult.WARN
+    assert "error" in response.message.lower()

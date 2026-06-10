@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -6,6 +7,17 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger("sarathi.evolve")
+
+# Provenance weighting applied to quality-signal deltas before they can
+# trigger a policy proposal. "measured" signals carry full weight; "derived"
+# signals (computed from other real data, not directly observed) carry half
+# weight and can never trigger a proposal on their own.
+_PROVENANCE_WEIGHT: dict[str, float] = {
+    "measured": 1.0,
+    "derived": 0.5,
+}
 
 
 @dataclass
@@ -106,21 +118,52 @@ class Evolver:
     def ingest_harness_outcome(self, outcome: Any) -> list[PolicyProposal]:
         """
         Score a HarnessOutcome against the per-TaskClass baseline.
-        Generates proposals when quality signals deviate by more than 10%.
+        Generates proposals when quality signals deviate by more than 10%,
+        weighted by signal provenance.
+
+        Provenance weighting: "measured" signals count fully (1.0), "derived"
+        signals (computed from other real data, not directly observed) count
+        at half weight (0.5). Unknown/absent provenance (legacy outcomes
+        persisted before signal_provenance existed) is treated as "measured"
+        for backward compatibility.
+
+        A proposal batch only fires when at least one of the deviating
+        signals is measured-provenance — derived-only evidence is held back
+        (and logged at debug level) rather than triggering a proposal.
         """
         proposals: list[PolicyProposal] = []
         baseline = self._get_or_create_baseline(outcome.task_class.value)
+        provenance_map = getattr(outcome, "signal_provenance", {}) or {}
 
+        deviations: list[tuple[str, float, float, str]] = []
         for signal_name, measured_value in outcome.quality_signals.items():
             expected = baseline.get(signal_name)
             if expected is None:
                 baseline[signal_name] = measured_value
                 continue
             delta = measured_value - expected
-            if abs(delta) > 0.1:
-                proposals.extend(
-                    self._proposals_for_quality_deviation(outcome, signal_name, delta)
-                )
+            provenance = provenance_map.get(signal_name, "measured")
+            weight = _PROVENANCE_WEIGHT.get(provenance, 1.0)
+            if abs(delta * weight) > 0.1:
+                deviations.append((signal_name, delta, weight, provenance))
+
+        if not deviations:
+            return proposals
+
+        if not any(provenance == "measured" for _, _, _, provenance in deviations):
+            logger.debug(
+                "Holding back %d quality-signal deviation(s) for task class %s: "
+                "all derived-provenance, no measured signal among contributors (%s).",
+                len(deviations),
+                outcome.task_class.value,
+                ", ".join(name for name, _, _, _ in deviations),
+            )
+            return proposals
+
+        for signal_name, delta, weight, provenance in deviations:
+            proposals.extend(
+                self._proposals_for_quality_deviation(outcome, signal_name, delta, provenance, weight)
+            )
 
         return proposals
 
@@ -134,6 +177,8 @@ class Evolver:
         outcome: Any,
         signal_name: str,
         delta: float,
+        provenance: str = "measured",
+        weight: float = 1.0,
     ) -> list[PolicyProposal]:
         direction = "degraded" if delta < 0 else "improved"
         task_class_value = outcome.task_class.value
@@ -144,13 +189,14 @@ class Evolver:
                 rationale=(
                     f"Signal '{signal_name}' deviated by {delta:+.2f} from baseline "
                     f"for task class {task_class_value} "
-                    f"(harness {outcome.harness_id}, task {outcome.task_id})."
+                    f"(harness {outcome.harness_id}, task {outcome.task_id}). "
+                    f"Evidence provenance: {provenance} (weight {weight:.1f})."
                 ),
                 suggested_change=(
                     f"Review {'assembly defaults' if delta < 0 else 'routing strategy'} for "
                     f"{task_class_value} tasks, focusing on {signal_name} optimization."
                 ),
-                evidence_refs=[f"{outcome.task_id}:quality:{signal_name}"],
+                evidence_refs=[f"{outcome.task_id}:quality:{signal_name}:{provenance}"],
                 confidence=min(1.0, 0.5 + abs(delta)),
                 source="harness_outcome",
             )

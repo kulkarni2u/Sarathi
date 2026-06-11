@@ -1,5 +1,9 @@
 from pathlib import Path
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib
 
 from src.dispatch import LocalDispatcher
 from src.engine import Complexity, Engine, Phase, TaskContext

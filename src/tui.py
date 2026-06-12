@@ -6,12 +6,15 @@ without any coordination.
 """
 from __future__ import annotations
 
+import json
+
 from rich.markup import escape
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Log, Static
+from textual.widgets import DataTable, Footer, Header, RichLog, Static
 
 try:
     from . import tui_data
@@ -25,6 +28,70 @@ def _short(text: object, width: int) -> str:
     if len(flattened) <= width:
         return flattened
     return flattened[: width - 1] + "…"
+
+
+_OUTCOME_STYLES = {
+    "pass": "green",
+    "success": "green",
+    "completed": "green",
+    "fail": "bold red",
+    "failed": "bold red",
+    "error": "bold red",
+    "unverified": "yellow",
+    "skipped": "dim",
+}
+
+_RISK_STYLES = {"low": "green", "medium": "yellow", "high": "bold red"}
+
+_DECISION_STYLES = {"accepted": "green", "rejected": "red"}
+
+
+def _styled(text: object, styles: dict[str, str]) -> Text:
+    value = str(text)
+    return Text(value, style=styles.get(value.lower(), ""))
+
+
+def _styled_phase(current_phase: str) -> Text:
+    if current_phase == "Completed":
+        return Text(current_phase, style="dim")
+    return Text(current_phase, style="bold cyan")
+
+
+def _format_snapshot(text: str) -> str:
+    """Dim the field labels in a `sarathi status` snapshot, keep values plain."""
+    lines = []
+    for line in text.splitlines():
+        key, sep, rest = line.partition(":")
+        if sep and not line.startswith(" "):
+            lines.append(f"[bold cyan]{escape(key)}:[/]{escape(rest)}")
+        else:
+            lines.append(escape(line))
+    return "\n".join(lines)
+
+
+def _styled_log_line(line: str) -> Text:
+    """Phase-log entry as `timestamp phase status` with a status color."""
+    try:
+        entry = json.loads(line)
+    except json.JSONDecodeError:
+        entry = None
+    if not isinstance(entry, dict):
+        return Text(line)
+    timestamp = str(entry.get("timestamp", ""))[:19].replace("T", " ")
+    status = str(entry.get("status", ""))
+    style = ""
+    lowered = status.lower()
+    if lowered in _OUTCOME_STYLES:
+        style = _OUTCOME_STYLES[lowered]
+    elif lowered == "started":
+        style = "cyan"
+    text = Text()
+    text.append(timestamp, style="dim")
+    text.append("  ")
+    text.append(str(entry.get("phase", "")), style="bold")
+    text.append("  ")
+    text.append(status, style=style)
+    return text
 
 
 def _discover_policy_pack() -> str | None:
@@ -71,12 +138,12 @@ class ProposalsScreen(Screen):
         for proposal in self.proposals:
             artifact = proposal.to_artifact()
             table.add_row(
-                artifact["id"],
-                artifact["risk_level"],
+                Text(artifact["id"], style="dim"),
+                _styled(artifact["risk_level"], _RISK_STYLES),
                 f"{artifact['confidence']:.2f}",
-                artifact["policy_file"],
+                Text(artifact["policy_file"], style="cyan"),
                 _short(artifact["title"], 60),
-                self.decided.get(artifact["id"], ""),
+                _styled(self.decided.get(artifact["id"], ""), _DECISION_STYLES),
                 key=artifact["id"],
             )
         if not self.proposals:
@@ -218,7 +285,7 @@ class SarathiDashboard(App):
             with Vertical(id="detail"):
                 yield Static("No task selected.", id="snapshot")
                 yield DataTable(id="phases")
-                yield Log(id="log")
+                yield RichLog(id="log")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -240,9 +307,9 @@ class SarathiDashboard(App):
             known.add(summary["task_id"])
             table.add_row(
                 _short(summary["task_id"], 20),
-                summary["current_phase"],
-                _short(summary["last_outcome"], 14),
-                str(summary["last_updated"])[5:16].replace("T", " "),
+                _styled_phase(summary["current_phase"]),
+                _styled(_short(summary["last_outcome"], 14), _OUTCOME_STYLES),
+                Text(str(summary["last_updated"])[5:16].replace("T", " "), style="dim"),
                 key=summary["task_id"],
             )
         if self.selected_task_id not in known:
@@ -254,24 +321,26 @@ class SarathiDashboard(App):
     def _refresh_detail(self) -> None:
         snapshot = self.query_one("#snapshot", Static)
         phases = self.query_one("#phases", DataTable)
-        log = self.query_one("#log", Log)
+        log = self.query_one("#log", RichLog)
         phases.clear()
         log.clear()
         if self.selected_task_id is None:
             snapshot.update("No saved tasks. Run `sarathi run \"…\"` first.")
             return
         text = tui_data.status_snapshot(self.persistence, self.selected_task_id)
-        snapshot.update(escape(text) if text else f"Task {self.selected_task_id} not found.")
+        snapshot.update(
+            _format_snapshot(text) if text else f"Task {self.selected_task_id} not found."
+        )
         for row in tui_data.phase_rows(self.persistence, self.selected_task_id):
             phases.add_row(
-                row["phase"],
+                Text(row["phase"], style="bold"),
                 row["agent"],
-                row["outcome"],
+                _styled(row["outcome"], _OUTCOME_STYLES),
                 str(row["iterations"]),
-                _short(row["error"], 40),
+                Text(_short(row["error"], 40), style="red"),
             )
         for line in tui_data.phase_log_tail(self.persistence, self.selected_task_id):
-            log.write_line(tui_data.format_log_line(line))
+            log.write(_styled_log_line(line))
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id != "tasks" or event.row_key is None:

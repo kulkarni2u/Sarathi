@@ -331,9 +331,9 @@ class _FakeProcess:
         pass
 
 
-def _fake_popen(lines):
+def _fake_popen(lines, returncode=0):
     def popen(command, **kwargs):
-        return _FakeProcess(lines)
+        return _FakeProcess(lines, returncode=returncode)
 
     return popen
 
@@ -448,3 +448,178 @@ def test_set_provider_unknown_returns_false(monkeypatch):
 
     assert session.set_provider("opencode") is False
     assert session.provider == ("claude", "/usr/bin/claude")
+
+
+def test_send_streaming_token_deltas_accumulate_without_doubling(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    full_text = "Hello, world!"
+
+    def delta_event(text):
+        return json.dumps(
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            }
+        )
+
+    lines = [
+        delta_event("Hello"),
+        delta_event(", "),
+        delta_event("world!"),
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": full_text}]},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "result",
+                "result": full_text,
+                "session_id": "sess-delta",
+                "is_error": False,
+            }
+        ),
+    ]
+    monkeypatch.setattr(tui_data.subprocess, "Popen", _fake_popen(lines))
+
+    session = tui_data.ChatSession()
+    seen = []
+    reply = session.send_streaming("hi", on_text=lambda text: seen.append(text))
+
+    assert reply == full_text
+    # Three deltas should have been delivered with progressively growing text.
+    assert seen[0] == "Hello"
+    assert seen[1] == "Hello, "
+    assert seen[2] == "Hello, world!"
+    # The assistant event re-delivers the same full text — must not double it.
+    assert all(text == full_text for text in seen[2:])
+    assert reply.count("Hello, world!") == 1
+    assert session.history == [("hi", full_text)]
+
+
+def test_send_streaming_command_includes_partial_messages_flag(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    captured = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        lines = [
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "ok",
+                    "session_id": "sess-flag",
+                    "is_error": False,
+                }
+            )
+        ]
+        return _FakeProcess(lines)
+
+    monkeypatch.setattr(tui_data.subprocess, "Popen", fake_popen)
+
+    session = tui_data.ChatSession()
+    session.send_streaming("hi")
+
+    assert "--include-partial-messages" in captured["command"]
+
+
+def test_send_streaming_falls_back_to_blocking_json_on_old_cli(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    # No "result" event and nothing accumulated; nonzero return code as if
+    # the older CLI rejected --include-partial-messages.
+    lines = [
+        json.dumps({"type": "system", "subtype": "init", "session_id": "sess-fallback"}),
+    ]
+    monkeypatch.setattr(tui_data.subprocess, "Popen", _fake_popen(lines, returncode=1))
+
+    class FakeCompleted:
+        def __init__(self, stdout):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(command, **kwargs):
+        return FakeCompleted(
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "fallback reply",
+                    "session_id": "sess-fallback-run",
+                    "is_error": False,
+                }
+            )
+        )
+
+    monkeypatch.setattr(tui_data.subprocess, "run", fake_run)
+
+    session = tui_data.ChatSession()
+    seen = []
+    reply = session.send_streaming("hi", on_text=lambda text: seen.append(text))
+
+    assert reply == "fallback reply"
+    assert seen == ["fallback reply"]
+    assert session.history == [("hi", "fallback reply")]
+
+
+def test_add_context_wraps_next_message_once(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    captured = []
+
+    class FakeCompleted:
+        def __init__(self, stdout):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(command, **kwargs):
+        captured.append(kwargs.get("input"))
+        return FakeCompleted(
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "ack",
+                    "session_id": "sess-ctx",
+                    "is_error": False,
+                }
+            )
+        )
+
+    monkeypatch.setattr(tui_data.subprocess, "run", fake_run)
+
+    session = tui_data.ChatSession()
+    session.add_context("Status of task t-1", "Phase: Build")
+
+    reply = session.send("what next?")
+
+    assert reply == "ack"
+    sent = captured[0]
+    assert "Context for this conversation" in sent
+    assert "Phase: Build" in sent
+    assert "what next?" in sent
+    assert session.pending_context == []
+    assert session.history[-1][0] == "what next?"
+
+    # A second send should not re-wrap with the (now consumed) context.
+    session.send("anything else?")
+    second_sent = captured[1]
+    assert "Context for this conversation" not in second_sent

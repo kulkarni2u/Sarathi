@@ -249,6 +249,36 @@ def test_task_completion_posts_chat_event(persistence, tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_context_command_attaches_task_status_and_reports_missing(persistence, monkeypatch):
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            for ch in "/context t-1":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            messages = app.screen.query(".chat-msg.system")
+            contents = [str(widget.content) for widget in messages]
+            assert any("t-1" in content for content in contents)
+            assert app.screen.session.pending_context
+
+            for ch in "/context missing":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            messages = app.screen.query(".chat-msg.system")
+            contents = [str(widget.content) for widget in messages]
+            assert any("not found" in content for content in contents)
+
+    asyncio.run(scenario())
+
+
 def test_model_command_lists_and_switches_provider(persistence, monkeypatch):
     def fake_which(name):
         return f"/usr/bin/{name}" if name in ("claude", "codex") else None

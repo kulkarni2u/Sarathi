@@ -218,6 +218,22 @@ class ChatSession:
         self.provider: tuple[str, str] | None = None
         self.claude_session_id: str | None = None
         self.history: list[tuple[str, str]] = []
+        self.pending_context: list[str] = []
+
+    def add_context(self, label: str, text: str) -> None:
+        """Queue `text` (under `label`) to be sent with the next message."""
+        self.pending_context.append(f"{label}:\n{text}")
+
+    def _consume_context(self, message: str) -> str:
+        """Wrap `message` with any pending context, clearing the queue.
+
+        Returns `message` unchanged when there is no pending context.
+        """
+        if not self.pending_context:
+            return message
+        joined = "\n\n".join(self.pending_context)
+        self.pending_context = []
+        return f"Context for this conversation:\n\n{joined}\n\nUser message: {message}"
 
     def resolve_provider(self) -> tuple[str, str] | None:
         """Locate the first available agent CLI as a (name, path) pair."""
@@ -255,12 +271,13 @@ class ChatSession:
         provider = self.resolve_provider()
         if provider is None:
             return NO_PROVIDER_HELP
+        resolved = self._consume_context(message)
         name, path = provider
         try:
             if name == "claude":
-                reply = self._send_claude(path, message)
+                reply = self._send_claude(path, resolved)
             else:
-                reply = self._send_one_shot(name, path, message)
+                reply = self._send_one_shot(name, path, resolved)
         except subprocess.TimeoutExpired:
             return f"{name} timed out after {self.timeout}s."
         except OSError as exc:
@@ -285,16 +302,28 @@ class ChatSession:
             if on_text is not None and reply:
                 on_text(reply)
             return reply
+        resolved = self._consume_context(message)
         name, path = provider
         try:
-            return self._send_claude_streaming(path, message, on_text)
+            return self._send_claude_streaming(path, message, resolved, on_text)
         except OSError as exc:
             return f"Could not start {name}: {exc}"
 
     def _send_claude_streaming(
-        self, path: str, message: str, on_text: Callable[[str], None] | None
+        self,
+        path: str,
+        original_message: str,
+        message: str,
+        on_text: Callable[[str], None] | None,
     ) -> str:
-        command = [path, "-p", "--output-format", "stream-json", "--verbose"]
+        command = [
+            path,
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+        ]
         if self.claude_session_id:
             command.extend(["--resume", self.claude_session_id])
         deadline = time.monotonic() + self.timeout
@@ -311,6 +340,7 @@ class ChatSession:
         session_id: str | None = None
         is_error = False
         timed_out = False
+        saw_delta = False
         try:
             if proc.stdin is not None:
                 try:
@@ -337,13 +367,32 @@ class ChatSession:
                         sid = event.get("session_id")
                         if isinstance(sid, str) and sid:
                             session_id = sid
+                    elif event_type == "stream_event":
+                        stream_event = event.get("event")
+                        if not isinstance(stream_event, dict):
+                            continue
+                        if stream_event.get("type") == "content_block_delta":
+                            delta = stream_event.get("delta")
+                            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                                text = delta.get("text")
+                                if isinstance(text, str) and text:
+                                    accumulated += text
+                                    saw_delta = True
+                                    if on_text is not None:
+                                        on_text(accumulated)
+                        # Other stream_event subtypes (message_start, etc.)
+                        # carry no text and are ignored.
                     elif event_type == "assistant":
-                        message_obj = event.get("message") or {}
-                        for block in message_obj.get("content") or []:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                accumulated += str(block.get("text") or "")
-                        if on_text is not None:
-                            on_text(accumulated)
+                        if not saw_delta:
+                            message_obj = event.get("message") or {}
+                            for block in message_obj.get("content") or []:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    accumulated += str(block.get("text") or "")
+                            if on_text is not None:
+                                on_text(accumulated)
+                        # else: assistant events re-deliver the full text
+                        # already streamed via text_delta — ignore to avoid
+                        # doubling.
                     elif event_type == "result":
                         result_text = str(event.get("result") or "")
                         sid = event.get("session_id")
@@ -371,11 +420,21 @@ class ChatSession:
             reply = result_text.strip() or accumulated
             if is_error:
                 return f"claude error: {reply}"
-            self.history.append((message, reply))
+            self.history.append((original_message, reply))
+            return reply
+
+        if not accumulated and proc.returncode not in (0, None):
+            # Older CLIs may reject --include-partial-messages and exit
+            # nonzero without ever producing a result event. Fall back to
+            # the blocking JSON path.
+            reply = self._send_claude(path, message)
+            if on_text is not None and reply:
+                on_text(reply)
+            self.history.append((original_message, reply))
             return reply
 
         reply = accumulated.strip() or "(empty response)"
-        self.history.append((message, reply))
+        self.history.append((original_message, reply))
         return reply
 
     def _send_claude(self, path: str, message: str) -> str:

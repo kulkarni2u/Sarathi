@@ -9,6 +9,7 @@ started elsewhere (CLI, MCP, service) without coordination.
 from __future__ import annotations
 
 import json
+import time
 
 from rich.markup import escape
 from rich.text import Text
@@ -37,6 +38,7 @@ CHAT_HELP = (
     "/run <description>  run a task through the policy-backed lifecycle\n"
     "                    (recent chat context is included automatically)\n"
     "/model [name]       show or switch the agent CLI used for chat\n"
+    "/context [task_id]  attach a task's status to the conversation\n"
     "/tasks              switch to the task panel (Ctrl+T also toggles)\n"
     "/help               show this help\n"
     "/quit               exit Sarathi\n"
@@ -339,8 +341,15 @@ class ChatScreen(Screen):
 
     def _deliver(self, message: str, widget: Static) -> None:
         thread = self.query_one("#chat-thread", VerticalScroll)
+        last_update = 0.0
+        throttle_seconds = 0.05
 
         def on_text(partial: str) -> None:
+            nonlocal last_update
+            now = time.monotonic()
+            if now - last_update < throttle_seconds:
+                return
+            last_update = now
             self.app.call_from_thread(
                 widget.update, f"[bold magenta]sarathi[/]  {escape(partial)}"
             )
@@ -377,12 +386,39 @@ class ChatScreen(Screen):
                     )
         elif command == "/model":
             self._handle_model_command(argument)
+        elif command == "/context":
+            self._handle_context_command(argument)
         elif command == "/help":
             self._system(CHAT_HELP)
         elif command in ("/quit", "/exit"):
             self.app.exit()
         else:
             self._system(f"Unknown command {command}. {CHAT_HELP}")
+
+    def _handle_context_command(self, argument: str) -> None:
+        if not argument:
+            summaries = tui_data.task_summaries(self.app.persistence)
+            if not summaries:
+                self._system("No saved tasks.")
+                return
+            ids = ", ".join(summary["task_id"] for summary in summaries[:10])
+            self._system(f"Usage: /context <task_id>. Available tasks: {ids}")
+            return
+        task_id = argument
+        snapshot = tui_data.status_snapshot(self.app.persistence, task_id)
+        if snapshot is None:
+            summaries = tui_data.task_summaries(self.app.persistence)
+            message = f"Task {task_id} not found."
+            if summaries:
+                ids = ", ".join(summary["task_id"] for summary in summaries[:10])
+                message += f" Available tasks: {ids}"
+            self._system(message)
+            return
+        self.session.add_context(f"Status of task {task_id}", snapshot)
+        self._system(snapshot)
+        self._system(
+            "Added to conversation context — it will be sent with your next message."
+        )
 
     def _handle_model_command(self, argument: str) -> None:
         providers = self.session.available_providers()

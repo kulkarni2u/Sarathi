@@ -607,6 +607,7 @@ class SarathiApp(App):
         width: auto;
         color: $text-muted;
         margin-bottom: 1;
+        text-style: italic;
     }
     #chat-input-home {
         width: 80;
@@ -615,6 +616,7 @@ class SarathiApp(App):
     #chat-provider {
         width: auto;
         margin-top: 1;
+        text-style: italic;
     }
     #chat-active {
         display: none;
@@ -636,6 +638,9 @@ class SarathiApp(App):
     }
     .chat-msg {
         margin-bottom: 1;
+    }
+    .chat-msg.system {
+        text-style: italic;
     }
     #tasks {
         width: 42%;

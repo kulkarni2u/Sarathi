@@ -49,6 +49,8 @@ sarathi tui --task <id>     # open directly in the task panel, with a task pre-s
 - The **detail** pane shows the same supervision snapshot as `sarathi status` (usage, budget, task graph, escalations), per-phase results, and a live tail of the phase transition log.
 - In the task panel, press `n` to launch a new task (description in, complexity auto-detected, runs through the full lifecycle in the background while the panel live-monitors it), `u` to resume the selected task, `p` to review pending policy proposals and accept (`a`) or reject (`x`) them into the discovered policy pack, `r` to force a refresh, and `q` to quit.
 
+**Recommended terminal setup.** The TUI renders in whatever monospace font your terminal emulator is configured with; for the best look, use a free (OFL-licensed) ligature font such as Victor Mono (cursive italics), JetBrains Mono, Fira Code, or Cascadia Code. Enable ligatures where needed — iTerm2 ("Use ligatures"), VS Code (`"terminal.integrated.fontLigatures": true`), and Kitty/Ghostty/Windows Terminal support them out of the box, while Alacritty and macOS Terminal.app do not render ligatures. Sarathi's chat view uses italics for system messages and accents, which render as cursive in Victor Mono or Cascadia Code.
+
 ## MCP Server
 
 Expose Sarathi as an MCP stdio server so MCP clients (Claude Code, Codex, etc.) can run tasks, check status, resume, browse history, and manage policy proposals natively:

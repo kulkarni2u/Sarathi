@@ -33,6 +33,20 @@ python3 -m pip install /path/to/Sarathi
 python3 -m pip install -e .
 ```
 
+## Terminal Dashboard
+
+A Textual-based dashboard for watching runs live, browsing task history, and reviewing policy proposals without leaving the terminal:
+
+```bash
+python3 -m pip install -e ".[tui]"
+sarathi tui                 # open the dashboard
+sarathi tui --task <id>     # open with a task pre-selected
+```
+
+- The **tasks** pane lists persisted tasks from `.sarathi/tasks` with their current phase and last outcome, refreshed every 2 seconds — so it can monitor runs started from the CLI, MCP server, or service.
+- The **detail** pane shows the same supervision snapshot as `sarathi status` (usage, budget, task graph, escalations), per-phase results, and a live tail of the phase transition log.
+- Press `p` to review pending policy proposals and accept (`a`) or reject (`x`) them into the discovered policy pack, `u` to resume the selected task, `r` to force a refresh, and `q` to quit.
+
 ## MCP Server
 
 Expose Sarathi as an MCP stdio server so MCP clients (Claude Code, Codex, etc.) can run tasks, check status, resume, browse history, and manage policy proposals natively:

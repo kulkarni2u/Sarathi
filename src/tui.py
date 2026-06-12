@@ -1,407 +1,324 @@
-from textual.app import App, ComposeResult
-from textual.widget import Widget
-from textual.widgets import Static, Label, Input
-from textual.layout import Layout
-from rich.panel import Panel
-from rich.text import Text
-from typing import List, Dict, Any
-import asyncio
-import sys
-import re
-import json
-from pathlib import Path
-from src.dispatch import DispatchRequest
+"""Sarathi terminal dashboard: live run monitor, task browser, proposal review.
 
-# --- Stellar Constants ---
-SARATHI_ASCII_BANNER = r"""
-  ██████  █████  ██████   █████  ████████ ██   ██ ██
- ██      ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
-  █████  ███████ ██████  ███████    ██    ███████ ██
-      ██ ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
-  ██████ ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
+Launch with `sarathi tui`. The dashboard polls `.sarathi/tasks` on an
+interval, so it can watch runs started elsewhere (CLI, MCP, service)
+without any coordination.
 """
+from __future__ import annotations
 
-SARATHI_TAGLINE = "─── GUIDING SYSTEMS ───────────────────"
+from rich.markup import escape
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.screen import Screen
+from textual.widgets import DataTable, Footer, Header, Log, Static
 
-# --- Utility Functions ---
-
-def get_aesthetic_style(name: str, type: str = "info", is_bold: bool = False) -> str:
-    """Gets a style based on OpenCode's vibrant, dark aesthetic."""
-    styles = {
-        "banner": "cyan on black",
-        "prompt": "bold green",
-        "error": "bold red",
-        "success": "bold green",
-        "phase_name": "bold cyan",
-        "progress": "cyan",
-        "warning": "bold yellow",
-        "info": "cyan",
-        "default": "white",
-    }
-    base_style = styles.get(type, "white")
-    style_parts = list(base_style.split(" "))
-    if is_bold:
-        style_parts.insert(0, "bold")
-    return " ".join(style_parts)
+try:
+    from . import tui_data
+except ImportError:
+    # Support direct execution via sarathi.py, which prepends src/ to sys.path.
+    import tui_data
 
 
-# --- Textual App ---
+def _short(text: object, width: int) -> str:
+    flattened = " ".join(str(text).split())
+    if len(flattened) <= width:
+        return flattened
+    return flattened[: width - 1] + "…"
 
-class SarathiTUI(App):
-    """The main interactive TUI application for Sarathi."""
-    
-    def __init__(self, initial_message: str | None = None, exit_after: bool = False):
+
+def _discover_policy_pack() -> str | None:
+    try:
+        from .cli import discover_policy_pack
+    except ImportError:
+        from cli import discover_policy_pack
+    return discover_policy_pack()
+
+
+class ProposalsScreen(Screen):
+    """Review policy proposals: accept into the policy pack or reject."""
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+        Binding("a", "accept", "Accept"),
+        Binding("x", "reject", "Reject"),
+        Binding("r", "reload", "Reload"),
+    ]
+
+    def __init__(self, persistence) -> None:
         super().__init__()
-        self.output_content = ""
-        self.initial_message = initial_message
-        self.exit_after = exit_after
+        self.persistence = persistence
+        self.proposals: list = []
+        self.selected_id: str | None = None
+        self.decided: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
-        yield Static(SARATHI_ASCII_BANNER)
-        yield Static(SARATHI_TAGLINE)
-        yield Static("""
-Welcome to Sarathi AI Orchestrator!
-
-• Ask general questions (what's today's date, explain X, etc.)
-• For project work, ensure you have a policy pack (run 'sarathi init')
-""", id="output-log")
-        yield Static("> ", id="prompt")
-        yield Input(placeholder="Ask a question or describe a task...")
+        yield Header()
+        yield DataTable(id="proposals")
+        yield Static("Loading proposals…", id="proposal-detail")
+        yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one(Input).focus()
-        
-        # Process initial message after a brief delay to ensure UI is ready
-        if self.initial_message:
-            msg = self.initial_message
-            self.initial_message = None
-            self.call_later(self._process_initial_message, msg)
+        table = self.query_one("#proposals", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("ID", "Risk", "Conf", "Target", "Title", "Decision")
+        self.action_reload()
 
-    def _process_initial_message(self, message: str):
-        """Process initial message after UI is ready."""
-        self.run_workflow(message)
-        if self.exit_after:
-            self.exit(0)
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        message = event.value.strip()
-        if not message:
-            return
-        
-        # Check for exit command
-        if message.lower() in ("exit", "quit", "q", "bye"):
-            self.output_content += "\n👋 Goodbye!"
-            self.query_one("#output-log").update(self.output_content)
-            self.exit(0)
-            return
-        
-        # Clear input
-        event.input.value = ""
-        
-        # Execute workflow
-        self.run_workflow(message)
-
-    def is_generic_question(self, message: str) -> bool:
-        """Classify if message is generic chat vs project task using LLM."""
-        text = message.lower().strip()
-        
-        # Quick heuristic for obvious cases
-        obvious_generic = {"hello", "hi", "hey", "help", "quit", "exit", "q", "bye"}
-        if text in obvious_generic:
-            return True
-        
-        # Try LLM classification
-        try:
-            return self._llm_classify(message)
-        except Exception:
-            # Fallback to pattern-based classification
-            return self._pattern_classify(message)
-
-    def _llm_classify(self, message: str) -> bool:
-        """Classify using lightweight LLM call."""
-        from src.dispatch import LocalDispatcher
-        
-        dispatcher = LocalDispatcher()
-        prompt = f"""Message: "{message}"
-
-Is this a casual conversation/question (generic) or a code/project task (project)?
-Respond with ONE word: generic or project"""
-        
-        request = DispatchRequest(
-            mode="execute",
-            task_id="classify",
-            phase="classify",
-            prompt=prompt,
-            inputs={},
-        )
-        
-        response = dispatcher.dispatch(request)
-        return "generic" in response.outputs.get("content", "").lower()[:20]
-
-    def _pattern_classify(self, message: str) -> bool:
-        """Fallback pattern-based classification."""
-        text = message.lower()
-        generic_patterns = [
-            r"what\s+(is|are|does|do|did|was|were|can)",
-            r"how\s+(do|does|did|can|could|would|should)",
-            r"why\s+",
-            r"explain\s+",
-            r"describe\s+",
-            r"define\s+",
-            r"tell\s+me\s+about",
-            r"who\s+is\s+",
-            r"when\s+did\s+",
-            r"where\s+(is|are|does)",
-            r"\bdate\b",
-            r"\btime\b",
-            r"^hello",
-            r"^hi\s",
-            r"^hey",
-            r"^help",
-        ]
-        project_patterns = [
-            r"\brefactor\b",
-            r"\barchitect\b",
-            r"\bmigrate\b",
-            r"\bredesign\b",
-            r"\b(build|create|implement)\s+",
-            r"\b(fix|debug)\s+",
-            r"\bwrite\s+",
-            r"\bgenerate\s+",
-            r"\badd\s+",
-            r"\bremove\s+",
-            r"\bupdate\s+",
-            r"\btest\s+",
-        ]
-        is_generic = any(re.search(p, text) for p in generic_patterns)
-        is_project = any(re.search(p, text) for p in project_patterns)
-        return is_generic or not is_project
-
-    def run_workflow(self, message: str):
-        """Execute the Sarathi workflow - either chat mode or project mode."""
-        log = self.query_one("#output-log")
-        
-        # Check for exit command first
-        if message.lower() in ("exit", "quit", "q", "bye"):
-            self.output_content += "\n👋 Goodbye!"
-            log.update(self.output_content)
-            self.exit(0)
-            return
-        
-        # Check if it's a generic question FIRST - even if policy pack exists
-        is_generic = self.is_generic_question(message)
-        
-        # Always use chat mode for generic questions (fast, no engine needed)
-        if is_generic:
-            self.run_chat_mode(message, log)
-            return
-        
-        # For project tasks, check for policy pack
-        from src.cli import discover_policy_pack
-        policy_pack = discover_policy_pack()
-        
-        if not policy_pack:
-            self.output_content += """
-⚠️  No policy pack found.
-
-For project work, run: sarathi init <project-path>
-"""
-            log.update(self.output_content)
-            return
-        
-        # Policy pack exists - use full engine for project tasks
-        try:
-            self.run_project_mode(message, policy_pack)
-        except Exception as e:
-            self.output_content += f"\n❌ Error: {str(e)}"
-        
-        log.update(self.output_content)
-
-    def run_chat_mode(self, message: str, log):
-        """Handle generic questions - answer using LLM."""
-        # Try quick responses for obvious cases
-        text = message.lower()
-        
-        if "date" in text and "today" in text:
-            from datetime import datetime
-            today = datetime.now().strftime("%B %d, %Y")
-            self.output_content += f"\n📅 Today's date is: {today}"
-            log.update(self.output_content)
-            return
-        elif "time" in text:
-            from datetime import datetime
-            now = datetime.now().strftime("%I:%M %p")
-            self.output_content += f"\n🕐 Current time: {now}"
-            log.update(self.output_content)
-            return
-        elif any(g in text for g in ["hello", "hi", "hey"]) and len(message.split()) < 3:
-            self.output_content += """
-👋 Hello! I'm Sarathi - your AI orchestration partner.
-
-I can help with:
-• General questions and conversations
-• Project work (with a policy pack)
-
-To work on a project: sarathi init <path>
-"""
-            log.update(self.output_content)
-            return
-        elif text == "help":
-            self.output_content += """
-ℹ️ Sarathi Commands:
-
-  sarathi           - Start interactive chat
-  sarathi init <path> - Initialize a project
-  sarathi run <task> - Run a task through phases
-  sarathi status    - Check task status
-
-Try asking me something!
-"""
-            log.update(self.output_content)
-            return
-        
-        # Use LLM to answer the question
-        self.output_content += f"\n🤖 {message}"
-        log.update(self.output_content)
-        
-        try:
-            answer = self._llm_answer(message)
-            self.output_content += f"\n{answer}"
-        except Exception as e:
-            self.output_content += f"""
-I can answer general questions. For project work,
-set up a policy pack: sarathi init <project-path>
-"""
-        
-        log.update(self.output_content)
-
-    def _llm_answer(self, question: str) -> str:
-        """Get answer from LLM for generic questions."""
-        import os
-        import shutil
-        from src.dispatch import DispatchRequest
-        from src.dispatch import LocalDispatcher
-        from src.storage import connect
-        
-        # Strategy 1: Check OPENAI_API_KEY env var
-        if os.getenv("OPENAI_API_KEY"):
-            provider_config = {"provider": "openai", "model": "gpt-4o"}
-            dispatcher = LocalDispatcher(provider_config=provider_config)
-            
-            prompt = f"""You are a helpful assistant. Answer this question concisely:
-
-Question: {question}
-
-Answer:"""
-            
-            request = DispatchRequest(
-                mode="execute",
-                task_id="answer",
-                phase="answer",
-                prompt=prompt,
-                inputs={},
+    def action_reload(self) -> None:
+        self.proposals = tui_data.load_proposals(self.persistence)
+        table = self.query_one("#proposals", DataTable)
+        table.clear()
+        for proposal in self.proposals:
+            artifact = proposal.to_artifact()
+            table.add_row(
+                artifact["id"],
+                artifact["risk_level"],
+                f"{artifact['confidence']:.2f}",
+                artifact["policy_file"],
+                _short(artifact["title"], 60),
+                self.decided.get(artifact["id"], ""),
+                key=artifact["id"],
             )
-            
-            try:
-                response = dispatcher.dispatch(request)
-                return response.outputs.get("content", "I don't have an answer right now.")
-            except Exception as e:
-                pass
-        
-        # Strategy 2: Try desktop database provider config
-        db_path = Path(".sarathi/sarathi.db")
-        if db_path.exists():
-            try:
-                conn = connect(db_path)
-                row = conn.execute("SELECT config FROM providers WHERE health = 'online' LIMIT 1").fetchone()
-                if row and row["config"]:
-                    provider_config = json.loads(row["config"])
-                    if provider_config.get("path"):
-                        dispatcher = LocalDispatcher(provider_config=provider_config)
-                        
-                        prompt = f"""You are a helpful assistant. Answer this question concisely:
+        if not self.proposals:
+            self.query_one("#proposal-detail", Static).update(
+                "No policy proposals from persisted learnings."
+            )
 
-Question: {question}
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.row_key is None or event.row_key.value is None:
+            return
+        self.selected_id = event.row_key.value
+        self._show_detail()
 
-Answer:"""
-                        
-                        request = DispatchRequest(
-                            mode="execute",
-                            task_id="answer",
-                            phase="answer",
-                            prompt=prompt,
-                            inputs={},
-                        )
-                        
-                        try:
-                            response = dispatcher.dispatch(request)
-                            return response.outputs.get("content", "I don't have an answer right now.")
-                        except Exception:
-                            pass
-                conn.close()
-            except Exception:
-                pass
-        
-        # Strategy 3: Try available CLI tools (claude, opencode, codex)
-        cli_tools = [("claude", ["-p", "--print"]), ("opencode", []), ("codex", ["--print"])]
-        for tool, args in cli_tools:
-            if shutil.which(tool):
-                try:
-                    import subprocess as sp
-                    result = sp.run(
-                        [tool] + args + [question],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
-                    if result.returncode == 0 and result.stdout:
-                        return result.stdout.strip()[:500]
-                except Exception:
-                    continue
-        
-        # No provider available
-        return """No LLM provider available. To enable AI answers:
+    def _selected_proposal(self):
+        for proposal in self.proposals:
+            if proposal.proposal_id == self.selected_id:
+                return proposal
+        return None
 
-  • Set OPENAI_API_KEY env var: export OPENAI_API_KEY=your-key
-  • Or install a CLI tool: Claude, OpenCode, or Codex
-  • Or run 'sarathi init <project>' for project mode"""
+    def _show_detail(self) -> None:
+        proposal = self._selected_proposal()
+        detail = self.query_one("#proposal-detail", Static)
+        if proposal is None:
+            detail.update("")
+            return
+        artifact = proposal.to_artifact()
+        lines = [
+            f"[b]{escape(artifact['title'])}[/b]",
+            "Target: {}   Kind: {}   Risk: {}   Confidence: {:.2f}".format(
+                escape(artifact["policy_file"]),
+                escape(artifact["proposal_kind"]),
+                escape(artifact["risk_level"]),
+                artifact["confidence"],
+            ),
+            "",
+            f"Rationale: {escape(artifact['rationale'])}",
+            "",
+            "Suggested change:",
+            escape(artifact["suggested_change"]),
+            "",
+            "Evidence: " + escape(", ".join(artifact["evidence_refs"]) or "none"),
+        ]
+        decision = self.decided.get(artifact["id"])
+        if decision:
+            lines.insert(0, f"[reverse] {escape(decision)} [/reverse]")
+        detail.update("\n".join(lines))
 
-    def run_project_mode(self, message: str, policy_pack: str):
-        """Execute full Sarathi workflow with policy pack."""
-        from src.engine import Engine, TaskContext, Complexity
-        
-        # Auto-calculate complexity
-        complexity = Complexity.MEDIUM
-        text = message.lower()
-        high_patterns = [r'\b(architect|architecture|refactor|migrate|redesign)\b', r'\b(new\s+feature)\b']
-        low_patterns = [r'\b(fix|bug|typo|simple)\b']
-        if any(p in text for p in high_patterns):
-            complexity = Complexity.HIGH
-        elif any(p in text for p in low_patterns):
-            complexity = Complexity.LOW
-        
-        self.output_content += f"\n⚙️ Running: {message}"
-        self.output_content += f"\n   Complexity: {complexity.value}"
-        
-        # Create engine and run task
-        engine = Engine(policy_pack_path=policy_pack, enforce_preflight=False)
-        task = TaskContext(
-            task_id=engine.generate_task_id(message),
-            description=message,
-            complexity=complexity,
+    def action_accept(self) -> None:
+        self._decide(accept=True)
+
+    def action_reject(self) -> None:
+        self._decide(accept=False)
+
+    def _decide(self, *, accept: bool) -> None:
+        proposal = self._selected_proposal()
+        if proposal is None:
+            self.notify("No proposal selected.", severity="warning")
+            return
+        policy_pack = _discover_policy_pack()
+        if not policy_pack:
+            self.notify(
+                "No policy pack found — run `sarathi init` first.", severity="error"
+            )
+            return
+        decision = tui_data.decide_proposal(
+            proposal, accept=accept, policy_pack=policy_pack
         )
-        
-        result = engine.run_task(task)
-        
-        self.output_content += f"\n✅ Completed ({len(result.phase_results)} phases)"
-        
-        # Show final outcome from last phase
-        if result.phase_results:
-            last = result.phase_results[-1]
-            self.output_content += f"\n   → {last.outcome[:100]}"
+        self.decided[decision["id"]] = decision["status"]
+        if accept:
+            self.notify(f"Accepted {decision['id']} -> {decision['policy_file']}")
+        else:
+            self.notify(f"Rejected {decision['id']}")
+        self.action_reload()
+        self._show_detail()
 
 
-def launch_sarathi_tui(initial_message: str | None = None, exit_after: bool = False) -> None:
-    """Launches the Sarathi TUI application."""
-    app = SarathiTUI(initial_message, exit_after)
-    app.run()
+class SarathiDashboard(App):
+    """Task browser, live run monitor, and proposal review for Sarathi."""
+
+    TITLE = "Sarathi"
+    SUB_TITLE = "harness dashboard"
+
+    CSS = """
+    #tasks {
+        width: 42%;
+        border-right: solid $primary;
+    }
+    #detail {
+        width: 1fr;
+    }
+    #snapshot {
+        padding: 0 1;
+        height: auto;
+        max-height: 50%;
+        overflow-y: auto;
+    }
+    #phases {
+        height: auto;
+        max-height: 12;
+    }
+    #log {
+        height: 1fr;
+        border-top: solid $primary;
+    }
+    #proposals {
+        height: 40%;
+    }
+    #proposal-detail {
+        padding: 1;
+        height: 1fr;
+        overflow-y: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("p", "proposals", "Proposals"),
+        Binding("u", "resume", "Resume task"),
+    ]
+
+    def __init__(
+        self,
+        persistence=None,
+        task_id: str | None = None,
+        refresh_interval: float = 2.0,
+    ) -> None:
+        super().__init__()
+        self.persistence = (
+            persistence if persistence is not None else tui_data.default_persistence()
+        )
+        self.selected_task_id = task_id
+        self.refresh_interval = refresh_interval
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal():
+            yield DataTable(id="tasks")
+            with Vertical(id="detail"):
+                yield Static("No task selected.", id="snapshot")
+                yield DataTable(id="phases")
+                yield Log(id="log")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        tasks = self.query_one("#tasks", DataTable)
+        tasks.cursor_type = "row"
+        tasks.add_columns("Task", "Phase", "Outcome", "Updated")
+        phases = self.query_one("#phases", DataTable)
+        phases.cursor_type = "none"
+        phases.add_columns("Phase", "Agent", "Outcome", "Iter", "Error")
+        self.refresh_data()
+        self.set_interval(self.refresh_interval, self.refresh_data)
+
+    def refresh_data(self) -> None:
+        summaries = tui_data.task_summaries(self.persistence)
+        table = self.query_one("#tasks", DataTable)
+        table.clear()
+        known: set[str] = set()
+        for summary in summaries:
+            known.add(summary["task_id"])
+            table.add_row(
+                _short(summary["task_id"], 20),
+                summary["current_phase"],
+                _short(summary["last_outcome"], 14),
+                str(summary["last_updated"])[:19].replace("T", " "),
+                key=summary["task_id"],
+            )
+        if self.selected_task_id not in known:
+            self.selected_task_id = summaries[0]["task_id"] if summaries else None
+        if self.selected_task_id is not None:
+            table.move_cursor(row=table.get_row_index(self.selected_task_id))
+        self._refresh_detail()
+
+    def _refresh_detail(self) -> None:
+        snapshot = self.query_one("#snapshot", Static)
+        phases = self.query_one("#phases", DataTable)
+        log = self.query_one("#log", Log)
+        phases.clear()
+        log.clear()
+        if self.selected_task_id is None:
+            snapshot.update("No saved tasks. Run `sarathi run \"…\"` first.")
+            return
+        text = tui_data.status_snapshot(self.persistence, self.selected_task_id)
+        snapshot.update(escape(text) if text else f"Task {self.selected_task_id} not found.")
+        for row in tui_data.phase_rows(self.persistence, self.selected_task_id):
+            phases.add_row(
+                row["phase"],
+                row["agent"],
+                row["outcome"],
+                str(row["iterations"]),
+                _short(row["error"], 40),
+            )
+        for line in tui_data.phase_log_tail(self.persistence, self.selected_task_id):
+            log.write_line(tui_data.format_log_line(line))
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "tasks" or event.row_key is None:
+            return
+        value = event.row_key.value
+        if value and value != self.selected_task_id:
+            self.selected_task_id = value
+            self._refresh_detail()
+
+    def action_refresh(self) -> None:
+        self.refresh_data()
+
+    def action_proposals(self) -> None:
+        self.push_screen(ProposalsScreen(self.persistence))
+
+    def action_resume(self) -> None:
+        task_id = self.selected_task_id
+        if task_id is None:
+            self.notify("No task selected.", severity="warning")
+            return
+        policy_pack = _discover_policy_pack()
+        if not policy_pack:
+            self.notify(
+                "No policy pack found — run `sarathi init` first.", severity="error"
+            )
+            return
+        self.notify(f"Resuming {task_id}…")
+        self.run_worker(
+            lambda: self._resume(task_id, policy_pack),
+            thread=True,
+            exclusive=True,
+            group="resume",
+        )
+
+    def _resume(self, task_id: str, policy_pack: str) -> None:
+        try:
+            result = tui_data.resume_task(self.persistence, task_id, policy_pack)
+        except Exception as exc:
+            self.call_from_thread(
+                self.notify, f"Resume failed: {exc}", severity="error"
+            )
+            return
+        phase = result.current_phase.value if result.current_phase else "Completed"
+        self.call_from_thread(self.notify, f"Resumed {task_id}: now at {phase}")
+        self.call_from_thread(self.refresh_data)
+
+
+def launch_sarathi_tui(task_id: str | None = None) -> None:
+    """Launch the Sarathi dashboard."""
+    SarathiDashboard(task_id=task_id).run()

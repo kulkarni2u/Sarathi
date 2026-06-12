@@ -443,6 +443,7 @@ def _show_home() -> None:
 
     print()
     print("  Commands")
+    print("    sarathi tui                                      open the terminal dashboard")
     print("    sarathi desktop                                  launch the desktop stack")
     print("    sarathi reuse                                    inspect workflow templates and playbooks")
     print("    sarathi run \"<task>\" --policy-pack ./policy-pack   orchestrate a task")
@@ -457,16 +458,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="sarathi",
         description="Sarathi - Workflow orchestration framework"
-    )
-    parser.add_argument(
-        "-m", "--message",
-        default=None,
-        help="Initial message to send to the TUI"
-    )
-    parser.add_argument(
-        "-x", "--exit",
-        action="store_true",
-        help="Exit after processing initial message (for testing)"
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -502,8 +493,17 @@ def main() -> None:
         help="Show detailed validation results",
     )
 
-    # Chat command (launches TUI)
-    chat_parser = subparsers.add_parser("chat", help="Start interactive chat mode")
+    # Dashboard command (terminal UI)
+    tui_parser = subparsers.add_parser(
+        "tui",
+        aliases=["dashboard", "chat"],
+        help="Open the terminal dashboard (tasks, phase logs, proposals)",
+    )
+    tui_parser.add_argument(
+        "--task",
+        default=None,
+        help="Task ID to select on launch",
+    )
 
     subparsers.add_parser("desktop", help="Run the local Sarathi desktop stack")
 
@@ -631,20 +631,11 @@ def main() -> None:
     else:
         args = parser.parse_args()
 
-    # Check for stdin input or message argument
-    initial_message = None
-    if args.message:
-        initial_message = args.message
-    elif not sys.stdin.isatty():
-        # Read from stdin if piped
-        initial_message = sys.stdin.read().strip()
-
     if args.command is None:
         _show_home()
         return
-    if args.command == "chat":
-        from src.tui import launch_sarathi_tui
-        launch_sarathi_tui(initial_message, exit_after=args.exit)
+    if args.command in ("tui", "dashboard", "chat"):
+        handle_tui(args)
         return
     if args.command == "desktop":
         handle_desktop(args)
@@ -899,6 +890,21 @@ def handle_run(args: argparse.Namespace) -> None:
             f"| {pr.phase.value:<20} | {phase_agent_name(pr):<12} |"
             f" {pr.outcome:<10} | {pr.iterations:<10} | {gate_status:<8} |"
         )
+
+
+def handle_tui(args: argparse.Namespace) -> None:
+    """Launch the terminal dashboard."""
+    try:
+        import textual  # noqa: F401
+    except ModuleNotFoundError:
+        print("The Sarathi dashboard requires the optional TUI dependencies.")
+        print('Install them with: python3 -m pip install "sarathi[tui]"')
+        raise SystemExit(1)
+    try:
+        from .tui import launch_sarathi_tui
+    except ImportError:
+        from tui import launch_sarathi_tui
+    launch_sarathi_tui(task_id=getattr(args, "task", None))
 
 
 def handle_list_tasks() -> None:

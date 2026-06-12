@@ -9,8 +9,9 @@ import pytest
 
 textual = pytest.importorskip("textual")
 
+from src import tui_data
 from src.engine import Complexity, PersistenceManager, Phase, PhaseResult, TaskContext
-from src.tui import SarathiDashboard
+from src.tui import ChatScreen, SarathiDashboard, TasksScreen
 from textual.widgets import DataTable, Static
 
 
@@ -37,13 +38,14 @@ def test_dashboard_lists_tasks_and_detail(persistence):
     async def scenario():
         app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
         async with app.run_test() as pilot:
+            app.switch_mode("tasks")
             await pilot.pause()
-            tasks = app.query_one("#tasks", DataTable)
+            tasks = app.screen.query_one("#tasks", DataTable)
             assert tasks.row_count == 1
-            assert app.selected_task_id == "t-1"
-            snapshot = app.query_one("#snapshot", Static)
+            assert app.screen.selected_task_id == "t-1"
+            snapshot = app.screen.query_one("#snapshot", Static)
             assert "t-1" in str(snapshot.content)
-            phases = app.query_one("#phases", DataTable)
+            phases = app.screen.query_one("#phases", DataTable)
             assert phases.row_count == 1
 
     asyncio.run(scenario())
@@ -53,6 +55,8 @@ def test_dashboard_opens_proposals_screen(persistence):
     async def scenario():
         app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
         async with app.run_test() as pilot:
+            app.switch_mode("tasks")
+            await pilot.pause()
             await pilot.press("p")
             await pilot.pause()
             detail = app.screen.query_one("#proposal-detail", Static)
@@ -74,6 +78,8 @@ def test_dashboard_new_task_screen_opens_and_cancels(persistence, tmp_path, monk
     async def scenario():
         app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
         async with app.run_test() as pilot:
+            app.switch_mode("tasks")
+            await pilot.pause()
             await pilot.press("n")
             await pilot.pause()
             assert isinstance(app.screen, NewTaskScreen)
@@ -89,9 +95,72 @@ def test_dashboard_empty_state(tmp_path):
         manager = PersistenceManager(str(tmp_path / "empty-tasks"))
         app = SarathiDashboard(persistence=manager, refresh_interval=60.0)
         async with app.run_test() as pilot:
+            app.switch_mode("tasks")
             await pilot.pause()
-            assert app.selected_task_id is None
-            snapshot = app.query_one("#snapshot", Static)
+            assert app.screen.selected_task_id is None
+            snapshot = app.screen.query_one("#snapshot", Static)
             assert "No saved tasks" in str(snapshot.content)
+
+    asyncio.run(scenario())
+
+
+def test_chat_is_default_mode(persistence):
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, ChatScreen)
+            assert not app.screen.has_class("-started")
+
+    asyncio.run(scenario())
+
+
+def test_chat_submit_message_gets_reply(persistence, monkeypatch):
+    monkeypatch.setattr(tui_data.ChatSession, "send", lambda self, m: f"echo: {m}")
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press(*"hi")
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app.screen.has_class("-started")
+            messages = app.screen.query(".chat-msg")
+            contents = [str(widget.content) for widget in messages]
+            assert any("hi" in content for content in contents if "you" in content)
+            assert any("echo: hi" in content for content in contents)
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_t_toggles_chat_and_tasks(persistence):
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, ChatScreen)
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            assert isinstance(app.screen, TasksScreen)
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            assert isinstance(app.screen, ChatScreen)
+
+    asyncio.run(scenario())
+
+
+def test_slash_tasks_command_switches_mode(persistence):
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for ch in "/tasks":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, TasksScreen)
 
     asyncio.run(scenario())

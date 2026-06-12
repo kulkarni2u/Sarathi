@@ -183,3 +183,93 @@ def test_start_task_blocked_preflight_raises(persistence, tmp_path):
 def test_resume_task_missing_raises(persistence):
     with pytest.raises(ValueError):
         tui_data.resume_task(persistence, "missing", "policy-pack")
+
+
+def test_chat_session_no_provider(monkeypatch):
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
+
+    session = tui_data.ChatSession()
+    reply = session.send("hello")
+
+    assert "No agent CLI" in reply
+
+
+def test_chat_session_claude_session_continuity(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    calls = []
+
+    class FakeCompleted:
+        def __init__(self, stdout):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return FakeCompleted(
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "hi there",
+                    "session_id": "sess-1",
+                    "is_error": False,
+                }
+            )
+        )
+
+    monkeypatch.setattr(tui_data.subprocess, "run", fake_run)
+
+    session = tui_data.ChatSession()
+
+    first_reply = session.send("hello")
+    assert first_reply == "hi there"
+    assert "--resume" not in calls[0]
+
+    second_reply = session.send("again")
+    assert second_reply == "hi there"
+    assert "--resume" in calls[1]
+    assert "sess-1" in calls[1]
+
+    assert len(session.history) == 2
+
+
+def test_chat_session_history_prompt():
+    session = tui_data.ChatSession()
+
+    assert session._prompt_with_history("q2") == "q2"
+
+    session.history = [("q1", "a1")]
+    prompt = session._prompt_with_history("q2")
+    assert "q1" in prompt
+    assert "a1" in prompt
+    assert "q2" in prompt
+
+
+def test_chat_session_claude_error_envelope(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    class FakeCompleted:
+        def __init__(self, stdout):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    def fake_run(command, **kwargs):
+        return FakeCompleted(
+            json.dumps({"type": "result", "result": "boom", "is_error": True})
+        )
+
+    monkeypatch.setattr(tui_data.subprocess, "run", fake_run)
+
+    session = tui_data.ChatSession()
+    reply = session.send("hello")
+
+    assert "claude error" in reply
+    assert "boom" in reply

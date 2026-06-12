@@ -33,19 +33,21 @@ python3 -m pip install /path/to/Sarathi
 python3 -m pip install -e .
 ```
 
-## Terminal Dashboard
+## Terminal UI
 
-A Textual-based dashboard for watching runs live, browsing task history, and reviewing policy proposals without leaving the terminal:
+A Textual-based, chat-first terminal UI for talking to an agent, watching runs live, browsing task history, and reviewing policy proposals without leaving the terminal:
 
 ```bash
 python3 -m pip install -e ".[tui]"
-sarathi tui                 # open the dashboard
-sarathi tui --task <id>     # open with a task pre-selected
+sarathi tui                 # open the chat prompt
+sarathi tui --task <id>     # open directly in the task panel, with a task pre-selected
 ```
+
+`sarathi tui` opens a centered chat prompt (OpenCode-style). Your first message docks the conversation to the bottom of the screen. Chat is sent to the first agent CLI found on PATH — `claude` (with true session continuity via `--resume`), then `opencode`, then `codex` — falling back to a help message if none is installed. Slash commands: `/run <task>` launches a task through the policy-backed lifecycle, `/tasks` switches to the task panel, `/help` shows this help, and `/quit` exits. `Ctrl+T` toggles between the chat view and the task panel at any time.
 
 - The **tasks** pane lists persisted tasks from `.sarathi/tasks` with their current phase and last outcome, refreshed every 2 seconds — so it can monitor runs started from the CLI, MCP server, or service.
 - The **detail** pane shows the same supervision snapshot as `sarathi status` (usage, budget, task graph, escalations), per-phase results, and a live tail of the phase transition log.
-- Press `n` to launch a new task (description in, complexity auto-detected, runs through the full lifecycle in the background while the dashboard live-monitors it), `u` to resume the selected task, `p` to review pending policy proposals and accept (`a`) or reject (`x`) them into the discovered policy pack, `r` to force a refresh, and `q` to quit.
+- In the task panel, press `n` to launch a new task (description in, complexity auto-detected, runs through the full lifecycle in the background while the panel live-monitors it), `u` to resume the selected task, `p` to review pending policy proposals and accept (`a`) or reject (`x`) them into the discovered policy pack, `r` to force a refresh, and `q` to quit.
 
 ## MCP Server
 

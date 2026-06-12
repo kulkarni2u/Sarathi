@@ -8,6 +8,9 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -177,6 +180,116 @@ def start_task(
             f" ({preflight.get('todo', 0)} TODO, {preflight.get('drift', 0)} drift)"
         )
     return engine.run_task(task)
+
+
+NO_PROVIDER_HELP = (
+    "No agent CLI found on PATH (looked for: claude, opencode, codex).\n"
+    "Install one to chat, or use the task panel (Ctrl+T) to run policy-backed tasks."
+)
+
+
+class ChatSession:
+    """Multi-turn chat backed by an agent CLI on PATH.
+
+    Prefers `claude` (true session continuity via --resume); falls back to
+    `opencode`/`codex` with recent history folded into the prompt. Free-form
+    chat deliberately bypasses the phase-prompt scaffolding the engine uses
+    for lifecycle dispatches.
+    """
+
+    PROVIDERS = ("claude", "opencode", "codex")
+    HISTORY_TURNS = 6
+
+    def __init__(self, workspace_root: str | None = None, timeout: int = 180):
+        self.workspace_root = workspace_root or os.getcwd()
+        self.timeout = timeout
+        self.provider: tuple[str, str] | None = None
+        self.claude_session_id: str | None = None
+        self.history: list[tuple[str, str]] = []
+
+    def resolve_provider(self) -> tuple[str, str] | None:
+        """Locate the first available agent CLI as a (name, path) pair."""
+        if self.provider is None:
+            for name in self.PROVIDERS:
+                path = shutil.which(name)
+                if path:
+                    self.provider = (name, path)
+                    break
+        return self.provider
+
+    def send(self, message: str) -> str:
+        provider = self.resolve_provider()
+        if provider is None:
+            return NO_PROVIDER_HELP
+        name, path = provider
+        try:
+            if name == "claude":
+                reply = self._send_claude(path, message)
+            else:
+                reply = self._send_one_shot(name, path, message)
+        except subprocess.TimeoutExpired:
+            return f"{name} timed out after {self.timeout}s."
+        except OSError as exc:
+            return f"Could not start {name}: {exc}"
+        self.history.append((message, reply))
+        return reply
+
+    def _send_claude(self, path: str, message: str) -> str:
+        command = [path, "-p", "--output-format", "json"]
+        if self.claude_session_id:
+            command.extend(["--resume", self.claude_session_id])
+        completed = subprocess.run(
+            command,
+            input=message,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+            cwd=self.workspace_root,
+        )
+        try:
+            envelope = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            envelope = None
+        if isinstance(envelope, dict):
+            session_id = envelope.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                self.claude_session_id = session_id
+            text = str(envelope.get("result") or "").strip()
+            if envelope.get("is_error"):
+                return f"claude error: {text or (completed.stderr or '').strip()}"
+            if text:
+                return text
+        if completed.returncode != 0:
+            detail = (completed.stderr or "").strip()[:400]
+            return f"claude exited with {completed.returncode}: {detail}"
+        return (completed.stdout or "").strip() or "(empty response)"
+
+    def _send_one_shot(self, name: str, path: str, message: str) -> str:
+        if name == "opencode":
+            command = [path, "run", "--", self._prompt_with_history(message)]
+        else:
+            command = [path, "exec", self._prompt_with_history(message)]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+            cwd=self.workspace_root,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or "").strip()[:400]
+            return f"{name} exited with {completed.returncode}: {detail}"
+        return (completed.stdout or "").strip() or "(empty response)"
+
+    def _prompt_with_history(self, message: str) -> str:
+        if not self.history:
+            return message
+        lines = ["Continue this conversation. Reply to the final user message only."]
+        for user, assistant in self.history[-self.HISTORY_TURNS:]:
+            lines.append(f"User: {user}")
+            lines.append(f"Assistant: {assistant}")
+        lines.append(f"User: {message}")
+        return "\n".join(lines)
 
 
 def resume_task(

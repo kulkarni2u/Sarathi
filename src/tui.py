@@ -1,8 +1,10 @@
-"""Sarathi terminal dashboard: live run monitor, task browser, proposal review.
+"""Sarathi terminal UI: chat-first home with a task dashboard mode.
 
-Launch with `sarathi tui`. The dashboard polls `.sarathi/tasks` on an
-interval, so it can watch runs started elsewhere (CLI, MCP, service)
-without any coordination.
+`sarathi tui` opens a centered chat prompt. The first message docks the
+conversation to the bottom of the screen; Ctrl+T flips between the chat
+view and the task panel (run monitor, task browser, proposal review) at
+any time. The task panel polls `.sarathi/tasks`, so it can watch runs
+started elsewhere (CLI, MCP, service) without coordination.
 """
 from __future__ import annotations
 
@@ -12,7 +14,7 @@ from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
@@ -23,12 +25,21 @@ except ImportError:
     import tui_data
 
 
-def _short(text: object, width: int) -> str:
-    flattened = " ".join(str(text).split())
-    if len(flattened) <= width:
-        return flattened
-    return flattened[: width - 1] + "…"
+SARATHI_BANNER = r"""
+ ██████  █████  ██████   █████  ████████ ██   ██ ██
+██      ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
+ █████  ███████ ██████  ███████    ██    ███████ ██
+     ██ ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
+ ██████ ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
+"""
 
+CHAT_HELP = (
+    "/run <description>  run a task through the policy-backed lifecycle\n"
+    "/tasks              switch to the task panel (Ctrl+T also toggles)\n"
+    "/help               show this help\n"
+    "/quit               exit Sarathi\n"
+    "Anything else is sent to the agent CLI as conversation."
+)
 
 _OUTCOME_STYLES = {
     "pass": "green",
@@ -57,8 +68,15 @@ def _styled_phase(current_phase: str) -> Text:
     return Text(current_phase, style="bold cyan")
 
 
+def _short(text: object, width: int) -> str:
+    flattened = " ".join(str(text).split())
+    if len(flattened) <= width:
+        return flattened
+    return flattened[: width - 1] + "…"
+
+
 def _format_snapshot(text: str) -> str:
-    """Dim the field labels in a `sarathi status` snapshot, keep values plain."""
+    """Highlight the field labels in a `sarathi status` snapshot."""
     lines = []
     for line in text.splitlines():
         key, sep, rest = line.partition(":")
@@ -244,13 +262,295 @@ class ProposalsScreen(Screen):
         self._show_detail()
 
 
-class SarathiDashboard(App):
-    """Task browser, live run monitor, and proposal review for Sarathi."""
+class ChatScreen(Screen):
+    """Chat-first home: centered prompt that docks once conversation starts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.session = tui_data.ChatSession()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="chat-home"):
+            yield Static(SARATHI_BANNER, id="chat-banner")
+            yield Static("─── guiding systems ───", id="chat-tagline")
+            yield Input(
+                placeholder="Ask anything — or /run <task>, /tasks, /help",
+                id="chat-input-home",
+            )
+            yield Static("", id="chat-provider")
+        with Vertical(id="chat-active"):
+            yield VerticalScroll(id="chat-thread")
+            yield Input(
+                placeholder="Message — /run <task>, /tasks, /help",
+                id="chat-input",
+            )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        provider = self.session.resolve_provider()
+        if provider:
+            status = f"model: {provider[0]} ({provider[1]})"
+        else:
+            status = "no agent CLI on PATH (claude/opencode/codex) — tasks still run via Ctrl+T"
+        self.query_one("#chat-provider", Static).update(f"[dim]{escape(status)}[/dim]")
+        self.query_one("#chat-input-home", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        message = event.value.strip()
+        event.input.value = ""
+        if not message:
+            return
+        if message.startswith("/"):
+            self._handle_command(message)
+            return
+        self._activate_thread()
+        self._append("you", message)
+        pending = self._append("sarathi", "thinking…", pending=True)
+        self.run_worker(
+            lambda: self._deliver(message, pending),
+            thread=True,
+            exclusive=True,
+            group="chat",
+        )
+
+    def _activate_thread(self) -> None:
+        """Dock the conversation: hide the centered home, focus the bottom input."""
+        if not self.has_class("-started"):
+            self.add_class("-started")
+        self.query_one("#chat-input", Input).focus()
+
+    def _append(self, role: str, text: str, *, pending: bool = False) -> Static:
+        thread = self.query_one("#chat-thread", VerticalScroll)
+        label = "[bold cyan]you[/]" if role == "you" else "[bold magenta]sarathi[/]"
+        body = f"[dim]{escape(text)}[/dim]" if pending else escape(text)
+        widget = Static(f"{label}  {body}", classes=f"chat-msg {role}")
+        thread.mount(widget)
+        thread.scroll_end(animate=False)
+        return widget
+
+    def _system(self, text: str) -> None:
+        self._activate_thread()
+        thread = self.query_one("#chat-thread", VerticalScroll)
+        thread.mount(Static(f"[dim]{escape(text)}[/dim]", classes="chat-msg system"))
+        thread.scroll_end(animate=False)
+
+    def _deliver(self, message: str, widget: Static) -> None:
+        reply = self.session.send(message)
+        self.app.call_from_thread(
+            widget.update, f"[bold magenta]sarathi[/]  {escape(reply)}"
+        )
+        self.app.call_from_thread(
+            self.query_one("#chat-thread", VerticalScroll).scroll_end
+        )
+
+    def _handle_command(self, message: str) -> None:
+        command, _, argument = message.partition(" ")
+        command = command.lower()
+        argument = argument.strip()
+        if command in ("/tasks", "/panel"):
+            self.app.action_toggle_mode()
+        elif command == "/run":
+            if not argument:
+                self._system("Usage: /run <task description>")
+            elif self.app.launch_task(argument):
+                self._system(
+                    f"Launched task: {argument} — watch it in the task panel (Ctrl+T)."
+                )
+        elif command == "/help":
+            self._system(CHAT_HELP)
+        elif command in ("/quit", "/exit"):
+            self.app.exit()
+        else:
+            self._system(f"Unknown command {command}. {CHAT_HELP}")
+
+
+class TasksScreen(Screen):
+    """Task panel: live run monitor, task browser, proposal review."""
+
+    BINDINGS = [
+        Binding("q", "app.quit", "Quit"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("n", "new_task", "New task"),
+        Binding("p", "proposals", "Proposals"),
+        Binding("u", "resume", "Resume task"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.selected_task_id: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal():
+            yield DataTable(id="tasks")
+            with Vertical(id="detail"):
+                yield Static("No task selected.", id="snapshot")
+                yield DataTable(id="phases")
+                yield RichLog(id="log")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.selected_task_id = self.app.initial_task_id
+        tasks = self.query_one("#tasks", DataTable)
+        tasks.cursor_type = "row"
+        tasks.add_columns("Task", "Phase", "Outcome", "Updated")
+        phases = self.query_one("#phases", DataTable)
+        phases.cursor_type = "none"
+        phases.add_columns("Phase", "Agent", "Outcome", "Iter", "Error")
+        self.refresh_data()
+        self.set_interval(self.app.refresh_interval, self.refresh_data)
+
+    def refresh_data(self) -> None:
+        summaries = tui_data.task_summaries(self.app.persistence)
+        table = self.query_one("#tasks", DataTable)
+        table.clear()
+        known: set[str] = set()
+        for summary in summaries:
+            known.add(summary["task_id"])
+            table.add_row(
+                _short(summary["task_id"], 20),
+                _styled_phase(summary["current_phase"]),
+                _styled(_short(summary["last_outcome"], 14), _OUTCOME_STYLES),
+                Text(str(summary["last_updated"])[5:16].replace("T", " "), style="dim"),
+                key=summary["task_id"],
+            )
+        if self.selected_task_id not in known:
+            self.selected_task_id = summaries[0]["task_id"] if summaries else None
+        if self.selected_task_id is not None:
+            table.move_cursor(row=table.get_row_index(self.selected_task_id))
+        self._refresh_detail()
+
+    def _refresh_detail(self) -> None:
+        snapshot = self.query_one("#snapshot", Static)
+        phases = self.query_one("#phases", DataTable)
+        log = self.query_one("#log", RichLog)
+        phases.clear()
+        log.clear()
+        if self.selected_task_id is None:
+            snapshot.update("No saved tasks. Run `sarathi run \"…\"` first.")
+            return
+        text = tui_data.status_snapshot(self.app.persistence, self.selected_task_id)
+        snapshot.update(
+            _format_snapshot(text) if text else f"Task {self.selected_task_id} not found."
+        )
+        for row in tui_data.phase_rows(self.app.persistence, self.selected_task_id):
+            phases.add_row(
+                Text(row["phase"], style="bold"),
+                row["agent"],
+                _styled(row["outcome"], _OUTCOME_STYLES),
+                str(row["iterations"]),
+                Text(_short(row["error"], 40), style="red"),
+            )
+        for line in tui_data.phase_log_tail(self.app.persistence, self.selected_task_id):
+            log.write(_styled_log_line(line))
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "tasks" or event.row_key is None:
+            return
+        value = event.row_key.value
+        if value and value != self.selected_task_id:
+            self.selected_task_id = value
+            self._refresh_detail()
+
+    def action_refresh(self) -> None:
+        self.refresh_data()
+
+    def action_proposals(self) -> None:
+        self.app.push_screen(ProposalsScreen(self.app.persistence))
+
+    def action_new_task(self) -> None:
+        def on_result(description: str | None) -> None:
+            if description:
+                self.app.launch_task(description)
+
+        self.app.push_screen(NewTaskScreen(), on_result)
+
+    def action_resume(self) -> None:
+        task_id = self.selected_task_id
+        if task_id is None:
+            self.notify("No task selected.", severity="warning")
+            return
+        policy_pack = _discover_policy_pack()
+        if not policy_pack:
+            self.notify(
+                "No policy pack found — run `sarathi init` first.", severity="error"
+            )
+            return
+        self.notify(f"Resuming {task_id}…")
+        self.run_worker(
+            lambda: self._resume(task_id, policy_pack),
+            thread=True,
+            exclusive=True,
+            group="resume",
+        )
+
+    def _resume(self, task_id: str, policy_pack: str) -> None:
+        try:
+            result = tui_data.resume_task(self.app.persistence, task_id, policy_pack)
+        except Exception as exc:
+            self.app.call_from_thread(
+                self.notify, f"Resume failed: {exc}", severity="error"
+            )
+            return
+        phase = result.current_phase.value if result.current_phase else "Completed"
+        self.app.call_from_thread(self.notify, f"Resumed {task_id}: now at {phase}")
+        self.app.call_from_thread(self.refresh_data)
+
+
+class SarathiApp(App):
+    """Chat-first Sarathi terminal UI with a toggleable task panel."""
 
     TITLE = "Sarathi"
-    SUB_TITLE = "harness dashboard"
+    SUB_TITLE = "guiding systems"
+
+    MODES = {"chat": ChatScreen, "tasks": TasksScreen}
+
+    BINDINGS = [
+        Binding("ctrl+t", "toggle_mode", "Chat/Tasks", priority=True),
+    ]
 
     CSS = """
+    #chat-home {
+        align: center middle;
+    }
+    #chat-banner {
+        width: auto;
+        color: $primary;
+    }
+    #chat-tagline {
+        width: auto;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #chat-input-home {
+        width: 80;
+        max-width: 90%;
+    }
+    #chat-provider {
+        width: auto;
+        margin-top: 1;
+    }
+    #chat-active {
+        display: none;
+        height: 1fr;
+    }
+    ChatScreen.-started #chat-home {
+        display: none;
+    }
+    ChatScreen.-started #chat-active {
+        display: block;
+    }
+    #chat-thread {
+        height: 1fr;
+        padding: 1 2;
+    }
+    #chat-input {
+        dock: bottom;
+        margin: 0 1 1 1;
+    }
+    .chat-msg {
+        margin-bottom: 1;
+    }
     #tasks {
         width: 42%;
         border-right: solid $primary;
@@ -292,14 +592,6 @@ class SarathiDashboard(App):
     }
     """
 
-    BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("r", "refresh", "Refresh"),
-        Binding("n", "new_task", "New task"),
-        Binding("p", "proposals", "Proposals"),
-        Binding("u", "resume", "Resume task"),
-    ]
-
     def __init__(
         self,
         persistence=None,
@@ -310,106 +602,31 @@ class SarathiDashboard(App):
         self.persistence = (
             persistence if persistence is not None else tui_data.default_persistence()
         )
-        self.selected_task_id = task_id
+        self.initial_task_id = task_id
         self.refresh_interval = refresh_interval
 
-    def compose(self) -> ComposeResult:
-        yield Header()
-        with Horizontal():
-            yield DataTable(id="tasks")
-            with Vertical(id="detail"):
-                yield Static("No task selected.", id="snapshot")
-                yield DataTable(id="phases")
-                yield RichLog(id="log")
-        yield Footer()
-
     def on_mount(self) -> None:
-        tasks = self.query_one("#tasks", DataTable)
-        tasks.cursor_type = "row"
-        tasks.add_columns("Task", "Phase", "Outcome", "Updated")
-        phases = self.query_one("#phases", DataTable)
-        phases.cursor_type = "none"
-        phases.add_columns("Phase", "Agent", "Outcome", "Iter", "Error")
-        self.refresh_data()
-        self.set_interval(self.refresh_interval, self.refresh_data)
+        # Opening with --task means the user wants the panel, not the chat.
+        self.switch_mode("tasks" if self.initial_task_id else "chat")
 
-    def refresh_data(self) -> None:
-        summaries = tui_data.task_summaries(self.persistence)
-        table = self.query_one("#tasks", DataTable)
-        table.clear()
-        known: set[str] = set()
-        for summary in summaries:
-            known.add(summary["task_id"])
-            table.add_row(
-                _short(summary["task_id"], 20),
-                _styled_phase(summary["current_phase"]),
-                _styled(_short(summary["last_outcome"], 14), _OUTCOME_STYLES),
-                Text(str(summary["last_updated"])[5:16].replace("T", " "), style="dim"),
-                key=summary["task_id"],
-            )
-        if self.selected_task_id not in known:
-            self.selected_task_id = summaries[0]["task_id"] if summaries else None
-        if self.selected_task_id is not None:
-            table.move_cursor(row=table.get_row_index(self.selected_task_id))
-        self._refresh_detail()
+    def action_toggle_mode(self) -> None:
+        self.switch_mode("tasks" if self.current_mode == "chat" else "chat")
 
-    def _refresh_detail(self) -> None:
-        snapshot = self.query_one("#snapshot", Static)
-        phases = self.query_one("#phases", DataTable)
-        log = self.query_one("#log", RichLog)
-        phases.clear()
-        log.clear()
-        if self.selected_task_id is None:
-            snapshot.update("No saved tasks. Run `sarathi run \"…\"` first.")
-            return
-        text = tui_data.status_snapshot(self.persistence, self.selected_task_id)
-        snapshot.update(
-            _format_snapshot(text) if text else f"Task {self.selected_task_id} not found."
-        )
-        for row in tui_data.phase_rows(self.persistence, self.selected_task_id):
-            phases.add_row(
-                Text(row["phase"], style="bold"),
-                row["agent"],
-                _styled(row["outcome"], _OUTCOME_STYLES),
-                str(row["iterations"]),
-                Text(_short(row["error"], 40), style="red"),
-            )
-        for line in tui_data.phase_log_tail(self.persistence, self.selected_task_id):
-            log.write(_styled_log_line(line))
-
-    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        if event.data_table.id != "tasks" or event.row_key is None:
-            return
-        value = event.row_key.value
-        if value and value != self.selected_task_id:
-            self.selected_task_id = value
-            self._refresh_detail()
-
-    def action_refresh(self) -> None:
-        self.refresh_data()
-
-    def action_proposals(self) -> None:
-        self.push_screen(ProposalsScreen(self.persistence))
-
-    def action_new_task(self) -> None:
+    def launch_task(self, description: str) -> bool:
+        """Run a new task through the lifecycle in a background worker."""
         policy_pack = _discover_policy_pack()
         if not policy_pack:
             self.notify(
                 "No policy pack found — run `sarathi init` first.", severity="error"
             )
-            return
-
-        def on_result(description: str | None) -> None:
-            if not description:
-                return
-            self.notify(f"Starting: {_short(description, 60)}")
-            self.run_worker(
-                lambda: self._start(description, policy_pack),
-                thread=True,
-                group="run",
-            )
-
-        self.push_screen(NewTaskScreen(), on_result)
+            return False
+        self.notify(f"Starting: {_short(description, 60)}")
+        self.run_worker(
+            lambda: self._start(description, policy_pack),
+            thread=True,
+            group="run",
+        )
+        return True
 
     def _start(self, description: str, policy_pack: str) -> None:
         try:
@@ -422,41 +639,16 @@ class SarathiDashboard(App):
         else:
             message = f"Task paused at {result.current_phase.value}: {result.task_id}"
         self.call_from_thread(self.notify, message)
-        self.selected_task_id = result.task_id
-        self.call_from_thread(self.refresh_data)
+        screen = self.screen
+        if isinstance(screen, TasksScreen):
+            screen.selected_task_id = result.task_id
+            self.call_from_thread(screen.refresh_data)
 
-    def action_resume(self) -> None:
-        task_id = self.selected_task_id
-        if task_id is None:
-            self.notify("No task selected.", severity="warning")
-            return
-        policy_pack = _discover_policy_pack()
-        if not policy_pack:
-            self.notify(
-                "No policy pack found — run `sarathi init` first.", severity="error"
-            )
-            return
-        self.notify(f"Resuming {task_id}…")
-        self.run_worker(
-            lambda: self._resume(task_id, policy_pack),
-            thread=True,
-            exclusive=True,
-            group="resume",
-        )
 
-    def _resume(self, task_id: str, policy_pack: str) -> None:
-        try:
-            result = tui_data.resume_task(self.persistence, task_id, policy_pack)
-        except Exception as exc:
-            self.call_from_thread(
-                self.notify, f"Resume failed: {exc}", severity="error"
-            )
-            return
-        phase = result.current_phase.value if result.current_phase else "Completed"
-        self.call_from_thread(self.notify, f"Resumed {task_id}: now at {phase}")
-        self.call_from_thread(self.refresh_data)
+# Backward-compatible alias: the app started life as a dashboard-only UI.
+SarathiDashboard = SarathiApp
 
 
 def launch_sarathi_tui(task_id: str | None = None) -> None:
-    """Launch the Sarathi dashboard."""
-    SarathiDashboard(task_id=task_id).run()
+    """Launch the Sarathi terminal UI."""
+    SarathiApp(task_id=task_id).run()

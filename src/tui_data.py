@@ -11,8 +11,9 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     from .engine import Engine, PersistenceManager, TaskContext
@@ -158,18 +159,29 @@ def decide_proposal(
 
 
 def start_task(
-    persistence: PersistenceManager, description: str, policy_pack: str | Path
+    persistence: PersistenceManager,
+    description: str,
+    policy_pack: str | Path,
+    context: str | None = None,
 ) -> TaskContext:
     """Create a new task from a description and run it through the lifecycle.
 
     Mirrors `sarathi run` with auto-detected complexity; raises RuntimeError
     when preflight validation blocks execution.
+
+    When `context` is given (and non-empty), it is appended to the task
+    description as recent chat context, but `task_id` and `complexity` are
+    still derived from the bare `description` so the transcript doesn't
+    pollute task identity.
     """
     engine = Engine(policy_pack_path=str(policy_pack), enforce_preflight=True)
     engine.persistence = persistence
+    task_description = description
+    if context:
+        task_description = f"{description}\n\nContext from chat conversation:\n{context}"
     task = TaskContext(
         task_id=engine.generate_task_id(description),
-        description=description,
+        description=task_description,
         complexity=_cli().calculate_complexity(description),
     )
     preflight = engine.preflight_validate_policy(task.task_id)
@@ -217,6 +229,28 @@ class ChatSession:
                     break
         return self.provider
 
+    def available_providers(self) -> list[tuple[str, str]]:
+        """All agent CLIs found on PATH, as (name, path) pairs."""
+        found = []
+        for name in self.PROVIDERS:
+            path = shutil.which(name)
+            if path:
+                found.append((name, path))
+        return found
+
+    def set_provider(self, name: str) -> bool:
+        """Switch the active provider, resetting any claude session.
+
+        Returns True if `name` was found on PATH and selected, else False
+        (leaving the current provider unchanged).
+        """
+        path = shutil.which(name)
+        if not path:
+            return False
+        self.provider = (name, path)
+        self.claude_session_id = None
+        return True
+
     def send(self, message: str) -> str:
         provider = self.resolve_provider()
         if provider is None:
@@ -231,6 +265,116 @@ class ChatSession:
             return f"{name} timed out after {self.timeout}s."
         except OSError as exc:
             return f"Could not start {name}: {exc}"
+        self.history.append((message, reply))
+        return reply
+
+    def send_streaming(
+        self, message: str, on_text: Callable[[str], None] | None = None
+    ) -> str:
+        """Send `message`, optionally streaming partial replies via `on_text`.
+
+        For `claude`, reads `stream-json` events from the CLI and invokes
+        `on_text` with the growing accumulated text as assistant message
+        chunks arrive. For other providers (or when no provider is
+        available), falls back to the blocking `send` and calls `on_text`
+        once with the full reply.
+        """
+        provider = self.resolve_provider()
+        if provider is None or provider[0] != "claude":
+            reply = self.send(message)
+            if on_text is not None and reply:
+                on_text(reply)
+            return reply
+        name, path = provider
+        try:
+            return self._send_claude_streaming(path, message, on_text)
+        except OSError as exc:
+            return f"Could not start {name}: {exc}"
+
+    def _send_claude_streaming(
+        self, path: str, message: str, on_text: Callable[[str], None] | None
+    ) -> str:
+        command = [path, "-p", "--output-format", "stream-json", "--verbose"]
+        if self.claude_session_id:
+            command.extend(["--resume", self.claude_session_id])
+        deadline = time.monotonic() + self.timeout
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=self.workspace_root,
+        )
+        accumulated = ""
+        result_text: str | None = None
+        session_id: str | None = None
+        is_error = False
+        timed_out = False
+        try:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.write(message)
+                except (BrokenPipeError, OSError):
+                    pass
+                proc.stdin.close()
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    if time.monotonic() > deadline:
+                        timed_out = True
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    event_type = event.get("type")
+                    if event_type == "system" and event.get("subtype") == "init":
+                        sid = event.get("session_id")
+                        if isinstance(sid, str) and sid:
+                            session_id = sid
+                    elif event_type == "assistant":
+                        message_obj = event.get("message") or {}
+                        for block in message_obj.get("content") or []:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                accumulated += str(block.get("text") or "")
+                        if on_text is not None:
+                            on_text(accumulated)
+                    elif event_type == "result":
+                        result_text = str(event.get("result") or "")
+                        sid = event.get("session_id")
+                        if isinstance(sid, str) and sid:
+                            session_id = sid
+                        is_error = bool(event.get("is_error"))
+            if not timed_out:
+                remaining = deadline - time.monotonic()
+                try:
+                    proc.wait(timeout=max(remaining, 0))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        if timed_out:
+            return f"claude timed out after {self.timeout}s."
+
+        if session_id:
+            self.claude_session_id = session_id
+
+        if result_text is not None:
+            reply = result_text.strip() or accumulated
+            if is_error:
+                return f"claude error: {reply}"
+            self.history.append((message, reply))
+            return reply
+
+        reply = accumulated.strip() or "(empty response)"
         self.history.append((message, reply))
         return reply
 

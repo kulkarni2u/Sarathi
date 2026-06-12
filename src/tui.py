@@ -35,6 +35,8 @@ SARATHI_BANNER = r"""
 
 CHAT_HELP = (
     "/run <description>  run a task through the policy-backed lifecycle\n"
+    "                    (recent chat context is included automatically)\n"
+    "/model [name]       show or switch the agent CLI used for chat\n"
     "/tasks              switch to the task panel (Ctrl+T also toggles)\n"
     "/help               show this help\n"
     "/quit               exit Sarathi\n"
@@ -287,6 +289,7 @@ class ChatScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.app.chat_screen = self
         provider = self.session.resolve_provider()
         if provider:
             status = f"model: {provider[0]} ({provider[1]})"
@@ -335,13 +338,27 @@ class ChatScreen(Screen):
         thread.scroll_end(animate=False)
 
     def _deliver(self, message: str, widget: Static) -> None:
-        reply = self.session.send(message)
+        thread = self.query_one("#chat-thread", VerticalScroll)
+
+        def on_text(partial: str) -> None:
+            self.app.call_from_thread(
+                widget.update, f"[bold magenta]sarathi[/]  {escape(partial)}"
+            )
+            self.app.call_from_thread(thread.scroll_end)
+
+        reply = self.session.send_streaming(message, on_text=on_text)
         self.app.call_from_thread(
             widget.update, f"[bold magenta]sarathi[/]  {escape(reply)}"
         )
-        self.app.call_from_thread(
-            self.query_one("#chat-thread", VerticalScroll).scroll_end
-        )
+        self.app.call_from_thread(thread.scroll_end)
+
+    def _transcript(self, max_turns: int = 6, max_chars: int = 500) -> str:
+        """Recent chat history formatted as alternating user/assistant lines."""
+        lines = []
+        for user, assistant in self.session.history[-max_turns:]:
+            lines.append(f"user: {user[:max_chars]}")
+            lines.append(f"assistant: {assistant[:max_chars]}")
+        return "\n".join(lines)
 
     def _handle_command(self, message: str) -> None:
         command, _, argument = message.partition(" ")
@@ -352,16 +369,47 @@ class ChatScreen(Screen):
         elif command == "/run":
             if not argument:
                 self._system("Usage: /run <task description>")
-            elif self.app.launch_task(argument):
-                self._system(
-                    f"Launched task: {argument} — watch it in the task panel (Ctrl+T)."
-                )
+            else:
+                context = self._transcript() if self.session.history else None
+                if self.app.launch_task(argument, context=context):
+                    self._system(
+                        f"Launched task: {argument} — watch it in the task panel (Ctrl+T)."
+                    )
+        elif command == "/model":
+            self._handle_model_command(argument)
         elif command == "/help":
             self._system(CHAT_HELP)
         elif command in ("/quit", "/exit"):
             self.app.exit()
         else:
             self._system(f"Unknown command {command}. {CHAT_HELP}")
+
+    def _handle_model_command(self, argument: str) -> None:
+        providers = self.session.available_providers()
+        if not argument:
+            if not providers:
+                self._system(
+                    "No agent CLI found on PATH (looked for: claude, opencode, codex)."
+                )
+                return
+            current = self.session.resolve_provider()
+            current_name = current[0] if current else None
+            parts = []
+            for name, _path in providers:
+                if name == current_name:
+                    parts.append(f"{name} (current)")
+                else:
+                    parts.append(name)
+            self._system(
+                "Providers: " + ", ".join(parts) + ". Use /model <name> to switch."
+            )
+            return
+        name = argument.strip().lower()
+        if self.session.set_provider(name):
+            self._system(f"Switched model to {name}.")
+        else:
+            choices = ", ".join(n for n, _ in providers) or "none detected"
+            self._system(f"Unknown or unavailable provider {name!r}. Available: {choices}.")
 
 
 class TasksScreen(Screen):
@@ -488,12 +536,14 @@ class TasksScreen(Screen):
         try:
             result = tui_data.resume_task(self.app.persistence, task_id, policy_pack)
         except Exception as exc:
-            self.app.call_from_thread(
-                self.notify, f"Resume failed: {exc}", severity="error"
-            )
+            message = f"Resume failed: {exc}"
+            self.app.call_from_thread(self.notify, message, severity="error")
+            self.app.call_from_thread(self.app.post_chat_event, message)
             return
         phase = result.current_phase.value if result.current_phase else "Completed"
-        self.app.call_from_thread(self.notify, f"Resumed {task_id}: now at {phase}")
+        message = f"Resumed {task_id}: now at {phase}"
+        self.app.call_from_thread(self.notify, message)
+        self.app.call_from_thread(self.app.post_chat_event, message)
         self.app.call_from_thread(self.refresh_data)
 
 
@@ -604,6 +654,7 @@ class SarathiApp(App):
         )
         self.initial_task_id = task_id
         self.refresh_interval = refresh_interval
+        self.chat_screen: ChatScreen | None = None
 
     def on_mount(self) -> None:
         # Opening with --task means the user wants the panel, not the chat.
@@ -612,7 +663,18 @@ class SarathiApp(App):
     def action_toggle_mode(self) -> None:
         self.switch_mode("tasks" if self.current_mode == "chat" else "chat")
 
-    def launch_task(self, description: str) -> bool:
+    def post_chat_event(self, text: str) -> None:
+        """Post a system message into the chat thread, if it has one started.
+
+        Safe to call from the UI thread only (callers from worker threads
+        should use `call_from_thread`). Does nothing if the chat screen has
+        never been activated, so users who haven't chatted aren't surprised
+        by a thread appearing.
+        """
+        if self.chat_screen is not None and self.chat_screen.has_class("-started"):
+            self.chat_screen._system(text)
+
+    def launch_task(self, description: str, context: str | None = None) -> bool:
         """Run a new task through the lifecycle in a background worker."""
         policy_pack = _discover_policy_pack()
         if not policy_pack:
@@ -622,23 +684,27 @@ class SarathiApp(App):
             return False
         self.notify(f"Starting: {_short(description, 60)}")
         self.run_worker(
-            lambda: self._start(description, policy_pack),
+            lambda: self._start(description, policy_pack, context),
             thread=True,
             group="run",
         )
         return True
 
-    def _start(self, description: str, policy_pack: str) -> None:
+    def _start(self, description: str, policy_pack: str, context: str | None = None) -> None:
         try:
-            result = tui_data.start_task(self.persistence, description, policy_pack)
+            result = tui_data.start_task(
+                self.persistence, description, policy_pack, context=context
+            )
         except Exception as exc:
             self.call_from_thread(self.notify, f"Task failed: {exc}", severity="error")
+            self.call_from_thread(self.post_chat_event, f"Task failed: {exc}")
             return
         if result.current_phase is None:
             message = f"Task completed: {result.task_id}"
         else:
             message = f"Task paused at {result.current_phase.value}: {result.task_id}"
         self.call_from_thread(self.notify, message)
+        self.call_from_thread(self.post_chat_event, message)
         screen = self.screen
         if isinstance(screen, TasksScreen):
             screen.selected_task_id = result.task_id

@@ -116,6 +116,7 @@ def test_chat_is_default_mode(persistence):
 
 
 def test_chat_submit_message_gets_reply(persistence, monkeypatch):
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
     monkeypatch.setattr(tui_data.ChatSession, "send", lambda self, m: f"echo: {m}")
 
     async def scenario():
@@ -162,5 +163,122 @@ def test_slash_tasks_command_switches_mode(persistence):
             await pilot.press("enter")
             await pilot.pause()
             assert isinstance(app.screen, TasksScreen)
+
+    asyncio.run(scenario())
+
+
+def test_run_command_passes_chat_context(persistence, tmp_path, monkeypatch):
+    pack = tmp_path / "policy-pack"
+    pack.mkdir()
+    for name in ("commands", "conventions", "review"):
+        (pack / f"{name}.md").write_text(f"# {name}\n")
+    monkeypatch.setattr("src.tui._discover_policy_pack", lambda: str(pack))
+
+    captured = {}
+
+    class DummyResult:
+        task_id = "t-x"
+        current_phase = None
+
+    def fake_start_task(persistence, description, policy_pack, context=None):
+        captured["description"] = description
+        captured["context"] = context
+        return DummyResult()
+
+    monkeypatch.setattr(tui_data, "start_task", fake_start_task)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.session.history.append(("what is foo?", "foo is a thing"))
+
+            for ch in "/run fix it":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+    assert captured["description"] == "fix it"
+    assert captured["context"] is not None
+    assert "what is foo?" in captured["context"]
+    assert "foo is a thing" in captured["context"]
+
+
+def test_task_completion_posts_chat_event(persistence, tmp_path, monkeypatch):
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tui_data.ChatSession, "send", lambda self, m: "ok")
+
+    pack = tmp_path / "policy-pack"
+    pack.mkdir()
+    for name in ("commands", "conventions", "review"):
+        (pack / f"{name}.md").write_text(f"# {name}\n")
+    monkeypatch.setattr("src.tui._discover_policy_pack", lambda: str(pack))
+
+    class DummyResult:
+        task_id = "t-done"
+        current_phase = None
+
+    monkeypatch.setattr(
+        tui_data, "start_task", lambda *a, **k: DummyResult()
+    )
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            # Start the chat thread so the chat screen is "-started".
+            await pilot.press(*"hi")
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            for ch in "/run something":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            messages = app.screen.query(".chat-msg.system")
+            contents = [str(widget.content) for widget in messages]
+            assert any("Task completed" in content for content in contents)
+
+    asyncio.run(scenario())
+
+
+def test_model_command_lists_and_switches_provider(persistence, monkeypatch):
+    def fake_which(name):
+        return f"/usr/bin/{name}" if name in ("claude", "codex") else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            for ch in "/model":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            messages = app.screen.query(".chat-msg.system")
+            contents = [str(widget.content) for widget in messages]
+            assert any(
+                "claude" in content and "codex" in content for content in contents
+            )
+
+            for ch in "/model codex":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            messages = app.screen.query(".chat-msg.system")
+            contents = [str(widget.content) for widget in messages]
+            assert any("codex" in content for content in contents)
+            assert app.screen.session.provider[0] == "codex"
 
     asyncio.run(scenario())

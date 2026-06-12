@@ -171,6 +171,23 @@ def test_start_task_runs_lifecycle_and_persists(persistence):
     assert result.task_id in [s["task_id"] for s in tui_data.task_summaries(persistence)]
 
 
+def test_start_task_with_context_includes_transcript(persistence):
+    policy_pack = Path(__file__).resolve().parents[1] / "policy-pack" / "EXAMPLE"
+
+    result = tui_data.start_task(
+        persistence,
+        "Fix typo in README",
+        policy_pack,
+        context="user: q1\nassistant: a1",
+    )
+
+    task_file = persistence.storage_path / f"{result.task_id}.json"
+    data = json.loads(task_file.read_text())
+    assert "Fix typo in README" in data["description"]
+    assert "Context from chat conversation:" in data["description"]
+    assert "q1" in data["description"]
+
+
 def test_start_task_blocked_preflight_raises(persistence, tmp_path):
     sparse_pack = tmp_path / "policy-pack"
     sparse_pack.mkdir()
@@ -273,3 +290,161 @@ def test_chat_session_claude_error_envelope(monkeypatch):
 
     assert "claude error" in reply
     assert "boom" in reply
+
+
+class _FakeStdout:
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+class _FakeStdin:
+    def __init__(self):
+        self.written = []
+        self.closed = False
+
+    def write(self, data):
+        self.written.append(data)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeProcess:
+    def __init__(self, lines, returncode=0):
+        self.stdin = _FakeStdin()
+        self.stdout = _FakeStdout(lines)
+        self.stderr = None
+        self.returncode = returncode
+        self._waited = False
+
+    def wait(self, timeout=None):
+        self._waited = True
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        pass
+
+
+def _fake_popen(lines):
+    def popen(command, **kwargs):
+        return _FakeProcess(lines)
+
+    return popen
+
+
+def test_send_streaming_accumulates_and_returns_result(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    lines = [
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "Hello"}]},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": ", world"}]},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "result",
+                "result": "Hello, world!",
+                "session_id": "sess-stream",
+                "is_error": False,
+            }
+        ),
+    ]
+    monkeypatch.setattr(tui_data.subprocess, "Popen", _fake_popen(lines))
+
+    session = tui_data.ChatSession()
+    seen = []
+    reply = session.send_streaming("hi", on_text=lambda text: seen.append(text))
+
+    assert reply == "Hello, world!"
+    assert len(seen) >= 2
+    assert seen[0] != seen[-1]
+    assert seen[-1].startswith("Hello")
+    assert session.claude_session_id == "sess-stream"
+    assert session.history == [("hi", "Hello, world!")]
+
+
+def test_send_streaming_is_error_result_not_appended(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    lines = [
+        json.dumps({"type": "result", "result": "boom", "is_error": True}),
+    ]
+    monkeypatch.setattr(tui_data.subprocess, "Popen", _fake_popen(lines))
+
+    session = tui_data.ChatSession()
+    reply = session.send_streaming("hi")
+
+    assert reply.startswith("claude error")
+    assert session.history == []
+
+
+def test_send_streaming_non_claude_falls_back_to_send(monkeypatch):
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tui_data.ChatSession, "send", lambda self, m: f"echo: {m}")
+
+    session = tui_data.ChatSession()
+    seen = []
+    reply = session.send_streaming("hi", on_text=lambda text: seen.append(text))
+
+    assert reply == "echo: hi"
+    assert seen == ["echo: hi"]
+
+
+def test_available_providers_lists_found_clis(monkeypatch):
+    def fake_which(name):
+        return f"/usr/bin/{name}" if name in ("claude", "codex") else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    session = tui_data.ChatSession()
+    providers = session.available_providers()
+
+    assert providers == [("claude", "/usr/bin/claude"), ("codex", "/usr/bin/codex")]
+
+
+def test_set_provider_switches_and_resets_session(monkeypatch):
+    def fake_which(name):
+        return f"/usr/bin/{name}" if name in ("claude", "codex") else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    session = tui_data.ChatSession()
+    session.resolve_provider()
+    session.claude_session_id = "sess-1"
+
+    assert session.set_provider("codex") is True
+    assert session.provider == ("codex", "/usr/bin/codex")
+    assert session.claude_session_id is None
+
+
+def test_set_provider_unknown_returns_false(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    session = tui_data.ChatSession()
+    session.resolve_provider()
+
+    assert session.set_provider("opencode") is False
+    assert session.provider == ("claude", "/usr/bin/claude")

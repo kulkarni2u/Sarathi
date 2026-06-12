@@ -154,6 +154,31 @@ def decide_proposal(
     return store.reject(proposal, reason=reason)
 
 
+def start_task(
+    persistence: PersistenceManager, description: str, policy_pack: str | Path
+) -> TaskContext:
+    """Create a new task from a description and run it through the lifecycle.
+
+    Mirrors `sarathi run` with auto-detected complexity; raises RuntimeError
+    when preflight validation blocks execution.
+    """
+    engine = Engine(policy_pack_path=str(policy_pack), enforce_preflight=True)
+    engine.persistence = persistence
+    task = TaskContext(
+        task_id=engine.generate_task_id(description),
+        description=description,
+        complexity=_cli().calculate_complexity(description),
+    )
+    preflight = engine.preflight_validate_policy(task.task_id)
+    task.preflight_validation = preflight
+    if preflight.get("blocking"):
+        raise RuntimeError(
+            "Preflight blocked the task"
+            f" ({preflight.get('todo', 0)} TODO, {preflight.get('drift', 0)} drift)"
+        )
+    return engine.run_task(task)
+
+
 def resume_task(
     persistence: PersistenceManager, task_id: str, policy_pack: str | Path
 ) -> TaskContext:

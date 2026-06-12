@@ -1,5 +1,6 @@
 """Tests for the terminal dashboard data layer (src/tui_data.py)."""
 import json
+from pathlib import Path
 
 import pytest
 
@@ -158,6 +159,25 @@ def test_decide_proposal_accept_and_reject(seeded, tmp_path):
     assert rejected["reason"] == "not now"
     decision_file = policy_pack / ".sarathi-proposals" / f"{proposal.proposal_id}.json"
     assert json.loads(decision_file.read_text())["status"] == "rejected"
+
+
+def test_start_task_runs_lifecycle_and_persists(persistence):
+    policy_pack = Path(__file__).resolve().parents[1] / "policy-pack" / "EXAMPLE"
+
+    result = tui_data.start_task(persistence, "Fix typo in README", policy_pack)
+
+    assert result.phase_results
+    assert (persistence.storage_path / f"{result.task_id}.json").exists()
+    assert result.task_id in [s["task_id"] for s in tui_data.task_summaries(persistence)]
+
+
+def test_start_task_blocked_preflight_raises(persistence, tmp_path):
+    sparse_pack = tmp_path / "policy-pack"
+    sparse_pack.mkdir()
+    (sparse_pack / "commands.md").write_text("# Commands\n")
+
+    with pytest.raises(RuntimeError, match="Preflight blocked"):
+        tui_data.start_task(persistence, "Fix typo in README", sparse_pack)
 
 
 def test_resume_task_missing_raises(persistence):

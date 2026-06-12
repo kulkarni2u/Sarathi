@@ -62,6 +62,28 @@ def test_dashboard_opens_proposals_screen(persistence):
     asyncio.run(scenario())
 
 
+def test_dashboard_new_task_screen_opens_and_cancels(persistence, tmp_path, monkeypatch):
+    from src.tui import NewTaskScreen
+
+    pack = tmp_path / "policy-pack"
+    pack.mkdir()
+    for name in ("commands", "conventions", "review"):
+        (pack / f"{name}.md").write_text(f"# {name}\n")
+    monkeypatch.setattr("src.tui._discover_policy_pack", lambda: str(pack))
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.press("n")
+            await pilot.pause()
+            assert isinstance(app.screen, NewTaskScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, NewTaskScreen)
+
+    asyncio.run(scenario())
+
+
 def test_dashboard_empty_state(tmp_path):
     async def scenario():
         manager = PersistenceManager(str(tmp_path / "empty-tasks"))

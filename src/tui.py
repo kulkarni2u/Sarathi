@@ -13,8 +13,8 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, RichLog, Static
+from textual.screen import ModalScreen, Screen
+from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 try:
     from . import tui_data
@@ -100,6 +100,30 @@ def _discover_policy_pack() -> str | None:
     except ImportError:
         from cli import discover_policy_pack
     return discover_policy_pack()
+
+
+class NewTaskScreen(ModalScreen):
+    """Prompt for a task description to run through the lifecycle."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="new-task-dialog"):
+            yield Static("[b]New task[/b] — describe it and press Enter")
+            yield Input(
+                placeholder="e.g. Fix null pointer in user service",
+                id="new-task-input",
+            )
+            yield Static("[dim]Complexity is auto-detected; Esc cancels.[/dim]")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class ProposalsScreen(Screen):
@@ -256,11 +280,22 @@ class SarathiDashboard(App):
         height: 1fr;
         overflow-y: auto;
     }
+    NewTaskScreen {
+        align: center middle;
+    }
+    #new-task-dialog {
+        width: 80;
+        height: auto;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
+        Binding("n", "new_task", "New task"),
         Binding("p", "proposals", "Proposals"),
         Binding("u", "resume", "Resume task"),
     ]
@@ -355,6 +390,40 @@ class SarathiDashboard(App):
 
     def action_proposals(self) -> None:
         self.push_screen(ProposalsScreen(self.persistence))
+
+    def action_new_task(self) -> None:
+        policy_pack = _discover_policy_pack()
+        if not policy_pack:
+            self.notify(
+                "No policy pack found — run `sarathi init` first.", severity="error"
+            )
+            return
+
+        def on_result(description: str | None) -> None:
+            if not description:
+                return
+            self.notify(f"Starting: {_short(description, 60)}")
+            self.run_worker(
+                lambda: self._start(description, policy_pack),
+                thread=True,
+                group="run",
+            )
+
+        self.push_screen(NewTaskScreen(), on_result)
+
+    def _start(self, description: str, policy_pack: str) -> None:
+        try:
+            result = tui_data.start_task(self.persistence, description, policy_pack)
+        except Exception as exc:
+            self.call_from_thread(self.notify, f"Task failed: {exc}", severity="error")
+            return
+        if result.current_phase is None:
+            message = f"Task completed: {result.task_id}"
+        else:
+            message = f"Task paused at {result.current_phase.value}: {result.task_id}"
+        self.call_from_thread(self.notify, message)
+        self.selected_task_id = result.task_id
+        self.call_from_thread(self.refresh_data)
 
     def action_resume(self) -> None:
         task_id = self.selected_task_id

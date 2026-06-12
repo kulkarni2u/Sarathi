@@ -45,7 +45,7 @@ sarathi tui --task <id>     # open with a task pre-selected
 
 - The **tasks** pane lists persisted tasks from `.sarathi/tasks` with their current phase and last outcome, refreshed every 2 seconds — so it can monitor runs started from the CLI, MCP server, or service.
 - The **detail** pane shows the same supervision snapshot as `sarathi status` (usage, budget, task graph, escalations), per-phase results, and a live tail of the phase transition log.
-- Press `p` to review pending policy proposals and accept (`a`) or reject (`x`) them into the discovered policy pack, `u` to resume the selected task, `r` to force a refresh, and `q` to quit.
+- Press `n` to launch a new task (description in, complexity auto-detected, runs through the full lifecycle in the background while the dashboard live-monitors it), `u` to resume the selected task, `p` to review pending policy proposals and accept (`a`) or reject (`x`) them into the discovered policy pack, `r` to force a refresh, and `q` to quit.
 
 ## MCP Server
 

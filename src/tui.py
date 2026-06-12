@@ -242,7 +242,7 @@ class SarathiDashboard(App):
                 _short(summary["task_id"], 20),
                 summary["current_phase"],
                 _short(summary["last_outcome"], 14),
-                str(summary["last_updated"])[:19].replace("T", " "),
+                str(summary["last_updated"])[5:16].replace("T", " "),
                 key=summary["task_id"],
             )
         if self.selected_task_id not in known:

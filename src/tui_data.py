@@ -10,6 +10,7 @@ import io
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -201,6 +202,14 @@ NO_PROVIDER_HELP = (
     "No agent CLI found on PATH (looked for: claude, opencode, codex).\n"
     "Install one to chat, or use the task panel (Ctrl+T) to run policy-backed tasks."
 )
+
+
+_ERROR_REPLY_RE = re.compile(r"^(claude|opencode|codex) (error|timed out|exited)|^Could not start ")
+
+
+def is_error_reply(reply: str) -> bool:
+    """True if `reply` is a CLI error/timeout message rather than a normal reply."""
+    return bool(_ERROR_REPLY_RE.match(reply))
 
 
 class ChatSession:

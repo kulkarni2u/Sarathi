@@ -4,6 +4,7 @@ Skipped automatically when the optional `textual` dependency is missing.
 """
 import asyncio
 import json
+import threading
 
 import pytest
 
@@ -12,7 +13,7 @@ textual = pytest.importorskip("textual")
 from src import tui_data
 from src.engine import Complexity, PersistenceManager, Phase, PhaseResult, TaskContext
 from src.tui import ChatScreen, SarathiDashboard, TasksScreen
-from textual.widgets import DataTable, Static
+from textual.widgets import DataTable, Input, Static
 
 
 @pytest.fixture
@@ -275,6 +276,56 @@ def test_context_command_attaches_task_status_and_reports_missing(persistence, m
             messages = app.screen.query(".chat-msg.system")
             contents = [str(widget.content) for widget in messages]
             assert any("not found" in content for content in contents)
+
+    asyncio.run(scenario())
+
+
+def test_chat_input_disabled_while_reply_pending(persistence, monkeypatch):
+    release = threading.Event()
+
+    def fake_send_streaming(self, message, on_text=None):
+        release.wait(timeout=5)
+        return "done"
+
+    monkeypatch.setattr(tui_data.ChatSession, "send_streaming", fake_send_streaming)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press(*"hi")
+            await pilot.press("enter")
+            await pilot.pause()
+
+            chat_input = app.screen.query_one("#chat-input", Input)
+            assert chat_input.disabled
+
+            release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert not chat_input.disabled
+
+    asyncio.run(scenario())
+
+
+def test_chat_error_reply_is_styled(persistence, monkeypatch):
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tui_data.ChatSession, "send", lambda self, m: "claude error: boom")
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press(*"hi")
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            messages = app.screen.query(".chat-msg.sarathi")
+            assert any(widget.has_class("error") for widget in messages)
+            contents = [str(widget.content) for widget in messages]
+            assert any("claude error: boom" in content for content in contents)
 
     asyncio.run(scenario())
 

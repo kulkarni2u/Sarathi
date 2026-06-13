@@ -281,6 +281,35 @@ def test_chat_session_history_prompt():
     assert "q2" in prompt
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "claude error: boom",
+        "claude error (exit 1): boom",
+        "claude timed out after 180s.",
+        "claude exited with 1: boom",
+        "opencode exited with 1: boom",
+        "codex timed out after 180s.",
+        "Could not start claude: [Errno 2] No such file or directory",
+    ],
+)
+def test_is_error_reply_true_for_cli_errors(reply):
+    assert tui_data.is_error_reply(reply)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Sure, here's the answer.",
+        "(empty response)",
+        tui_data.NO_PROVIDER_HELP,
+        "claudette is not an error",
+    ],
+)
+def test_is_error_reply_false_for_normal_replies(reply):
+    assert not tui_data.is_error_reply(reply)
+
+
 def test_chat_session_claude_error_envelope(monkeypatch):
     def fake_which(name):
         return "/usr/bin/claude" if name == "claude" else None

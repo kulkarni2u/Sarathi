@@ -311,8 +311,11 @@ class ChatScreen(Screen):
         self._activate_thread()
         self._append("you", message)
         pending = self._append("sarathi", "thinking…", pending=True)
+        chat_input = self.query_one("#chat-input", Input)
+        chat_input.disabled = True
+        chat_input.placeholder = "Waiting for reply…"
         self.run_worker(
-            lambda: self._deliver(message, pending),
+            lambda: self._deliver(message, pending, chat_input),
             thread=True,
             exclusive=True,
             group="chat",
@@ -339,7 +342,7 @@ class ChatScreen(Screen):
         thread.mount(Static(f"[dim]{escape(text)}[/dim]", classes="chat-msg system"))
         thread.scroll_end(animate=False)
 
-    def _deliver(self, message: str, widget: Static) -> None:
+    def _deliver(self, message: str, widget: Static, chat_input: Input) -> None:
         thread = self.query_one("#chat-thread", VerticalScroll)
         last_update = 0.0
         throttle_seconds = 0.05
@@ -355,11 +358,23 @@ class ChatScreen(Screen):
             )
             self.app.call_from_thread(thread.scroll_end)
 
-        reply = self.session.send_streaming(message, on_text=on_text)
-        self.app.call_from_thread(
-            widget.update, f"[bold magenta]sarathi[/]  {escape(reply)}"
-        )
-        self.app.call_from_thread(thread.scroll_end)
+        try:
+            reply = self.session.send_streaming(message, on_text=on_text)
+            if tui_data.is_error_reply(reply):
+                self.app.call_from_thread(widget.add_class, "error")
+                rendered = f"[bold magenta]sarathi[/]  [bold red]{escape(reply)}[/]"
+            else:
+                rendered = f"[bold magenta]sarathi[/]  {escape(reply)}"
+            self.app.call_from_thread(widget.update, rendered)
+            self.app.call_from_thread(thread.scroll_end)
+        finally:
+            self.app.call_from_thread(self._finish_delivery, chat_input)
+
+    def _finish_delivery(self, chat_input: Input) -> None:
+        chat_input.disabled = False
+        chat_input.placeholder = "Message — /run <task>, /tasks, /help"
+        if self.has_class("-started"):
+            chat_input.focus()
 
     def _transcript(self, max_turns: int = 6, max_chars: int = 500) -> str:
         """Recent chat history formatted as alternating user/assistant lines."""
@@ -641,6 +656,9 @@ class SarathiApp(App):
     }
     .chat-msg.system {
         text-style: italic;
+    }
+    .chat-msg.error {
+        border-left: thick $error;
     }
     #tasks {
         width: 42%;

@@ -231,6 +231,30 @@ class ChatSession:
         self.claude_session_id: str | None = None
         self.history: list[tuple[str, str]] = []
         self.pending_context: list[str] = []
+        self.cancelled = False
+        self._active_proc: subprocess.Popen | None = None
+        self._proc_lock = threading.Lock()
+
+    def clear(self) -> None:
+        """Forget the conversation: history, pending context, and CLI session."""
+        self.history = []
+        self.pending_context = []
+        self.claude_session_id = None
+
+    def cancel(self) -> bool:
+        """Kill the in-flight CLI subprocess, if any.
+
+        Returns True if a running process was signalled. Best-effort: only
+        the streaming `claude` path registers a killable process; one-shot
+        `subprocess.run` calls cannot be interrupted this way.
+        """
+        with self._proc_lock:
+            proc = self._active_proc
+        if proc is not None and proc.poll() is None:
+            self.cancelled = True
+            proc.kill()
+            return True
+        return False
 
     def add_context(self, label: str, text: str) -> None:
         """Queue `text` (under `label`) to be sent with the next message."""
@@ -280,6 +304,7 @@ class ChatSession:
         return True
 
     def send(self, message: str) -> str:
+        self.cancelled = False
         provider = self.resolve_provider()
         if provider is None:
             return NO_PROVIDER_HELP
@@ -308,6 +333,7 @@ class ChatSession:
         available), falls back to the blocking `send` and calls `on_text`
         once with the full reply.
         """
+        self.cancelled = False
         provider = self.resolve_provider()
         if provider is None or provider[0] != "claude":
             reply = self.send(message)
@@ -347,6 +373,8 @@ class ChatSession:
             text=True,
             cwd=self.workspace_root,
         )
+        with self._proc_lock:
+            self._active_proc = proc
         accumulated = ""
         result_text: str | None = None
         session_id: str | None = None
@@ -458,8 +486,13 @@ class ChatSession:
                 proc.kill()
                 proc.wait()
             stderr_thread.join(timeout=1)
+            with self._proc_lock:
+                self._active_proc = None
 
         stderr_text = "".join(stderr_chunks)
+
+        if self.cancelled:
+            return "(cancelled)"
 
         if timed_out:
             return f"claude timed out after {self.timeout}s."

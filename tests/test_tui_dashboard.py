@@ -5,6 +5,7 @@ Skipped automatically when the optional `textual` dependency is missing.
 import asyncio
 import json
 import threading
+import time
 
 import pytest
 
@@ -326,6 +327,99 @@ def test_chat_error_reply_is_styled(persistence, monkeypatch):
             assert any(widget.has_class("error") for widget in messages)
             contents = [str(widget.content) for widget in messages]
             assert any("claude error: boom" in content for content in contents)
+
+    asyncio.run(scenario())
+
+
+def test_clear_command_resets_conversation(persistence, monkeypatch):
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tui_data.ChatSession, "send", lambda self, m: "echo")
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press(*"hi")
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app.screen.has_class("-started")
+            app.screen.session.history.append(("q", "a"))
+
+            for ch in "/clear":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert not app.screen.has_class("-started")
+            assert app.screen.session.history == []
+            assert app.screen.query(".chat-msg").__len__() == 0
+
+    asyncio.run(scenario())
+
+
+def test_context_command_truncates_large_snapshot(persistence, monkeypatch):
+    from src.tui import MAX_CONTEXT_CHARS
+
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
+    big = "x" * (MAX_CONTEXT_CHARS + 500)
+    monkeypatch.setattr(tui_data, "status_snapshot", lambda p, t: big)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for ch in "/context t-1":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            attached = "\n\n".join(app.screen.session.pending_context)
+            assert "…(truncated)" in attached
+            assert len(attached) < len(big)
+
+            messages = app.screen.query(".chat-msg.system")
+            contents = [str(widget.content) for widget in messages]
+            assert any("truncated to" in content for content in contents)
+
+    asyncio.run(scenario())
+
+
+def test_escape_cancels_pending_reply(persistence, monkeypatch):
+    def fake_send_streaming(self, message, on_text=None):
+        for _ in range(100):
+            if self.cancelled:
+                return "(cancelled)"
+            time.sleep(0.02)
+        return "done"
+
+    def fake_cancel(self):
+        self.cancelled = True
+        return True
+
+    monkeypatch.setattr(tui_data.ChatSession, "send_streaming", fake_send_streaming)
+    monkeypatch.setattr(tui_data.ChatSession, "cancel", fake_cancel)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press(*"hi")
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.screen._chat_pending
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert not app.screen._chat_pending
+            chat_input = app.screen.query_one("#chat-input", Input)
+            assert not chat_input.disabled
+            messages = app.screen.query(".chat-msg.sarathi")
+            contents = [str(widget.content) for widget in messages]
+            assert any("cancelled" in content for content in contents)
 
     asyncio.run(scenario())
 

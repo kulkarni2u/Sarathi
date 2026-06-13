@@ -310,6 +310,46 @@ def test_is_error_reply_false_for_normal_replies(reply):
     assert not tui_data.is_error_reply(reply)
 
 
+def test_chat_session_clear_resets_state():
+    session = tui_data.ChatSession()
+    session.history = [("q", "a")]
+    session.pending_context = ["ctx"]
+    session.claude_session_id = "sid-1"
+
+    session.clear()
+
+    assert session.history == []
+    assert session.pending_context == []
+    assert session.claude_session_id is None
+
+
+def test_chat_session_cancel_kills_active_process():
+    session = tui_data.ChatSession()
+
+    class _Running:
+        def __init__(self):
+            self.killed = False
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+    proc = _Running()
+    session._active_proc = proc
+
+    assert session.cancel() is True
+    assert proc.killed is True
+    assert session.cancelled is True
+
+
+def test_chat_session_cancel_no_active_process():
+    session = tui_data.ChatSession()
+    assert session.cancel() is False
+    assert session.cancelled is False
+
+
 def test_chat_session_claude_error_envelope(monkeypatch):
     def fake_which(name):
         return "/usr/bin/claude" if name == "claude" else None
@@ -419,6 +459,47 @@ class FakePopen:
 
     def kill(self):
         self._killed = True
+
+
+def test_send_streaming_cancel_returns_cancelled(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    session = tui_data.ChatSession()
+
+    class _CancelOnIterStdout:
+        def __iter__(self):
+            # Simulate the user pressing Esc mid-stream.
+            session.cancel()
+            return iter([])
+
+    class _CancelFakePopen:
+        def __init__(self):
+            self.stdin = io.StringIO()
+            self.stdout = _CancelOnIterStdout()
+            self.stderr = io.StringIO("")
+            self._alive = True
+
+        def poll(self):
+            return None if self._alive else -9
+
+        def wait(self, timeout=None):
+            return -9
+
+        def kill(self):
+            self._alive = False
+
+    monkeypatch.setattr(
+        tui_data.subprocess, "Popen", lambda *a, **k: _CancelFakePopen()
+    )
+
+    reply = session.send_streaming("hi")
+
+    assert reply == "(cancelled)"
+    assert session.cancelled is True
+    assert session.history == []
 
 
 def test_send_streaming_accumulates_and_returns_result(monkeypatch):

@@ -39,11 +39,17 @@ CHAT_HELP = (
     "                    (recent chat context is included automatically)\n"
     "/model [name]       show or switch the agent CLI used for chat\n"
     "/context [task_id]  attach a task's status to the conversation\n"
+    "/clear              forget the conversation and start fresh\n"
     "/tasks              switch to the task panel (Ctrl+T also toggles)\n"
     "/help               show this help\n"
     "/quit               exit Sarathi\n"
-    "Anything else is sent to the agent CLI as conversation."
+    "Anything else is sent to the agent CLI as conversation.\n"
+    "Press Esc to cancel a reply that's still in progress."
 )
+
+# Cap how much of a task's status snapshot `/context` injects into the
+# next message, so a large task graph doesn't silently balloon the prompt.
+MAX_CONTEXT_CHARS = 4000
 
 _OUTCOME_STYLES = {
     "pass": "green",
@@ -269,9 +275,12 @@ class ProposalsScreen(Screen):
 class ChatScreen(Screen):
     """Chat-first home: centered prompt that docks once conversation starts."""
 
+    BINDINGS = [Binding("escape", "cancel_chat", "Cancel reply", show=False)]
+
     def __init__(self) -> None:
         super().__init__()
         self.session = tui_data.ChatSession()
+        self._chat_pending = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="chat-home"):
@@ -313,13 +322,19 @@ class ChatScreen(Screen):
         pending = self._append("sarathi", "thinking…", pending=True)
         chat_input = self.query_one("#chat-input", Input)
         chat_input.disabled = True
-        chat_input.placeholder = "Waiting for reply…"
+        chat_input.placeholder = "Waiting for reply… (Esc to cancel)"
+        self._chat_pending = True
         self.run_worker(
             lambda: self._deliver(message, pending, chat_input),
             thread=True,
             exclusive=True,
             group="chat",
         )
+
+    def action_cancel_chat(self) -> None:
+        """Esc: kill an in-flight reply. No-op when nothing is pending."""
+        if self._chat_pending:
+            self.session.cancel()
 
     def _activate_thread(self) -> None:
         """Dock the conversation: hide the centered home, focus the bottom input."""
@@ -360,7 +375,9 @@ class ChatScreen(Screen):
 
         try:
             reply = self.session.send_streaming(message, on_text=on_text)
-            if tui_data.is_error_reply(reply):
+            if reply == "(cancelled)":
+                rendered = "[bold magenta]sarathi[/]  [dim](cancelled)[/]"
+            elif tui_data.is_error_reply(reply):
                 self.app.call_from_thread(widget.add_class, "error")
                 rendered = f"[bold magenta]sarathi[/]  [bold red]{escape(reply)}[/]"
             else:
@@ -371,6 +388,7 @@ class ChatScreen(Screen):
             self.app.call_from_thread(self._finish_delivery, chat_input)
 
     def _finish_delivery(self, chat_input: Input) -> None:
+        self._chat_pending = False
         chat_input.disabled = False
         chat_input.placeholder = "Message — /run <task>, /tasks, /help"
         if self.has_class("-started"):
@@ -403,6 +421,8 @@ class ChatScreen(Screen):
             self._handle_model_command(argument)
         elif command == "/context":
             self._handle_context_command(argument)
+        elif command in ("/clear", "/reset"):
+            self._clear_conversation()
         elif command == "/help":
             self._system(CHAT_HELP)
         elif command in ("/quit", "/exit"):
@@ -429,11 +449,27 @@ class ChatScreen(Screen):
                 message += f" Available tasks: {ids}"
             self._system(message)
             return
-        self.session.add_context(f"Status of task {task_id}", snapshot)
-        self._system(snapshot)
+        attached = snapshot
+        note = ""
+        if len(snapshot) > MAX_CONTEXT_CHARS:
+            attached = snapshot[:MAX_CONTEXT_CHARS] + "\n…(truncated)"
+            note = (
+                f" ({len(snapshot)} chars, truncated to {MAX_CONTEXT_CHARS})"
+            )
+        self.session.add_context(f"Status of task {task_id}", attached)
+        self._system(attached)
         self._system(
-            "Added to conversation context — it will be sent with your next message."
+            f"Added to conversation context{note} —"
+            " it will be sent with your next message."
         )
+
+    def _clear_conversation(self) -> None:
+        """Forget history and pending context, returning to the home view."""
+        self.session.clear()
+        self.query_one("#chat-thread", VerticalScroll).remove_children()
+        self.remove_class("-started")
+        self.query_one("#chat-input-home", Input).focus()
+        self.app.notify("Conversation cleared.")
 
     def _handle_model_command(self, argument: str) -> None:
         providers = self.session.available_providers()

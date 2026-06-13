@@ -43,6 +43,10 @@ sarathi tui                 # open the chat prompt
 sarathi tui --task <id>     # open directly in the task panel, with a task pre-selected
 ```
 
+![Sarathi terminal UI chat view](docs/assets/tui-chat.svg)
+
+![Sarathi terminal UI task dashboard](docs/assets/tui-tasks.svg)
+
 `sarathi tui` opens a centered chat prompt (OpenCode-style). Your first message docks the conversation to the bottom of the screen. Chat is sent to the first agent CLI found on PATH — `claude` (with true session continuity via `--resume`), then `opencode`, then `codex` — falling back to a help message if none is installed; `claude` replies stream in as they're generated. Slash commands: `/run <task>` launches a task through the policy-backed lifecycle (including recent chat context automatically), `/model [name]` shows or switches the agent CLI used for chat, `/context <task_id>` attaches a task's status to the conversation, `/tasks` switches to the task panel, `/help` shows this help, and `/quit` exits. `Ctrl+T` toggles between the chat view and the task panel at any time.
 
 - The **tasks** pane lists persisted tasks from `.sarathi/tasks` with their current phase and last outcome, refreshed every 2 seconds — so it can monitor runs started from the CLI, MCP server, or service.

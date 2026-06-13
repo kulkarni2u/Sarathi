@@ -75,7 +75,7 @@ def test_dashboard_new_task_screen_opens_and_cancels(persistence, tmp_path, monk
     pack.mkdir()
     for name in ("commands", "conventions", "review"):
         (pack / f"{name}.md").write_text(f"# {name}\n")
-    monkeypatch.setattr("src.tui._discover_policy_pack", lambda: str(pack))
+    monkeypatch.setattr("src.tui._discover_policy_pack", lambda *a, **k: str(pack))
 
     async def scenario():
         app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
@@ -174,7 +174,7 @@ def test_run_command_passes_chat_context(persistence, tmp_path, monkeypatch):
     pack.mkdir()
     for name in ("commands", "conventions", "review"):
         (pack / f"{name}.md").write_text(f"# {name}\n")
-    monkeypatch.setattr("src.tui._discover_policy_pack", lambda: str(pack))
+    monkeypatch.setattr("src.tui._discover_policy_pack", lambda *a, **k: str(pack))
 
     captured = {}
 
@@ -217,7 +217,7 @@ def test_task_completion_posts_chat_event(persistence, tmp_path, monkeypatch):
     pack.mkdir()
     for name in ("commands", "conventions", "review"):
         (pack / f"{name}.md").write_text(f"# {name}\n")
-    monkeypatch.setattr("src.tui._discover_policy_pack", lambda: str(pack))
+    monkeypatch.setattr("src.tui._discover_policy_pack", lambda *a, **k: str(pack))
 
     class DummyResult:
         task_id = "t-done"
@@ -420,6 +420,86 @@ def test_escape_cancels_pending_reply(persistence, monkeypatch):
             messages = app.screen.query(".chat-msg.sarathi")
             contents = [str(widget.content) for widget in messages]
             assert any("cancelled" in content for content in contents)
+
+    asyncio.run(scenario())
+
+
+def test_init_command_reports_created_policy_pack(persistence, monkeypatch):
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
+
+    captured = {}
+
+    def fake_init_workspace(path, engine="markdown"):
+        captured["path"] = path
+        return {
+            "policy_pack": f"{path}/policy-pack",
+            "languages": ["Python"],
+            "build_tools": [],
+            "validation_passed": 24,
+            "validation_total": 24,
+        }
+
+    monkeypatch.setattr(tui_data, "init_workspace", fake_init_workspace)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for ch in "/init":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert captured["path"] == app.workspace
+            messages = app.screen.query(".chat-msg.system")
+            contents = [str(widget.content) for widget in messages]
+            assert any("Initialized policy pack" in content for content in contents)
+            assert any("24/24" in content for content in contents)
+
+    asyncio.run(scenario())
+
+
+def test_cd_command_switches_workspace(persistence, tmp_path):
+    repo = tmp_path / "other-repo"
+    repo.mkdir()
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for ch in f"/cd {repo}":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.workspace == str(repo)
+            assert str(repo) in str(app.persistence.storage_path)
+            assert app.screen.session.workspace_root == str(repo)
+            messages = app.screen.query(".chat-msg.system")
+            contents = [str(widget.content) for widget in messages]
+            assert any("Workspace set to" in content for content in contents)
+
+    asyncio.run(scenario())
+
+
+def test_cd_command_rejects_missing_directory(persistence, tmp_path):
+    missing = tmp_path / "nope"
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            original = app.workspace
+            for ch in f"/cd {missing}":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.workspace == original
+            messages = app.screen.query(".chat-msg.system")
+            contents = [str(widget.content) for widget in messages]
+            assert any("Not a directory" in content for content in contents)
 
     asyncio.run(scenario())
 

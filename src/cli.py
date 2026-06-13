@@ -504,6 +504,11 @@ def main() -> None:
         default=None,
         help="Task ID to select on launch",
     )
+    tui_parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Folder/repo to operate on (default: current directory)",
+    )
 
     subparsers.add_parser("desktop", help="Run the local Sarathi desktop stack")
 
@@ -904,7 +909,10 @@ def handle_tui(args: argparse.Namespace) -> None:
         from .tui import launch_sarathi_tui
     except ImportError:
         from tui import launch_sarathi_tui
-    launch_sarathi_tui(task_id=getattr(args, "task", None))
+    launch_sarathi_tui(
+        task_id=getattr(args, "task", None),
+        workspace=getattr(args, "workspace", None),
+    )
 
 
 def handle_list_tasks() -> None:

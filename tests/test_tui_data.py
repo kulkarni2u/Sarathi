@@ -117,6 +117,28 @@ def test_phase_rows_include_agent_and_error(seeded):
     assert tui_data.phase_rows(seeded, "missing") == []
 
 
+def test_init_workspace_creates_policy_pack(tmp_path):
+    (tmp_path / "main.py").write_text("print('hi')\n")
+    (tmp_path / "pyproject.toml").write_text("[project]\n")
+
+    result = tui_data.init_workspace(str(tmp_path))
+
+    assert "error" not in result
+    pack = Path(result["policy_pack"])
+    assert pack.is_dir()
+    assert len(list(pack.glob("*.md"))) >= 3
+    assert "Python" in result["languages"]
+    assert result["validation_total"] > 0
+    assert result["validation_passed"] <= result["validation_total"]
+
+
+def test_init_workspace_rejects_missing_directory(tmp_path):
+    result = tui_data.init_workspace(str(tmp_path / "does-not-exist"))
+
+    assert "error" in result
+    assert "Not a directory" in result["error"]
+
+
 def test_phase_log_tail_limits_lines(seeded):
     tail = tui_data.phase_log_tail(seeded, "t-running", max_lines=2)
 

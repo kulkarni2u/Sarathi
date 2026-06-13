@@ -9,6 +9,7 @@ started elsewhere (CLI, MCP, service) without coordination.
 from __future__ import annotations
 
 import json
+import os
 import time
 
 from rich.markup import escape
@@ -37,6 +38,8 @@ SARATHI_BANNER = r"""
 CHAT_HELP = (
     "/run <description>  run a task through the policy-backed lifecycle\n"
     "                    (recent chat context is included automatically)\n"
+    "/cd [path]          show or switch the active folder/repo (workspace)\n"
+    "/init [path]        create a policy pack for the workspace (default: cwd)\n"
     "/model [name]       show or switch the agent CLI used for chat\n"
     "/context [task_id]  attach a task's status to the conversation\n"
     "/clear              forget the conversation and start fresh\n"
@@ -122,12 +125,12 @@ def _styled_log_line(line: str) -> Text:
     return text
 
 
-def _discover_policy_pack() -> str | None:
+def _discover_policy_pack(start_path: str = ".") -> str | None:
     try:
         from .cli import discover_policy_pack
     except ImportError:
         from cli import discover_policy_pack
-    return discover_policy_pack()
+    return discover_policy_pack(start_path)
 
 
 class NewTaskScreen(ModalScreen):
@@ -254,7 +257,7 @@ class ProposalsScreen(Screen):
         if proposal is None:
             self.notify("No proposal selected.", severity="warning")
             return
-        policy_pack = _discover_policy_pack()
+        policy_pack = _discover_policy_pack(self.app.workspace)
         if not policy_pack:
             self.notify(
                 "No policy pack found — run `sarathi init` first.", severity="error"
@@ -417,6 +420,10 @@ class ChatScreen(Screen):
                     self._system(
                         f"Launched task: {argument} — watch it in the task panel (Ctrl+T)."
                     )
+        elif command in ("/cd", "/workspace"):
+            self._handle_workspace_command(argument)
+        elif command == "/init":
+            self._handle_init_command(argument)
         elif command == "/model":
             self._handle_model_command(argument)
         elif command == "/context":
@@ -470,6 +477,49 @@ class ChatScreen(Screen):
         self.remove_class("-started")
         self.query_one("#chat-input-home", Input).focus()
         self.app.notify("Conversation cleared.")
+
+    def _handle_workspace_command(self, argument: str) -> None:
+        if not argument:
+            pack = _discover_policy_pack(self.app.workspace)
+            status = (
+                f"policy pack: {pack}" if pack else "no policy pack — run /init to create one"
+            )
+            self._system(f"Workspace: {self.app.workspace} ({status})")
+            return
+        if not self.app.set_workspace(argument):
+            self._system(f"Not a directory: {argument}")
+            return
+        pack = _discover_policy_pack(self.app.workspace)
+        status = (
+            f"policy pack found: {pack}"
+            if pack
+            else "no policy pack here — run /init to create one"
+        )
+        self._system(f"Workspace set to {self.app.workspace} ({status}).")
+
+    def _handle_init_command(self, argument: str) -> None:
+        path = os.path.abspath(os.path.expanduser(argument)) if argument else self.app.workspace
+        if not os.path.isdir(path):
+            self._system(f"Not a directory: {path}")
+            return
+        self._system(f"Initializing policy pack in {path} — scanning repo…")
+        self.run_worker(lambda: self._run_init(path), thread=True, group="init")
+
+    def _run_init(self, path: str) -> None:
+        result = tui_data.init_workspace(path)
+        self.app.call_from_thread(self._report_init, path, result)
+
+    def _report_init(self, path: str, result: dict) -> None:
+        if result.get("error"):
+            self._system(f"Init failed: {result['error']}")
+            return
+        languages = ", ".join(result.get("languages") or []) or "none detected"
+        self._system(
+            f"Initialized policy pack: {result['policy_pack']}\n"
+            f"Languages: {languages}\n"
+            f"Validation: {result['validation_passed']}/{result['validation_total']} passed.\n"
+            "You can now /run tasks (or use the task panel) for this workspace."
+        )
 
     def _handle_model_command(self, argument: str) -> None:
         providers = self.session.available_providers()
@@ -605,7 +655,7 @@ class TasksScreen(Screen):
         if task_id is None:
             self.notify("No task selected.", severity="warning")
             return
-        policy_pack = _discover_policy_pack()
+        policy_pack = _discover_policy_pack(self.app.workspace)
         if not policy_pack:
             self.notify(
                 "No policy pack found — run `sarathi init` first.", severity="error"
@@ -742,14 +792,42 @@ class SarathiApp(App):
         persistence=None,
         task_id: str | None = None,
         refresh_interval: float = 2.0,
+        workspace: str | None = None,
     ) -> None:
         super().__init__()
-        self.persistence = (
-            persistence if persistence is not None else tui_data.default_persistence()
-        )
+        self.workspace = os.path.abspath(os.path.expanduser(workspace)) if workspace else os.getcwd()
+        if persistence is not None:
+            self.persistence = persistence
+        else:
+            self.persistence = tui_data.default_persistence(
+                os.path.join(self.workspace, ".sarathi", "tasks")
+            )
         self.initial_task_id = task_id
         self.refresh_interval = refresh_interval
         self.chat_screen: ChatScreen | None = None
+
+    def set_workspace(self, path: str) -> bool:
+        """Point the app at a different folder/repo.
+
+        Re-roots task persistence at ``<path>/.sarathi/tasks``, runs chat
+        and lifecycle tasks from there, and refreshes the task panel if it
+        is open. Returns False (leaving the workspace unchanged) when
+        ``path`` is not a directory.
+        """
+        resolved = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isdir(resolved):
+            return False
+        self.workspace = resolved
+        self.persistence = tui_data.default_persistence(
+            os.path.join(resolved, ".sarathi", "tasks")
+        )
+        if self.chat_screen is not None:
+            self.chat_screen.session.workspace_root = resolved
+        screen = self.screen
+        if isinstance(screen, TasksScreen):
+            screen.selected_task_id = None
+            screen.refresh_data()
+        return True
 
     def on_mount(self) -> None:
         # Opening with --task means the user wants the panel, not the chat.
@@ -771,10 +849,11 @@ class SarathiApp(App):
 
     def launch_task(self, description: str, context: str | None = None) -> bool:
         """Run a new task through the lifecycle in a background worker."""
-        policy_pack = _discover_policy_pack()
+        policy_pack = _discover_policy_pack(self.workspace)
         if not policy_pack:
             self.notify(
-                "No policy pack found — run `sarathi init` first.", severity="error"
+                "No policy pack found — run /init (or `sarathi init`) first.",
+                severity="error",
             )
             return False
         self.notify(f"Starting: {_short(description, 60)}")
@@ -810,6 +889,8 @@ class SarathiApp(App):
 SarathiDashboard = SarathiApp
 
 
-def launch_sarathi_tui(task_id: str | None = None) -> None:
+def launch_sarathi_tui(
+    task_id: str | None = None, workspace: str | None = None
+) -> None:
     """Launch the Sarathi terminal UI."""
-    SarathiApp(task_id=task_id).run()
+    SarathiApp(task_id=task_id, workspace=workspace).run()

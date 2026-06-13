@@ -589,6 +589,45 @@ class ChatSession:
         return "\n".join(lines)
 
 
+def init_workspace(target_path: str | Path, engine: str = "markdown") -> dict[str, Any]:
+    """Run the onboarding workflow on a folder, creating a policy pack.
+
+    Mirrors `sarathi init <target_path>` (inspect → interview → generate →
+    validate → evolve) but returns a summary dict instead of printing, so
+    the TUI can run it in a worker and report results into the chat. The
+    returned dict has an ``error`` key on failure, otherwise ``policy_pack``,
+    ``languages``, ``build_tools``, ``validation_passed`` and
+    ``validation_total``.
+    """
+    try:
+        from .init import InitWorkflow
+    except ImportError:
+        from init import InitWorkflow
+
+    target = Path(target_path).expanduser()
+    if not target.is_dir():
+        return {"error": f"Not a directory: {target}"}
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        workflow = InitWorkflow(target_path=str(target), engine_path=engine)
+        inspection = workflow.inspect()
+        if inspection.get("error"):
+            return {"error": inspection["error"]}
+        interview = workflow.interview(inspection)
+        policy_path = workflow.generate(inspection, interview)
+        validation = workflow.validate(policy_path)
+        passed = sum(
+            1 for r in validation if getattr(r.status, "value", r.status) == "PASS"
+        )
+        workflow.evolve()
+    return {
+        "policy_pack": str(policy_path),
+        "languages": inspection.get("languages", []),
+        "build_tools": inspection.get("build_tools", []),
+        "validation_passed": passed,
+        "validation_total": len(validation),
+    }
+
+
 def resume_task(
     persistence: PersistenceManager, task_id: str, policy_pack: str | Path
 ) -> TaskContext:

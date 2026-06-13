@@ -9,8 +9,10 @@ import contextlib
 import io
 import json
 import os
+import queue
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -174,24 +176,25 @@ def start_task(
     still derived from the bare `description` so the transcript doesn't
     pollute task identity.
     """
-    engine = Engine(policy_pack_path=str(policy_pack), enforce_preflight=True)
-    engine.persistence = persistence
-    task_description = description
-    if context:
-        task_description = f"{description}\n\nContext from chat conversation:\n{context}"
-    task = TaskContext(
-        task_id=engine.generate_task_id(description),
-        description=task_description,
-        complexity=_cli().calculate_complexity(description),
-    )
-    preflight = engine.preflight_validate_policy(task.task_id)
-    task.preflight_validation = preflight
-    if preflight.get("blocking"):
-        raise RuntimeError(
-            "Preflight blocked the task"
-            f" ({preflight.get('todo', 0)} TODO, {preflight.get('drift', 0)} drift)"
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        engine = Engine(policy_pack_path=str(policy_pack), enforce_preflight=True)
+        engine.persistence = persistence
+        task_description = description
+        if context:
+            task_description = f"{description}\n\nContext from chat conversation:\n{context}"
+        task = TaskContext(
+            task_id=engine.generate_task_id(description),
+            description=task_description,
+            complexity=_cli().calculate_complexity(description),
         )
-    return engine.run_task(task)
+        preflight = engine.preflight_validate_policy(task.task_id)
+        task.preflight_validation = preflight
+        if preflight.get("blocking"):
+            raise RuntimeError(
+                "Preflight blocked the task"
+                f" ({preflight.get('todo', 0)} TODO, {preflight.get('drift', 0)} drift)"
+            )
+        return engine.run_task(task)
 
 
 NO_PROVIDER_HELP = (
@@ -341,64 +344,100 @@ class ChatSession:
         is_error = False
         timed_out = False
         saw_delta = False
-        try:
-            if proc.stdin is not None:
-                try:
-                    proc.stdin.write(message)
-                except (BrokenPipeError, OSError):
-                    pass
+
+        if proc.stdin is not None:
+            try:
+                proc.stdin.write(message)
+            except (BrokenPipeError, OSError):
+                pass
+            try:
                 proc.stdin.close()
-            if proc.stdout is not None:
-                for line in proc.stdout:
-                    if time.monotonic() > deadline:
-                        timed_out = True
-                        break
-                    line = line.strip()
-                    if not line:
+            except (BrokenPipeError, OSError):
+                pass
+
+        line_queue: queue.Queue[str | None] = queue.Queue()
+        stderr_chunks: list[str] = []
+
+        def _read_stdout() -> None:
+            try:
+                if proc.stdout is not None:
+                    for raw_line in proc.stdout:
+                        line_queue.put(raw_line)
+            finally:
+                line_queue.put(None)
+
+        def _read_stderr() -> None:
+            try:
+                if proc.stderr is not None:
+                    for raw_line in proc.stderr:
+                        stderr_chunks.append(raw_line)
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+        stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    line = line_queue.get(timeout=min(remaining, 0.5))
+                except queue.Empty:
+                    continue
+                if line is None:  # EOF sentinel
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type")
+                if event_type == "system" and event.get("subtype") == "init":
+                    sid = event.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        session_id = sid
+                elif event_type == "stream_event":
+                    stream_event = event.get("event")
+                    if not isinstance(stream_event, dict):
                         continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    event_type = event.get("type")
-                    if event_type == "system" and event.get("subtype") == "init":
-                        sid = event.get("session_id")
-                        if isinstance(sid, str) and sid:
-                            session_id = sid
-                    elif event_type == "stream_event":
-                        stream_event = event.get("event")
-                        if not isinstance(stream_event, dict):
-                            continue
-                        if stream_event.get("type") == "content_block_delta":
-                            delta = stream_event.get("delta")
-                            if isinstance(delta, dict) and delta.get("type") == "text_delta":
-                                text = delta.get("text")
-                                if isinstance(text, str) and text:
-                                    accumulated += text
-                                    saw_delta = True
-                                    if on_text is not None:
-                                        on_text(accumulated)
-                        # Other stream_event subtypes (message_start, etc.)
-                        # carry no text and are ignored.
-                    elif event_type == "assistant":
-                        if not saw_delta:
-                            message_obj = event.get("message") or {}
-                            for block in message_obj.get("content") or []:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    accumulated += str(block.get("text") or "")
-                            if on_text is not None:
-                                on_text(accumulated)
-                        # else: assistant events re-deliver the full text
-                        # already streamed via text_delta — ignore to avoid
-                        # doubling.
-                    elif event_type == "result":
-                        result_text = str(event.get("result") or "")
-                        sid = event.get("session_id")
-                        if isinstance(sid, str) and sid:
-                            session_id = sid
-                        is_error = bool(event.get("is_error"))
+                    if stream_event.get("type") == "content_block_delta":
+                        delta = stream_event.get("delta")
+                        if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                            text = delta.get("text")
+                            if isinstance(text, str) and text:
+                                accumulated += text
+                                saw_delta = True
+                                if on_text is not None:
+                                    on_text(accumulated)
+                    # Other stream_event subtypes (message_start, etc.)
+                    # carry no text and are ignored.
+                elif event_type == "assistant":
+                    if not saw_delta:
+                        message_obj = event.get("message") or {}
+                        for block in message_obj.get("content") or []:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                accumulated += str(block.get("text") or "")
+                        if on_text is not None:
+                            on_text(accumulated)
+                    # else: assistant events re-deliver the full text
+                    # already streamed via text_delta — ignore to avoid
+                    # doubling.
+                elif event_type == "result":
+                    result_text = str(event.get("result") or "")
+                    sid = event.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        session_id = sid
+                    is_error = bool(event.get("is_error"))
+
             if not timed_out:
                 remaining = deadline - time.monotonic()
                 try:
@@ -409,6 +448,9 @@ class ChatSession:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+            stderr_thread.join(timeout=1)
+
+        stderr_text = "".join(stderr_chunks)
 
         if timed_out:
             return f"claude timed out after {self.timeout}s."
@@ -423,19 +465,29 @@ class ChatSession:
             self.history.append((original_message, reply))
             return reply
 
-        if not accumulated and proc.returncode not in (0, None):
-            # Older CLIs may reject --include-partial-messages and exit
-            # nonzero without ever producing a result event. Fall back to
-            # the blocking JSON path.
-            reply = self._send_claude(path, message)
-            if on_text is not None and reply:
-                on_text(reply)
+        if accumulated.strip():
+            reply = accumulated.strip()
             self.history.append((original_message, reply))
             return reply
 
-        reply = accumulated.strip() or "(empty response)"
-        self.history.append((original_message, reply))
-        return reply
+        returncode = proc.returncode
+        if returncode not in (0, None):
+            # Older CLIs may reject --include-partial-messages and exit
+            # nonzero without ever producing a result event. Fall back to
+            # the blocking JSON path.
+            try:
+                reply = self._send_claude(path, message)
+            except (subprocess.TimeoutExpired, OSError):
+                reply = ""
+            if reply and not reply.startswith(("claude error", "claude exited", "claude timed out")):
+                if on_text is not None:
+                    on_text(reply)
+                self.history.append((original_message, reply))
+                return reply
+            detail = stderr_text.strip()[:300] or "no output"
+            return f"claude error (exit {returncode}): {detail}"
+
+        return "(empty response)"
 
     def _send_claude(self, path: str, message: str) -> str:
         command = [path, "-p", "--output-format", "json"]
@@ -504,4 +556,5 @@ def resume_task(
         raise ValueError(f"Task {task_id} not found")
     engine = Engine(policy_pack_path=str(policy_pack), enforce_preflight=True)
     engine.persistence = persistence
-    return engine.resume_task(task)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        return engine.resume_task(task)

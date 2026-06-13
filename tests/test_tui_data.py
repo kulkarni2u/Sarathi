@@ -1,5 +1,7 @@
 """Tests for the terminal dashboard data layer (src/tui_data.py)."""
+import io
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -171,6 +173,19 @@ def test_start_task_runs_lifecycle_and_persists(persistence):
     assert result.task_id in [s["task_id"] for s in tui_data.task_summaries(persistence)]
 
 
+def test_start_task_suppresses_engine_stdout(persistence, capsys):
+    policy_pack = Path(__file__).resolve().parents[1] / "policy-pack" / "EXAMPLE"
+
+    tui_data.start_task(persistence, "Fix typo in README", policy_pack)
+
+    captured = capsys.readouterr()
+    assert "Gate FAILED" not in captured.out
+    assert "Gate advisory" not in captured.out
+    assert "[ncp]" not in captured.out
+    assert captured.out.strip() == ""
+    assert captured.err.strip() == ""
+
+
 def test_start_task_with_context_includes_transcript(persistence):
     policy_pack = Path(__file__).resolve().parents[1] / "policy-pack" / "EXAMPLE"
 
@@ -336,6 +351,45 @@ def _fake_popen(lines, returncode=0):
         return _FakeProcess(lines, returncode=returncode)
 
     return popen
+
+
+class _IterStream:
+    """Stdout-like iterable: yields `lines`, optionally blocking before EOF.
+
+    When `block_seconds` is set, iteration sleeps for that long (simulating a
+    hung CLI that never writes anything) before raising StopIteration.
+    """
+
+    def __init__(self, lines, block_seconds=None):
+        self._lines = list(lines)
+        self._block_seconds = block_seconds
+
+    def __iter__(self):
+        if self._block_seconds is not None:
+            time.sleep(self._block_seconds)
+            return iter(self._lines)
+        return iter(self._lines)
+
+
+class FakePopen:
+    """Reusable fake `subprocess.Popen` for the reader-thread streaming path."""
+
+    def __init__(self, stdout_lines, stderr="", returncode=0, stdout_block_seconds=None):
+        self._stdout_lines = stdout_lines
+        self.stdin = io.StringIO()
+        self.stdout = _IterStream(stdout_lines, stdout_block_seconds)
+        self.stderr = io.StringIO(stderr)
+        self.returncode = returncode
+        self._killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self._killed = True
 
 
 def test_send_streaming_accumulates_and_returns_result(monkeypatch):
@@ -575,6 +629,70 @@ def test_send_streaming_falls_back_to_blocking_json_on_old_cli(monkeypatch):
     assert reply == "fallback reply"
     assert seen == ["fallback reply"]
     assert session.history == [("hi", "fallback reply")]
+
+
+def test_send_streaming_timeout_returns_message_when_no_output(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    created = {}
+
+    def fake_popen(command, **kwargs):
+        proc = FakePopen([], returncode=None, stdout_block_seconds=2.0)
+        created["proc"] = proc
+        return proc
+
+    monkeypatch.setattr(tui_data.subprocess, "Popen", fake_popen)
+
+    session = tui_data.ChatSession()
+    session.timeout = 0.3
+
+    start = time.monotonic()
+    reply = session.send_streaming("hi")
+    elapsed = time.monotonic() - start
+
+    assert "timed out" in reply
+    assert elapsed < 1.5
+    assert session.history == []
+    assert created["proc"]._killed is True
+
+
+def test_send_streaming_surfaces_error_on_nonzero_exit_no_result(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/claude" if name == "claude" else None
+
+    monkeypatch.setattr(tui_data.shutil, "which", fake_which)
+
+    def fake_popen(command, **kwargs):
+        return FakePopen([], stderr="bad flag", returncode=2)
+
+    monkeypatch.setattr(tui_data.subprocess, "Popen", fake_popen)
+
+    class FakeCompleted:
+        def __init__(self, stdout, returncode, stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(command, **kwargs):
+        # Not valid JSON, and a nonzero return code: _send_claude's fallback
+        # should surface this as an error-ish string rather than a clean
+        # reply.
+        return FakeCompleted("not json", returncode=2, stderr="bad flag")
+
+    monkeypatch.setattr(tui_data.subprocess, "run", fake_run)
+
+    session = tui_data.ChatSession()
+    reply = session.send_streaming("hi")
+
+    # _send_claude's fallback returns "claude exited with 2: bad flag" for a
+    # nonzero, non-JSON completion, which does not start with the
+    # error-prefixes _send_claude_streaming checks for, so it is surfaced
+    # directly as the reply.
+    assert "exit 2" in reply or "bad flag" in reply or "claude error" in reply
+    assert session.history == []
 
 
 def test_add_context_wraps_next_message_once(monkeypatch):

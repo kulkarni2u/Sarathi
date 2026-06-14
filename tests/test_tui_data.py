@@ -239,6 +239,73 @@ def test_resume_task_missing_raises(persistence):
         tui_data.resume_task(persistence, "missing", "policy-pack")
 
 
+def test_start_task_forwards_cancel_and_timeout(persistence, monkeypatch):
+    policy_pack = Path(__file__).resolve().parents[1] / "policy-pack" / "EXAMPLE"
+    captured = {}
+
+    def fake_run_task(self, task, *, cancel_check=None, task_timeout=None):
+        captured["cancel_check"] = cancel_check
+        captured["task_timeout"] = task_timeout
+        task.current_phase = None
+        return task
+
+    monkeypatch.setattr(tui_data.Engine, "run_task", fake_run_task)
+
+    cancel_check = lambda: False
+    tui_data.start_task(
+        persistence,
+        "Fix typo in README",
+        policy_pack,
+        cancel_check=cancel_check,
+        task_timeout=42.0,
+    )
+
+    assert captured["cancel_check"] is cancel_check
+    assert captured["task_timeout"] == 42.0
+
+
+def test_start_task_defaults_cancel_and_timeout_to_none(persistence, monkeypatch):
+    policy_pack = Path(__file__).resolve().parents[1] / "policy-pack" / "EXAMPLE"
+    captured = {}
+
+    def fake_run_task(self, task, *, cancel_check=None, task_timeout=None):
+        captured["cancel_check"] = cancel_check
+        captured["task_timeout"] = task_timeout
+        task.current_phase = None
+        return task
+
+    monkeypatch.setattr(tui_data.Engine, "run_task", fake_run_task)
+
+    tui_data.start_task(persistence, "Fix typo in README", policy_pack)
+
+    assert captured["cancel_check"] is None
+    assert captured["task_timeout"] is None
+
+
+def test_resume_task_forwards_cancel_and_timeout(seeded, monkeypatch):
+    captured = {}
+
+    def fake_resume_task(self, task, *, cancel_check=None, task_timeout=None):
+        captured["cancel_check"] = cancel_check
+        captured["task_timeout"] = task_timeout
+        task.current_phase = None
+        return task
+
+    monkeypatch.setattr(tui_data.Engine, "resume_task", fake_resume_task)
+
+    cancel_check = lambda: True
+    tui_data.resume_task(
+        seeded,
+        "t-running",
+        "policy-pack",
+        cancel_check=cancel_check,
+        task_timeout=99.0,
+    )
+
+    assert captured["cancel_check"] is cancel_check
+    assert captured["task_timeout"] == 99.0
+
+
 def test_chat_session_no_provider(monkeypatch):
     monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
 

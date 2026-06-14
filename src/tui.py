@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 
 from rich.markup import escape
@@ -38,6 +39,7 @@ SARATHI_BANNER = r"""
 CHAT_HELP = (
     "/run <description>  run a task through the policy-backed lifecycle\n"
     "                    (recent chat context is included automatically)\n"
+    "/cancel             stop the running task after the current phase\n"
     "/cd [path]          show or switch the active folder/repo (workspace);\n"
     "                    starts a fresh agent session in the new workspace\n"
     "/init [path]        create a policy pack for the workspace (default: cwd)\n"
@@ -54,6 +56,10 @@ CHAT_HELP = (
 # Cap how much of a task's status snapshot `/context` injects into the
 # next message, so a large task graph doesn't silently balloon the prompt.
 MAX_CONTEXT_CHARS = 4000
+
+# Wall-clock cap for a `/run`/launch_task lifecycle run, checked between
+# phases (cooperative — see Engine.run_task's `task_timeout`).
+DEFAULT_TASK_TIMEOUT = 1800.0  # 30 min wall-clock cap, checked between phases
 
 _OUTCOME_STYLES = {
     "pass": "green",
@@ -176,7 +182,10 @@ class InitWorkspaceScreen(ModalScreen):
         self.query_one(Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        self.dismiss(event.value.strip() or None)
+        # Dismiss with the (possibly empty) path; empty means "use the
+        # current workspace". Distinct from `action_cancel`'s `None`, which
+        # means "do nothing" — both must be distinguishable to `on_result`.
+        self.dismiss(event.value.strip())
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -446,6 +455,8 @@ class ChatScreen(Screen):
                     self._system(
                         f"Launched task: {argument} — watch it in the task panel (Ctrl+T)."
                     )
+        elif command == "/cancel":
+            self.app.request_cancel()
         elif command in ("/cd", "/workspace"):
             self._handle_workspace_command(argument)
         elif command == "/init":
@@ -566,6 +577,7 @@ class TasksScreen(Screen):
         Binding("p", "proposals", "Proposals"),
         Binding("u", "resume", "Resume task"),
         Binding("i", "init_workspace", "Init pack"),
+        Binding("c", "cancel_run", "Cancel run"),
     ]
 
     def __init__(self) -> None:
@@ -660,9 +672,13 @@ class TasksScreen(Screen):
 
     def action_init_workspace(self) -> None:
         def on_result(path: str | None) -> None:
-            self.app.launch_init(path or self.app.workspace)
+            if path is not None:
+                self.app.launch_init(path or self.app.workspace)
 
         self.app.push_screen(InitWorkspaceScreen(), on_result)
+
+    def action_cancel_run(self) -> None:
+        self.app.request_cancel()
 
     def action_resume(self) -> None:
         task_id = self.selected_task_id
@@ -685,8 +701,13 @@ class TasksScreen(Screen):
         )
 
     def _resume(self, task_id: str, policy_pack: str) -> None:
+        # Resumes are bounded by the same wall-clock cap as launches; the
+        # interactive cancel affordance (`c` / `/cancel`) targets the
+        # active `/run`/launch_task run, not a resume.
         try:
-            result = tui_data.resume_task(self.app.persistence, task_id, policy_pack)
+            result = tui_data.resume_task(
+                self.app.persistence, task_id, policy_pack, task_timeout=DEFAULT_TASK_TIMEOUT
+            )
         except Exception as exc:
             message = f"Resume failed: {exc}"
             self.app.call_from_thread(self.notify, message, severity="error")
@@ -832,6 +853,7 @@ class SarathiApp(App):
         self.chat_screen: ChatScreen | None = None
         self._init_active = False
         self._run_active = False
+        self._run_cancel: threading.Event | None = None
 
     def set_workspace(self, path: str) -> bool:
         """Point the app at a different folder/repo.
@@ -894,6 +916,7 @@ class SarathiApp(App):
             return False
         self.notify(f"Starting: {_short(description, 60)}")
         self._run_active = True
+        self._run_cancel = threading.Event()
         self.run_worker(
             lambda: self._start(description, policy_pack, context),
             thread=True,
@@ -902,19 +925,37 @@ class SarathiApp(App):
         return True
 
     def _start(self, description: str, policy_pack: str, context: str | None = None) -> None:
+        cancel_event = self._run_cancel
         try:
             try:
                 result = tui_data.start_task(
-                    self.persistence, description, policy_pack, context=context
+                    self.persistence,
+                    description,
+                    policy_pack,
+                    context=context,
+                    cancel_check=cancel_event.is_set if cancel_event is not None else None,
+                    task_timeout=DEFAULT_TASK_TIMEOUT,
                 )
             except Exception as exc:
                 self.call_from_thread(self.notify, f"Task failed: {exc}", severity="error")
                 self.call_from_thread(self.post_chat_event, f"Task failed: {exc}")
                 return
-            if result.current_phase is None:
+            phase = result.current_phase.value if result.current_phase else "Completed"
+            stop_reason = getattr(result, "stop_reason", None)
+            if stop_reason == "cancelled":
+                message = (
+                    f"Task cancelled at {phase}: {result.task_id}"
+                    " — resume with `u` or `sarathi resume`."
+                )
+            elif stop_reason == "timeout":
+                message = (
+                    f"Task timed out at {phase} after {int(DEFAULT_TASK_TIMEOUT)}s:"
+                    f" {result.task_id} — resume with `u`."
+                )
+            elif result.current_phase is None:
                 message = f"Task completed: {result.task_id}"
             else:
-                message = f"Task paused at {result.current_phase.value}: {result.task_id}"
+                message = f"Task paused at {phase}: {result.task_id}"
             self.call_from_thread(self.notify, message)
             self.call_from_thread(self.post_chat_event, message)
             screen = self.screen
@@ -926,6 +967,20 @@ class SarathiApp(App):
 
     def _clear_run_active(self) -> None:
         self._run_active = False
+        self._run_cancel = None
+
+    def request_cancel(self) -> bool:
+        """Ask the active `/run`/launch_task run to stop after this phase.
+
+        Returns True if a run was signalled, else False (and notifies that
+        nothing is running).
+        """
+        if self._run_active and self._run_cancel is not None:
+            self._run_cancel.set()
+            self.notify("Cancelling after the current phase…")
+            return True
+        self.notify("No task is running.", severity="warning")
+        return False
 
     def launch_init(self, path: str) -> bool:
         """Create a policy pack for `path` in a background worker.

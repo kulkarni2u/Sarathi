@@ -166,6 +166,8 @@ def start_task(
     description: str,
     policy_pack: str | Path,
     context: str | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    task_timeout: float | None = None,
 ) -> TaskContext:
     """Create a new task from a description and run it through the lifecycle.
 
@@ -176,6 +178,9 @@ def start_task(
     description as recent chat context, but `task_id` and `complexity` are
     still derived from the bare `description` so the transcript doesn't
     pollute task identity.
+
+    `cancel_check` and `task_timeout` are forwarded to `Engine.run_task` for
+    cooperative cancellation and a wall-clock cap (see `task.stop_reason`).
     """
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         engine = Engine(policy_pack_path=str(policy_pack), enforce_preflight=True)
@@ -195,7 +200,7 @@ def start_task(
                 "Preflight blocked the task"
                 f" ({preflight.get('todo', 0)} TODO, {preflight.get('drift', 0)} drift)"
             )
-        return engine.run_task(task)
+        return engine.run_task(task, cancel_check=cancel_check, task_timeout=task_timeout)
 
 
 NO_PROVIDER_HELP = (
@@ -633,13 +638,21 @@ def init_workspace(target_path: str | Path, engine: str = "markdown") -> dict[st
 
 
 def resume_task(
-    persistence: PersistenceManager, task_id: str, policy_pack: str | Path
+    persistence: PersistenceManager,
+    task_id: str,
+    policy_pack: str | Path,
+    cancel_check: Callable[[], bool] | None = None,
+    task_timeout: float | None = None,
 ) -> TaskContext:
-    """Resume a persisted task through the engine."""
+    """Resume a persisted task through the engine.
+
+    `cancel_check` and `task_timeout` are forwarded to `Engine.resume_task`
+    (see `start_task`).
+    """
     task = persistence.load_task(task_id)
     if task is None:
         raise ValueError(f"Task {task_id} not found")
     engine = Engine(policy_pack_path=str(policy_pack), enforce_preflight=True)
     engine.persistence = persistence
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        return engine.resume_task(task)
+        return engine.resume_task(task, cancel_check=cancel_check, task_timeout=task_timeout)

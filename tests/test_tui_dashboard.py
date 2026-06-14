@@ -182,7 +182,7 @@ def test_run_command_passes_chat_context(persistence, tmp_path, monkeypatch):
         task_id = "t-x"
         current_phase = None
 
-    def fake_start_task(persistence, description, policy_pack, context=None):
+    def fake_start_task(persistence, description, policy_pack, context=None, **kwargs):
         captured["description"] = description
         captured["context"] = context
         return DummyResult()
@@ -600,7 +600,7 @@ def test_launch_task_rejects_while_run_active(persistence, tmp_path, monkeypatch
         task_id = "t-x"
         current_phase = None
 
-    def fake_start_task(persistence, description, policy_pack, context=None):
+    def fake_start_task(persistence, description, policy_pack, context=None, **kwargs):
         release.wait(timeout=5)
         return DummyResult()
 
@@ -641,6 +641,154 @@ def test_cd_command_resets_agent_session(persistence, tmp_path):
 
             assert app.workspace == str(repo)
             assert app.screen.session.claude_session_id is None
+
+    asyncio.run(scenario())
+
+
+def _cancellable_pack(tmp_path):
+    pack = tmp_path / "policy-pack"
+    pack.mkdir()
+    for name in ("commands", "conventions", "review"):
+        (pack / f"{name}.md").write_text(f"# {name}\n")
+    return pack
+
+
+def test_cancel_command_stops_active_run(persistence, tmp_path, monkeypatch):
+    pack = _cancellable_pack(tmp_path)
+    monkeypatch.setattr("src.tui._discover_policy_pack", lambda *a, **k: str(pack))
+
+    class DummyResult:
+        task_id = "t-cancel"
+        current_phase = Phase.BUILD
+        stop_reason = "cancelled"
+
+    def fake_start_task(persistence, description, policy_pack, context=None, cancel_check=None, task_timeout=None):
+        # Block until the app sets the cancel event via /cancel.
+        for _ in range(200):
+            if cancel_check is not None and cancel_check():
+                break
+            time.sleep(0.01)
+        return DummyResult()
+
+    monkeypatch.setattr(tui_data, "start_task", fake_start_task)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            # Start the chat thread so the chat screen is "-started" and
+            # picks up the post-run system message.
+            monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
+            await pilot.press(*"hi")
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app.launch_task("a task") is True
+            assert app._run_active is True
+            assert app._run_cancel is not None
+
+            for ch in "/cancel":
+                await pilot.press(ch)
+            await pilot.press("enter")
+
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app._run_active is False
+            messages = app.screen.query(".chat-msg.system")
+            contents = [str(widget.content) for widget in messages]
+            assert any("cancelled" in content and "t-cancel" in content for content in contents)
+
+    asyncio.run(scenario())
+
+
+def test_cancel_run_binding_stops_active_run(persistence, tmp_path, monkeypatch):
+    pack = _cancellable_pack(tmp_path)
+    monkeypatch.setattr("src.tui._discover_policy_pack", lambda *a, **k: str(pack))
+
+    class DummyResult:
+        task_id = "t-cancel-binding"
+        current_phase = Phase.VERIFY
+        stop_reason = "cancelled"
+
+    def fake_start_task(persistence, description, policy_pack, context=None, cancel_check=None, task_timeout=None):
+        for _ in range(200):
+            if cancel_check is not None and cancel_check():
+                break
+            time.sleep(0.01)
+        return DummyResult()
+
+    monkeypatch.setattr(tui_data, "start_task", fake_start_task)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            assert app.launch_task("a task") is True
+            assert app._run_active is True
+
+            app.switch_mode("tasks")
+            await pilot.pause()
+            await pilot.press("c")
+
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app._run_active is False
+            assert app._run_cancel is None
+
+    asyncio.run(scenario())
+
+
+def test_request_cancel_with_no_active_run_returns_false(persistence):
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            assert app._run_active is False
+            assert app.request_cancel() is False
+
+    asyncio.run(scenario())
+
+
+def test_timeout_reports_timed_out_message(persistence, tmp_path, monkeypatch):
+    pack = _cancellable_pack(tmp_path)
+    monkeypatch.setattr("src.tui._discover_policy_pack", lambda *a, **k: str(pack))
+
+    class DummyResult:
+        task_id = "t-timeout"
+        current_phase = Phase.REVIEW
+        stop_reason = "timeout"
+
+    def fake_start_task(persistence, description, policy_pack, context=None, cancel_check=None, task_timeout=None):
+        return DummyResult()
+
+    monkeypatch.setattr(tui_data, "start_task", fake_start_task)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            # Start the chat thread so the chat screen is "-started" and
+            # picks up the post-run system message.
+            monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
+            await pilot.press(*"hi")
+            await pilot.press("enter")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app.launch_task("a task") is True
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            messages = app.screen.query(".chat-msg.system")
+            contents = [str(widget.content) for widget in messages]
+            assert any("timed out" in content and "t-timeout" in content for content in contents)
 
     asyncio.run(scenario())
 

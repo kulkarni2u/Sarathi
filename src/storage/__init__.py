@@ -339,7 +339,7 @@ class Storage:
                 t.id,
                 MAX(t.updated_at) AS last_activity
             FROM tasks t
-            WHERE json_extract(t.metadata, '$.project_id') = ?
+            WHERE t.project_id = ?
             GROUP BY t.id
             """,
             (project_id,),
@@ -526,15 +526,16 @@ class Storage:
         status: str = "pending",
         description: str | None = None,
         metadata: dict[str, Any] | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         task_id = _new_id()
         now = _utc_now()
         self.conn.execute(
             """
             INSERT INTO tasks (
-                id, workspace_id, title, description, status, metadata, created_at, updated_at
+                id, workspace_id, title, description, status, metadata, created_at, updated_at, project_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -545,6 +546,7 @@ class Storage:
                 _dump_json(metadata),
                 now,
                 now,
+                project_id,
             ),
         )
         self.conn.commit()
@@ -555,7 +557,7 @@ class Storage:
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             """
-            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at
+            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at, project_id
             FROM tasks
             WHERE id = ?
             """,
@@ -592,7 +594,7 @@ class Storage:
     def list_tasks_for_workspace(self, workspace_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             """
-            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at
+            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at, project_id
             FROM tasks
             WHERE workspace_id = ?
             ORDER BY created_at, id
@@ -1482,6 +1484,7 @@ def _task_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "metadata": _load_json(row["metadata"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "project_id": row["project_id"] if "project_id" in row.keys() else None,
     }
 
 

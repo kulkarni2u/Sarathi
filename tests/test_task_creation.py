@@ -43,6 +43,50 @@ def test_storage_can_create_and_list_task_messages(tmp_path):
         assert storage.list_messages(workspace_id=workspace["id"], task_id=task["id"]) == [message]
 
 
+def test_create_task_with_project_id_round_trips(tmp_path):
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn)
+        workspace = storage.create_workspace(name="Sarathi", root_path=str(tmp_path))
+        project = storage.create_project(workspace_id=workspace["id"], name="Atlas")
+
+        task = storage.create_task(
+            workspace_id=workspace["id"],
+            title="Plan UI-05",
+            project_id=project["id"],
+        )
+
+        assert task["project_id"] == project["id"]
+        assert storage.get_task(task["id"])["project_id"] == project["id"]
+
+        listed = storage.list_tasks_for_workspace(workspace["id"])
+        assert [t["project_id"] for t in listed if t["id"] == task["id"]] == [project["id"]]
+
+        no_project_task = storage.create_task(workspace_id=workspace["id"], title="Untracked task")
+        assert no_project_task["project_id"] is None
+
+
+def test_get_project_stats_counts_tasks_by_project_id_column(tmp_path):
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn)
+        workspace = storage.create_workspace(name="Sarathi", root_path=str(tmp_path))
+        project = storage.create_project(workspace_id=workspace["id"], name="Atlas")
+        other_project = storage.create_project(workspace_id=workspace["id"], name="Borealis")
+
+        storage.create_task(workspace_id=workspace["id"], title="In Atlas 1", project_id=project["id"])
+        storage.create_task(workspace_id=workspace["id"], title="In Atlas 2", project_id=project["id"])
+        storage.create_task(workspace_id=workspace["id"], title="In Borealis", project_id=other_project["id"])
+        storage.create_task(workspace_id=workspace["id"], title="No project")
+
+        stats = storage.get_project_stats(project["id"])
+        assert stats["task_count"] == 2
+        assert stats["last_activity"] is not None
+
+        other_stats = storage.get_project_stats(other_project["id"])
+        assert other_stats["task_count"] == 1
+
+
 def test_service_creates_task_draft_from_orchestrator_prompt(tmp_path):
     app = create_app(tmp_path / "sarathi.db")
     _, workspace_data = assert_ok(

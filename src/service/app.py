@@ -33,6 +33,7 @@ from .intake import (
     _task_draft_metadata,
     _write_brainstorm_spec,
 )
+from .openapi import build_openapi_spec
 from .preferences import (
     _effective_auto_approve_preference,
     _evaluate_threshold,
@@ -136,9 +137,28 @@ class ServiceApp:
         try:
             if not skip_auth:
                 self._authorize(headers)
+            method = method.upper()
+            parts = _path_parts(path)
+            if parts and parts[0] == "api":
+                parts = parts[1:]
+            # The OpenAPI document (and its docs page) are returned as-is,
+            # without the success envelope, since they must be valid
+            # top-level OpenAPI/HTML documents for tooling that fetches them
+            # directly (e.g. Redoc, openapi-spec-validator).
+            if method == "GET" and parts == ["openapi.json"]:
+                return 200, build_openapi_spec()
+            if method == "GET" and parts == ["docs"]:
+                return 200, {
+                    "openapi_url": "/openapi.json",
+                    "note": (
+                        "Interactive HTML docs are not served by this JSON-only "
+                        "service; fetch /openapi.json and render it with Redoc "
+                        "or another OpenAPI viewer."
+                    ),
+                }
             status, data = self._route(
-                method.upper(),
-                _path_parts(path),
+                method,
+                parts,
                 _query(path),
                 body or {},
             )
@@ -671,11 +691,13 @@ class ServiceApp:
             workspace_id = parts[1]
             if storage.get_workspace(workspace_id) is None:
                 raise ServiceError("not_found", "Workspace not found.", 404)
+            task_metadata = _merge_task_defaults(_optional_dict(body, "metadata"))
             task = storage.create_task(
                 workspace_id=workspace_id,
                 title=_required_text(body, "title"),
                 description=_optional_text(body, "description"),
-                metadata=_merge_task_defaults(_optional_dict(body, "metadata")),
+                metadata=task_metadata,
+                project_id=task_metadata.get("project_id"),
             )
             storage.create_lifecycle_event(
                 workspace_id=workspace_id,
@@ -707,6 +729,7 @@ class ServiceApp:
                 status="prd_pending",
                 description=metadata["prd"]["problem"],
                 metadata=metadata,
+                project_id=metadata.get("project_id"),
             )
             user_message = storage.create_message(
                 workspace_id=workspace_id,
@@ -797,6 +820,7 @@ class ServiceApp:
                 status="prd_pending",
                 description=issue["url"] or f"Imported GitHub issue #{issue['number']}.",
                 metadata=task_metadata,
+                project_id=task_metadata.get("project_id"),
             )
             user_message = storage.create_message(
                 workspace_id=workspace_id,
@@ -1155,6 +1179,7 @@ class ServiceApp:
                     "project_id": checkpoint["project_id"],
                     "repository_action_preference": checkpoint["repository_action_preference"],
                 },
+                project_id=checkpoint["project_id"],
             )
             storage.create_lifecycle_event(
                 workspace_id=checkpoint["workspace_id"],
@@ -1342,6 +1367,7 @@ class ServiceApp:
                 title=session["title"],
                 description=spec_content,
                 metadata=task_metadata,
+                project_id=task_metadata.get("project_id"),
             )
             approved = storage.approve_brainstorm_session(session["id"], task_id=task["id"])
             spec_path = _write_brainstorm_spec(approved)

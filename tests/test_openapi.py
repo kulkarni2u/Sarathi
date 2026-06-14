@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.service import create_app
 from src.service.openapi import build_openapi_spec
 
 
@@ -80,3 +81,37 @@ def test_openapi_spec_validator_if_available():
 
     spec = build_openapi_spec()
     validate(spec)
+
+
+def test_openapi_json_route_returns_unwrapped_document(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+
+    status, payload = app.handle(
+        "GET",
+        "/openapi.json",
+        headers={"x-correlation-id": "corr-openapi"},
+    )
+
+    assert status == 200
+    # The document must be returned as-is at the top level (not wrapped in
+    # the {"ok": ..., "data": ...} success envelope) so it is a valid
+    # OpenAPI document for tooling that fetches it directly.
+    assert "ok" not in payload
+    assert "data" not in payload
+    assert payload["openapi"] == "3.1.0"
+    assert "info" in payload
+    assert "paths" in payload
+    assert payload == build_openapi_spec()
+
+
+def test_docs_route_points_at_openapi_json(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+
+    status, payload = app.handle(
+        "GET",
+        "/docs",
+        headers={"x-correlation-id": "corr-docs"},
+    )
+
+    assert status == 200
+    assert payload["openapi_url"] == "/openapi.json"

@@ -95,6 +95,18 @@ Dependencies are explicit; everything else can proceed in parallel.
 - **Acceptance:** From a browser a user can create a task, watch phases advance
   live, and approve a gate.
 - **Effort:** L. **Depends on:** A1, A2.
+- **Decision (2026-06-14):** This is a **greenfield build, not a revival**. An
+  earlier web UI attempt was stopped due to bugs while the CLI/Skill were
+  stabilized; that code is **not in this repository** (no `web/`, `frontend/`,
+  `package.json`, or `.tsx` in tree or history — the `WorkspacesHome` /
+  `WorkspaceDashboard` commits were TUI views, since rebuilt in PR #8). The old
+  attempt lives only on a local machine; if it is pushed to a branch later we
+  will mine it for lessons, but the plan does not depend on it.
+- **Lesson baked in:** the prior attempt's likely failure mode was a UI talking
+  to an undocumented, unstable service. B1 therefore **hard-depends on A1
+  (documented API) and A2 (SSE)** and must consume only those contracts.
+- **Reference:** mirror the rebuilt TUI harness dashboard (run monitor, task
+  browser, proposal review) so the browser and terminal surfaces stay consistent.
 
 #### Task B2 — Session model: sharing & co-drive
 - **Why:** Omnigent's `attach` / share / fork. This is the collaboration core.
@@ -280,3 +292,22 @@ omnigent-class reach with Sarathi-only measurement on top.
 | Declarative agents | Compile to `TaskClass`/`HarnessConfig` → still emit `PolicyProposal`s |
 | Layered governance | Resolved policy is a diffable artifact (HarnessConfig ethos) |
 | Recipe agents | Same FANOUT/JUDGE patterns, but with measured quality signals |
+
+---
+
+## 7. Decision log
+
+- **2026-06-14 — Branch baseline.** This roadmap branch is rebased onto `main`
+  after PR #8 ("Rebuild TUI as a harness dashboard") merged, so the design
+  assumes the rebuilt TUI as the reference UX for B1.
+- **2026-06-14 — Web UI is greenfield.** No browser UI code exists in the repo;
+  the earlier attempt is local-only and not a dependency (see Task B1 decision).
+- **2026-06-14 — Sequencing confirmed.** Recommended first tasks: **C1**
+  (gateway provider — lowest risk, high ROI) or **A1** (OpenAPI — foundation for
+  all clients). UI work (B1) does not start until A1 + A2 land.
+- **2026-06-14 — Provider-connection parity.** Omnigent connects via three
+  mechanisms (native CLI through tmux/pty, Python SDKs, and OpenAI/Anthropic-
+  compatible gateways via `base_url`), plus local/host/cloud-sandbox runners.
+  Sarathi already covers the first two; C1 exposes the gateway path (the
+  `base_url` support already exists in `OpenAISdkProviderAdapter`) and C2 adds
+  the sandbox runner. This mapping is the basis for Workstream C.

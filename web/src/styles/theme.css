@@ -1,0 +1,58 @@
+/* Theme tokens ported from docs/mockups/sarathi-webui-mockup.html
+   Dark is the default theme; light is opt-in via [data-theme="light"]. */
+
+[data-theme="dark"] {
+  --bg: #0a0a0b;
+  --panel: #141416;
+  --elev: #19191c;
+  --elev2: #212126;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-soft: rgba(255, 255, 255, 0.05);
+  --text: #f3f3f4;
+  --muted: #9a9aa2;
+  --faint: #6a6a72;
+  --field: #161618;
+  --field-br: rgba(255, 255, 255, 0.1);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 30px rgba(0, 0, 0, 0.35);
+  --hover: rgba(255, 255, 255, 0.04);
+}
+
+[data-theme="light"] {
+  --bg: #f1f1f3;
+  --panel: #ffffff;
+  --elev: #f7f7f9;
+  --elev2: #eeeef1;
+  --border: rgba(0, 0, 0, 0.09);
+  --border-soft: rgba(0, 0, 0, 0.055);
+  --text: #17171a;
+  --muted: #65656e;
+  --faint: #9b9ba4;
+  --field: #ffffff;
+  --field-br: rgba(0, 0, 0, 0.13);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 12px 30px rgba(0, 0, 0, 0.08);
+  --hover: rgba(0, 0, 0, 0.035);
+}
+
+:root {
+  --brand1: #f0a93b;
+  --brand2: #e0742a;
+  --blue: #5b8def;
+  --blueb: rgba(91, 141, 239, 0.16);
+  --green: #3fb27f;
+  --greenb: rgba(63, 178, 127, 0.16);
+  --amber: #e0902f;
+  --amberb: rgba(224, 144, 47, 0.16);
+  --red: #e05c5c;
+  --redb: rgba(224, 92, 92, 0.15);
+  --purple: #9b7ff0;
+  --purpleb: rgba(155, 127, 240, 0.16);
+  --slate: #8a8a93;
+  --slateb: rgba(138, 138, 147, 0.14);
+
+  --r-lg: 16px;
+  --r-md: 12px;
+  --r-sm: 9px;
+
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  --mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}

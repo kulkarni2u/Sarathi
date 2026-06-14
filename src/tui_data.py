@@ -241,6 +241,10 @@ class ChatSession:
         self.pending_context = []
         self.claude_session_id = None
 
+    def reset_session(self) -> None:
+        """Drop the resumable claude session, keeping history and pending context."""
+        self.claude_session_id = None
+
     def cancel(self) -> bool:
         """Kill the in-flight CLI subprocess, if any.
 

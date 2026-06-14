@@ -38,7 +38,8 @@ SARATHI_BANNER = r"""
 CHAT_HELP = (
     "/run <description>  run a task through the policy-backed lifecycle\n"
     "                    (recent chat context is included automatically)\n"
-    "/cd [path]          show or switch the active folder/repo (workspace)\n"
+    "/cd [path]          show or switch the active folder/repo (workspace);\n"
+    "                    starts a fresh agent session in the new workspace\n"
     "/init [path]        create a policy pack for the workspace (default: cwd)\n"
     "/model [name]       show or switch the agent CLI used for chat\n"
     "/context [task_id]  attach a task's status to the conversation\n"
@@ -157,6 +158,30 @@ class NewTaskScreen(ModalScreen):
         self.dismiss(None)
 
 
+class InitWorkspaceScreen(ModalScreen):
+    """Prompt for a target path to create a policy pack in."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="init-task-dialog"):
+            yield Static("[b]Init policy pack[/b] — enter a path and press Enter")
+            yield Input(
+                placeholder=self.app.workspace,
+                id="init-task-input",
+            )
+            yield Static("[dim]Empty = current workspace; Esc cancels.[/dim]")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ProposalsScreen(Screen):
     """Review policy proposals: accept into the policy pack or reject."""
 
@@ -260,7 +285,8 @@ class ProposalsScreen(Screen):
         policy_pack = _discover_policy_pack(self.app.workspace)
         if not policy_pack:
             self.notify(
-                "No policy pack found — run `sarathi init` first.", severity="error"
+                "No policy pack found — run /init (or `sarathi init`) first.",
+                severity="error",
             )
             return
         decision = tui_data.decide_proposal(
@@ -499,27 +525,8 @@ class ChatScreen(Screen):
 
     def _handle_init_command(self, argument: str) -> None:
         path = os.path.abspath(os.path.expanduser(argument)) if argument else self.app.workspace
-        if not os.path.isdir(path):
-            self._system(f"Not a directory: {path}")
-            return
         self._system(f"Initializing policy pack in {path} — scanning repo…")
-        self.run_worker(lambda: self._run_init(path), thread=True, group="init")
-
-    def _run_init(self, path: str) -> None:
-        result = tui_data.init_workspace(path)
-        self.app.call_from_thread(self._report_init, path, result)
-
-    def _report_init(self, path: str, result: dict) -> None:
-        if result.get("error"):
-            self._system(f"Init failed: {result['error']}")
-            return
-        languages = ", ".join(result.get("languages") or []) or "none detected"
-        self._system(
-            f"Initialized policy pack: {result['policy_pack']}\n"
-            f"Languages: {languages}\n"
-            f"Validation: {result['validation_passed']}/{result['validation_total']} passed.\n"
-            "You can now /run tasks (or use the task panel) for this workspace."
-        )
+        self.app.launch_init(path)
 
     def _handle_model_command(self, argument: str) -> None:
         providers = self.session.available_providers()
@@ -558,6 +565,7 @@ class TasksScreen(Screen):
         Binding("n", "new_task", "New task"),
         Binding("p", "proposals", "Proposals"),
         Binding("u", "resume", "Resume task"),
+        Binding("i", "init_workspace", "Init pack"),
     ]
 
     def __init__(self) -> None:
@@ -650,6 +658,12 @@ class TasksScreen(Screen):
 
         self.app.push_screen(NewTaskScreen(), on_result)
 
+    def action_init_workspace(self) -> None:
+        def on_result(path: str | None) -> None:
+            self.app.launch_init(path or self.app.workspace)
+
+        self.app.push_screen(InitWorkspaceScreen(), on_result)
+
     def action_resume(self) -> None:
         task_id = self.selected_task_id
         if task_id is None:
@@ -658,7 +672,8 @@ class TasksScreen(Screen):
         policy_pack = _discover_policy_pack(self.app.workspace)
         if not policy_pack:
             self.notify(
-                "No policy pack found — run `sarathi init` first.", severity="error"
+                "No policy pack found — run /init (or `sarathi init`) first.",
+                severity="error",
             )
             return
         self.notify(f"Resuming {task_id}…")
@@ -785,6 +800,16 @@ class SarathiApp(App):
         border: thick $primary;
         background: $surface;
     }
+    InitWorkspaceScreen {
+        align: center middle;
+    }
+    #init-task-dialog {
+        width: 80;
+        height: auto;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
     """
 
     def __init__(
@@ -805,6 +830,8 @@ class SarathiApp(App):
         self.initial_task_id = task_id
         self.refresh_interval = refresh_interval
         self.chat_screen: ChatScreen | None = None
+        self._init_active = False
+        self._run_active = False
 
     def set_workspace(self, path: str) -> bool:
         """Point the app at a different folder/repo.
@@ -823,6 +850,9 @@ class SarathiApp(App):
         )
         if self.chat_screen is not None:
             self.chat_screen.session.workspace_root = resolved
+            # Drop the resumable claude session so the next agent call
+            # starts fresh in the new workspace.
+            self.chat_screen.session.reset_session()
         screen = self.screen
         if isinstance(screen, TasksScreen):
             screen.selected_task_id = None
@@ -849,6 +879,12 @@ class SarathiApp(App):
 
     def launch_task(self, description: str, context: str | None = None) -> bool:
         """Run a new task through the lifecycle in a background worker."""
+        if self._run_active:
+            self.notify(
+                "A task is already running — wait for it to finish.",
+                severity="warning",
+            )
+            return False
         policy_pack = _discover_policy_pack(self.workspace)
         if not policy_pack:
             self.notify(
@@ -857,6 +893,7 @@ class SarathiApp(App):
             )
             return False
         self.notify(f"Starting: {_short(description, 60)}")
+        self._run_active = True
         self.run_worker(
             lambda: self._start(description, policy_pack, context),
             thread=True,
@@ -866,23 +903,78 @@ class SarathiApp(App):
 
     def _start(self, description: str, policy_pack: str, context: str | None = None) -> None:
         try:
-            result = tui_data.start_task(
-                self.persistence, description, policy_pack, context=context
-            )
-        except Exception as exc:
-            self.call_from_thread(self.notify, f"Task failed: {exc}", severity="error")
-            self.call_from_thread(self.post_chat_event, f"Task failed: {exc}")
+            try:
+                result = tui_data.start_task(
+                    self.persistence, description, policy_pack, context=context
+                )
+            except Exception as exc:
+                self.call_from_thread(self.notify, f"Task failed: {exc}", severity="error")
+                self.call_from_thread(self.post_chat_event, f"Task failed: {exc}")
+                return
+            if result.current_phase is None:
+                message = f"Task completed: {result.task_id}"
+            else:
+                message = f"Task paused at {result.current_phase.value}: {result.task_id}"
+            self.call_from_thread(self.notify, message)
+            self.call_from_thread(self.post_chat_event, message)
+            screen = self.screen
+            if isinstance(screen, TasksScreen):
+                screen.selected_task_id = result.task_id
+                self.call_from_thread(screen.refresh_data)
+        finally:
+            self.call_from_thread(self._clear_run_active)
+
+    def _clear_run_active(self) -> None:
+        self._run_active = False
+
+    def launch_init(self, path: str) -> bool:
+        """Create a policy pack for `path` in a background worker.
+
+        Shared by the task panel (`i`) and the chat `/init` command. Returns
+        False without starting a worker when `path` isn't a directory or an
+        init is already running.
+        """
+        resolved = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isdir(resolved):
+            self.notify(f"Not a directory: {resolved}", severity="error")
+            return False
+        if self._init_active:
+            self.notify("An init is already running.", severity="warning")
+            return False
+        self._init_active = True
+        self.notify(f"Initializing policy pack in {resolved}…")
+        self.run_worker(
+            lambda: self._run_init_worker(resolved),
+            thread=True,
+            group="init",
+        )
+        return True
+
+    def _run_init_worker(self, path: str) -> None:
+        try:
+            result = tui_data.init_workspace(path)
+        except Exception as exc:  # never leave _init_active stuck on a crash
+            result = {"error": str(exc)}
+        self.call_from_thread(self._report_init, path, result)
+
+    def _report_init(self, path: str, result: dict) -> None:
+        self._init_active = False
+        if result.get("error"):
+            self.notify(f"Init failed: {result['error']}", severity="error")
+            self.post_chat_event(f"Init failed: {result['error']}")
             return
-        if result.current_phase is None:
-            message = f"Task completed: {result.task_id}"
-        else:
-            message = f"Task paused at {result.current_phase.value}: {result.task_id}"
-        self.call_from_thread(self.notify, message)
-        self.call_from_thread(self.post_chat_event, message)
+        languages = ", ".join(result.get("languages") or []) or "none detected"
+        summary = (
+            f"Initialized policy pack: {result['policy_pack']}\n"
+            f"Languages: {languages}\n"
+            f"Validation: {result['validation_passed']}/{result['validation_total']} passed.\n"
+            "You can now /run tasks (or use the task panel) for this workspace."
+        )
+        self.notify(f"Policy pack created: {result['policy_pack']}")
+        self.post_chat_event(summary)
         screen = self.screen
         if isinstance(screen, TasksScreen):
-            screen.selected_task_id = result.task_id
-            self.call_from_thread(screen.refresh_data)
+            screen.refresh_data()
 
 
 # Backward-compatible alias: the app started life as a dashboard-only UI.

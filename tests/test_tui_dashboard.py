@@ -504,6 +504,147 @@ def test_cd_command_rejects_missing_directory(persistence, tmp_path):
     asyncio.run(scenario())
 
 
+def test_dashboard_init_workspace_screen_opens_and_cancels(persistence):
+    from src.tui import InitWorkspaceScreen
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            app.switch_mode("tasks")
+            await pilot.pause()
+            await pilot.press("i")
+            await pilot.pause()
+            assert isinstance(app.screen, InitWorkspaceScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert not isinstance(app.screen, InitWorkspaceScreen)
+
+    asyncio.run(scenario())
+
+
+def test_launch_init_reports_success_and_refreshes(persistence, monkeypatch):
+    captured = {}
+
+    def fake_init_workspace(path, engine="markdown"):
+        captured["path"] = path
+        return {
+            "policy_pack": f"{path}/policy-pack",
+            "languages": ["Python"],
+            "build_tools": [],
+            "validation_passed": 24,
+            "validation_total": 24,
+        }
+
+    monkeypatch.setattr(tui_data, "init_workspace", fake_init_workspace)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            app.switch_mode("tasks")
+            await pilot.pause()
+
+            assert app.launch_init(app.workspace) is True
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert captured["path"] == app.workspace
+            assert app._init_active is False
+
+    asyncio.run(scenario())
+
+
+def test_launch_init_rejects_when_already_active(persistence, monkeypatch):
+    release = threading.Event()
+
+    def fake_init_workspace(path, engine="markdown"):
+        release.wait(timeout=5)
+        return {
+            "policy_pack": f"{path}/policy-pack",
+            "languages": [],
+            "build_tools": [],
+            "validation_passed": 1,
+            "validation_total": 1,
+        }
+
+    monkeypatch.setattr(tui_data, "init_workspace", fake_init_workspace)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            app.switch_mode("tasks")
+            await pilot.pause()
+
+            assert app.launch_init(app.workspace) is True
+            assert app._init_active is True
+            assert app.launch_init(app.workspace) is False
+
+            release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app._init_active is False
+
+    asyncio.run(scenario())
+
+
+def test_launch_task_rejects_while_run_active(persistence, tmp_path, monkeypatch):
+    pack = tmp_path / "policy-pack"
+    pack.mkdir()
+    for name in ("commands", "conventions", "review"):
+        (pack / f"{name}.md").write_text(f"# {name}\n")
+    monkeypatch.setattr("src.tui._discover_policy_pack", lambda *a, **k: str(pack))
+
+    release = threading.Event()
+
+    class DummyResult:
+        task_id = "t-x"
+        current_phase = None
+
+    def fake_start_task(persistence, description, policy_pack, context=None):
+        release.wait(timeout=5)
+        return DummyResult()
+
+    monkeypatch.setattr(tui_data, "start_task", fake_start_task)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            assert app.launch_task("first task") is True
+            assert app._run_active is True
+            assert app.launch_task("second task") is False
+
+            release.set()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            assert app._run_active is False
+
+    asyncio.run(scenario())
+
+
+def test_cd_command_resets_agent_session(persistence, tmp_path):
+    repo = tmp_path / "other-repo"
+    repo.mkdir()
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.session.claude_session_id = "sid-old"
+
+            for ch in f"/cd {repo}":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.workspace == str(repo)
+            assert app.screen.session.claude_session_id is None
+
+    asyncio.run(scenario())
+
+
 def test_model_command_lists_and_switches_provider(persistence, monkeypatch):
     def fake_which(name):
         return f"/usr/bin/{name}" if name in ("claude", "codex") else None

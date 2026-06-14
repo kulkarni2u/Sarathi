@@ -345,6 +345,19 @@ def test_chat_session_clear_resets_state():
     assert session.claude_session_id is None
 
 
+def test_chat_session_reset_session_preserves_history():
+    session = tui_data.ChatSession()
+    session.history = [("q", "a")]
+    session.pending_context = ["ctx"]
+    session.claude_session_id = "sid-1"
+
+    session.reset_session()
+
+    assert session.claude_session_id is None
+    assert session.history == [("q", "a")]
+    assert session.pending_context == ["ctx"]
+
+
 def test_chat_session_cancel_kills_active_process():
     session = tui_data.ChatSession()
 

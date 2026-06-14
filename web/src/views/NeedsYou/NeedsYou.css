@@ -1,0 +1,87 @@
+/* Needs You — attention list of tasks awaiting operator action. */
+
+.ny-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ny-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  width: 100%;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.ny-row:hover {
+  box-shadow: var(--shadow);
+  border-color: var(--field-br);
+}
+
+.ny-row .ny-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ny-row .ny-title {
+  font-weight: 620;
+  font-size: 13px;
+  margin-bottom: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ny-row .ny-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.ny-row .ny-reason {
+  color: var(--muted);
+}
+
+.ny-row .ny-age {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 11px;
+  white-space: nowrap;
+  flex: none;
+}
+
+.ny-row .ny-action {
+  flex: none;
+}
+
+.ny-empty {
+  padding: 32px 18px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.ny-empty .ny-empty-icon {
+  font-size: 28px;
+  margin-bottom: 10px;
+  display: block;
+}
+
+.ny-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}

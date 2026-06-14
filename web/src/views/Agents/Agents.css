@@ -1,0 +1,128 @@
+/* Agents — provider runtime, transport posture, and Sarathi roles, ported
+   from docs/mockups/sarathi-webui-mockup.html (#agents .stats/.card2/.kvl). */
+
+.agt-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+@media (max-width: 1100px) {
+  .agt-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 720px) {
+  .agt-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.agt-card {
+  padding: 15px;
+}
+
+.agt-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 13px;
+}
+
+.agt-pic {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: var(--elev2);
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 11px;
+  color: var(--muted);
+  flex: none;
+}
+
+.agt-id {
+  flex: 1;
+  min-width: 0;
+}
+
+.agt-id b {
+  font-size: 12.5px;
+}
+
+.agt-id span {
+  display: block;
+  color: var(--faint);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- status pill (ported from global .st, extended with err) ---------- */
+.st.err {
+  color: var(--red);
+}
+.st.err .d {
+  background: var(--red);
+}
+
+/* ---------- key/value rows (ported from mockup .kvl) ---------- */
+.kvl {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 0;
+  border-top: 1px solid var(--border-soft);
+  font-size: 12.5px;
+  gap: 12px;
+}
+
+.kvl:first-of-type {
+  border-top: none;
+}
+
+.kvl span {
+  color: var(--muted);
+}
+
+.kvl b {
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.agt-error {
+  color: var(--red);
+}
+
+/* ---------- roles + sections ---------- */
+.agt-sect {
+  padding: 17px;
+}
+
+.agt-sect h3 {
+  margin: 0 0 13px;
+  font-size: 13.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 650;
+}
+
+.agt-note {
+  color: var(--faint);
+  font-size: 11px;
+  margin-top: 8px;
+}
+
+/* ---------- states ---------- */
+.agt-empty,
+.agt-loading {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--muted);
+}

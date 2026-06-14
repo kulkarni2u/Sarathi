@@ -1,0 +1,162 @@
+/* Workspace (manage) — health, attached repos, provider readiness, policy
+   posture. Layout draws on the same card/kvl/stat idioms as the mockup's
+   settings + agents sections. */
+
+.ws-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  align-items: start;
+  margin-bottom: 14px;
+}
+
+@media (max-width: 900px) {
+  .ws-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ws-sect {
+  padding: 17px;
+}
+
+.ws-sect h3 {
+  margin: 0 0 13px;
+  font-size: 13.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 650;
+}
+
+.ws-kvl {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border-soft);
+  font-size: 12.5px;
+}
+
+.ws-kvl:first-of-type {
+  border-top: none;
+}
+
+.ws-kvl > span:first-child {
+  color: var(--muted);
+}
+
+.ws-kvl b {
+  text-align: right;
+  font-weight: 620;
+}
+
+/* ---------- repo rows ---------- */
+.ws-repo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.ws-repo:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.ws-repo .ws-repo-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  background: var(--elev2);
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+  flex: none;
+}
+
+.ws-repo .ws-repo-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.ws-repo .ws-repo-info b {
+  font-size: 12.5px;
+  display: block;
+}
+
+.ws-repo .ws-repo-info span {
+  display: block;
+  color: var(--faint);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- provider readiness rows ---------- */
+.ws-provider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.ws-provider:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.ws-provider .ws-provider-pic {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  background: var(--elev2);
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 11px;
+  color: var(--muted);
+  flex: none;
+  font-family: var(--mono);
+}
+
+.ws-provider .ws-provider-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.ws-provider .ws-provider-info b {
+  font-size: 12.5px;
+  display: block;
+}
+
+.ws-provider .ws-provider-info span {
+  display: block;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.ws-empty,
+.ws-placeholder {
+  color: var(--faint);
+  font-size: 12px;
+  padding: 8px 0;
+}
+
+.ws-health-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.ws-health-row .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: none;
+}

@@ -1,0 +1,546 @@
+/* Task Studio — graph + conversation view for a single task, ported from
+   docs/mockups/sarathi-webui-mockup.html (.studio/.sleft/.tshead/.gwrap/.chat
+   etc). Reuses global `.card2`, `.btn`, `.seg`, `.banner`, `.search`, `.tabs`,
+   `.tab`, `.ph` from styles/global.css; everything else is namespaced with a
+   `ts-` prefix and defined here. */
+
+.ts-page {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.ts-back {
+  margin-bottom: 12px;
+}
+
+/* ---------- two-pane layout ---------- */
+.ts-studio {
+  display: grid;
+  grid-template-columns: 1fr 384px;
+  gap: 14px;
+  min-height: 520px;
+}
+
+@media (max-width: 1100px) {
+  .ts-studio {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ts-left {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+}
+
+/* ---------- state header ---------- */
+.ts-head {
+  padding: 15px 17px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 22px;
+  align-items: center;
+}
+
+.ts-head h2 {
+  margin: 0;
+  width: 100%;
+  font-size: 16.5px;
+  font-weight: 670;
+}
+
+.ts-kv span {
+  color: var(--faint);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  display: block;
+}
+
+.ts-kv b {
+  font-size: 12.5px;
+  font-weight: 620;
+}
+
+.ts-nextsafe {
+  margin-left: auto;
+  background: var(--amberb);
+  color: var(--amber);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-weight: 600;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  white-space: nowrap;
+}
+
+/* ---------- graph panel ---------- */
+.ts-gwrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.ts-gtool {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 15px;
+  border-bottom: 1px solid var(--border-soft);
+  flex-wrap: wrap;
+}
+
+.ts-legend {
+  display: flex;
+  gap: 13px;
+  color: var(--faint);
+  font-size: 11px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+.ts-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ts-legend i {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  display: inline-block;
+}
+
+.ts-legend .ts-badge-sample {
+  font-family: var(--mono);
+  font-weight: 700;
+  background: var(--elev2);
+  border-radius: 5px;
+  padding: 1px 5px;
+  color: var(--muted);
+}
+
+.ts-canvas {
+  flex: 1;
+  min-height: 320px;
+  overflow: auto;
+  padding: 4px;
+}
+
+.ts-canvas-empty {
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
+/* ---------- DAG node styling (SVG) ---------- */
+.ts-node-done rect.ts-node-box {
+  fill: var(--greenb);
+  stroke: var(--green);
+}
+.ts-node-running rect.ts-node-box,
+.ts-node-in_progress rect.ts-node-box {
+  fill: var(--blueb);
+  stroke: var(--blue);
+}
+.ts-node-waiting rect.ts-node-box,
+.ts-node-blocked rect.ts-node-box,
+.ts-node-queued rect.ts-node-box,
+.ts-node-default rect.ts-node-box {
+  fill: var(--slateb);
+  stroke: var(--slate);
+}
+.ts-node-failed rect.ts-node-box,
+.ts-node-rejected rect.ts-node-box {
+  fill: var(--redb);
+  stroke: var(--red);
+}
+
+.ts-node-title {
+  fill: var(--text);
+  font-family: var(--font);
+  font-weight: 600;
+}
+
+.ts-node-badge-bg {
+  fill: var(--elev2);
+}
+
+.ts-node-badge-text {
+  fill: var(--muted);
+  font-family: var(--mono);
+  font-weight: 700;
+}
+
+.ts-edge {
+  stroke: var(--slate);
+  stroke-width: 1.6;
+  fill: none;
+  opacity: 0.5;
+}
+
+.ts-edge-future {
+  stroke-dasharray: 6 5;
+  opacity: 0.4;
+}
+
+/* ---------- graph list fallback ---------- */
+.ts-graph-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+
+.ts-graph-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border-soft);
+  background: var(--elev);
+}
+
+.ts-graph-row .ts-status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  flex: none;
+}
+
+.ts-status-done {
+  background: var(--green);
+}
+.ts-status-running,
+.ts-status-in_progress {
+  background: var(--blue);
+}
+.ts-status-waiting,
+.ts-status-blocked,
+.ts-status-queued,
+.ts-status-default {
+  background: transparent;
+  border: 1.5px solid var(--slate);
+}
+.ts-status-failed,
+.ts-status-rejected {
+  background: var(--red);
+}
+
+.ts-graph-row .ts-row-title {
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+}
+
+.ts-graph-row .ts-row-meta {
+  color: var(--faint);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.ts-provider-badge {
+  font-family: var(--mono);
+  font-weight: 700;
+  background: var(--elev2);
+  border-radius: 6px;
+  padding: 1px 6px;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+
+/* ---------- chat panel ---------- */
+.ts-chat {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ts-chh {
+  padding: 13px 15px;
+  border-bottom: 1px solid var(--border-soft);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.ts-chh b {
+  font-size: 12.5px;
+}
+
+.ts-chh .ts-who {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.ts-chat-search {
+  padding: 10px 13px 0;
+}
+
+.ts-chat-search .search {
+  margin: 0;
+}
+
+.ts-chb {
+  flex: 1;
+  overflow: auto;
+  padding: 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  min-height: 240px;
+}
+
+.ts-chb-empty {
+  color: var(--muted);
+  text-align: center;
+  padding: 24px;
+}
+
+.ts-msg {
+  display: flex;
+  gap: 10px;
+}
+
+.ts-msg .ts-avatar {
+  width: 27px;
+  height: 27px;
+  border-radius: 9px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.ts-msg.ts-msg-user .ts-avatar {
+  background: var(--elev2);
+  color: var(--muted);
+}
+
+.ts-msg.ts-msg-sarathi .ts-avatar {
+  background: linear-gradient(135deg, var(--brand1), var(--brand2));
+  color: #1c1305;
+}
+
+.ts-msg.ts-msg-agent .ts-avatar {
+  background: var(--blueb);
+  color: var(--blue);
+}
+
+.ts-msg .ts-bd {
+  flex: 1;
+  min-width: 0;
+}
+
+.ts-msg .ts-nm {
+  font-size: 11px;
+  color: var(--faint);
+  margin-bottom: 4px;
+}
+
+.ts-msg .ts-nm b {
+  color: var(--muted);
+}
+
+.ts-bub {
+  background: var(--elev);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  border-top-left-radius: 4px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ts-msg.ts-msg-user .ts-bub {
+  background: var(--elev2);
+}
+
+/* ---------- approval card ---------- */
+.ts-appr {
+  background: var(--amberb);
+  border: 1px solid transparent;
+  border-radius: 12px;
+  padding: 13px;
+  margin-top: 5px;
+}
+
+.ts-appr h4 {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  color: var(--amber);
+  display: flex;
+  gap: 7px;
+  align-items: center;
+}
+
+.ts-appr p {
+  margin: 0 0 11px;
+  color: var(--text);
+  opacity: 0.85;
+  font-size: 12px;
+}
+
+.ts-appr .ts-acts {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ts-appr .ts-ok {
+  background: var(--green);
+  border-color: transparent;
+  color: #062417;
+}
+
+.ts-appr .ts-no {
+  background: transparent;
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.ts-appr button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* ---------- composer ---------- */
+.ts-comp {
+  border-top: 1px solid var(--border-soft);
+  padding: 11px;
+  display: flex;
+  gap: 9px;
+  align-items: flex-end;
+}
+
+.ts-comp .ts-sender {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 11px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--field);
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: not-allowed;
+}
+
+.ts-comp textarea {
+  flex: 1;
+  resize: none;
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  color: var(--text);
+  padding: 10px 12px;
+  font-family: inherit;
+  font-size: 12.5px;
+  height: 40px;
+  outline: none;
+}
+
+.ts-comp textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.ts-comp .ts-send {
+  width: 40px;
+  height: 40px;
+  border-radius: 11px;
+  border: none;
+  background: linear-gradient(180deg, var(--brand1), var(--brand2));
+  color: #1c1305;
+  font-weight: 800;
+  display: grid;
+  place-items: center;
+}
+
+.ts-comp .ts-send:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.ts-comp-hint {
+  padding: 6px 13px 11px;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+/* ---------- tabs / sub-views ---------- */
+.ts-tabs-panel {
+  margin-top: 16px;
+}
+
+.ts-table-wrap {
+  overflow: hidden;
+}
+
+.ts-table-wrap table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.ts-table-wrap thead th {
+  text-align: left;
+  color: var(--faint);
+  font-weight: 600;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.ts-table-wrap tbody td {
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--border-soft);
+  vertical-align: top;
+}
+
+.ts-table-wrap tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.ts-table-wrap tbody tr:hover {
+  background: var(--hover);
+}
+
+.ts-empty {
+  padding: 18px;
+  color: var(--muted);
+}
+
+.ts-mono {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.ts-pre {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  max-width: 480px;
+}

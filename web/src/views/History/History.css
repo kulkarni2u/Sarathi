@@ -1,0 +1,127 @@
+/* History — phase transitions and governance events, ported from
+   docs/mockups/sarathi-webui-mockup.html (#history .card2 table + .tag). */
+
+.hist-card {
+  overflow: hidden;
+}
+
+.hist-card table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.hist-card thead th {
+  text-align: left;
+  color: var(--faint);
+  font-weight: 600;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.hist-card tbody td {
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--border-soft);
+  vertical-align: top;
+}
+
+.hist-card tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.hist-card tbody tr:hover {
+  background: var(--hover);
+}
+
+.hist-num {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.hist-decisions {
+  color: var(--muted);
+}
+
+/* ---------- outcome tag chips (ported from mockup .tag/.t-*) ---------- */
+.tag {
+  font-size: 10.5px;
+  border-radius: 6px;
+  padding: 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.tag .d {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.t-run {
+  background: var(--blueb);
+  color: var(--blue);
+}
+.t-run .d {
+  background: var(--blue);
+}
+
+.t-plan {
+  background: var(--slateb);
+  color: var(--slate);
+}
+.t-plan .d {
+  background: var(--slate);
+}
+
+.t-need {
+  background: var(--amberb);
+  color: var(--amber);
+}
+.t-need .d {
+  background: var(--amber);
+}
+
+.t-block {
+  background: var(--redb);
+  color: var(--red);
+}
+.t-block .d {
+  background: var(--red);
+}
+
+.t-review {
+  background: var(--purpleb);
+  color: var(--purple);
+}
+.t-review .d {
+  background: var(--purple);
+}
+
+.t-done {
+  background: var(--greenb);
+  color: var(--green);
+}
+.t-done .d {
+  background: var(--green);
+}
+
+/* ---------- segmented filter ---------- */
+.hist-seg button.on {
+  background: var(--elev2);
+  color: var(--text);
+}
+
+/* ---------- states ---------- */
+.hist-empty,
+.hist-loading {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--muted);
+}

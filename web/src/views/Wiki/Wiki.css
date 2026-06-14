@@ -1,0 +1,118 @@
+/* Wiki — page list + content pane, ported from
+   docs/mockups/sarathi-webui-mockup.html (.wiki/.wnav/.wi/.doc). */
+
+.wiki-layout {
+  display: grid;
+  grid-template-columns: 236px 1fr;
+  gap: 0;
+  min-height: calc(100vh - 54px - 44px - 56px);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+
+.wiki-nav {
+  padding: 9px;
+  border-right: 1px solid var(--border-soft);
+  overflow: auto;
+}
+
+.wiki-item {
+  padding: 9px 11px;
+  border-radius: 9px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 12.5px;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  cursor: pointer;
+}
+
+.wiki-item:hover {
+  background: var(--hover);
+}
+
+.wiki-item.on {
+  background: var(--elev2);
+  color: var(--text);
+}
+
+.wiki-item .wiki-icon {
+  flex: none;
+}
+
+.wiki-item .wiki-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wiki-item .wiki-tag {
+  margin-left: auto;
+  font-size: 9px;
+  color: var(--brand1);
+  border: 1px solid var(--brand1);
+  border-radius: 5px;
+  padding: 0 5px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  flex: none;
+}
+
+.wiki-item .wiki-tag.human {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.wiki-doc {
+  padding: 24px 28px;
+  overflow: auto;
+  min-width: 0;
+}
+
+.wiki-doc h2 {
+  margin: 0 0 4px;
+  font-size: 19px;
+}
+
+.wiki-doc .wiki-provenance {
+  color: var(--faint);
+  font-size: 11.5px;
+  margin-bottom: 18px;
+}
+
+.wiki-doc .wiki-body {
+  color: var(--text);
+  opacity: 0.82;
+  max-width: 680px;
+  white-space: pre-wrap;
+}
+
+.wiki-doc .wiki-body h3 {
+  font-size: 14px;
+  margin: 22px 0 6px;
+}
+
+.wiki-doc .wiki-body p {
+  margin: 0 0 12px;
+}
+
+.wiki-doc .wiki-body code {
+  font-family: var(--mono);
+  background: var(--elev2);
+  border-radius: 5px;
+  padding: 1px 5px;
+  font-size: 11.5px;
+}
+
+.wiki-empty,
+.wiki-loading {
+  padding: 18px;
+  color: var(--muted);
+}

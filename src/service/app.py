@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import shutil
 import threading
 from dataclasses import dataclass, field
@@ -210,12 +211,27 @@ class ServiceApp:
     ) -> tuple[int, dict[str, Any]] | RawResponse:
         correlation_id = _correlation_id(headers)
         try:
+            method = method.upper()
+            raw_parts = _path_parts(path)
+            is_api_request = bool(raw_parts) and raw_parts[0] == "api"
+
+            # Public, unauthenticated routes for the same-origin "installable
+            # app" path: a browser navigating directly to this service (e.g.
+            # http://127.0.0.1:8765/) has no `Authorization` header yet, so
+            # the SPA shell, its static assets, `/docs`, `/openapi.json`,
+            # `/health`, and the runtime-config script must be reachable
+            # without a bearer token. Anything under `/api/...` (the JSON
+            # API) is never treated as public here and always requires
+            # `_authorize` below — this check runs only for non-`/api`
+            # GET requests.
+            if method == "GET" and not is_api_request:
+                public_response = self._public_get_response(raw_parts, correlation_id)
+                if public_response is not None:
+                    return public_response
+
             if not skip_auth:
                 self._authorize(headers)
-            method = method.upper()
-            parts = _path_parts(path)
-            if parts and parts[0] == "api":
-                parts = parts[1:]
+            parts = raw_parts[1:] if is_api_request else raw_parts
             # The OpenAPI document (and its docs page) are returned as-is,
             # without the success envelope, since they must be valid
             # top-level OpenAPI/HTML documents for tooling that fetches them
@@ -252,6 +268,52 @@ class ServiceApp:
             return status, _ok(data, correlation_id)
         except ServiceError as error:
             return error.status, _error(error, correlation_id)
+
+    def _public_get_response(
+        self, raw_parts: list[str], correlation_id: str
+    ) -> tuple[int, dict[str, Any]] | RawResponse | None:
+        """Handle public (no bearer token required) GET requests.
+
+        Only called for GET requests whose path does not start with
+        `/api/`. Covers the same-origin SPA shell and its static assets, the
+        SPA history-mode fallback, `/docs`, `/openapi.json`, `/health`, and
+        `/sarathi-runtime.js`. Returns ``None`` if `raw_parts` is an
+        unauthenticated request for an API-shaped path (e.g. a bare
+        `/workspaces` without the `/api` prefix), which falls through to the
+        normal authorized routing below.
+        """
+        if raw_parts == ["health"]:
+            return 200, _ok({"status": "ok"}, correlation_id)
+        if raw_parts == ["openapi.json"]:
+            return 200, build_openapi_spec()
+        if raw_parts == ["docs"]:
+            return _html_response(200, _DOCS_HTML)
+        if raw_parts == ["sarathi-runtime.js"]:
+            return self._serve_runtime_config()
+        if not raw_parts or raw_parts[0] not in self._API_PREFIXES:
+            # The SPA shell (`/`), its static assets, and extensionless SPA
+            # fallback routes (e.g. `/tasks/123`) all live here.
+            return self._serve_static(raw_parts)
+        return None
+
+    def _serve_runtime_config(self) -> RawResponse:
+        """Serve `/sarathi-runtime.js`: the same-origin SPA's bearer token.
+
+        Trust model: like the discovery file written by `desktop.py`
+        (`~/.sarathi/service.json`, mode 0600) and the runtime-config script
+        it generates for the split-origin desktop UI, this endpoint is only
+        safe because the service binds to 127.0.0.1/localhost — any local
+        process that can reach this port can already read those files or
+        connect directly. This route is the single-origin analogue: it hands
+        the same bearer token to the SPA when it is served from this same
+        origin (so `baseUrl` is `""`, i.e. same-origin requests).
+        """
+        payload = {"baseUrl": "", "token": self.token or ""}
+        body = (
+            "window.__SARATHI_RUNTIME_CONFIG__ = "
+            f"{json.dumps(payload, sort_keys=True)};\n"
+        )
+        return RawResponse(200, "application/javascript", body.encode("utf-8"))
 
     def _handle_event_stream(
         self,

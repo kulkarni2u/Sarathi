@@ -104,6 +104,13 @@ _PATH_PARAMS: dict[str, dict[str, Any]] = {
         "schema": {"type": "string"},
         "description": "Task identifier.",
     },
+    "stream_task_id": {
+        "name": "taskId",
+        "in": "path",
+        "required": True,
+        "schema": {"type": "string"},
+        "description": "Task identifier.",
+    },
     "subtask_id": {
         "name": "id",
         "in": "path",
@@ -162,26 +169,44 @@ def _responses(
     *,
     data_schema: dict[str, Any] | None = None,
     not_found: bool = False,
+    raw_content_type: str | None = None,
+    raw_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a responses object for a route.
 
     ``data_schema``, if given, replaces the generic ``data`` object schema in
     the success envelope so callers can describe a tighter response shape.
+
+    ``raw_content_type``, if given, describes a non-enveloped (raw) success
+    response of that content type instead of the usual ``{ok, data,
+    correlation_id}`` JSON envelope — e.g. ``text/event-stream`` for SSE
+    routes. ``raw_schema`` optionally describes the body for that content
+    type (defaults to a plain string).
     """
 
-    envelope = SUCCESS_ENVELOPE
-    if data_schema is not None:
-        envelope = {
-            **SUCCESS_ENVELOPE,
-            "properties": {**SUCCESS_ENVELOPE["properties"], "data": data_schema},
+    if raw_content_type is not None:
+        responses: dict[str, Any] = {
+            success_status: {
+                "description": success_description,
+                "content": {
+                    raw_content_type: {"schema": raw_schema or {"type": "string"}}
+                },
+            }
         }
+    else:
+        envelope = SUCCESS_ENVELOPE
+        if data_schema is not None:
+            envelope = {
+                **SUCCESS_ENVELOPE,
+                "properties": {**SUCCESS_ENVELOPE["properties"], "data": data_schema},
+            }
 
-    responses: dict[str, Any] = {
-        success_status: {
-            "description": success_description,
-            "content": {"application/json": {"schema": envelope}},
+        responses = {
+            success_status: {
+                "description": success_description,
+                "content": {"application/json": {"schema": envelope}},
+            }
         }
-    }
     if not_found:
         responses["404"] = {
             "description": "Resource not found.",
@@ -563,6 +588,15 @@ ROUTES: list[dict[str, Any]] = [
         "tags": ["views"],
         "params": ["id"],
         "success": ("200", "Operational views payload."),
+        "not_found": True,
+    },
+    {
+        "method": "GET",
+        "path": "/workspaces/{id}/usage-stats",
+        "summary": "Get provider/token usage stats for a workspace.",
+        "tags": ["views"],
+        "params": ["id"],
+        "success": ("200", "Usage stats payload."),
         "not_found": True,
     },
     {
@@ -1053,6 +1087,16 @@ ROUTES: list[dict[str, Any]] = [
         },
         "not_found": True,
     },
+    {
+        "method": "GET",
+        "path": "/workspaces/{id}/tasks/{taskId}/events/stream",
+        "summary": "Replay a task's lifecycle events as a Server-Sent Events stream.",
+        "tags": ["events"],
+        "params": ["workspace_id", "stream_task_id"],
+        "success": ("200", "Server-Sent Events stream of lifecycle events."),
+        "raw_content_type": "text/event-stream",
+        "not_found": True,
+    },
     # ── Brainstorm sessions ───────────────────────────────────────────────
     {
         "method": "POST",
@@ -1186,6 +1230,8 @@ def _operation(route: dict[str, Any]) -> dict[str, Any]:
         description,
         data_schema=route.get("data_schema"),
         not_found=route.get("not_found", False),
+        raw_content_type=route.get("raw_content_type"),
+        raw_schema=route.get("raw_schema"),
     )
     return operation
 

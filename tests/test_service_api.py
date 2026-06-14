@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 import pytest
 
 from src.service import create_app, create_http_server
+from src.service.app import RawResponse
+from src.service.openapi import build_openapi_spec
 from src.storage import Storage, connect, run_migrations
 
 
@@ -2101,3 +2103,95 @@ def test_http_static_serving_over_the_wire(tmp_path):
 
         status, headers, body = http_raw("GET", f"{base_url}/assets/missing.js", token="secret")
         assert status == 404
+
+
+def test_root_spa_shell_is_public_even_with_token_configured(tmp_path):
+    # The single-origin "installable app" path: a browser navigating to
+    # http://127.0.0.1:8765/ has no Authorization header. The SPA shell must
+    # be served (200), not rejected with 401.
+    dist_root = tmp_path / "dist"
+    dist_root.mkdir()
+    (dist_root / "index.html").write_text("<html><body>SPA shell</body></html>", encoding="utf-8")
+
+    app = create_app(tmp_path / "sarathi.db", token="secret", dist_root=dist_root)
+
+    result = app.handle("GET", "/")
+
+    assert isinstance(result, RawResponse)
+    assert result.status == 200
+    assert result.content_type.startswith("text/html")
+    assert b"SPA shell" in result.body
+
+
+def test_api_routes_still_require_auth_when_token_configured(tmp_path):
+    dist_root = tmp_path / "dist"
+    dist_root.mkdir()
+    (dist_root / "index.html").write_text("<html><body>SPA shell</body></html>", encoding="utf-8")
+
+    app = create_app(tmp_path / "sarathi.db", token="secret", dist_root=dist_root)
+
+    # No Authorization header -> the JSON API is still locked down.
+    assert_error(
+        app.handle("GET", "/api/workspaces", headers={"x-correlation-id": "corr-test"}),
+        status=401,
+        code="unauthorized",
+    )
+
+    # With the correct bearer token, the API still works as before.
+    status, data = assert_ok(
+        app.handle(
+            "GET",
+            "/api/workspaces",
+            headers={"authorization": "Bearer secret", "x-correlation-id": "corr-test"},
+        )
+    )
+    assert status == 200
+    assert data == {"workspaces": []}
+
+
+def test_sarathi_runtime_js_is_public_and_contains_token(tmp_path):
+    app = create_app(tmp_path / "sarathi.db", token="secret")
+
+    result = app.handle("GET", "/sarathi-runtime.js")
+
+    assert isinstance(result, RawResponse)
+    assert result.status == 200
+    assert result.content_type.startswith("application/javascript")
+    body = result.body.decode("utf-8")
+    assert "__SARATHI_RUNTIME_CONFIG__" in body
+    assert "secret" in body
+    assert '"baseUrl": ""' in body or '"baseUrl":""' in body
+
+
+def test_health_route_is_public_without_token(tmp_path):
+    app = create_app(tmp_path / "sarathi.db", token="secret")
+
+    status, data = assert_ok(app.handle("GET", "/health", headers={"x-correlation-id": "corr-test"}))
+
+    assert status == 200
+    assert data == {"status": "ok"}
+
+
+def test_docs_and_openapi_routes_are_public_without_token(tmp_path):
+    app = create_app(tmp_path / "sarathi.db", token="secret")
+
+    docs_result = app.handle("GET", "/docs")
+    assert isinstance(docs_result, RawResponse)
+    assert docs_result.status == 200
+    assert docs_result.content_type.startswith("text/html")
+
+    status, spec = app.handle("GET", "/openapi.json")
+    assert status == 200
+    assert spec["openapi"].startswith("3.")
+
+
+def test_openapi_spec_includes_usage_stats_and_event_stream_routes():
+    spec = build_openapi_spec()
+    paths = spec["paths"]
+
+    assert "/workspaces/{id}/usage-stats" in paths
+    assert "get" in paths["/workspaces/{id}/usage-stats"]
+
+    assert "/workspaces/{id}/tasks/{taskId}/events/stream" in paths
+    stream_op = paths["/workspaces/{id}/tasks/{taskId}/events/stream"]["get"]
+    assert "text/event-stream" in stream_op["responses"]["200"]["content"]

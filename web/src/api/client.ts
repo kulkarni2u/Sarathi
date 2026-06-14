@@ -10,7 +10,6 @@
 import { getRuntimeConfig } from "./runtimeConfig";
 import type {
   ApiEnvelope,
-  DogfoodAcceptanceData,
   EventsData,
   GetWorkspaceData,
   HealthData,
@@ -29,6 +28,7 @@ import type {
   TaskPanelData,
   TaskReviewsData,
   TaskStudioData,
+  UsageStatsData,
   WikiIndexData,
   WikiPageData,
   WorkspaceRepositoriesData,
@@ -293,22 +293,15 @@ export const api = {
   },
 
   /**
-   * GET /workspaces/{id}/dogfood-acceptance
+   * GET /workspaces/{id}/usage-stats
    *
-   * Used as the Usage Stats view's data source for now: it's the closest
-   * existing projection with quality/acceptance signal at the workspace
-   * level. `/workspaces/{id}/operational-views` is also available via
-   * `getWorkspaceOperationalViews` if the stats view needs lifecycle
-   * counts instead.
-   *
-   * TODO(M1): dedicated usage-stats projection endpoint exposing
-   * HarnessOutcome-derived quality signals (pass/fail rates, latency,
-   * cost) does not exist yet in docs/openapi.json. Replace this method's
-   * backing endpoint once that lands.
+   * HarnessOutcome-derived quality signals for a workspace (test pass rate,
+   * avg blast radius, total tokens, policy proposal counts) plus a per-task
+   * breakdown. Backed by `src.service.usage_stats.build_usage_stats`.
    */
-  getUsageStats(workspaceId: string, signal?: AbortSignal): Promise<DogfoodAcceptanceData> {
-    return request<DogfoodAcceptanceData>(
-      `/workspaces/${encodeURIComponent(workspaceId)}/dogfood-acceptance`,
+  getUsageStats(workspaceId: string, signal?: AbortSignal): Promise<UsageStatsData> {
+    return request<UsageStatsData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/usage-stats`,
       { signal },
     );
   },

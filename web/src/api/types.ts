@@ -157,10 +157,45 @@ export type WikiPageData = AnyRecord;
 
 /**
  * GET /workspaces/{id}/dogfood-acceptance — `additionalProperties: true`.
- * Closest existing endpoint to an M1 "usage stats" projection; see the
- * `getUsageStats` TODO on `api` in client.ts.
  */
 export type DogfoodAcceptanceData = AnyRecord;
+
+/** Pending/accepted/rejected counts for a workspace's policy proposals. */
+export interface UsageStatsProposalCounts {
+  pending: number;
+  accepted: number;
+  rejected: number;
+}
+
+/** Per-task row in the usage stats breakdown. */
+export interface UsageStatsTask {
+  task_id: string;
+  title: string;
+  task_class: string | null;
+  agent: string | null;
+  pass: boolean | null;
+  blast_radius: number | null;
+  tokens: number | null;
+  latency: number | null;
+  [key: string]: unknown;
+}
+
+/**
+ * GET /workspaces/{id}/usage-stats — HarnessOutcome-derived quality signals
+ * for a workspace (test pass rate, blast radius, token cost, proposal
+ * review activity) plus a per-task breakdown. Backed by
+ * `src.service.usage_stats.build_usage_stats`.
+ */
+export interface UsageStatsData {
+  workspace_id?: string;
+  test_pass_rate: number | null;
+  avg_blast_radius: number | null;
+  total_tokens: number | null;
+  proposal_counts: UsageStatsProposalCounts | null;
+  task_count: number;
+  tasks: UsageStatsTask[];
+  [key: string]: unknown;
+}
 
 export interface WorkspaceRepository extends AnyRecord {
   id?: string;

@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 8
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -92,6 +92,13 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
             (7, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 8:
+        conn.executescript(_MIGRATION_008)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (8, _utc_now()),
         )
         conn.commit()
 
@@ -2124,4 +2131,26 @@ ALTER TABLE subtasks ADD COLUMN heartbeat_at TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_subtasks_claim
     ON subtasks(status, claimed_by);
+"""
+
+
+_MIGRATION_008 = """
+ALTER TABLE tasks ADD COLUMN project_id TEXT;
+
+INSERT INTO projects (id, workspace_id, name, description, status, metadata, created_at, updated_at)
+SELECT
+    w.id || '-default' AS id,
+    w.id AS workspace_id,
+    'Default' AS name,
+    'Default project created during migration' AS description,
+    'active' AS status,
+    '{}' AS metadata,
+    datetime('now') AS created_at,
+    datetime('now') AS updated_at
+FROM workspaces w
+WHERE w.id NOT IN (SELECT DISTINCT workspace_id FROM projects);
+
+UPDATE tasks
+SET project_id = workspace_id || '-default'
+WHERE project_id IS NULL;
 """

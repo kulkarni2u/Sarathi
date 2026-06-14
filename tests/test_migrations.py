@@ -245,7 +245,7 @@ def test_migration_7_adds_subtask_claim_columns_on_fresh_db(tmp_path):
         run_migrations(conn)
 
         assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
-        assert LATEST_SCHEMA_VERSION == 7
+        assert LATEST_SCHEMA_VERSION == 8
 
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(subtasks)")}
         assert {"claimed_by", "claimed_at", "heartbeat_at"} <= columns
@@ -289,6 +289,281 @@ def test_migration_7_applies_on_top_of_v6_db(tmp_path):
         assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(subtasks)")}
         assert {"claimed_by", "claimed_at", "heartbeat_at"} <= columns
+
+        versions = [
+            row["version"]
+            for row in conn.execute("SELECT version FROM schema_version ORDER BY version")
+        ]
+        assert versions == list(range(1, LATEST_SCHEMA_VERSION + 1))
+
+
+def test_migration_8_adds_project_id_column_to_tasks(tmp_path):
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        assert LATEST_SCHEMA_VERSION == 8
+
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        assert "project_id" in columns
+
+
+def test_migration_8_creates_default_project_for_each_workspace(tmp_path):
+    # This test verifies that during migration 8, when run_migrations is called,
+    # default projects are created for all existing workspaces
+    with connect(tmp_path / "sarathi.db") as conn:
+        # Manually run migrations 1-7 to set up v7 schema
+        from src.storage import (
+            _MIGRATION_001,
+            _MIGRATION_002,
+            _MIGRATION_003,
+            _MIGRATION_004,
+            _MIGRATION_005,
+            _MIGRATION_006,
+            _MIGRATION_007,
+            _utc_now,
+        )
+
+        for version, script in (
+            (1, _MIGRATION_001),
+            (2, _MIGRATION_002),
+            (3, _MIGRATION_003),
+            (4, _MIGRATION_004),
+            (5, _MIGRATION_005),
+            (6, _MIGRATION_006),
+            (7, _MIGRATION_007),
+        ):
+            conn.executescript(script)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, _utc_now()),
+            )
+            conn.commit()
+
+        # Create two workspaces before migration 8
+        conn.execute(
+            """
+            INSERT INTO workspaces (id, name, root_path, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "workspace-1",
+                "Workspace 1",
+                "/work/1",
+                "{}",
+                "now",
+                "now",
+                "workspace-2",
+                "Workspace 2",
+                "/work/2",
+                "{}",
+                "now",
+                "now",
+            ),
+        )
+        conn.commit()
+
+        # Run migrations to apply migration 8
+        run_migrations(conn)
+
+        projects = conn.execute(
+            "SELECT id, workspace_id, name, status FROM projects ORDER BY workspace_id"
+        ).fetchall()
+
+        # Should have 2 default projects, one for each workspace
+        default_projects = {
+            (row["workspace_id"], row["id"], row["name"], row["status"])
+            for row in projects
+            if row["id"] == row["workspace_id"] + "-default"
+        }
+
+        assert len(default_projects) == 2
+        assert ("workspace-1", "workspace-1-default", "Default", "active") in default_projects
+        assert ("workspace-2", "workspace-2-default", "Default", "active") in default_projects
+
+
+def test_migration_8_does_not_duplicate_default_projects(tmp_path):
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+
+        # Create workspace and a default project manually
+        conn.execute(
+            """
+            INSERT INTO workspaces (id, name, root_path, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("workspace-1", "Workspace 1", "/work/1", "{}", "now", "now"),
+        )
+        conn.execute(
+            """
+            INSERT INTO projects (id, workspace_id, name, description, status, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("workspace-1-default", "workspace-1", "Default", "Existing project", "active", "{}", "now", "now"),
+        )
+        conn.commit()
+
+        # Run migrations again
+        run_migrations(conn)
+
+        # Check that there's still only one default project
+        projects = conn.execute(
+            "SELECT COUNT(*) as count FROM projects WHERE id = 'workspace-1-default'"
+        ).fetchone()
+
+        assert projects["count"] == 1
+
+
+def test_migration_8_backfills_existing_tasks_with_project_id(tmp_path):
+    # Test that migration 8 backfills existing tasks with their workspace's default project
+    from src.storage import (
+        _MIGRATION_001,
+        _MIGRATION_002,
+        _MIGRATION_003,
+        _MIGRATION_004,
+        _MIGRATION_005,
+        _MIGRATION_006,
+        _MIGRATION_007,
+        _utc_now,
+    )
+
+    db_path = tmp_path / "sarathi.db"
+    with connect(db_path) as conn:
+        # Run migrations 1-7
+        for version, script in (
+            (1, _MIGRATION_001),
+            (2, _MIGRATION_002),
+            (3, _MIGRATION_003),
+            (4, _MIGRATION_004),
+            (5, _MIGRATION_005),
+            (6, _MIGRATION_006),
+            (7, _MIGRATION_007),
+        ):
+            conn.executescript(script)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, _utc_now()),
+            )
+            conn.commit()
+
+        # Create a workspace
+        conn.execute(
+            """
+            INSERT INTO workspaces (id, name, root_path, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("workspace-1", "Workspace 1", "/work/1", "{}", "now", "now"),
+        )
+
+        # Create tasks (before migration 8, so no project_id column yet)
+        conn.execute(
+            """
+            INSERT INTO tasks (id, workspace_id, title, description, status, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "task-1",
+                "workspace-1",
+                "Task 1",
+                None,
+                "pending",
+                "{}",
+                "now",
+                "now",
+                "task-2",
+                "workspace-1",
+                "Task 2",
+                None,
+                "pending",
+                "{}",
+                "now",
+                "now",
+            ),
+        )
+        conn.commit()
+
+    # Now apply migration 8
+    with connect(db_path) as conn:
+        run_migrations(conn)
+
+        # Verify tasks are backfilled
+        tasks_after = conn.execute(
+            "SELECT id, workspace_id, project_id FROM tasks ORDER BY id"
+        ).fetchall()
+
+        assert len(tasks_after) == 2
+        for row in tasks_after:
+            assert row["project_id"] == "workspace-1-default"
+
+
+def test_migration_8_applies_on_top_of_v7_db(tmp_path):
+    from src.storage import (
+        _MIGRATION_001,
+        _MIGRATION_002,
+        _MIGRATION_003,
+        _MIGRATION_004,
+        _MIGRATION_005,
+        _MIGRATION_006,
+        _MIGRATION_007,
+        _utc_now,
+    )
+
+    db_path = tmp_path / "sarathi.db"
+    with connect(db_path) as conn:
+        for version, script in (
+            (1, _MIGRATION_001),
+            (2, _MIGRATION_002),
+            (3, _MIGRATION_003),
+            (4, _MIGRATION_004),
+            (5, _MIGRATION_005),
+            (6, _MIGRATION_006),
+            (7, _MIGRATION_007),
+        ):
+            conn.executescript(script)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, _utc_now()),
+            )
+            conn.commit()
+
+        assert current_schema_version(conn) == 7
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        assert "project_id" not in columns
+
+        # Create some test data
+        conn.execute(
+            """
+            INSERT INTO workspaces (id, name, root_path, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("workspace-1", "Workspace 1", "/work/1", "{}", "now", "now"),
+        )
+        conn.execute(
+            """
+            INSERT INTO tasks (id, workspace_id, title, status, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("task-1", "workspace-1", "Task 1", "pending", "{}", "now", "now"),
+        )
+        conn.commit()
+
+    with connect(db_path) as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        assert "project_id" in columns
+
+        # Verify the task was backfilled
+        task = conn.execute("SELECT project_id FROM tasks WHERE id = 'task-1'").fetchone()
+        assert task["project_id"] == "workspace-1-default"
+
+        # Verify default project was created
+        project = conn.execute(
+            "SELECT id, name FROM projects WHERE id = 'workspace-1-default'"
+        ).fetchone()
+        assert project is not None
+        assert project["name"] == "Default"
 
         versions = [
             row["version"]

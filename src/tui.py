@@ -1,407 +1,1043 @@
-from textual.app import App, ComposeResult
-from textual.widget import Widget
-from textual.widgets import Static, Label, Input
-from textual.layout import Layout
-from rich.panel import Panel
-from rich.text import Text
-from typing import List, Dict, Any
-import asyncio
-import sys
-import re
-import json
-from pathlib import Path
-from src.dispatch import DispatchRequest
+"""Sarathi terminal UI: chat-first home with a task dashboard mode.
 
-# --- Stellar Constants ---
-SARATHI_ASCII_BANNER = r"""
-  ██████  █████  ██████   █████  ████████ ██   ██ ██
- ██      ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
-  █████  ███████ ██████  ███████    ██    ███████ ██
-      ██ ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
-  ██████ ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
+`sarathi tui` opens a centered chat prompt. The first message docks the
+conversation to the bottom of the screen; Ctrl+T flips between the chat
+view and the task panel (run monitor, task browser, proposal review) at
+any time. The task panel polls `.sarathi/tasks`, so it can watch runs
+started elsewhere (CLI, MCP, service) without coordination.
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+
+from rich.markup import escape
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen, Screen
+from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
+
+try:
+    from . import tui_data
+except ImportError:
+    # Support direct execution via sarathi.py, which prepends src/ to sys.path.
+    import tui_data
+
+
+SARATHI_BANNER = r"""
+ ██████  █████  ██████   █████  ████████ ██   ██ ██
+██      ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
+ █████  ███████ ██████  ███████    ██    ███████ ██
+     ██ ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
+ ██████ ██   ██ ██   ██ ██   ██    ██    ██   ██ ██
 """
 
-SARATHI_TAGLINE = "─── GUIDING SYSTEMS ───────────────────"
+CHAT_HELP = (
+    "/run <description>  run a task through the policy-backed lifecycle\n"
+    "                    (recent chat context is included automatically)\n"
+    "/cancel             stop the running task after the current phase\n"
+    "/cd [path]          show or switch the active folder/repo (workspace);\n"
+    "                    starts a fresh agent session in the new workspace\n"
+    "/init [path]        create a policy pack for the workspace (default: cwd)\n"
+    "/model [name]       show or switch the agent CLI used for chat\n"
+    "/context [task_id]  attach a task's status to the conversation\n"
+    "/clear              forget the conversation and start fresh\n"
+    "/tasks              switch to the task panel (Ctrl+T also toggles)\n"
+    "/help               show this help\n"
+    "/quit               exit Sarathi\n"
+    "Anything else is sent to the agent CLI as conversation.\n"
+    "Press Esc to cancel a reply that's still in progress."
+)
 
-# --- Utility Functions ---
+# Cap how much of a task's status snapshot `/context` injects into the
+# next message, so a large task graph doesn't silently balloon the prompt.
+MAX_CONTEXT_CHARS = 4000
 
-def get_aesthetic_style(name: str, type: str = "info", is_bold: bool = False) -> str:
-    """Gets a style based on OpenCode's vibrant, dark aesthetic."""
-    styles = {
-        "banner": "cyan on black",
-        "prompt": "bold green",
-        "error": "bold red",
-        "success": "bold green",
-        "phase_name": "bold cyan",
-        "progress": "cyan",
-        "warning": "bold yellow",
-        "info": "cyan",
-        "default": "white",
-    }
-    base_style = styles.get(type, "white")
-    style_parts = list(base_style.split(" "))
-    if is_bold:
-        style_parts.insert(0, "bold")
-    return " ".join(style_parts)
+# Wall-clock cap for a `/run`/launch_task lifecycle run, checked between
+# phases (cooperative — see Engine.run_task's `task_timeout`).
+DEFAULT_TASK_TIMEOUT = 1800.0  # 30 min wall-clock cap, checked between phases
+
+_OUTCOME_STYLES = {
+    "pass": "green",
+    "success": "green",
+    "completed": "green",
+    "fail": "bold red",
+    "failed": "bold red",
+    "error": "bold red",
+    "unverified": "yellow",
+    "skipped": "dim",
+}
+
+_RISK_STYLES = {"low": "green", "medium": "yellow", "high": "bold red"}
+
+_DECISION_STYLES = {"accepted": "green", "rejected": "red"}
 
 
-# --- Textual App ---
+def _styled(text: object, styles: dict[str, str]) -> Text:
+    value = str(text)
+    return Text(value, style=styles.get(value.lower(), ""))
 
-class SarathiTUI(App):
-    """The main interactive TUI application for Sarathi."""
-    
-    def __init__(self, initial_message: str | None = None, exit_after: bool = False):
-        super().__init__()
-        self.output_content = ""
-        self.initial_message = initial_message
-        self.exit_after = exit_after
+
+def _styled_phase(current_phase: str) -> Text:
+    if current_phase == "Completed":
+        return Text(current_phase, style="dim")
+    return Text(current_phase, style="bold cyan")
+
+
+def _short(text: object, width: int) -> str:
+    flattened = " ".join(str(text).split())
+    if len(flattened) <= width:
+        return flattened
+    return flattened[: width - 1] + "…"
+
+
+def _format_snapshot(text: str) -> str:
+    """Highlight the field labels in a `sarathi status` snapshot."""
+    lines = []
+    for line in text.splitlines():
+        key, sep, rest = line.partition(":")
+        if sep and not line.startswith(" "):
+            lines.append(f"[bold cyan]{escape(key)}:[/]{escape(rest)}")
+        else:
+            lines.append(escape(line))
+    return "\n".join(lines)
+
+
+def _styled_log_line(line: str) -> Text:
+    """Phase-log entry as `timestamp phase status` with a status color."""
+    try:
+        entry = json.loads(line)
+    except json.JSONDecodeError:
+        entry = None
+    if not isinstance(entry, dict):
+        return Text(line)
+    timestamp = str(entry.get("timestamp", ""))[:19].replace("T", " ")
+    status = str(entry.get("status", ""))
+    style = ""
+    lowered = status.lower()
+    if lowered in _OUTCOME_STYLES:
+        style = _OUTCOME_STYLES[lowered]
+    elif lowered == "started":
+        style = "cyan"
+    text = Text()
+    text.append(timestamp, style="dim")
+    text.append("  ")
+    text.append(str(entry.get("phase", "")), style="bold")
+    text.append("  ")
+    text.append(status, style=style)
+    return text
+
+
+def _discover_policy_pack(start_path: str = ".") -> str | None:
+    try:
+        from .cli import discover_policy_pack
+    except ImportError:
+        from cli import discover_policy_pack
+    return discover_policy_pack(start_path)
+
+
+class NewTaskScreen(ModalScreen):
+    """Prompt for a task description to run through the lifecycle."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     def compose(self) -> ComposeResult:
-        yield Static(SARATHI_ASCII_BANNER)
-        yield Static(SARATHI_TAGLINE)
-        yield Static("""
-Welcome to Sarathi AI Orchestrator!
-
-• Ask general questions (what's today's date, explain X, etc.)
-• For project work, ensure you have a policy pack (run 'sarathi init')
-""", id="output-log")
-        yield Static("> ", id="prompt")
-        yield Input(placeholder="Ask a question or describe a task...")
+        with Vertical(id="new-task-dialog"):
+            yield Static("[b]New task[/b] — describe it and press Enter")
+            yield Input(
+                placeholder="e.g. Fix null pointer in user service",
+                id="new-task-input",
+            )
+            yield Static("[dim]Complexity is auto-detected; Esc cancels.[/dim]")
 
     def on_mount(self) -> None:
         self.query_one(Input).focus()
-        
-        # Process initial message after a brief delay to ensure UI is ready
-        if self.initial_message:
-            msg = self.initial_message
-            self.initial_message = None
-            self.call_later(self._process_initial_message, msg)
 
-    def _process_initial_message(self, message: str):
-        """Process initial message after UI is ready."""
-        self.run_workflow(message)
-        if self.exit_after:
-            self.exit(0)
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class InitWorkspaceScreen(ModalScreen):
+    """Prompt for a target path to create a policy pack in."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="init-task-dialog"):
+            yield Static("[b]Init policy pack[/b] — enter a path and press Enter")
+            yield Input(
+                placeholder=self.app.workspace,
+                id="init-task-input",
+            )
+            yield Static("[dim]Empty = current workspace; Esc cancels.[/dim]")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Dismiss with the (possibly empty) path; empty means "use the
+        # current workspace". Distinct from `action_cancel`'s `None`, which
+        # means "do nothing" — both must be distinguishable to `on_result`.
+        self.dismiss(event.value.strip())
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ProposalsScreen(Screen):
+    """Review policy proposals: accept into the policy pack or reject."""
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+        Binding("a", "accept", "Accept"),
+        Binding("x", "reject", "Reject"),
+        Binding("r", "reload", "Reload"),
+    ]
+
+    def __init__(self, persistence) -> None:
+        super().__init__()
+        self.persistence = persistence
+        self.proposals: list = []
+        self.selected_id: str | None = None
+        self.decided: dict[str, str] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield DataTable(id="proposals")
+        yield Static("Loading proposals…", id="proposal-detail")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#proposals", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("ID", "Risk", "Conf", "Target", "Title", "Decision")
+        self.action_reload()
+
+    def action_reload(self) -> None:
+        self.proposals = tui_data.load_proposals(self.persistence)
+        table = self.query_one("#proposals", DataTable)
+        table.clear()
+        for proposal in self.proposals:
+            artifact = proposal.to_artifact()
+            table.add_row(
+                Text(artifact["id"], style="dim"),
+                _styled(artifact["risk_level"], _RISK_STYLES),
+                f"{artifact['confidence']:.2f}",
+                Text(artifact["policy_file"], style="cyan"),
+                _short(artifact["title"], 60),
+                _styled(self.decided.get(artifact["id"], ""), _DECISION_STYLES),
+                key=artifact["id"],
+            )
+        if not self.proposals:
+            self.query_one("#proposal-detail", Static).update(
+                "No policy proposals from persisted learnings."
+            )
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.row_key is None or event.row_key.value is None:
+            return
+        self.selected_id = event.row_key.value
+        self._show_detail()
+
+    def _selected_proposal(self):
+        for proposal in self.proposals:
+            if proposal.proposal_id == self.selected_id:
+                return proposal
+        return None
+
+    def _show_detail(self) -> None:
+        proposal = self._selected_proposal()
+        detail = self.query_one("#proposal-detail", Static)
+        if proposal is None:
+            detail.update("")
+            return
+        artifact = proposal.to_artifact()
+        lines = [
+            f"[b]{escape(artifact['title'])}[/b]",
+            "Target: {}   Kind: {}   Risk: {}   Confidence: {:.2f}".format(
+                escape(artifact["policy_file"]),
+                escape(artifact["proposal_kind"]),
+                escape(artifact["risk_level"]),
+                artifact["confidence"],
+            ),
+            "",
+            f"Rationale: {escape(artifact['rationale'])}",
+            "",
+            "Suggested change:",
+            escape(artifact["suggested_change"]),
+            "",
+            "Evidence: " + escape(", ".join(artifact["evidence_refs"]) or "none"),
+        ]
+        decision = self.decided.get(artifact["id"])
+        if decision:
+            lines.insert(0, f"[reverse] {escape(decision)} [/reverse]")
+        detail.update("\n".join(lines))
+
+    def action_accept(self) -> None:
+        self._decide(accept=True)
+
+    def action_reject(self) -> None:
+        self._decide(accept=False)
+
+    def _decide(self, *, accept: bool) -> None:
+        proposal = self._selected_proposal()
+        if proposal is None:
+            self.notify("No proposal selected.", severity="warning")
+            return
+        policy_pack = _discover_policy_pack(self.app.workspace)
+        if not policy_pack:
+            self.notify(
+                "No policy pack found — run /init (or `sarathi init`) first.",
+                severity="error",
+            )
+            return
+        decision = tui_data.decide_proposal(
+            proposal, accept=accept, policy_pack=policy_pack
+        )
+        self.decided[decision["id"]] = decision["status"]
+        if accept:
+            self.notify(f"Accepted {decision['id']} -> {decision['policy_file']}")
+        else:
+            self.notify(f"Rejected {decision['id']}")
+        self.action_reload()
+        self._show_detail()
+
+
+class ChatScreen(Screen):
+    """Chat-first home: centered prompt that docks once conversation starts."""
+
+    BINDINGS = [Binding("escape", "cancel_chat", "Cancel reply", show=False)]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.session = tui_data.ChatSession()
+        self._chat_pending = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="chat-home"):
+            yield Static(SARATHI_BANNER, id="chat-banner")
+            yield Static("─── guiding systems ───", id="chat-tagline")
+            yield Input(
+                placeholder="Ask anything — or /run <task>, /tasks, /help",
+                id="chat-input-home",
+            )
+            yield Static("", id="chat-provider")
+        with Vertical(id="chat-active"):
+            yield VerticalScroll(id="chat-thread")
+            yield Input(
+                placeholder="Message — /run <task>, /tasks, /help",
+                id="chat-input",
+            )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.app.chat_screen = self
+        provider = self.session.resolve_provider()
+        if provider:
+            status = f"model: {provider[0]} ({provider[1]})"
+        else:
+            status = "no agent CLI on PATH (claude/opencode/codex) — tasks still run via Ctrl+T"
+        self.query_one("#chat-provider", Static).update(f"[dim]{escape(status)}[/dim]")
+        self.query_one("#chat-input-home", Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         message = event.value.strip()
+        event.input.value = ""
         if not message:
             return
-        
-        # Check for exit command
-        if message.lower() in ("exit", "quit", "q", "bye"):
-            self.output_content += "\n👋 Goodbye!"
-            self.query_one("#output-log").update(self.output_content)
-            self.exit(0)
+        if message.startswith("/"):
+            self._handle_command(message)
             return
-        
-        # Clear input
-        event.input.value = ""
-        
-        # Execute workflow
-        self.run_workflow(message)
-
-    def is_generic_question(self, message: str) -> bool:
-        """Classify if message is generic chat vs project task using LLM."""
-        text = message.lower().strip()
-        
-        # Quick heuristic for obvious cases
-        obvious_generic = {"hello", "hi", "hey", "help", "quit", "exit", "q", "bye"}
-        if text in obvious_generic:
-            return True
-        
-        # Try LLM classification
-        try:
-            return self._llm_classify(message)
-        except Exception:
-            # Fallback to pattern-based classification
-            return self._pattern_classify(message)
-
-    def _llm_classify(self, message: str) -> bool:
-        """Classify using lightweight LLM call."""
-        from src.dispatch import LocalDispatcher
-        
-        dispatcher = LocalDispatcher()
-        prompt = f"""Message: "{message}"
-
-Is this a casual conversation/question (generic) or a code/project task (project)?
-Respond with ONE word: generic or project"""
-        
-        request = DispatchRequest(
-            mode="execute",
-            task_id="classify",
-            phase="classify",
-            prompt=prompt,
-            inputs={},
+        self._activate_thread()
+        self._append("you", message)
+        pending = self._append("sarathi", "thinking…", pending=True)
+        chat_input = self.query_one("#chat-input", Input)
+        chat_input.disabled = True
+        chat_input.placeholder = "Waiting for reply… (Esc to cancel)"
+        self._chat_pending = True
+        self.run_worker(
+            lambda: self._deliver(message, pending, chat_input),
+            thread=True,
+            exclusive=True,
+            group="chat",
         )
-        
-        response = dispatcher.dispatch(request)
-        return "generic" in response.outputs.get("content", "").lower()[:20]
 
-    def _pattern_classify(self, message: str) -> bool:
-        """Fallback pattern-based classification."""
-        text = message.lower()
-        generic_patterns = [
-            r"what\s+(is|are|does|do|did|was|were|can)",
-            r"how\s+(do|does|did|can|could|would|should)",
-            r"why\s+",
-            r"explain\s+",
-            r"describe\s+",
-            r"define\s+",
-            r"tell\s+me\s+about",
-            r"who\s+is\s+",
-            r"when\s+did\s+",
-            r"where\s+(is|are|does)",
-            r"\bdate\b",
-            r"\btime\b",
-            r"^hello",
-            r"^hi\s",
-            r"^hey",
-            r"^help",
-        ]
-        project_patterns = [
-            r"\brefactor\b",
-            r"\barchitect\b",
-            r"\bmigrate\b",
-            r"\bredesign\b",
-            r"\b(build|create|implement)\s+",
-            r"\b(fix|debug)\s+",
-            r"\bwrite\s+",
-            r"\bgenerate\s+",
-            r"\badd\s+",
-            r"\bremove\s+",
-            r"\bupdate\s+",
-            r"\btest\s+",
-        ]
-        is_generic = any(re.search(p, text) for p in generic_patterns)
-        is_project = any(re.search(p, text) for p in project_patterns)
-        return is_generic or not is_project
+    def action_cancel_chat(self) -> None:
+        """Esc: kill an in-flight reply. No-op when nothing is pending."""
+        if self._chat_pending:
+            self.session.cancel()
 
-    def run_workflow(self, message: str):
-        """Execute the Sarathi workflow - either chat mode or project mode."""
-        log = self.query_one("#output-log")
-        
-        # Check for exit command first
-        if message.lower() in ("exit", "quit", "q", "bye"):
-            self.output_content += "\n👋 Goodbye!"
-            log.update(self.output_content)
-            self.exit(0)
-            return
-        
-        # Check if it's a generic question FIRST - even if policy pack exists
-        is_generic = self.is_generic_question(message)
-        
-        # Always use chat mode for generic questions (fast, no engine needed)
-        if is_generic:
-            self.run_chat_mode(message, log)
-            return
-        
-        # For project tasks, check for policy pack
-        from src.cli import discover_policy_pack
-        policy_pack = discover_policy_pack()
-        
-        if not policy_pack:
-            self.output_content += """
-⚠️  No policy pack found.
+    def _activate_thread(self) -> None:
+        """Dock the conversation: hide the centered home, focus the bottom input."""
+        if not self.has_class("-started"):
+            self.add_class("-started")
+        self.query_one("#chat-input", Input).focus()
 
-For project work, run: sarathi init <project-path>
-"""
-            log.update(self.output_content)
-            return
-        
-        # Policy pack exists - use full engine for project tasks
-        try:
-            self.run_project_mode(message, policy_pack)
-        except Exception as e:
-            self.output_content += f"\n❌ Error: {str(e)}"
-        
-        log.update(self.output_content)
+    def _append(self, role: str, text: str, *, pending: bool = False) -> Static:
+        thread = self.query_one("#chat-thread", VerticalScroll)
+        label = "[bold cyan]you[/]" if role == "you" else "[bold magenta]sarathi[/]"
+        body = f"[dim]{escape(text)}[/dim]" if pending else escape(text)
+        widget = Static(f"{label}  {body}", classes=f"chat-msg {role}")
+        thread.mount(widget)
+        thread.scroll_end(animate=False)
+        return widget
 
-    def run_chat_mode(self, message: str, log):
-        """Handle generic questions - answer using LLM."""
-        # Try quick responses for obvious cases
-        text = message.lower()
-        
-        if "date" in text and "today" in text:
-            from datetime import datetime
-            today = datetime.now().strftime("%B %d, %Y")
-            self.output_content += f"\n📅 Today's date is: {today}"
-            log.update(self.output_content)
-            return
-        elif "time" in text:
-            from datetime import datetime
-            now = datetime.now().strftime("%I:%M %p")
-            self.output_content += f"\n🕐 Current time: {now}"
-            log.update(self.output_content)
-            return
-        elif any(g in text for g in ["hello", "hi", "hey"]) and len(message.split()) < 3:
-            self.output_content += """
-👋 Hello! I'm Sarathi - your AI orchestration partner.
+    def _system(self, text: str) -> None:
+        self._activate_thread()
+        thread = self.query_one("#chat-thread", VerticalScroll)
+        thread.mount(Static(f"[dim]{escape(text)}[/dim]", classes="chat-msg system"))
+        thread.scroll_end(animate=False)
 
-I can help with:
-• General questions and conversations
-• Project work (with a policy pack)
+    def _deliver(self, message: str, widget: Static, chat_input: Input) -> None:
+        thread = self.query_one("#chat-thread", VerticalScroll)
+        last_update = 0.0
+        throttle_seconds = 0.05
 
-To work on a project: sarathi init <path>
-"""
-            log.update(self.output_content)
-            return
-        elif text == "help":
-            self.output_content += """
-ℹ️ Sarathi Commands:
-
-  sarathi           - Start interactive chat
-  sarathi init <path> - Initialize a project
-  sarathi run <task> - Run a task through phases
-  sarathi status    - Check task status
-
-Try asking me something!
-"""
-            log.update(self.output_content)
-            return
-        
-        # Use LLM to answer the question
-        self.output_content += f"\n🤖 {message}"
-        log.update(self.output_content)
-        
-        try:
-            answer = self._llm_answer(message)
-            self.output_content += f"\n{answer}"
-        except Exception as e:
-            self.output_content += f"""
-I can answer general questions. For project work,
-set up a policy pack: sarathi init <project-path>
-"""
-        
-        log.update(self.output_content)
-
-    def _llm_answer(self, question: str) -> str:
-        """Get answer from LLM for generic questions."""
-        import os
-        import shutil
-        from src.dispatch import DispatchRequest
-        from src.dispatch import LocalDispatcher
-        from src.storage import connect
-        
-        # Strategy 1: Check OPENAI_API_KEY env var
-        if os.getenv("OPENAI_API_KEY"):
-            provider_config = {"provider": "openai", "model": "gpt-4o"}
-            dispatcher = LocalDispatcher(provider_config=provider_config)
-            
-            prompt = f"""You are a helpful assistant. Answer this question concisely:
-
-Question: {question}
-
-Answer:"""
-            
-            request = DispatchRequest(
-                mode="execute",
-                task_id="answer",
-                phase="answer",
-                prompt=prompt,
-                inputs={},
+        def on_text(partial: str) -> None:
+            nonlocal last_update
+            now = time.monotonic()
+            if now - last_update < throttle_seconds:
+                return
+            last_update = now
+            self.app.call_from_thread(
+                widget.update, f"[bold magenta]sarathi[/]  {escape(partial)}"
             )
-            
-            try:
-                response = dispatcher.dispatch(request)
-                return response.outputs.get("content", "I don't have an answer right now.")
-            except Exception as e:
-                pass
-        
-        # Strategy 2: Try desktop database provider config
-        db_path = Path(".sarathi/sarathi.db")
-        if db_path.exists():
-            try:
-                conn = connect(db_path)
-                row = conn.execute("SELECT config FROM providers WHERE health = 'online' LIMIT 1").fetchone()
-                if row and row["config"]:
-                    provider_config = json.loads(row["config"])
-                    if provider_config.get("path"):
-                        dispatcher = LocalDispatcher(provider_config=provider_config)
-                        
-                        prompt = f"""You are a helpful assistant. Answer this question concisely:
+            self.app.call_from_thread(thread.scroll_end)
 
-Question: {question}
+        try:
+            reply = self.session.send_streaming(message, on_text=on_text)
+            if reply == "(cancelled)":
+                rendered = "[bold magenta]sarathi[/]  [dim](cancelled)[/]"
+            elif tui_data.is_error_reply(reply):
+                self.app.call_from_thread(widget.add_class, "error")
+                rendered = f"[bold magenta]sarathi[/]  [bold red]{escape(reply)}[/]"
+            else:
+                rendered = f"[bold magenta]sarathi[/]  {escape(reply)}"
+            self.app.call_from_thread(widget.update, rendered)
+            self.app.call_from_thread(thread.scroll_end)
+        finally:
+            self.app.call_from_thread(self._finish_delivery, chat_input)
 
-Answer:"""
-                        
-                        request = DispatchRequest(
-                            mode="execute",
-                            task_id="answer",
-                            phase="answer",
-                            prompt=prompt,
-                            inputs={},
-                        )
-                        
-                        try:
-                            response = dispatcher.dispatch(request)
-                            return response.outputs.get("content", "I don't have an answer right now.")
-                        except Exception:
-                            pass
-                conn.close()
-            except Exception:
-                pass
-        
-        # Strategy 3: Try available CLI tools (claude, opencode, codex)
-        cli_tools = [("claude", ["-p", "--print"]), ("opencode", []), ("codex", ["--print"])]
-        for tool, args in cli_tools:
-            if shutil.which(tool):
-                try:
-                    import subprocess as sp
-                    result = sp.run(
-                        [tool] + args + [question],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
+    def _finish_delivery(self, chat_input: Input) -> None:
+        self._chat_pending = False
+        chat_input.disabled = False
+        chat_input.placeholder = "Message — /run <task>, /tasks, /help"
+        if self.has_class("-started"):
+            chat_input.focus()
+
+    def _transcript(self, max_turns: int = 6, max_chars: int = 500) -> str:
+        """Recent chat history formatted as alternating user/assistant lines."""
+        lines = []
+        for user, assistant in self.session.history[-max_turns:]:
+            lines.append(f"user: {user[:max_chars]}")
+            lines.append(f"assistant: {assistant[:max_chars]}")
+        return "\n".join(lines)
+
+    def _handle_command(self, message: str) -> None:
+        command, _, argument = message.partition(" ")
+        command = command.lower()
+        argument = argument.strip()
+        if command in ("/tasks", "/panel"):
+            self.app.action_toggle_mode()
+        elif command == "/run":
+            if not argument:
+                self._system("Usage: /run <task description>")
+            else:
+                context = self._transcript() if self.session.history else None
+                if self.app.launch_task(argument, context=context):
+                    self._system(
+                        f"Launched task: {argument} — watch it in the task panel (Ctrl+T)."
                     )
-                    if result.returncode == 0 and result.stdout:
-                        return result.stdout.strip()[:500]
-                except Exception:
-                    continue
-        
-        # No provider available
-        return """No LLM provider available. To enable AI answers:
+        elif command == "/cancel":
+            self.app.request_cancel()
+        elif command in ("/cd", "/workspace"):
+            self._handle_workspace_command(argument)
+        elif command == "/init":
+            self._handle_init_command(argument)
+        elif command == "/model":
+            self._handle_model_command(argument)
+        elif command == "/context":
+            self._handle_context_command(argument)
+        elif command in ("/clear", "/reset"):
+            self._clear_conversation()
+        elif command == "/help":
+            self._system(CHAT_HELP)
+        elif command in ("/quit", "/exit"):
+            self.app.exit()
+        else:
+            self._system(f"Unknown command {command}. {CHAT_HELP}")
 
-  • Set OPENAI_API_KEY env var: export OPENAI_API_KEY=your-key
-  • Or install a CLI tool: Claude, OpenCode, or Codex
-  • Or run 'sarathi init <project>' for project mode"""
-
-    def run_project_mode(self, message: str, policy_pack: str):
-        """Execute full Sarathi workflow with policy pack."""
-        from src.engine import Engine, TaskContext, Complexity
-        
-        # Auto-calculate complexity
-        complexity = Complexity.MEDIUM
-        text = message.lower()
-        high_patterns = [r'\b(architect|architecture|refactor|migrate|redesign)\b', r'\b(new\s+feature)\b']
-        low_patterns = [r'\b(fix|bug|typo|simple)\b']
-        if any(p in text for p in high_patterns):
-            complexity = Complexity.HIGH
-        elif any(p in text for p in low_patterns):
-            complexity = Complexity.LOW
-        
-        self.output_content += f"\n⚙️ Running: {message}"
-        self.output_content += f"\n   Complexity: {complexity.value}"
-        
-        # Create engine and run task
-        engine = Engine(policy_pack_path=policy_pack, enforce_preflight=False)
-        task = TaskContext(
-            task_id=engine.generate_task_id(message),
-            description=message,
-            complexity=complexity,
+    def _handle_context_command(self, argument: str) -> None:
+        if not argument:
+            summaries = tui_data.task_summaries(self.app.persistence)
+            if not summaries:
+                self._system("No saved tasks.")
+                return
+            ids = ", ".join(summary["task_id"] for summary in summaries[:10])
+            self._system(f"Usage: /context <task_id>. Available tasks: {ids}")
+            return
+        task_id = argument
+        snapshot = tui_data.status_snapshot(self.app.persistence, task_id)
+        if snapshot is None:
+            summaries = tui_data.task_summaries(self.app.persistence)
+            message = f"Task {task_id} not found."
+            if summaries:
+                ids = ", ".join(summary["task_id"] for summary in summaries[:10])
+                message += f" Available tasks: {ids}"
+            self._system(message)
+            return
+        attached = snapshot
+        note = ""
+        if len(snapshot) > MAX_CONTEXT_CHARS:
+            attached = snapshot[:MAX_CONTEXT_CHARS] + "\n…(truncated)"
+            note = (
+                f" ({len(snapshot)} chars, truncated to {MAX_CONTEXT_CHARS})"
+            )
+        self.session.add_context(f"Status of task {task_id}", attached)
+        self._system(attached)
+        self._system(
+            f"Added to conversation context{note} —"
+            " it will be sent with your next message."
         )
-        
-        result = engine.run_task(task)
-        
-        self.output_content += f"\n✅ Completed ({len(result.phase_results)} phases)"
-        
-        # Show final outcome from last phase
-        if result.phase_results:
-            last = result.phase_results[-1]
-            self.output_content += f"\n   → {last.outcome[:100]}"
+
+    def _clear_conversation(self) -> None:
+        """Forget history and pending context, returning to the home view."""
+        self.session.clear()
+        self.query_one("#chat-thread", VerticalScroll).remove_children()
+        self.remove_class("-started")
+        self.query_one("#chat-input-home", Input).focus()
+        self.app.notify("Conversation cleared.")
+
+    def _handle_workspace_command(self, argument: str) -> None:
+        if not argument:
+            pack = _discover_policy_pack(self.app.workspace)
+            status = (
+                f"policy pack: {pack}" if pack else "no policy pack — run /init to create one"
+            )
+            self._system(f"Workspace: {self.app.workspace} ({status})")
+            return
+        if not self.app.set_workspace(argument):
+            self._system(f"Not a directory: {argument}")
+            return
+        pack = _discover_policy_pack(self.app.workspace)
+        status = (
+            f"policy pack found: {pack}"
+            if pack
+            else "no policy pack here — run /init to create one"
+        )
+        self._system(f"Workspace set to {self.app.workspace} ({status}).")
+
+    def _handle_init_command(self, argument: str) -> None:
+        path = os.path.abspath(os.path.expanduser(argument)) if argument else self.app.workspace
+        self._system(f"Initializing policy pack in {path} — scanning repo…")
+        self.app.launch_init(path)
+
+    def _handle_model_command(self, argument: str) -> None:
+        providers = self.session.available_providers()
+        if not argument:
+            if not providers:
+                self._system(
+                    "No agent CLI found on PATH (looked for: claude, opencode, codex)."
+                )
+                return
+            current = self.session.resolve_provider()
+            current_name = current[0] if current else None
+            parts = []
+            for name, _path in providers:
+                if name == current_name:
+                    parts.append(f"{name} (current)")
+                else:
+                    parts.append(name)
+            self._system(
+                "Providers: " + ", ".join(parts) + ". Use /model <name> to switch."
+            )
+            return
+        name = argument.strip().lower()
+        if self.session.set_provider(name):
+            self._system(f"Switched model to {name}.")
+        else:
+            choices = ", ".join(n for n, _ in providers) or "none detected"
+            self._system(f"Unknown or unavailable provider {name!r}. Available: {choices}.")
 
 
-def launch_sarathi_tui(initial_message: str | None = None, exit_after: bool = False) -> None:
-    """Launches the Sarathi TUI application."""
-    app = SarathiTUI(initial_message, exit_after)
-    app.run()
+class TasksScreen(Screen):
+    """Task panel: live run monitor, task browser, proposal review."""
+
+    BINDINGS = [
+        Binding("q", "app.quit", "Quit"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("n", "new_task", "New task"),
+        Binding("p", "proposals", "Proposals"),
+        Binding("u", "resume", "Resume task"),
+        Binding("i", "init_workspace", "Init pack"),
+        Binding("c", "cancel_run", "Cancel run"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.selected_task_id: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal():
+            yield DataTable(id="tasks")
+            with Vertical(id="detail"):
+                yield Static("No task selected.", id="snapshot")
+                yield DataTable(id="phases")
+                yield RichLog(id="log")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.selected_task_id = self.app.initial_task_id
+        tasks = self.query_one("#tasks", DataTable)
+        tasks.cursor_type = "row"
+        tasks.add_columns("Task", "Phase", "Outcome", "Updated")
+        phases = self.query_one("#phases", DataTable)
+        phases.cursor_type = "none"
+        phases.add_columns("Phase", "Agent", "Outcome", "Iter", "Error")
+        self.refresh_data()
+        self.set_interval(self.app.refresh_interval, self.refresh_data)
+
+    def refresh_data(self) -> None:
+        summaries = tui_data.task_summaries(self.app.persistence)
+        table = self.query_one("#tasks", DataTable)
+        table.clear()
+        known: set[str] = set()
+        for summary in summaries:
+            known.add(summary["task_id"])
+            table.add_row(
+                _short(summary["task_id"], 20),
+                _styled_phase(summary["current_phase"]),
+                _styled(_short(summary["last_outcome"], 14), _OUTCOME_STYLES),
+                Text(str(summary["last_updated"])[5:16].replace("T", " "), style="dim"),
+                key=summary["task_id"],
+            )
+        if self.selected_task_id not in known:
+            self.selected_task_id = summaries[0]["task_id"] if summaries else None
+        if self.selected_task_id is not None:
+            table.move_cursor(row=table.get_row_index(self.selected_task_id))
+        self._refresh_detail()
+
+    def _refresh_detail(self) -> None:
+        snapshot = self.query_one("#snapshot", Static)
+        phases = self.query_one("#phases", DataTable)
+        log = self.query_one("#log", RichLog)
+        phases.clear()
+        log.clear()
+        if self.selected_task_id is None:
+            snapshot.update("No saved tasks. Run `sarathi run \"…\"` first.")
+            return
+        text = tui_data.status_snapshot(self.app.persistence, self.selected_task_id)
+        snapshot.update(
+            _format_snapshot(text) if text else f"Task {self.selected_task_id} not found."
+        )
+        for row in tui_data.phase_rows(self.app.persistence, self.selected_task_id):
+            phases.add_row(
+                Text(row["phase"], style="bold"),
+                row["agent"],
+                _styled(row["outcome"], _OUTCOME_STYLES),
+                str(row["iterations"]),
+                Text(_short(row["error"], 40), style="red"),
+            )
+        for line in tui_data.phase_log_tail(self.app.persistence, self.selected_task_id):
+            log.write(_styled_log_line(line))
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "tasks" or event.row_key is None:
+            return
+        value = event.row_key.value
+        if value and value != self.selected_task_id:
+            self.selected_task_id = value
+            self._refresh_detail()
+
+    def action_refresh(self) -> None:
+        self.refresh_data()
+
+    def action_proposals(self) -> None:
+        self.app.push_screen(ProposalsScreen(self.app.persistence))
+
+    def action_new_task(self) -> None:
+        def on_result(description: str | None) -> None:
+            if description:
+                self.app.launch_task(description)
+
+        self.app.push_screen(NewTaskScreen(), on_result)
+
+    def action_init_workspace(self) -> None:
+        def on_result(path: str | None) -> None:
+            if path is not None:
+                self.app.launch_init(path or self.app.workspace)
+
+        self.app.push_screen(InitWorkspaceScreen(), on_result)
+
+    def action_cancel_run(self) -> None:
+        self.app.request_cancel()
+
+    def action_resume(self) -> None:
+        task_id = self.selected_task_id
+        if task_id is None:
+            self.notify("No task selected.", severity="warning")
+            return
+        policy_pack = _discover_policy_pack(self.app.workspace)
+        if not policy_pack:
+            self.notify(
+                "No policy pack found — run /init (or `sarathi init`) first.",
+                severity="error",
+            )
+            return
+        self.notify(f"Resuming {task_id}…")
+        self.run_worker(
+            lambda: self._resume(task_id, policy_pack),
+            thread=True,
+            exclusive=True,
+            group="resume",
+        )
+
+    def _resume(self, task_id: str, policy_pack: str) -> None:
+        # Resumes are bounded by the same wall-clock cap as launches; the
+        # interactive cancel affordance (`c` / `/cancel`) targets the
+        # active `/run`/launch_task run, not a resume.
+        try:
+            result = tui_data.resume_task(
+                self.app.persistence, task_id, policy_pack, task_timeout=DEFAULT_TASK_TIMEOUT
+            )
+        except Exception as exc:
+            message = f"Resume failed: {exc}"
+            self.app.call_from_thread(self.notify, message, severity="error")
+            self.app.call_from_thread(self.app.post_chat_event, message)
+            return
+        phase = result.current_phase.value if result.current_phase else "Completed"
+        message = f"Resumed {task_id}: now at {phase}"
+        self.app.call_from_thread(self.notify, message)
+        self.app.call_from_thread(self.app.post_chat_event, message)
+        self.app.call_from_thread(self.refresh_data)
+
+
+class SarathiApp(App):
+    """Chat-first Sarathi terminal UI with a toggleable task panel."""
+
+    TITLE = "Sarathi"
+    SUB_TITLE = "guiding systems"
+
+    MODES = {"chat": ChatScreen, "tasks": TasksScreen}
+
+    BINDINGS = [
+        Binding("ctrl+t", "toggle_mode", "Chat/Tasks", priority=True),
+    ]
+
+    CSS = """
+    #chat-home {
+        align: center middle;
+    }
+    #chat-banner {
+        width: auto;
+        color: $primary;
+    }
+    #chat-tagline {
+        width: auto;
+        color: $text-muted;
+        margin-bottom: 1;
+        text-style: italic;
+    }
+    #chat-input-home {
+        width: 80;
+        max-width: 90%;
+    }
+    #chat-provider {
+        width: auto;
+        margin-top: 1;
+        text-style: italic;
+    }
+    #chat-active {
+        display: none;
+        height: 1fr;
+    }
+    ChatScreen.-started #chat-home {
+        display: none;
+    }
+    ChatScreen.-started #chat-active {
+        display: block;
+    }
+    #chat-thread {
+        height: 1fr;
+        padding: 1 2;
+    }
+    #chat-input {
+        dock: bottom;
+        margin: 0 1 1 1;
+    }
+    .chat-msg {
+        margin-bottom: 1;
+    }
+    .chat-msg.system {
+        text-style: italic;
+    }
+    .chat-msg.error {
+        border-left: thick $error;
+    }
+    #tasks {
+        width: 42%;
+        border-right: solid $primary;
+    }
+    #detail {
+        width: 1fr;
+    }
+    #snapshot {
+        padding: 0 1;
+        height: auto;
+        max-height: 50%;
+        overflow-y: auto;
+    }
+    #phases {
+        height: auto;
+        max-height: 12;
+    }
+    #log {
+        height: 1fr;
+        border-top: solid $primary;
+    }
+    #proposals {
+        height: 40%;
+    }
+    #proposal-detail {
+        padding: 1;
+        height: 1fr;
+        overflow-y: auto;
+    }
+    NewTaskScreen {
+        align: center middle;
+    }
+    #new-task-dialog {
+        width: 80;
+        height: auto;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    InitWorkspaceScreen {
+        align: center middle;
+    }
+    #init-task-dialog {
+        width: 80;
+        height: auto;
+        padding: 1 2;
+        border: thick $primary;
+        background: $surface;
+    }
+    """
+
+    def __init__(
+        self,
+        persistence=None,
+        task_id: str | None = None,
+        refresh_interval: float = 2.0,
+        workspace: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.workspace = os.path.abspath(os.path.expanduser(workspace)) if workspace else os.getcwd()
+        if persistence is not None:
+            self.persistence = persistence
+        else:
+            self.persistence = tui_data.default_persistence(
+                os.path.join(self.workspace, ".sarathi", "tasks")
+            )
+        self.initial_task_id = task_id
+        self.refresh_interval = refresh_interval
+        self.chat_screen: ChatScreen | None = None
+        self._init_active = False
+        self._run_active = False
+        self._run_cancel: threading.Event | None = None
+
+    def set_workspace(self, path: str) -> bool:
+        """Point the app at a different folder/repo.
+
+        Re-roots task persistence at ``<path>/.sarathi/tasks``, runs chat
+        and lifecycle tasks from there, and refreshes the task panel if it
+        is open. Returns False (leaving the workspace unchanged) when
+        ``path`` is not a directory.
+        """
+        resolved = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isdir(resolved):
+            return False
+        self.workspace = resolved
+        self.persistence = tui_data.default_persistence(
+            os.path.join(resolved, ".sarathi", "tasks")
+        )
+        if self.chat_screen is not None:
+            self.chat_screen.session.workspace_root = resolved
+            # Drop the resumable claude session so the next agent call
+            # starts fresh in the new workspace.
+            self.chat_screen.session.reset_session()
+        screen = self.screen
+        if isinstance(screen, TasksScreen):
+            screen.selected_task_id = None
+            screen.refresh_data()
+        return True
+
+    def on_mount(self) -> None:
+        # Opening with --task means the user wants the panel, not the chat.
+        self.switch_mode("tasks" if self.initial_task_id else "chat")
+
+    def action_toggle_mode(self) -> None:
+        self.switch_mode("tasks" if self.current_mode == "chat" else "chat")
+
+    def post_chat_event(self, text: str) -> None:
+        """Post a system message into the chat thread, if it has one started.
+
+        Safe to call from the UI thread only (callers from worker threads
+        should use `call_from_thread`). Does nothing if the chat screen has
+        never been activated, so users who haven't chatted aren't surprised
+        by a thread appearing.
+        """
+        if self.chat_screen is not None and self.chat_screen.has_class("-started"):
+            self.chat_screen._system(text)
+
+    def launch_task(self, description: str, context: str | None = None) -> bool:
+        """Run a new task through the lifecycle in a background worker."""
+        if self._run_active:
+            self.notify(
+                "A task is already running — wait for it to finish.",
+                severity="warning",
+            )
+            return False
+        policy_pack = _discover_policy_pack(self.workspace)
+        if not policy_pack:
+            self.notify(
+                "No policy pack found — run /init (or `sarathi init`) first.",
+                severity="error",
+            )
+            return False
+        self.notify(f"Starting: {_short(description, 60)}")
+        self._run_active = True
+        self._run_cancel = threading.Event()
+        self.run_worker(
+            lambda: self._start(description, policy_pack, context),
+            thread=True,
+            group="run",
+        )
+        return True
+
+    def _start(self, description: str, policy_pack: str, context: str | None = None) -> None:
+        cancel_event = self._run_cancel
+        try:
+            try:
+                result = tui_data.start_task(
+                    self.persistence,
+                    description,
+                    policy_pack,
+                    context=context,
+                    cancel_check=cancel_event.is_set if cancel_event is not None else None,
+                    task_timeout=DEFAULT_TASK_TIMEOUT,
+                )
+            except Exception as exc:
+                self.call_from_thread(self.notify, f"Task failed: {exc}", severity="error")
+                self.call_from_thread(self.post_chat_event, f"Task failed: {exc}")
+                return
+            phase = result.current_phase.value if result.current_phase else "Completed"
+            stop_reason = getattr(result, "stop_reason", None)
+            if stop_reason == "cancelled":
+                message = (
+                    f"Task cancelled at {phase}: {result.task_id}"
+                    " — resume with `u` or `sarathi resume`."
+                )
+            elif stop_reason == "timeout":
+                message = (
+                    f"Task timed out at {phase} after {int(DEFAULT_TASK_TIMEOUT)}s:"
+                    f" {result.task_id} — resume with `u`."
+                )
+            elif result.current_phase is None:
+                message = f"Task completed: {result.task_id}"
+            else:
+                message = f"Task paused at {phase}: {result.task_id}"
+            self.call_from_thread(self.notify, message)
+            self.call_from_thread(self.post_chat_event, message)
+            screen = self.screen
+            if isinstance(screen, TasksScreen):
+                screen.selected_task_id = result.task_id
+                self.call_from_thread(screen.refresh_data)
+        finally:
+            self.call_from_thread(self._clear_run_active)
+
+    def _clear_run_active(self) -> None:
+        self._run_active = False
+        self._run_cancel = None
+
+    def request_cancel(self) -> bool:
+        """Ask the active `/run`/launch_task run to stop after this phase.
+
+        Returns True if a run was signalled, else False (and notifies that
+        nothing is running).
+        """
+        if self._run_active and self._run_cancel is not None:
+            self._run_cancel.set()
+            self.notify("Cancelling after the current phase…")
+            return True
+        self.notify("No task is running.", severity="warning")
+        return False
+
+    def launch_init(self, path: str) -> bool:
+        """Create a policy pack for `path` in a background worker.
+
+        Shared by the task panel (`i`) and the chat `/init` command. Returns
+        False without starting a worker when `path` isn't a directory or an
+        init is already running.
+        """
+        resolved = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isdir(resolved):
+            self.notify(f"Not a directory: {resolved}", severity="error")
+            return False
+        if self._init_active:
+            self.notify("An init is already running.", severity="warning")
+            return False
+        self._init_active = True
+        self.notify(f"Initializing policy pack in {resolved}…")
+        self.run_worker(
+            lambda: self._run_init_worker(resolved),
+            thread=True,
+            group="init",
+        )
+        return True
+
+    def _run_init_worker(self, path: str) -> None:
+        try:
+            result = tui_data.init_workspace(path)
+        except Exception as exc:  # never leave _init_active stuck on a crash
+            result = {"error": str(exc)}
+        self.call_from_thread(self._report_init, path, result)
+
+    def _report_init(self, path: str, result: dict) -> None:
+        self._init_active = False
+        if result.get("error"):
+            self.notify(f"Init failed: {result['error']}", severity="error")
+            self.post_chat_event(f"Init failed: {result['error']}")
+            return
+        languages = ", ".join(result.get("languages") or []) or "none detected"
+        summary = (
+            f"Initialized policy pack: {result['policy_pack']}\n"
+            f"Languages: {languages}\n"
+            f"Validation: {result['validation_passed']}/{result['validation_total']} passed.\n"
+            "You can now /run tasks (or use the task panel) for this workspace."
+        )
+        self.notify(f"Policy pack created: {result['policy_pack']}")
+        self.post_chat_event(summary)
+        screen = self.screen
+        if isinstance(screen, TasksScreen):
+            screen.refresh_data()
+
+
+# Backward-compatible alias: the app started life as a dashboard-only UI.
+SarathiDashboard = SarathiApp
+
+
+def launch_sarathi_tui(
+    task_id: str | None = None, workspace: str | None = None
+) -> None:
+    """Launch the Sarathi terminal UI."""
+    SarathiApp(task_id=task_id, workspace=workspace).run()

@@ -5,12 +5,13 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass, field, replace as _dc_replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -913,8 +914,21 @@ class Engine:
         except Exception:
             logger.exception("Failed to persist task %s after dispatch journal reconciliation", task.task_id)
 
-    def run_task(self, task: TaskContext) -> TaskContext:
-        """Run a task through the full lifecycle."""
+    def run_task(
+        self,
+        task: TaskContext,
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+        task_timeout: float | None = None,
+    ) -> TaskContext:
+        """Run a task through the full lifecycle.
+
+        `cancel_check` and `task_timeout` enable cooperative cancellation: both
+        default to None, leaving behavior identical to a plain call. When set,
+        they are polled at each phase boundary (not mid-phase) — see
+        `task.stop_reason`.
+        """
+        task.stop_reason = None
         if hasattr(self.dispatcher, "reset_task_state"):
             self.dispatcher.reset_task_state()
         self._reconcile_inflight_dispatches(task)
@@ -930,9 +944,21 @@ class Engine:
         budget_warned = False
 
         task.current_phase = Phase.ROUTE
+        deadline = time.monotonic() + task_timeout if task_timeout else None
 
         while task.current_phase is not None and task.current_phase != Phase.LEARN:
             phase = task.current_phase
+
+            if cancel_check is not None and cancel_check():
+                task.stop_reason = "cancelled"
+                self._log_phase(task, phase, "cancelled")
+                self.persistence.save_task(task)
+                return task
+            if deadline is not None and time.monotonic() >= deadline:
+                task.stop_reason = "timeout"
+                self._log_phase(task, phase, "timed_out")
+                self.persistence.save_task(task)
+                return task
 
             if self._should_skip_phase(task, phase):
                 skip_result = PhaseResult(
@@ -1022,10 +1048,21 @@ class Engine:
 
         return task
 
-    def resume_task(self, task: TaskContext) -> TaskContext:
-        """Resume a previously saved task from the next unresolved phase."""
+    def resume_task(
+        self,
+        task: TaskContext,
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+        task_timeout: float | None = None,
+    ) -> TaskContext:
+        """Resume a previously saved task from the next unresolved phase.
+
+        `cancel_check` and `task_timeout` mirror `run_task`: polled at each
+        phase boundary, see `task.stop_reason`.
+        """
+        task.stop_reason = None
         if not task.phase_results:
-            return self.run_task(task)
+            return self.run_task(task, cancel_check=cancel_check, task_timeout=task_timeout)
 
         self._reconcile_inflight_dispatches(task)
 
@@ -1052,9 +1089,22 @@ class Engine:
             self._log_phase(task, next_phase, "skipped")
             next_phase = PHASE_TRANSITIONS.get(next_phase, Phase.LEARN)
         task.current_phase = next_phase
+        deadline = time.monotonic() + task_timeout if task_timeout else None
 
         while task.current_phase is not None and task.current_phase != Phase.LEARN:
             phase = task.current_phase
+
+            if cancel_check is not None and cancel_check():
+                task.stop_reason = "cancelled"
+                self._log_phase(task, phase, "cancelled")
+                self.persistence.save_task(task)
+                return task
+            if deadline is not None and time.monotonic() >= deadline:
+                task.stop_reason = "timeout"
+                self._log_phase(task, phase, "timed_out")
+                self.persistence.save_task(task)
+                return task
+
             phase_results = self._execute_phase_with_recovery(task, phase)
             for phase_result in phase_results:
                 task.phase_results.append(phase_result)

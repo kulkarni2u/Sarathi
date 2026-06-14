@@ -842,7 +842,8 @@ def _task_dashboard(
 ) -> list[dict[str, Any]]:
     summaries = []
     for task in storage.list_tasks_for_workspace(workspace_id):
-        if project_id is not None and task["metadata"].get("project_id") != project_id:
+        task_project_id = task.get("project_id") or task["metadata"].get("project_id")
+        if project_id is not None and task_project_id != project_id:
             continue
         approvals = storage.list_approval_gates_for_task(task["id"])
         graph = _graph_for_task(storage, task)
@@ -851,19 +852,24 @@ def _task_dashboard(
         handoffs = storage.list_handoffs_for_task(task["id"])
         latest_checkpoint = _latest_or_none(checkpoints)
         latest_handoff = _latest_or_none(handoffs)
+        reviews = storage.list_review_runs_for_task(task["id"])
+        handoff_state = _handoff_state(latest_handoff)
+        queue_state = _task_studio_queue_state(task, graph, approvals, reviews, handoff_state)
         summaries.append(
             {
                 "id": task["id"],
                 "workspace_id": task["workspace_id"],
+                "project_id": task_project_id,
                 "title": task["title"],
                 "status": task["status"],
+                "queue_state": queue_state,
                 "phase": task["metadata"].get("phase", task["status"]),
                 "approval_state": _approval_state(approvals),
                 "graph_state": _graph_state(graph, approvals),
                 "next_gate": next_gate["name"] if next_gate else None,
                 "node_count": len(graph["nodes"]),
                 "blocked_count": len(graph.get("blocked_nodes", [])) + len(graph.get("waiting_human_nodes", [])),
-                "review_needed_count": _review_needed_count(approvals, storage.list_review_runs_for_task(task["id"])),
+                "review_needed_count": _review_needed_count(approvals, reviews),
                 "coordination_state": graph.get("coordination_state"),
                 "fan_out_ready_count": len(graph.get("fan_out_ready_nodes", [])),
                 "fan_in_count": len(graph.get("fan_in_nodes", [])),
@@ -875,7 +881,7 @@ def _task_dashboard(
                 ),
                 "updated_at": task["updated_at"],
                 "checkpoint_state": _checkpoint_state(latest_checkpoint),
-                "handoff_state": _handoff_state(latest_handoff),
+                "handoff_state": handoff_state,
             }
         )
     return summaries

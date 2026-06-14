@@ -16,6 +16,7 @@ import type {
   HealthData,
   ListWorkspacesData,
   OperationalViewsData,
+  ProjectsData,
   ProposalsData,
   ProvidersData,
   TaskApprovalsData,
@@ -275,6 +276,13 @@ export const api = {
       `/workspaces/${encodeURIComponent(workspaceId)}/repositories`,
       { signal },
     );
+  },
+
+  /** GET /workspaces/{id}/projects */
+  getProjects(workspaceId: string, signal?: AbortSignal): Promise<ProjectsData> {
+    return request<ProjectsData>(`/workspaces/${encodeURIComponent(workspaceId)}/projects`, {
+      signal,
+    });
   },
 
   /** GET /workspaces/{id}/proposals */

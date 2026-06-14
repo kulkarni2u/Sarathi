@@ -1,7 +1,8 @@
-import { useState } from "react";
-import { NavLink } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { NavLink, useNavigate } from "react-router-dom";
 import { useWorkspace } from "../context/WorkspaceContext";
-import type { Workspace } from "../api/types";
+import { api } from "../api/client";
+import type { Project, Workspace } from "../api/types";
 
 // Icons are inlined (stroke="currentColor") to match the mockup's lightweight
 // SVG style without pulling in an icon library dependency.
@@ -101,17 +102,72 @@ function healthDotColor(health: string | undefined): string {
   }
 }
 
-// Placeholder "pinned projects" until a later worker wires this to real
-// project data (e.g. from /workspaces/{id}/projects).
-const PINNED_PROJECTS: { name: string; gradient: string }[] = [
-  { name: "checkout-revamp", gradient: "linear-gradient(135deg,#5b8def,#9b7ff0)" },
-  { name: "fraud-engine", gradient: "linear-gradient(135deg,#e0742a,#f0a93b)" },
-  { name: "platform-infra", gradient: "linear-gradient(135deg,#3fb27f,#5b8def)" },
+// Gradient swatches cycled for each project's pin dot, matching the
+// mockup's varied color treatment for the (formerly hardcoded) pinned list.
+const PROJECT_DOT_GRADIENTS = [
+  "linear-gradient(135deg,#5b8def,#9b7ff0)",
+  "linear-gradient(135deg,#e0742a,#f0a93b)",
+  "linear-gradient(135deg,#3fb27f,#5b8def)",
+  "linear-gradient(135deg,#c44ad0,#5b8def)",
+  "linear-gradient(135deg,#f0a93b,#e0742a)",
 ];
+
+function projectDotGradient(index: number): string {
+  return PROJECT_DOT_GRADIENTS[index % PROJECT_DOT_GRADIENTS.length];
+}
+
+/** Best-effort human-readable name for a project payload of unknown shape. */
+function projectName(project: Project, index: number): string {
+  return project.name ?? project.id ?? `project-${index + 1}`;
+}
 
 export function Sidebar() {
   const { workspaces, currentWorkspace, currentWorkspaceId, setCurrentWorkspaceId, serviceStatus } = useWorkspace();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectsLoading, setProjectsLoading] = useState(false);
+  const navigate = useNavigate();
+
+  // Load the active workspace's projects for the "Pinned projects" list.
+  // Re-fetches whenever the current workspace changes.
+  useEffect(() => {
+    if (!currentWorkspaceId) {
+      setProjects([]);
+      setProjectsLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    let cancelled = false;
+
+    setProjectsLoading(true);
+    api
+      .getProjects(currentWorkspaceId, controller.signal)
+      .then((data) => {
+        if (cancelled) return;
+        setProjects(data.projects ?? []);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setProjects([]);
+      })
+      .finally(() => {
+        if (!cancelled) setProjectsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [currentWorkspaceId]);
+
+  function openProject(project: Project) {
+    if (project.id) {
+      navigate(`/?project_id=${encodeURIComponent(project.id)}`);
+    } else {
+      navigate("/");
+    }
+  }
 
   const presenceLabel =
     serviceStatus === "online"
@@ -212,12 +268,29 @@ export function Sidebar() {
         </NavLink>
 
         <div className="nl">Pinned projects</div>
-        {PINNED_PROJECTS.map((project) => (
-          <div className="pin" key={project.name}>
-            <span className="dot" style={{ background: project.gradient }} />
-            {project.name}
+        {projects.map((project, index) => (
+          <div
+            className="pin"
+            key={project.id ?? project.name ?? index}
+            role="button"
+            tabIndex={0}
+            onClick={() => openProject(project)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                openProject(project);
+              }
+            }}
+          >
+            <span className="dot" style={{ background: projectDotGradient(index) }} />
+            {projectName(project, index)}
           </div>
         ))}
+        {!projectsLoading && projects.length === 0 && (
+          <div className="pin" style={{ color: "var(--faint)", cursor: "default" }}>
+            No projects
+          </div>
+        )}
       </nav>
 
       {/* ---- connection presence ---- */}

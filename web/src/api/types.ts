@@ -175,3 +175,14 @@ export interface WorkspaceRepositoriesData {
 
 /** GET /workspaces/{id}/proposals — "Proposals payload", `additionalProperties: true`. */
 export type ProposalsData = AnyRecord;
+
+export interface Project extends AnyRecord {
+  id?: string;
+  name?: string;
+  [key: string]: unknown;
+}
+
+/** GET /workspaces/{id}/projects */
+export interface ProjectsData {
+  projects: Project[];
+}

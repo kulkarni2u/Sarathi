@@ -1,4 +1,5 @@
 from src.service import create_app
+from src.storage import Storage, connect, run_migrations
 
 
 def request(app, method, path, body=None, correlation_id="corr-dashboard"):
@@ -109,6 +110,98 @@ def test_task_dashboard_can_be_filtered_to_a_project(tmp_path):
 
     assert status == 200
     assert [summary["title"] for summary in data["tasks"]] == ["Project one task"]
+
+
+def test_task_dashboard_includes_project_name_for_each_task(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    workspace_id = create_workspace(app, tmp_path)
+
+    _, project_one = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/projects",
+            {"name": "Project One"},
+        )
+    )
+
+    create_task_draft(
+        app,
+        workspace_id,
+        "Project one task",
+        "Project one task",
+        project_id=project_one["project"]["id"],
+    )
+    create_task_draft(app, workspace_id, "Unassigned task", "Unassigned task")
+
+    status, data = assert_ok(request(app, "GET", f"/api/workspaces/{workspace_id}/task-dashboard"))
+
+    assert status == 200
+    by_title = {summary["title"]: summary for summary in data["tasks"]}
+    assert by_title["Project one task"]["project_name"] == "Project One"
+    assert by_title["Unassigned task"]["project_name"] is None
+
+
+def test_task_dashboard_maps_fan_in_blocked_coordination_state_to_blocked_queue_state(tmp_path):
+    db_path = tmp_path / "sarathi.db"
+    app = create_app(db_path)
+
+    with connect(db_path) as conn:
+        run_migrations(conn)
+        storage = Storage(conn)
+        workspace = storage.create_workspace(name="Sarathi App", root_path=str(db_path.parent))
+        task = storage.create_task(
+            workspace_id=workspace["id"],
+            title="Fan-in blocked task",
+            status="in_progress",
+            metadata={"phase": "TaskTracking"},
+        )
+        root_a = storage.create_subtask(
+            workspace_id=workspace["id"],
+            task_id=task["id"],
+            title="Root A",
+            status="complete",
+            metadata={
+                "role": "Pravaha",
+                "provider": "Codex",
+                "blocked_by": [],
+                "evidence_required": ["tests"],
+                "task_packet": {"goal": "Run A"},
+            },
+        )
+        root_b = storage.create_subtask(
+            workspace_id=workspace["id"],
+            task_id=task["id"],
+            title="Root B",
+            status="queued",
+            metadata={
+                "role": "Pravaha",
+                "provider": "Claude",
+                "blocked_by": [],
+                "evidence_required": ["review"],
+                "task_packet": {"goal": "Run B"},
+            },
+        )
+        storage.create_subtask(
+            workspace_id=workspace["id"],
+            task_id=task["id"],
+            title="Join review",
+            status="blocked",
+            metadata={
+                "role": "Nirnaya",
+                "provider": "Codex",
+                "blocked_by": [root_a["id"], root_b["id"]],
+                "evidence_required": ["ac_coverage"],
+                "task_packet": {"goal": "Review both"},
+            },
+        )
+
+    status, data = assert_ok(request(app, "GET", f"/api/workspaces/{workspace['id']}/task-dashboard"))
+
+    assert status == 200
+    summary = next(item for item in data["tasks"] if item["id"] == task["id"])
+    assert summary["coordination_state"] == "fan_in_blocked"
+    assert summary["queue_state"] == "blocked"
 
 
 def test_task_dashboard_items_include_control_tower_fields(tmp_path):

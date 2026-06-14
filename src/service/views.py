@@ -840,6 +840,7 @@ def _task_dashboard(
     *,
     project_id: str | None = None,
 ) -> list[dict[str, Any]]:
+    project_names = {project["id"]: project["name"] for project in storage.list_projects(workspace_id)}
     summaries = []
     for task in storage.list_tasks_for_workspace(workspace_id):
         task_project_id = task.get("project_id") or task["metadata"].get("project_id")
@@ -860,6 +861,7 @@ def _task_dashboard(
                 "id": task["id"],
                 "workspace_id": task["workspace_id"],
                 "project_id": task_project_id,
+                "project_name": project_names.get(task_project_id),
                 "title": task["title"],
                 "status": task["status"],
                 "queue_state": queue_state,
@@ -1071,13 +1073,17 @@ def _task_studio_queue_state(
     if any(gate["status"] == "pending" for gate in approvals):
         return "awaiting_approval"
     coordination_state = graph.get("coordination_state")
+    # _coordination_state() (src/service/scheduling.py) returns one of: waiting_human,
+    # fan_out_ready, active, fan_in_blocked, blocked, ready, fan_out_complete, idle.
+    # Map every "stuck" variant to its corresponding queue state so blocked/waiting
+    # tasks surface in the dashboard's "Needs You" lane instead of "planning".
     if coordination_state == "waiting_human":
         return "waiting_human"
-    if coordination_state == "blocked":
+    if coordination_state in {"blocked", "fan_in_blocked"}:
         return "blocked"
     if coordination_state == "active":
         return "running"
-    if coordination_state == "ready":
+    if coordination_state in {"ready", "fan_out_ready"}:
         return "ready"
     if task["status"] in {"done", "complete"}:
         return "done"

@@ -84,6 +84,11 @@ Dependencies are explicit; everything else can proceed in parallel.
 
 ### Workstream B — Web UI & collaboration (the headline gap)
 
+> **Detailed v1 surface design:** see `docs/webui-v1-design.md` — covers the
+> three-surface thin-client model (CLI/TUI/Web UI over one local service +
+> installable app), multi-workspace switcher, object hierarchy, the leaner v1
+> IA (Dashboard / Task Studio / Wiki / Outcomes / Settings), and open decisions.
+
 #### Task B1 — Minimal web UI (read + run)
 - **Why:** Omnigent's biggest visible advantage is the browser experience.
 - **Scope:** A small TypeScript SPA (Vite) served by the desktop launcher /

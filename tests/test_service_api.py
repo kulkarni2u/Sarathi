@@ -1019,8 +1019,10 @@ def test_http_server_rejects_oversized_body(tmp_path):
 
 
 class running_server:
-    def __init__(self, db_path, token):
-        self.server = create_http_server(db_path=db_path, token=token, host="127.0.0.1", port=0)
+    def __init__(self, db_path, token, dist_root=None):
+        self.server = create_http_server(
+            db_path=db_path, token=token, host="127.0.0.1", port=0, dist_root=dist_root
+        )
         self.thread = threading.Thread(
             target=lambda: self.server.serve_forever(poll_interval=0.01),
             daemon=True,
@@ -1872,3 +1874,230 @@ test:
     )
     (policy_dir / "model-routing.md").write_text("# Model routing\n", encoding="utf-8")
     (policy_dir / "escalation.md").write_text("# Escalation\n", encoding="utf-8")
+
+
+# ── Usage stats, SSE replay, /docs, and static serving ─────────────────────
+
+
+def test_usage_stats_route_returns_projection(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    _, task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/tasks",
+            {"title": "Usage task"},
+        )
+    )
+    task_id = task_data["task"]["id"]
+
+    status, data = assert_ok(
+        request(app, "GET", f"/api/workspaces/{workspace_id}/usage-stats")
+    )
+
+    assert status == 200
+    assert data["workspace_id"] == workspace_id
+    assert data["task_count"] == 1
+    assert data["tasks"][0]["task_id"] == task_id
+    # Defensive defaults for a fresh task with no reviews/dispatches.
+    assert data["test_pass_rate"] is None
+    assert data["avg_blast_radius"] is None
+    assert data["total_tokens"] == 0
+
+
+def test_usage_stats_route_404s_for_unknown_workspace(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+
+    assert_error(
+        request(app, "GET", "/api/workspaces/nonexistent/usage-stats"),
+        status=404,
+        code="not_found",
+    )
+
+
+def test_events_stream_route_replays_lifecycle_events_as_sse(tmp_path):
+    db_path = tmp_path / "sarathi.db"
+    app = create_app(db_path)
+
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    _, task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/tasks",
+            {"title": "Streamed task"},
+        )
+    )
+    task_id = task_data["task"]["id"]
+
+    conn, storage = app._storage()
+    storage.create_lifecycle_event(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type="task.started",
+        payload={"object_id": task_id},
+    )
+    storage.create_lifecycle_event(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type="task.completed",
+        payload={"object_id": task_id},
+    )
+
+    result = app.handle(
+        "GET", f"/api/workspaces/{workspace_id}/tasks/{task_id}/events/stream"
+    )
+
+    assert result.status == 200
+    assert result.content_type == "text/event-stream"
+    body = result.body.decode("utf-8")
+    assert "event: task.created" in body
+    assert "event: task.started" in body
+    assert "event: task.completed" in body
+    # Each SSE frame is terminated by a blank line.
+    assert body.count("\n\n") >= 3
+
+    # Honor Last-Event-ID: replay only events strictly after the given id.
+    events = storage.list_events(workspace_id=workspace_id, task_id=task_id)
+    created_event_id = next(e["id"] for e in events if e["event_type"] == "task.created")
+
+    result_after = app.handle(
+        "GET",
+        f"/api/workspaces/{workspace_id}/tasks/{task_id}/events/stream",
+        headers={"Last-Event-ID": created_event_id},
+    )
+    body_after = result_after.body.decode("utf-8")
+    assert "event: task.created" not in body_after
+    assert "event: task.started" in body_after
+    assert "event: task.completed" in body_after
+
+
+def test_events_stream_route_404s_for_unknown_task(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    result = app.handle(
+        "GET", f"/api/workspaces/{workspace_id}/tasks/missing/events/stream"
+    )
+
+    # 404s are still returned through the normal {ok, error} envelope since
+    # the route did not match the raw-SSE special case (task lookup failed
+    # before any SSE bytes were written).
+    status, payload = result
+    assert status == 404
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_found"
+
+
+def test_docs_route_returns_html_referencing_openapi(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+
+    result = app.handle("GET", "/api/docs")
+
+    assert result.status == 200
+    assert result.content_type.startswith("text/html")
+    body = result.body.decode("utf-8")
+    assert "/openapi.json" in body
+    assert "<html" in body.lower()
+
+
+def test_http_docs_route_serves_html_over_the_wire(tmp_path):
+    with running_server(tmp_path / "sarathi.db", token="secret") as base_url:
+        status, headers, body = http_raw("GET", f"{base_url}/api/docs", token="secret")
+
+        assert status == 200
+        assert headers["content-type"].startswith("text/html")
+        assert "/openapi.json" in body
+
+
+def test_static_serving_returns_seeded_file_from_temp_dist_root(tmp_path):
+    dist_root = tmp_path / "dist"
+    dist_root.mkdir()
+    (dist_root / "index.html").write_text("<html><body>SPA shell</body></html>", encoding="utf-8")
+    assets_dir = dist_root / "assets"
+    assets_dir.mkdir()
+    (assets_dir / "app.js").write_text("console.log('hi');", encoding="utf-8")
+
+    app = create_app(tmp_path / "sarathi.db", dist_root=dist_root)
+
+    # A direct asset request returns the seeded file with the right content type.
+    result = app.handle("GET", "/assets/app.js")
+    assert result.status == 200
+    assert result.content_type.startswith("text/javascript")
+    assert result.body == b"console.log('hi');"
+
+    # A client-side route with no extension falls back to index.html.
+    result = app.handle("GET", "/some/spa/route")
+    assert result.status == 200
+    assert result.content_type.startswith("text/html")
+    assert b"SPA shell" in result.body
+
+    # A missing asset (has an extension, no file on disk) 404s.
+    result = app.handle("GET", "/assets/missing.js")
+    assert result.status == 404
+
+
+def test_static_serving_does_not_shadow_api_routes(tmp_path):
+    dist_root = tmp_path / "dist"
+    dist_root.mkdir()
+    (dist_root / "index.html").write_text("<html><body>SPA shell</body></html>", encoding="utf-8")
+
+    app = create_app(tmp_path / "sarathi.db", dist_root=dist_root)
+
+    # /api/health must still hit the JSON API, not the static fallback.
+    status, data = assert_ok(request(app, "GET", "/api/health"))
+    assert status == 200
+    assert data == {"status": "ok"}
+
+    # An unknown workspace under /api/workspaces/... still 404s through the
+    # normal error envelope rather than falling back to the SPA shell.
+    assert_error(
+        request(app, "GET", "/api/workspaces/nonexistent"),
+        status=404,
+        code="not_found",
+    )
+
+
+def test_http_static_serving_over_the_wire(tmp_path):
+    dist_root = tmp_path / "dist"
+    dist_root.mkdir()
+    (dist_root / "index.html").write_text("<html><body>SPA shell</body></html>", encoding="utf-8")
+    assets_dir = dist_root / "assets"
+    assets_dir.mkdir()
+    (assets_dir / "app.js").write_text("console.log('hi');", encoding="utf-8")
+
+    with running_server(tmp_path / "sarathi.db", token="secret", dist_root=dist_root) as base_url:
+        status, headers, body = http_raw("GET", f"{base_url}/assets/app.js", token="secret")
+        assert status == 200
+        assert headers["content-type"].startswith("text/javascript")
+        assert body == "console.log('hi');"
+
+        status, headers, body = http_raw("GET", f"{base_url}/assets/missing.js", token="secret")
+        assert status == 404

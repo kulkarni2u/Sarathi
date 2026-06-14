@@ -107,11 +107,15 @@ def test_openapi_json_route_returns_unwrapped_document(tmp_path):
 def test_docs_route_points_at_openapi_json(tmp_path):
     app = create_app(tmp_path / "sarathi.db")
 
-    status, payload = app.handle(
+    result = app.handle(
         "GET",
         "/docs",
         headers={"x-correlation-id": "corr-docs"},
     )
 
-    assert status == 200
-    assert payload["openapi_url"] == "/openapi.json"
+    # /docs is a raw (non-enveloped) HTML response that renders an OpenAPI
+    # viewer pointing at /openapi.json.
+    assert result.status == 200
+    assert result.content_type.startswith("text/html")
+    body = result.body.decode("utf-8")
+    assert "/openapi.json" in body

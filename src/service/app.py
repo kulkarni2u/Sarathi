@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import shutil
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import unquote
@@ -20,6 +21,9 @@ from .errors import (
     _path_parts,
     _query,
 )
+from .events import format_sse_event, replay_events
+from .static_files import resolve_static_file
+from .usage_stats import build_usage_stats
 from .intake import (
     _build_github_issue_reference,
     _derive_task_title,
@@ -95,12 +99,70 @@ from .views import (
 )
 
 
+# Repository root: src/service/app.py -> src/service -> src -> <repo root>
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Default location of the built web bundle (Vite/SPA `dist` output).
+DEFAULT_DIST_ROOT = _REPO_ROOT / "web" / "dist"
+
+
+@dataclass(frozen=True)
+class RawResponse:
+    """A non-enveloped HTTP response (bypasses the ``{ok, data}`` JSON envelope).
+
+    Used for responses that must be a specific content type at the top
+    level — e.g. the OpenAPI document, the `/docs` HTML page, SSE streams,
+    and static assets from the built web bundle.
+    """
+
+    status: int
+    content_type: str
+    body: bytes
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+def _html_response(status: int, html: str) -> RawResponse:
+    return RawResponse(status, "text/html; charset=utf-8", html.encode("utf-8"))
+
+
+def _sse_response(status: int, body: str) -> RawResponse:
+    return RawResponse(
+        status,
+        "text/event-stream",
+        body.encode("utf-8"),
+        headers={"cache-control": "no-cache"},
+    )
+
+
+_DOCS_HTML = """<!DOCTYPE html>
+<html>
+  <head>
+    <title>Sarathi API Docs</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>body { margin: 0; padding: 0; }</style>
+  </head>
+  <body>
+    <redoc spec-url="/openapi.json"></redoc>
+    <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+  </body>
+</html>
+"""
+
+
 class ServiceApp:
     """Callable local request handler that does not require a socket server."""
 
-    def __init__(self, db_path: str | Path, token: str | None = None):
+    def __init__(
+        self,
+        db_path: str | Path,
+        token: str | None = None,
+        *,
+        dist_root: str | Path | None = None,
+    ):
         self.db_path = Path(db_path)
         self.token = token
+        self.dist_root = Path(dist_root) if dist_root is not None else DEFAULT_DIST_ROOT
         self._local = threading.local()
         # Run migrations once at startup on the main thread
         with connect(self.db_path) as _conn:
@@ -121,8 +183,21 @@ class ServiceApp:
         *,
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
-    ) -> tuple[int, dict[str, Any]]:
+    ) -> tuple[int, dict[str, Any]] | RawResponse:
         return self.handle(method, path, body=body, headers=headers)
+
+    # First path segments that are served by the JSON API router (`_route`).
+    # A GET to any other top-level path falls back to the static web bundle.
+    _API_PREFIXES = {
+        "health",
+        "workspaces",
+        "tasks",
+        "subtasks",
+        "providers",
+        "chat",
+        "events",
+        "brainstorm",
+    }
 
     def handle(
         self,
@@ -132,7 +207,7 @@ class ServiceApp:
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
         skip_auth: bool = False,
-    ) -> tuple[int, dict[str, Any]]:
+    ) -> tuple[int, dict[str, Any]] | RawResponse:
         correlation_id = _correlation_id(headers)
         try:
             if not skip_auth:
@@ -148,14 +223,26 @@ class ServiceApp:
             if method == "GET" and parts == ["openapi.json"]:
                 return 200, build_openapi_spec()
             if method == "GET" and parts == ["docs"]:
-                return 200, {
-                    "openapi_url": "/openapi.json",
-                    "note": (
-                        "Interactive HTML docs are not served by this JSON-only "
-                        "service; fetch /openapi.json and render it with Redoc "
-                        "or another OpenAPI viewer."
-                    ),
-                }
+                return _html_response(200, _DOCS_HTML)
+            # SSE replay stream for a task's lifecycle events. Like
+            # /openapi.json and /docs, this is a raw (non-enveloped)
+            # response because its top-level content type must be
+            # text/event-stream.
+            if (
+                method == "GET"
+                and len(parts) == 6
+                and parts[0] == "workspaces"
+                and parts[2] == "tasks"
+                and parts[4] == "events"
+                and parts[5] == "stream"
+            ):
+                return self._handle_event_stream(parts[1], parts[3], headers)
+            if method == "GET" and (not parts or parts[0] not in self._API_PREFIXES):
+                # No matching API route for this GET — fall back to serving
+                # the built web bundle (the SPA), if present.
+                static_response = self._serve_static(parts)
+                if static_response is not None:
+                    return static_response
             status, data = self._route(
                 method,
                 parts,
@@ -165,6 +252,53 @@ class ServiceApp:
             return status, _ok(data, correlation_id)
         except ServiceError as error:
             return error.status, _error(error, correlation_id)
+
+    def _handle_event_stream(
+        self,
+        workspace_id: str,
+        task_id: str,
+        headers: Mapping[str, str] | None,
+    ) -> RawResponse:
+        """Replay a task's lifecycle events as a Server-Sent Events stream.
+
+        MVP behaviour: this writes the full (or `Last-Event-ID`-bounded)
+        backlog of events as SSE frames and then closes the stream with a
+        200. Continuous tailing of newly-created events is a follow-up (the
+        `/api/events/stream` websocket-style polling endpoint in
+        `http.py` already provides a live snapshot stream in the meantime).
+        """
+        conn, storage = self._storage()
+        if storage.get_workspace(workspace_id) is None:
+            raise ServiceError("not_found", "Workspace not found.", 404)
+        if storage.get_task(task_id) is None:
+            raise ServiceError("not_found", "Task not found.", 404)
+
+        after_id = None
+        if headers:
+            for key, value in headers.items():
+                if key.lower() == "last-event-id" and value:
+                    after_id = value
+                    break
+
+        events = replay_events(conn, workspace_id, task_id, after_id=after_id)
+        body = "".join(
+            format_sse_event(event["id"], event["event_type"], event["payload"])
+            for event in events
+        )
+        return _sse_response(200, body)
+
+    def _serve_static(self, parts: list[str]) -> RawResponse | None:
+        """Serve a file from the built web bundle (`self.dist_root`).
+
+        Returns ``None`` when there is no asset to serve (caller should fall
+        through to the normal API routing/404 behaviour) or a `RawResponse`
+        (200 for a resolved asset/SPA fallback, 404 for a missing asset).
+        """
+        url_path = "/" + "/".join(parts)
+        result = resolve_static_file(self.dist_root, url_path)
+        if result is None:
+            return RawResponse(404, "text/plain; charset=utf-8", b"Not Found")
+        return RawResponse(result.status, result.content_type, result.body)
 
     def _route(
         self,
@@ -505,6 +639,17 @@ class ServiceApp:
             if storage.get_workspace(workspace_id) is None:
                 raise ServiceError("not_found", "Workspace not found.", 404)
             return 200, _workspace_operational_views(storage, workspace_id)
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
+            and parts[2] == "usage-stats"
+        ):
+            workspace_id = parts[1]
+            if storage.get_workspace(workspace_id) is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, build_usage_stats(storage, workspace_id)
 
         if (
             method == "GET"
@@ -1411,6 +1556,11 @@ class ServiceApp:
         raise ServiceError("unauthorized", "Missing or invalid authorization token.", 401)
 
 
-def create_app(db_path: str | Path, token: str | None = None) -> ServiceApp:
-    return ServiceApp(db_path, token=token)
+def create_app(
+    db_path: str | Path,
+    token: str | None = None,
+    *,
+    dist_root: str | Path | None = None,
+) -> ServiceApp:
+    return ServiceApp(db_path, token=token, dist_root=dist_root)
 

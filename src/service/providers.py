@@ -88,6 +88,44 @@ def _dispatch_subtask(
         and workspace_root is not None
         and (workspace_root / ".ncp" / "config.toml").exists()
     )
+
+    ncp_run_path = workspace_root / ".ncp" / "run.py" if workspace_root is not None else None
+    ncp_config_present = bool(
+        workspace_root is not None
+        and (workspace_root / ".ncp" / "config.toml").exists()
+        and ncp_run_path is not None
+        and ncp_run_path.exists()
+    )
+
+    ncp_adapter = None
+    ncp_available = False
+    ncp_prior_findings_fetched = 0
+    if ncp_config_present:
+        from src.ncp_adapter.persistence_adapter import NCPPersistenceAdapter
+
+        ncp_adapter = NCPPersistenceAdapter(run_path=ncp_run_path)
+        try:
+            fetch_chunks = ncp_adapter._call_fetch(
+                f"{task['title']} {subtask['title']}", k=3
+            )
+            ncp_available = True
+            for chunk in fetch_chunks:
+                text = ncp_adapter._reconstruct_chunk_text(chunk).strip()
+                if not text:
+                    continue
+                ncp_prior_findings_fetched += 1
+                agent_input = context_pack_artifact.setdefault("agent_input", {})
+                prior_findings = list(agent_input.get("prior_findings", []))
+                prior_findings = [text[:200]] + prior_findings
+                agent_input["prior_findings"] = prior_findings[:8]
+            context_pack_artifact.setdefault("compilation", {})["ncp_prior_findings"] = (
+                ncp_prior_findings_fetched
+            )
+        except Exception:
+            ncp_available = False
+            ncp_prior_findings_fetched = 0
+            context_pack_artifact.setdefault("compilation", {})["ncp_prior_findings"] = 0
+
     storage.create_lifecycle_event(
         workspace_id=subtask["workspace_id"],
         task_id=subtask["task_id"],
@@ -137,6 +175,27 @@ def _dispatch_subtask(
         purpose="child_task_execution",
     ).to_artifact()
     status = "completed" if response.success else "failed"
+
+    phase_log_written = False
+    cost_logged = False
+    if ncp_config_present and ncp_available and ncp_adapter is not None:
+        try:
+            ncp_adapter.save_phase_log(
+                task={"task_id": task["id"]}, phase="TaskTracking", status=status,
+            )
+            phase_log_written = True
+        except Exception:
+            pass
+        if response.usage:
+            try:
+                ncp_adapter.log_cost(
+                    usage_record=response.usage.to_artifact(),
+                    pipeline_id=f"sarathi_{subtask['id']}",
+                )
+                cost_logged = True
+            except Exception:
+                pass
+
     dispatch = storage.create_dispatch(
         workspace_id=subtask["workspace_id"],
         task_id=subtask["task_id"],
@@ -152,6 +211,19 @@ def _dispatch_subtask(
             "artifact_index": artifact_index,
             **({"usage": response.usage.to_artifact()} if response.usage else {}),
             **({"error": response.error} if response.error else {}),
+            **(
+                {
+                    "ncp": {
+                        "config_present": True,
+                        "available": ncp_available,
+                        "prior_findings_fetched": ncp_prior_findings_fetched,
+                        "phase_log_written": phase_log_written,
+                        "cost_logged": cost_logged,
+                    }
+                }
+                if ncp_config_present
+                else {}
+            ),
         },
     )
     next_status = "review" if response.success else "failed"
@@ -167,6 +239,20 @@ def _dispatch_subtask(
             "status": status,
         },
     )
+
+    if ncp_config_present:
+        storage.create_lifecycle_event(
+            workspace_id=subtask["workspace_id"],
+            task_id=subtask["task_id"],
+            event_type="ncp.memory_written",
+            payload={
+                "object_id": subtask["id"],
+                "dispatch_id": dispatch["id"],
+                "phase_log_written": phase_log_written,
+                "cost_logged": cost_logged,
+                "prior_findings_fetched": ncp_prior_findings_fetched,
+            },
+        )
 
     evidence = None
     if response.success:

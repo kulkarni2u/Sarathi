@@ -1223,3 +1223,96 @@ def _write_provider_script(path: Path, inline_python: str) -> Path:
     path.write_text("#!/usr/bin/env python3\n" + inline_python + "\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def _write_ncp_run_stub(workspace_root: Path) -> Path:
+    """Write a minimal `.ncp/run.py` stub that doesn't depend on the real ncp package.
+
+    Supports the subset of subcommands exercised by ``NCPTransportMixin`` and
+    ``NCPContextAdapter.check_available``: ``status``, ``fetch``, ``write_memory``,
+    and ``log_cost``.
+    """
+    ncp_dir = workspace_root / ".ncp"
+    ncp_dir.mkdir(parents=True, exist_ok=True)
+    (ncp_dir / "config.toml").write_text("[store]\ntype = 'sqlite'\n", encoding="utf-8")
+    script = ncp_dir / "run.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "\n"
+        "command = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+        "\n"
+        "if command == 'status':\n"
+        "    sys.exit(0)\n"
+        "elif command == 'fetch':\n"
+        "    print('chunk:prior-1')\n"
+        "    print('  {\"note\": \"previous run found X\"}')\n"
+        "    sys.exit(0)\n"
+        "elif command == 'write_memory':\n"
+        "    sys.exit(0)\n"
+        "elif command == 'log_cost':\n"
+        "    sys.exit(0)\n"
+        "else:\n"
+        "    sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script
+
+
+def test_dispatch_writes_to_ncp_memory_when_workspace_is_ncp_enabled(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+    _write_ncp_run_stub(tmp_path)
+
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, scheduled_snapshot = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    running_node = scheduled_snapshot["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{running_node['id']}/dispatch",
+            {"provider": "local"},
+        )
+    )
+
+    assert status == 201
+    ncp_meta = data["dispatch"]["metadata"]["ncp"]
+    assert ncp_meta["config_present"] is True
+    assert ncp_meta["available"] is True
+    assert ncp_meta["prior_findings_fetched"] >= 1
+    assert ncp_meta["cost_logged"] is True
+
+    compilation = data["dispatch"]["metadata"]["context_pack"]["compilation"]
+    assert compilation["ncp_prior_findings"] >= 1
+
+    prior_findings = data["dispatch"]["metadata"]["context_pack"]["agent_input"]["prior_findings"]
+    assert any("previous run found X" in finding for finding in prior_findings)
+
+    _, studio_data = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    event_types = [event["event_type"] for event in studio_data["events"]]
+    assert "ncp.memory_written" in event_types
+
+
+def test_dispatch_omits_ncp_metadata_when_workspace_has_no_ncp_config(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, scheduled_snapshot = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    running_node = scheduled_snapshot["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{running_node['id']}/dispatch",
+            {"provider": "local"},
+        )
+    )
+
+    assert status == 201
+    assert "ncp" not in data["dispatch"]["metadata"]
+    assert "ncp_prior_findings" not in data["dispatch"]["metadata"]["context_pack"]["compilation"]

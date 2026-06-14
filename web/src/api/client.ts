@@ -65,7 +65,24 @@ export interface RequestOptions {
 
 function buildUrl(path: string, query?: RequestOptions["query"]): string {
   const { baseUrl } = getRuntimeConfig();
-  const url = new URL(path.replace(/^\/+/, "/"), baseUrl + "/");
+  const normalizedPath = path.replace(/^\/+/, "/");
+
+  // An empty `baseUrl` means "same origin as the page" — build a relative
+  // URL (e.g. "/workspaces/...") instead of feeding "" to `new URL()`, which
+  // would throw since "" is not a valid absolute/base URL.
+  if (!baseUrl) {
+    const params = new URLSearchParams();
+    if (query) {
+      for (const [key, value] of Object.entries(query)) {
+        if (value === undefined || value === null) continue;
+        params.set(key, String(value));
+      }
+    }
+    const queryString = params.toString();
+    return queryString ? `${normalizedPath}?${queryString}` : normalizedPath;
+  }
+
+  const url = new URL(normalizedPath, baseUrl + "/");
   if (query) {
     for (const [key, value] of Object.entries(query)) {
       if (value === undefined || value === null) continue;

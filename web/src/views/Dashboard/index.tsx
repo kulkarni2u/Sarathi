@@ -202,13 +202,21 @@ export default function Dashboard() {
     }
   }, [tasks, projectFilter]);
 
-  const projectIds = useMemo(() => {
+  // Distinct {project_id, project_name} pairs for the filter chips. The chip
+  // label prefers the human-readable `project_name`, falling back to the
+  // (UUID) `project_id` only when no name is present.
+  const projectChips = useMemo(() => {
     if (!tasks) return [];
-    const ids = new Set<string>();
+    const byId = new Map<string, string>();
     for (const task of tasks) {
-      if (typeof task.project_id === "string" && task.project_id) ids.add(task.project_id);
+      if (typeof task.project_id !== "string" || !task.project_id) continue;
+      if (byId.has(task.project_id)) continue;
+      const name = typeof task.project_name === "string" && task.project_name ? task.project_name : task.project_id;
+      byId.set(task.project_id, name);
     }
-    return Array.from(ids).sort();
+    return Array.from(byId.entries())
+      .map(([projectId, projectName]) => ({ projectId, projectName }))
+      .sort((a, b) => a.projectName.localeCompare(b.projectName));
   }, [tasks]);
 
   const visibleTasks = useMemo(() => {
@@ -228,6 +236,10 @@ export default function Dashboard() {
   const offline = serviceStatus === "offline";
   const degraded = serviceStatus === "degraded";
 
+  const projectFilterLabel = projectFilter
+    ? projectChips.find((chip) => chip.projectId === projectFilter)?.projectName ?? projectFilter
+    : null;
+
   return (
     <section>
       <div className="ph">
@@ -236,7 +248,7 @@ export default function Dashboard() {
             <h1>Dashboard</h1>
             <p>
               {currentWorkspace?.name ?? currentWorkspaceId ?? "no workspace selected"} ·{" "}
-              {projectFilter ?? "all projects"} ·{" "}
+              {projectFilterLabel ?? "all projects"} ·{" "}
               {offline ? "offline" : degraded ? "degraded service projection" : "live service projection"}
             </p>
           </div>
@@ -279,13 +291,13 @@ export default function Dashboard() {
             >
               All projects
             </span>
-            {projectIds.map((projectId) => (
+            {projectChips.map(({ projectId, projectName }) => (
               <span
                 key={projectId}
                 className={`dash-chip ${projectFilter === projectId ? "on" : ""}`}
                 onClick={() => setProjectFilter(projectId)}
               >
-                {projectId}
+                {projectName}
               </span>
             ))}
           </div>

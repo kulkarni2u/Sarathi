@@ -81,3 +81,97 @@ export interface LifecycleEvent extends AnyRecord {
 export interface EventsData {
   events: LifecycleEvent[];
 }
+
+// ---------------------------------------------------------------------
+// Task Studio + related task sub-resources
+// ---------------------------------------------------------------------
+
+/**
+ * GET /tasks/{id}/studio — `additionalProperties: true` in openapi.json.
+ * Shape is still evolving; narrow locally as the view stabilizes.
+ */
+export type TaskStudioData = AnyRecord;
+
+/** GET /tasks/{id}/graph — `additionalProperties: true` in openapi.json. */
+export type TaskGraphData = AnyRecord;
+
+export interface TaskMessage extends AnyRecord {
+  id?: string;
+  role?: string;
+  content?: string;
+  [key: string]: unknown;
+}
+
+export interface TaskMessagesData {
+  messages: TaskMessage[];
+}
+
+/** GET /tasks/{id}/evidence — `additionalProperties: true` in openapi.json. */
+export type TaskEvidenceData = AnyRecord;
+
+/** GET /tasks/{id}/reviews — `additionalProperties: true` in openapi.json. */
+export type TaskReviewsData = AnyRecord;
+
+/**
+ * GET /tasks/{id}/handoff — "Latest handoff (or null)" per openapi.json.
+ * `additionalProperties: true` when present.
+ */
+export type TaskHandoffData = AnyRecord | null;
+
+export interface ApprovalGate extends AnyRecord {
+  id?: string;
+  status?: string;
+  [key: string]: unknown;
+}
+
+export interface TaskApprovalsData {
+  approval_gates: ApprovalGate[];
+}
+
+export interface Dispatch extends AnyRecord {
+  id?: string;
+  status?: string;
+  [key: string]: unknown;
+}
+
+export interface TaskDispatchesData {
+  dispatches: Dispatch[];
+}
+
+/** GET /tasks/{id}/panel — "Task panel entries", `additionalProperties: true`. */
+export type TaskPanelData = AnyRecord;
+
+// ---------------------------------------------------------------------
+// Workspace projections: wiki, operational views, repositories, proposals,
+// dogfood acceptance
+// ---------------------------------------------------------------------
+
+/** GET /workspaces/{id}/operational-views — `additionalProperties: true`. */
+export type OperationalViewsData = AnyRecord;
+
+/** GET /workspaces/{id}/wiki — "Wiki index payload", `additionalProperties: true`. */
+export type WikiIndexData = AnyRecord;
+
+/** GET /workspaces/{id}/wiki/{page} — "Wiki page payload", `additionalProperties: true`. */
+export type WikiPageData = AnyRecord;
+
+/**
+ * GET /workspaces/{id}/dogfood-acceptance — `additionalProperties: true`.
+ * Closest existing endpoint to an M1 "usage stats" projection; see the
+ * `getUsageStats` TODO on `api` in client.ts.
+ */
+export type DogfoodAcceptanceData = AnyRecord;
+
+export interface WorkspaceRepository extends AnyRecord {
+  id?: string;
+  repository_id?: string;
+  name?: string;
+  [key: string]: unknown;
+}
+
+export interface WorkspaceRepositoriesData {
+  repositories: WorkspaceRepository[];
+}
+
+/** GET /workspaces/{id}/proposals — "Proposals payload", `additionalProperties: true`. */
+export type ProposalsData = AnyRecord;

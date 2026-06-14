@@ -10,12 +10,27 @@
 import { getRuntimeConfig } from "./runtimeConfig";
 import type {
   ApiEnvelope,
+  DogfoodAcceptanceData,
   EventsData,
   GetWorkspaceData,
   HealthData,
   ListWorkspacesData,
+  OperationalViewsData,
+  ProposalsData,
   ProvidersData,
+  TaskApprovalsData,
   TaskDashboardData,
+  TaskDispatchesData,
+  TaskEvidenceData,
+  TaskGraphData,
+  TaskHandoffData,
+  TaskMessagesData,
+  TaskPanelData,
+  TaskReviewsData,
+  TaskStudioData,
+  WikiIndexData,
+  WikiPageData,
+  WorkspaceRepositoriesData,
 } from "./types";
 
 export class ApiClientError extends Error {
@@ -167,5 +182,126 @@ export const api = {
       query: { workspace_id: params.workspaceId, task_id: params.taskId },
       signal,
     });
+  },
+
+  // -------------------------------------------------------------------
+  // Task Studio + task sub-resources
+  // -------------------------------------------------------------------
+
+  /** GET /tasks/{id}/studio */
+  getTaskStudio(taskId: string, signal?: AbortSignal): Promise<TaskStudioData> {
+    return request<TaskStudioData>(`/tasks/${encodeURIComponent(taskId)}/studio`, { signal });
+  },
+
+  /** GET /tasks/{id}/graph */
+  getTaskGraph(taskId: string, signal?: AbortSignal): Promise<TaskGraphData> {
+    return request<TaskGraphData>(`/tasks/${encodeURIComponent(taskId)}/graph`, { signal });
+  },
+
+  /** GET /tasks/{id}/messages */
+  getTaskMessages(taskId: string, signal?: AbortSignal): Promise<TaskMessagesData> {
+    return request<TaskMessagesData>(`/tasks/${encodeURIComponent(taskId)}/messages`, { signal });
+  },
+
+  /** GET /tasks/{id}/evidence */
+  getTaskEvidence(taskId: string, signal?: AbortSignal): Promise<TaskEvidenceData> {
+    return request<TaskEvidenceData>(`/tasks/${encodeURIComponent(taskId)}/evidence`, { signal });
+  },
+
+  /** GET /tasks/{id}/reviews */
+  getTaskReviews(taskId: string, signal?: AbortSignal): Promise<TaskReviewsData> {
+    return request<TaskReviewsData>(`/tasks/${encodeURIComponent(taskId)}/reviews`, { signal });
+  },
+
+  /** GET /tasks/{id}/handoff (latest handoff, or null) */
+  getTaskHandoff(taskId: string, signal?: AbortSignal): Promise<TaskHandoffData> {
+    return request<TaskHandoffData>(`/tasks/${encodeURIComponent(taskId)}/handoff`, { signal });
+  },
+
+  /** GET /tasks/{id}/approvals */
+  getTaskApprovals(taskId: string, signal?: AbortSignal): Promise<TaskApprovalsData> {
+    return request<TaskApprovalsData>(`/tasks/${encodeURIComponent(taskId)}/approvals`, { signal });
+  },
+
+  /** GET /tasks/{id}/dispatches */
+  getTaskDispatches(taskId: string, signal?: AbortSignal): Promise<TaskDispatchesData> {
+    return request<TaskDispatchesData>(`/tasks/${encodeURIComponent(taskId)}/dispatches`, { signal });
+  },
+
+  /** GET /tasks/{id}/panel */
+  getTaskPanel(taskId: string, signal?: AbortSignal): Promise<TaskPanelData> {
+    return request<TaskPanelData>(`/tasks/${encodeURIComponent(taskId)}/panel`, { signal });
+  },
+
+  // -------------------------------------------------------------------
+  // Wiki
+  // -------------------------------------------------------------------
+
+  /** GET /workspaces/{id}/wiki */
+  getWiki(workspaceId: string, signal?: AbortSignal): Promise<WikiIndexData> {
+    return request<WikiIndexData>(`/workspaces/${encodeURIComponent(workspaceId)}/wiki`, { signal });
+  },
+
+  /** GET /workspaces/{id}/wiki/{page} */
+  getWikiPage(workspaceId: string, page: string, signal?: AbortSignal): Promise<WikiPageData> {
+    return request<WikiPageData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/wiki/${encodeURIComponent(page)}`,
+      { signal },
+    );
+  },
+
+  // -------------------------------------------------------------------
+  // Workspace projections: operational views, repositories, proposals,
+  // usage stats
+  // -------------------------------------------------------------------
+
+  /** GET /workspaces/{id}/operational-views */
+  getWorkspaceOperationalViews(
+    workspaceId: string,
+    signal?: AbortSignal,
+  ): Promise<OperationalViewsData> {
+    return request<OperationalViewsData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/operational-views`,
+      { signal },
+    );
+  },
+
+  /** GET /workspaces/{id}/repositories */
+  getWorkspaceRepositories(
+    workspaceId: string,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceRepositoriesData> {
+    return request<WorkspaceRepositoriesData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/repositories`,
+      { signal },
+    );
+  },
+
+  /** GET /workspaces/{id}/proposals */
+  getProposals(workspaceId: string, signal?: AbortSignal): Promise<ProposalsData> {
+    return request<ProposalsData>(`/workspaces/${encodeURIComponent(workspaceId)}/proposals`, {
+      signal,
+    });
+  },
+
+  /**
+   * GET /workspaces/{id}/dogfood-acceptance
+   *
+   * Used as the Usage Stats view's data source for now: it's the closest
+   * existing projection with quality/acceptance signal at the workspace
+   * level. `/workspaces/{id}/operational-views` is also available via
+   * `getWorkspaceOperationalViews` if the stats view needs lifecycle
+   * counts instead.
+   *
+   * TODO(M1): dedicated usage-stats projection endpoint exposing
+   * HarnessOutcome-derived quality signals (pass/fail rates, latency,
+   * cost) does not exist yet in docs/openapi.json. Replace this method's
+   * backing endpoint once that lands.
+   */
+  getUsageStats(workspaceId: string, signal?: AbortSignal): Promise<DogfoodAcceptanceData> {
+    return request<DogfoodAcceptanceData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/dogfood-acceptance`,
+      { signal },
+    );
   },
 };

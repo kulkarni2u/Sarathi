@@ -128,6 +128,53 @@ export interface TaskApprovalsData {
   approval_gates: ApprovalGate[];
 }
 
+/**
+ * POST /tasks/{id}/approve and /tasks/{id}/auto-approve — `additionalProperties:
+ * true`. Always carries `approval_gate` (or `approved` for auto-approve); may
+ * carry `auto_schedule` when approving the "Task graph" gate triggers
+ * scheduling of ready units.
+ */
+export interface ApprovalActionData extends AnyRecord {
+  approval_gate?: ApprovalGate;
+  approved?: ApprovalGate[];
+  auto_schedule?: AnyRecord;
+}
+
+/** POST /tasks/{id}/graph-draft — `{ graph, approval_gate }`. */
+export interface GraphDraftData extends AnyRecord {
+  graph: TaskGraphData;
+  approval_gate: ApprovalGate;
+}
+
+/** POST /tasks/{id}/messages — `{ message }`. */
+export interface TaskMessageResult extends AnyRecord {
+  message: TaskMessage;
+}
+
+/**
+ * POST /subtasks/{id}/transition — `{ subtask, unblocked, auto_scheduled, task }`,
+ * `additionalProperties: true`.
+ */
+export type SubtaskTransitionResult = AnyRecord;
+
+/**
+ * POST /subtasks/{id}/dispatch — `{ subtask, dispatch, evidence }`,
+ * `additionalProperties: true`.
+ */
+export type SubtaskDispatchResult = AnyRecord;
+
+/**
+ * POST /tasks/{id}/schedule — `{ task, scheduled, blocked, waiting_human,
+ * coordination_state, fan_out_ready_nodes, fan_in_nodes }`.
+ */
+export type ScheduleResult = AnyRecord;
+
+/** POST /tasks/{id}/handoff — `{ handoff, repository_action_gate, checkpoint }`. */
+export type CreateHandoffResult = AnyRecord;
+
+/** POST /tasks/{id}/repository-action — updated handoff, `additionalProperties: true`. */
+export type RepositoryActionResult = AnyRecord;
+
 export interface Dispatch extends AnyRecord {
   id?: string;
   status?: string;

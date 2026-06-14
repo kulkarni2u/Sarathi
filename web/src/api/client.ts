@@ -10,20 +10,28 @@
 import { getRuntimeConfig } from "./runtimeConfig";
 import type {
   ApiEnvelope,
+  ApprovalActionData,
+  CreateHandoffResult,
   EventsData,
   GetWorkspaceData,
+  GraphDraftData,
   HealthData,
   ListWorkspacesData,
   OperationalViewsData,
   ProjectsData,
   ProposalsData,
   ProvidersData,
+  RepositoryActionResult,
+  ScheduleResult,
+  SubtaskDispatchResult,
+  SubtaskTransitionResult,
   TaskApprovalsData,
   TaskDashboardData,
   TaskDispatchesData,
   TaskEvidenceData,
   TaskGraphData,
   TaskHandoffData,
+  TaskMessageResult,
   TaskMessagesData,
   TaskPanelData,
   TaskReviewsData,
@@ -249,6 +257,124 @@ export const api = {
   /** GET /tasks/{id}/panel */
   getTaskPanel(taskId: string, signal?: AbortSignal): Promise<TaskPanelData> {
     return request<TaskPanelData>(`/tasks/${encodeURIComponent(taskId)}/panel`, { signal });
+  },
+
+  // -------------------------------------------------------------------
+  // Governed actions (M2): approvals, messages, transitions, dispatch
+  // -------------------------------------------------------------------
+
+  /**
+   * POST /tasks/{id}/messages — post a chat message, visible to all agents
+   * on the task. `role` defaults to "user"; `target` defaults to
+   * "Current task agents".
+   */
+  postTaskMessage(
+    taskId: string,
+    body: { content: string; role?: string; target?: string },
+    signal?: AbortSignal,
+  ): Promise<TaskMessageResult> {
+    return request<TaskMessageResult>(`/tasks/${encodeURIComponent(taskId)}/messages`, {
+      method: "POST",
+      body,
+      signal,
+    });
+  },
+
+  /**
+   * POST /tasks/{id}/approve — record an approval-gate decision
+   * (`status: "approved" | "rejected"`). Approving the "Task graph" gate
+   * triggers `auto_schedule` of ready units server-side.
+   */
+  recordApproval(
+    taskId: string,
+    body: { name: string; status: string; metadata?: Record<string, unknown> },
+    signal?: AbortSignal,
+  ): Promise<ApprovalActionData> {
+    return request<ApprovalActionData>(`/tasks/${encodeURIComponent(taskId)}/approve`, {
+      method: "POST",
+      body,
+      signal,
+    });
+  },
+
+  /**
+   * POST /tasks/{id}/graph-draft — generate (or fetch) the task graph after
+   * "PRD/AC" is approved; opens a new "Task graph" approval gate.
+   */
+  createGraphDraft(taskId: string, signal?: AbortSignal): Promise<GraphDraftData> {
+    return request<GraphDraftData>(`/tasks/${encodeURIComponent(taskId)}/graph-draft`, {
+      method: "POST",
+      signal,
+    });
+  },
+
+  /**
+   * POST /tasks/{id}/schedule — schedule all ready units (requires the
+   * "Task graph" gate to be approved).
+   */
+  scheduleTask(taskId: string, signal?: AbortSignal): Promise<ScheduleResult> {
+    return request<ScheduleResult>(`/tasks/${encodeURIComponent(taskId)}/schedule`, {
+      method: "POST",
+      signal,
+    });
+  },
+
+  /**
+   * POST /subtasks/{id}/transition — move a unit to `status` (e.g. requeue a
+   * rejected/failed unit back to "queued", or mark "complete"/"skipped").
+   */
+  transitionSubtask(
+    subtaskId: string,
+    body: { status: string; actor?: string; reason?: string },
+    signal?: AbortSignal,
+  ): Promise<SubtaskTransitionResult> {
+    return request<SubtaskTransitionResult>(`/subtasks/${encodeURIComponent(subtaskId)}/transition`, {
+      method: "POST",
+      body,
+      signal,
+    });
+  },
+
+  /**
+   * POST /subtasks/{id}/dispatch — dispatch an in-progress unit to
+   * `provider` (defaults to "local"). Used for both initial dispatch and
+   * "reroute provider" retries.
+   */
+  dispatchSubtask(
+    subtaskId: string,
+    body: { provider?: string; worker_id?: string } = {},
+    signal?: AbortSignal,
+  ): Promise<SubtaskDispatchResult> {
+    return request<SubtaskDispatchResult>(`/subtasks/${encodeURIComponent(subtaskId)}/dispatch`, {
+      method: "POST",
+      body,
+      signal,
+    });
+  },
+
+  /** POST /tasks/{id}/handoff — produce the final handoff dossier. */
+  createTaskHandoff(taskId: string, signal?: AbortSignal): Promise<CreateHandoffResult> {
+    return request<CreateHandoffResult>(`/tasks/${encodeURIComponent(taskId)}/handoff`, {
+      method: "POST",
+      signal,
+    });
+  },
+
+  /**
+   * POST /tasks/{id}/repository-action — approve (or no-op) the repo action
+   * recorded on the handoff. `approved` must be `true`; `action` is one of
+   * the handoff's `repository_action_gate.metadata.allowed_actions`.
+   */
+  recordRepositoryAction(
+    taskId: string,
+    body: { approved: boolean; action: string; note?: string },
+    signal?: AbortSignal,
+  ): Promise<RepositoryActionResult> {
+    return request<RepositoryActionResult>(`/tasks/${encodeURIComponent(taskId)}/repository-action`, {
+      method: "POST",
+      body,
+      signal,
+    });
   },
 
   // -------------------------------------------------------------------

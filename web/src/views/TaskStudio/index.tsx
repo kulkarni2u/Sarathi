@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api, ApiClientError } from "../../api/client";
 import { subscribeToEvents } from "../../api/events";
@@ -13,6 +14,29 @@ import type {
 } from "../../api/types";
 import { useWorkspace } from "../../context/WorkspaceContext";
 import "./TaskStudio.css";
+
+/** Fallback provider id list, mirrors the ids surfaced by GET /providers
+ * (see web/src/views/Agents/index.tsx) for environments where the
+ * providers fetch hasn't resolved yet. */
+const FALLBACK_PROVIDERS = ["local", "claude", "codex", "opencode"];
+
+/** `_REPOSITORY_ACTION_MODES` from src/service/preferences.py, with
+ * friendly labels for the action-button row. */
+const REPOSITORY_ACTION_LABELS: Record<string, string> = {
+  no_action: "No repo action",
+  prepare_patch: "Prepare patch",
+  commit: "Commit changes",
+  draft_pr: "Open draft PR",
+  ready_pr: "Open PR for review",
+};
+
+const REPOSITORY_ACTION_MODES = [
+  "no_action",
+  "prepare_patch",
+  "commit",
+  "draft_pr",
+  "ready_pr",
+];
 
 /**
  * Task Studio — graph + conversation view for a single task.
@@ -345,7 +369,67 @@ function humanize(value: string | undefined | null): string {
 // Approval gate inline card
 // ---------------------------------------------------------------------
 
-function ApprovalCard({ gate }: { gate: ApprovalGate }) {
+/**
+ * Shared action-button row for "Repository action" gates — used both by
+ * the in-chat ApprovalCard (when the pending gate is "Repository action")
+ * and by the Handoff tab (when `handoff.metadata.repository_action.status
+ * === "pending"`).
+ */
+function RepositoryActionButtons({
+  taskId,
+  allowedActions,
+  onChanged,
+}: {
+  taskId: string;
+  allowedActions: string[];
+  onChanged: () => void;
+}) {
+  const [loading, setLoading] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const actions = allowedActions.length > 0 ? allowedActions : REPOSITORY_ACTION_MODES;
+
+  const handleClick = async (action: string) => {
+    setLoading(action);
+    try {
+      await api.recordRepositoryAction(taskId, { approved: true, action });
+      onChanged();
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : String(err));
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  return (
+    <div className="ts-appr-actions">
+      <div className="ts-acts">
+        {actions.map((action) => (
+          <button
+            key={action}
+            type="button"
+            className="btn ts-ok"
+            disabled={loading !== null}
+            onClick={() => handleClick(action)}
+          >
+            {loading === action ? "Working…" : REPOSITORY_ACTION_LABELS[action] ?? humanize(action)}
+          </button>
+        ))}
+      </div>
+      {error && <p className="ts-err">{error}</p>}
+    </div>
+  );
+}
+
+function ApprovalCard({
+  gate,
+  taskId,
+  onChanged,
+}: {
+  gate: ApprovalGate;
+  taskId: string;
+  onChanged: () => void;
+}) {
   const name = stringField(gate, "name") ?? "approval";
   const status = stringField(gate, "status") ?? "pending";
   const meta = asRecord(gate.metadata);
@@ -354,6 +438,50 @@ function ApprovalCard({ gate }: { gate: ApprovalGate }) {
     stringField(meta, "description", "summary") ??
     "Operator review requested before this unit can proceed.";
 
+  const [loading, setLoading] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  const runApproval = async (decision: "approved" | "rejected") => {
+    setLoading(decision);
+    setNote(null);
+    try {
+      if (name === "PRD/AC") {
+        await api.recordApproval(taskId, { name, status: decision });
+        if (decision === "approved") {
+          await api.createGraphDraft(taskId);
+        }
+      } else if (name === "Task graph") {
+        const result = await api.recordApproval(taskId, { name, status: decision });
+        const autoSchedule = asRecord(result.auto_schedule);
+        const scheduled = asArray(autoSchedule?.scheduled);
+        if (decision === "approved" && scheduled.length > 0) {
+          setNote(`Scheduled ${scheduled.length} unit(s).`);
+        }
+      } else {
+        await api.recordApproval(taskId, { name, status: decision });
+      }
+      onChanged();
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : String(err));
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  if (name === "Repository action") {
+    const allowedActions = asStringArray(meta?.allowed_actions);
+    return (
+      <div className="ts-appr">
+        <h4>
+          ⚠ Approval {status === "pending" ? "required" : humanize(status)} — {name}
+        </h4>
+        <p>{description}</p>
+        <RepositoryActionButtons taskId={taskId} allowedActions={allowedActions} onChanged={onChanged} />
+      </div>
+    );
+  }
+
   return (
     <div className="ts-appr">
       <h4>
@@ -361,16 +489,63 @@ function ApprovalCard({ gate }: { gate: ApprovalGate }) {
       </h4>
       <p>{description}</p>
       <div className="ts-acts">
-        <button type="button" className="btn ts-ok" disabled title="Action wiring lands in M2">
-          Approve &amp; dispatch
+        <button
+          type="button"
+          className="btn ts-ok"
+          disabled={loading !== null}
+          onClick={() => runApproval("approved")}
+        >
+          {loading === "approved" ? "Working…" : "Approve & dispatch"}
         </button>
-        <button type="button" className="btn ts-no" disabled title="Action wiring lands in M2">
-          Reject
-        </button>
-        <button type="button" className="btn ghost" disabled title="Action wiring lands in M2">
-          Change provider
+        <button
+          type="button"
+          className="btn ts-no"
+          disabled={loading !== null}
+          onClick={() => runApproval("rejected")}
+        >
+          {loading === "rejected" ? "Working…" : "Reject"}
         </button>
       </div>
+      {note && <p className="ts-note">{note}</p>}
+      {error && <p className="ts-err">{error}</p>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
+// "Schedule ready units" toolbar button — calls POST /tasks/{id}/schedule,
+// the canonical "schedule whatever is ready" action. Idempotent: units
+// whose blockers aren't satisfied simply aren't scheduled.
+// ---------------------------------------------------------------------
+
+function ScheduleReadyButton({ taskId, onChanged }: { taskId: string; onChanged: () => void }) {
+  const [loading, setLoading] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleClick = async () => {
+    setLoading(true);
+    setError(null);
+    setNote(null);
+    try {
+      const result = await api.scheduleTask(taskId);
+      const scheduled = asArray(result.scheduled);
+      setNote(`Scheduled ${scheduled.length} unit(s).`);
+      onChanged();
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="ts-schedule-tool">
+      <button type="button" className="btn ghost" disabled={loading} onClick={handleClick}>
+        {loading ? "Working…" : "Schedule ready units"}
+      </button>
+      {note && <span className="ts-note ts-inline-note">{note}</span>}
+      {error && <span className="ts-err ts-inline-note">{error}</span>}
     </div>
   );
 }
@@ -404,6 +579,12 @@ export default function TaskStudio() {
   const [graphView, setGraphView] = useState<GraphViewMode>("graph");
   const [messageSearch, setMessageSearch] = useState("");
   const [activeTab, setActiveTab] = useState<StudioTab>("evidence");
+
+  // Composer (chat send box) state.
+  const [composerText, setComposerText] = useState("");
+  const [composerRole, setComposerRole] = useState<"user" | "assistant">("user");
+  const [composerSending, setComposerSending] = useState(false);
+  const [composerError, setComposerError] = useState<string | null>(null);
 
   // Tab-specific data, lazily fetched.
   const [tabData, setTabData] = useState<Record<StudioTab, unknown>>({
@@ -469,6 +650,36 @@ export default function TaskStudio() {
     loadCore(controller.signal);
     return () => controller.abort();
   }, [id, loadCore]);
+
+  // Re-run the core fetches (studio, graph, messages, approvals). Also
+  // invalidate the lazily-fetched Handoff tab data so it refetches after a
+  // governed action (e.g. generating a handoff or recording a repository
+  // action) — `loadCore` alone doesn't touch `tabData`.
+  const refresh = useCallback(() => {
+    loadCore();
+    setTabData((prev) => ({ ...prev, handoff: undefined }));
+  }, [loadCore]);
+
+  // -----------------------------------------------------------------
+  // Provider options for the graph list view's dispatch controls.
+  // -----------------------------------------------------------------
+  const [providerOptions, setProviderOptions] = useState<string[]>(FALLBACK_PROVIDERS);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    api
+      .getProviders(currentWorkspaceId ?? undefined, controller.signal)
+      .then((data) => {
+        const ids = (data.providers ?? [])
+          .map((p) => stringField(p, "id", "name"))
+          .filter((p): p is string => !!p);
+        if (ids.length > 0) setProviderOptions(ids);
+      })
+      .catch(() => {
+        // Keep the fallback list on error.
+      });
+    return () => controller.abort();
+  }, [currentWorkspaceId]);
 
   // -----------------------------------------------------------------
   // Live updates: poll /events for this task and re-fetch the
@@ -623,6 +834,29 @@ export default function TaskStudio() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [filteredMessages.length]);
 
+  // -----------------------------------------------------------------
+  // Composer: post a chat message visible to all agents on this task.
+  // -----------------------------------------------------------------
+  const sendMessage = useCallback(async () => {
+    const content = composerText.trim();
+    if (!content || composerSending || !id) return;
+    setComposerSending(true);
+    setComposerError(null);
+    try {
+      const result = await api.postTaskMessage(id, {
+        content,
+        role: composerRole,
+        target: "Current task agents",
+      });
+      setMessages((prev) => [...prev, result.message]);
+      setComposerText("");
+    } catch (err) {
+      setComposerError(err instanceof ApiClientError ? err.message : String(err));
+    } finally {
+      setComposerSending(false);
+    }
+  }, [composerText, composerSending, composerRole, id]);
+
   const offline = serviceStatus === "offline";
 
   if (!id) {
@@ -712,6 +946,7 @@ export default function TaskStudio() {
                       List
                     </button>
                   </div>
+                  <ScheduleReadyButton taskId={id} onChanged={refresh} />
                   <div className="ts-legend">
                     <span>
                       <i style={{ background: "var(--green)" }} />
@@ -745,7 +980,12 @@ export default function TaskStudio() {
                   ) : graphView === "graph" ? (
                     <TaskGraphSvg graph={graph} layout={layout} />
                   ) : (
-                    <TaskGraphList graph={graph} />
+                    <TaskGraphList
+                      graph={graph}
+                      taskId={id}
+                      onChanged={refresh}
+                      providerOptions={providerOptions}
+                    />
                   )}
                 </div>
               </div>
@@ -807,21 +1047,50 @@ export default function TaskStudio() {
                       <div className="ts-nm">
                         <b>Sarathi</b> · approval gate
                       </div>
-                      <ApprovalCard gate={gate} />
+                      <ApprovalCard gate={gate} taskId={id} onChanged={refresh} />
                     </div>
                   </div>
                 ))}
               </div>
               <div className="ts-comp">
-                <div className="ts-sender" title="Sender selection lands in M2">
-                  You ▾
-                </div>
-                <textarea placeholder="Send a message to agents…" disabled />
-                <button type="button" className="ts-send" disabled title="Sending lands in M2">
-                  ↑
+                <select
+                  className="ts-sender"
+                  value={composerRole}
+                  onChange={(e) => setComposerRole(e.target.value === "assistant" ? "assistant" : "user")}
+                  title="Sender"
+                >
+                  <option value="user">You</option>
+                  <option value="assistant">Sarathi</option>
+                </select>
+                <textarea
+                  placeholder="Send a message to agents…"
+                  value={composerText}
+                  onChange={(e) => setComposerText(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      void sendMessage();
+                    }
+                  }}
+                  disabled={composerSending}
+                />
+                <button
+                  type="button"
+                  className="ts-send"
+                  disabled={composerText.trim().length === 0 || composerSending}
+                  onClick={() => void sendMessage()}
+                  title="Send"
+                >
+                  {composerSending ? "…" : "↑"}
                 </button>
               </div>
-              <div className="ts-comp-hint">Enter to send · visible to all agents on this ticket</div>
+              <div className="ts-comp-hint">
+                {composerError ? (
+                  <span className="ts-err">{composerError}</span>
+                ) : (
+                  "Enter to send · visible to all agents on this ticket"
+                )}
+              </div>
             </div>
           </div>
 
@@ -845,6 +1114,10 @@ export default function TaskStudio() {
               data={tabData[activeTab]}
               loading={tabLoading}
               error={tabError}
+              taskId={id}
+              onChanged={refresh}
+              approvals={approvals}
+              allComplete={graph.nodes.length > 0 && graph.completeNodes.size === graph.nodes.length}
             />
           </div>
         </>
@@ -949,27 +1222,189 @@ function TaskGraphSvg({ graph, layout }: { graph: NormalizedGraph; layout: DagLa
 // Graph (list) renderer — defensive fallback for unknown graph shapes
 // ---------------------------------------------------------------------
 
-function TaskGraphList({ graph }: { graph: NormalizedGraph }) {
+function TaskGraphList({
+  graph,
+  taskId,
+  onChanged,
+  providerOptions,
+}: {
+  graph: NormalizedGraph;
+  taskId: string;
+  onChanged: () => void;
+  providerOptions: string[];
+}) {
   return (
     <div className="ts-graph-list">
-      {graph.nodes.map((node, idx) => {
-        const status = nodeStatusInfo(node, graph);
-        const title = stringField(node, "title", "name") ?? stringField(node, "id") ?? `Node ${idx + 1}`;
-        const provider = stringField(node, "provider");
-        const role = stringField(node, "role");
-        const badge = providerBadge(provider);
-        return (
-          <div className="ts-graph-row" key={stringField(node, "id") ?? idx}>
-            <span className={`ts-status-dot ts-status-${status.key}`} />
-            <span className="ts-row-title">{title}</span>
-            <span className="ts-row-meta">
-              {role && <span>{role}</span>}
-              {badge && <span className="ts-provider-badge">{badge}</span>}
-              <span>{status.label}</span>
-            </span>
-          </div>
-        );
-      })}
+      {graph.nodes.map((node, idx) => (
+        <GraphListRow
+          key={stringField(node, "id") ?? idx}
+          node={node}
+          idx={idx}
+          graph={graph}
+          taskId={taskId}
+          onChanged={onChanged}
+          providerOptions={providerOptions}
+        />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * A single row in the graph "list" view, plus any per-node governed-action
+ * controls appropriate for its current status (see scheduling.py's subtask
+ * status machine: queued, in_progress, blocked, waiting_human, review,
+ * complete, failed, skipped, paused).
+ */
+function GraphListRow({
+  node,
+  idx,
+  graph,
+  taskId,
+  onChanged,
+  providerOptions,
+}: {
+  node: GraphNode;
+  idx: number;
+  graph: NormalizedGraph;
+  taskId: string;
+  onChanged: () => void;
+  providerOptions: string[];
+}) {
+  const [loading, setLoading] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<string>(
+    stringField(node, "provider") ?? providerOptions[0] ?? "local",
+  );
+
+  const status = nodeStatusInfo(node, graph);
+  const rawStatus = stringField(node, "status")?.toLowerCase();
+  const title = stringField(node, "title", "name") ?? stringField(node, "id") ?? `Node ${idx + 1}`;
+  const provider = stringField(node, "provider");
+  const role = stringField(node, "role");
+  const badge = providerBadge(provider);
+  const nodeId = stringField(node, "id");
+
+  const runAction = async (key: string, action: () => Promise<void>) => {
+    setLoading(key);
+    setError(null);
+    try {
+      await action();
+      onChanged();
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : String(err));
+    } finally {
+      setLoading(null);
+    }
+  };
+
+  let controls: ReactNode = null;
+  if (rawStatus === "queued") {
+    controls = (
+      <button
+        type="button"
+        className="btn ghost ts-row-btn"
+        disabled={loading !== null}
+        onClick={() => runAction("dispatch", () => api.scheduleTask(taskId).then(() => undefined))}
+      >
+        {loading === "dispatch" ? "Working…" : "Dispatch"}
+      </button>
+    );
+  } else if (rawStatus === "in_progress" && nodeId) {
+    controls = (
+      <>
+        <select
+          className="ts-row-select"
+          value={selectedProvider}
+          onChange={(e) => setSelectedProvider(e.target.value)}
+          disabled={loading !== null}
+        >
+          {providerOptions.map((p) => (
+            <option key={p} value={p}>
+              {p}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          className="btn ghost ts-row-btn"
+          disabled={loading !== null}
+          onClick={() =>
+            runAction("run", () => api.dispatchSubtask(nodeId, { provider: selectedProvider }).then(() => undefined))
+          }
+        >
+          {loading === "run" ? "Working…" : "Run"}
+        </button>
+      </>
+    );
+  } else if (rawStatus === "review" && nodeId) {
+    controls = (
+      <>
+        <button
+          type="button"
+          className="btn ghost ts-row-btn"
+          disabled={loading !== null}
+          onClick={() =>
+            runAction("complete", () =>
+              api.transitionSubtask(nodeId, { status: "complete", actor: "Operator" }).then(() => undefined),
+            )
+          }
+        >
+          {loading === "complete" ? "Working…" : "Mark complete"}
+        </button>
+        <button
+          type="button"
+          className="btn ghost ts-row-btn"
+          disabled={loading !== null}
+          onClick={() =>
+            runAction("requeue", () =>
+              api
+                .transitionSubtask(nodeId, {
+                  status: "queued",
+                  actor: "Operator",
+                  reason: "Sent back for rework by operator",
+                })
+                .then(() => undefined),
+            )
+          }
+        >
+          {loading === "requeue" ? "Working…" : "Send back"}
+        </button>
+      </>
+    );
+  } else if (rawStatus === "failed" && nodeId) {
+    controls = (
+      <button
+        type="button"
+        className="btn ghost ts-row-btn"
+        disabled={loading !== null}
+        onClick={() =>
+          runAction("retry", async () => {
+            await api.transitionSubtask(nodeId, { status: "queued", actor: "Operator", reason: "Retry" });
+            try {
+              await api.scheduleTask(taskId);
+            } catch {
+              // best-effort — ignore scheduling errors after a retry requeue
+            }
+          })
+        }
+      >
+        {loading === "retry" ? "Working…" : "Retry"}
+      </button>
+    );
+  }
+
+  return (
+    <div className="ts-graph-row" key={nodeId ?? idx}>
+      <span className={`ts-status-dot ts-status-${status.key}`} />
+      <span className="ts-row-title">{title}</span>
+      <span className="ts-row-meta">
+        {role && <span>{role}</span>}
+        {badge && <span className="ts-provider-badge">{badge}</span>}
+        <span>{status.label}</span>
+      </span>
+      {controls && <span className="ts-row-actions">{controls}</span>}
+      {error && <span className="ts-err ts-row-error">{error}</span>}
     </div>
   );
 }
@@ -983,11 +1418,19 @@ function TabPanel({
   data,
   loading,
   error,
+  taskId,
+  onChanged,
+  approvals,
+  allComplete,
 }: {
   tab: StudioTab;
   data: unknown;
   loading: boolean;
   error: string | null;
+  taskId: string;
+  onChanged: () => void;
+  approvals: ApprovalGate[];
+  allComplete: boolean;
 }) {
   if (loading) {
     return <div className="card2 ts-empty">Loading {tab}…</div>;
@@ -1008,7 +1451,7 @@ function TabPanel({
       return <HistoryTab data={data} />;
     case "handoff":
     default:
-      return <HandoffTab data={data} />;
+      return <HandoffTab data={data} taskId={taskId} onChanged={onChanged} approvals={approvals} allComplete={allComplete} />;
   }
 }
 
@@ -1143,15 +1586,66 @@ function HistoryTab({ data }: { data: unknown }) {
 }
 
 /** GET /tasks/{id}/handoff — latest handoff object, or null. */
-function HandoffTab({ data }: { data: unknown }) {
+function HandoffTab({
+  data,
+  taskId,
+  onChanged,
+  approvals,
+  allComplete,
+}: {
+  data: unknown;
+  taskId: string;
+  onChanged: () => void;
+  approvals: ApprovalGate[];
+  allComplete: boolean;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
   const record = asRecord(data);
   // app.py wraps the latest handoff as { task_id, handoff: {...} | null };
   // some shapes may return the handoff object directly instead.
   const handoff = record && "handoff" in record ? asRecord(record.handoff) : record;
+
+  const handleGenerate = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      await api.createTaskHandoff(taskId);
+      onChanged();
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   if (!handoff || Object.keys(handoff).length === 0) {
-    return <div className="card2 ts-empty">No handoff has been produced for this task yet.</div>;
+    return (
+      <div className="card2 ts-empty ts-handoff-empty">
+        <p>No handoff has been produced for this task yet.</p>
+        {allComplete && (
+          <div className="ts-acts">
+            <button type="button" className="btn ts-ok" disabled={loading} onClick={handleGenerate}>
+              {loading ? "Working…" : "Generate handoff"}
+            </button>
+          </div>
+        )}
+        {error && <p className="ts-err">{error}</p>}
+      </div>
+    );
   }
+
   const entries = Object.entries(handoff).filter(([key]) => key !== "id");
+  const metadata = asRecord(handoff.metadata);
+  const repositoryAction = asRecord(metadata?.repository_action);
+  const repositoryActionPending = stringField(repositoryAction, "status") === "pending";
+
+  const repoActionGate = approvals.find(
+    (g) => stringField(g, "name") === "Repository action" && stringField(g, "status") === "pending",
+  );
+  const allowedActions = asStringArray(asRecord(repoActionGate?.metadata)?.allowed_actions);
+
   return (
     <div className="card2 ts-table-wrap">
       <table>
@@ -1170,6 +1664,12 @@ function HandoffTab({ data }: { data: unknown }) {
           ))}
         </tbody>
       </table>
+      {repositoryActionPending && (
+        <div className="ts-handoff-repo-action">
+          <p className="ts-handoff-repo-action-label">Repository action required:</p>
+          <RepositoryActionButtons taskId={taskId} allowedActions={allowedActions} onChanged={onChanged} />
+        </div>
+      )}
     </div>
   );
 }

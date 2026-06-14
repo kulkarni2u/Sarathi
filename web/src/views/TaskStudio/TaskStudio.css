@@ -95,6 +95,18 @@
   flex-wrap: wrap;
 }
 
+.ts-schedule-tool {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ts-inline-note {
+  font-size: 11px;
+  margin: 0;
+}
+
 .ts-legend {
   display: flex;
   gap: 13px;
@@ -206,6 +218,7 @@
   border-radius: var(--r-md);
   border: 1px solid var(--border-soft);
   background: var(--elev);
+  flex-wrap: wrap;
 }
 
 .ts-graph-row .ts-status-dot {
@@ -257,6 +270,32 @@
   padding: 1px 6px;
   color: var(--muted);
   font-size: 10.5px;
+}
+
+.ts-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.ts-row-btn {
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
+.ts-row-select {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-size: 11px;
+  padding: 4px 6px;
+}
+
+.ts-row-error {
+  flex: 1 0 100%;
+  margin: 0;
 }
 
 /* ---------- chat panel ---------- */
@@ -418,6 +457,50 @@
   opacity: 0.6;
 }
 
+/* ---------- shared action-row / inline status styles ----------
+   Used by ApprovalCard, RepositoryActionButtons, ScheduleReadyButton,
+   GraphListRow and HandoffTab — both inside `.ts-appr` (where the rules
+   above add color overrides) and standalone (e.g. in the Handoff tab). */
+.ts-acts {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.ts-appr-actions {
+  margin-top: 4px;
+}
+
+.ts-ok {
+  background: var(--green);
+  border-color: transparent;
+  color: #062417;
+}
+
+.ts-no {
+  background: transparent;
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.ts-page button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.ts-note {
+  margin: 8px 0 0;
+  color: var(--blue);
+  font-size: 11.5px;
+}
+
+.ts-err {
+  margin: 8px 0 0;
+  color: var(--red);
+  font-size: 11.5px;
+}
+
 /* ---------- composer ---------- */
 .ts-comp {
   border-top: 1px solid var(--border-soft);
@@ -439,7 +522,12 @@
   color: var(--muted);
   font-size: 12px;
   white-space: nowrap;
-  cursor: not-allowed;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.ts-comp .ts-sender:focus {
+  outline: 1px solid var(--blue);
 }
 
 .ts-comp textarea {
@@ -543,4 +631,29 @@
   word-break: break-word;
   margin: 0;
   max-width: 480px;
+}
+
+/* ---------- Handoff tab ---------- */
+.ts-handoff-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.ts-handoff-empty p {
+  margin: 0;
+}
+
+.ts-handoff-repo-action {
+  padding: 13px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.ts-handoff-repo-action-label {
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--faint);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
 }

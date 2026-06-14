@@ -253,7 +253,7 @@ export default function NeedsYou() {
                   </div>
                 </div>
                 <span className="ny-age">{formatAge(asString(task.updated_at))}</span>
-                <span className="btn ghost ny-action" aria-disabled="true" title="Inline approval actions are not available in M1">
+                <span className="btn ghost ny-action" title="Open in Task Studio">
                   Review →
                 </span>
               </button>

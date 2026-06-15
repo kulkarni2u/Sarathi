@@ -82,6 +82,12 @@ from .review import (
     _record_repository_action,
     _run_task_review,
 )
+from .auth import (
+    auth_enabled as _auth_enabled,
+    Principal,
+    require_admin,
+    resolve_principal,
+)
 from .sessions import (
     attach_via_share_token,
     create_task_session,
@@ -169,10 +175,12 @@ class ServiceApp:
         token: str | None = None,
         *,
         dist_root: str | Path | None = None,
+        auth_enabled: bool | None = None,
     ):
         self.db_path = Path(db_path)
         self.token = token
         self.dist_root = Path(dist_root) if dist_root is not None else DEFAULT_DIST_ROOT
+        self.auth_enabled = _auth_enabled() if auth_enabled is None else auth_enabled
         self._local = threading.local()
         # Run migrations once at startup on the main thread
         with connect(self.db_path) as _conn:
@@ -208,6 +216,7 @@ class ServiceApp:
         "events",
         "brainstorm",
         "sessions",
+        "users",
     }
 
     def handle(
@@ -239,8 +248,7 @@ class ServiceApp:
                 if public_response is not None:
                     return public_response
 
-            if not skip_auth:
-                self._authorize(headers)
+            principal = None if skip_auth else self._authorize(headers)
             parts = raw_parts[1:] if is_api_request else raw_parts
             # The OpenAPI document (and its docs page) are returned as-is,
             # without the success envelope, since they must be valid
@@ -274,6 +282,7 @@ class ServiceApp:
                 parts,
                 _query(path),
                 body or {},
+                principal=principal,
             )
             return status, _ok(data, correlation_id)
         except ServiceError as error:
@@ -378,6 +387,8 @@ class ServiceApp:
         parts: list[str],
         query: Mapping[str, list[str]],
         body: Mapping[str, Any],
+        *,
+        principal: Principal | None = None,
     ) -> tuple[int, dict[str, Any]]:
         if parts and parts[0] == "api":
             parts = parts[1:]
@@ -1565,10 +1576,18 @@ class ServiceApp:
             session = storage.get_session(parts[1])
             if session is None:
                 raise ServiceError("not_found", "Session not found.", 404)
+            # With auth on, the actor is the authenticated principal, not a
+            # client-supplied field — so observers cannot post by spoofing a
+            # driver's user id in the body.
+            actor = (
+                principal.username
+                if principal is not None and not principal.is_admin
+                else _required_text(body, "user")
+            )
             message = post_session_message(
                 storage,
                 session,
-                user=_required_text(body, "user"),
+                user=actor,
                 content=_required_text(body, "content"),
                 role=_optional_text(body, "role"),
             )
@@ -1591,6 +1610,23 @@ class ServiceApp:
                 status=_optional_text(body, "status"),
             )
             return 200, {"session": session}
+
+        # ── Users (opt-in multi-user auth: admin-only provisioning) ──────────
+        if method == "POST" and parts == ["users"]:
+            require_admin(principal)
+            username = _required_text(body, "username")
+            if storage.get_user_by_username(username) is not None:
+                raise ServiceError("conflict", "Username already exists.", 409)
+            user = storage.create_user(
+                username=username,
+                display_name=_optional_text(body, "display_name"),
+                metadata=_optional_dict(body, "metadata"),
+            )
+            return 201, {"user": user}
+
+        if method == "GET" and parts == ["users"]:
+            require_admin(principal)
+            return 200, {"users": storage.list_users()}
 
         if method == "GET" and parts == ["providers"]:
             workspace_id = _first_query(query, "workspace_id")
@@ -1735,15 +1771,23 @@ class ServiceApp:
 
         raise ServiceError("not_found", "Endpoint not found.", 404)
 
-    def _authorize(self, headers: Mapping[str, str] | None) -> None:
+    def _authorize(self, headers: Mapping[str, str] | None) -> Principal | None:
+        # Opt-in multi-user mode: the bearer must be the admin token or an
+        # active user token; the resolved principal is returned for routing.
+        if self.auth_enabled:
+            _conn, storage = self._storage()
+            return resolve_principal(
+                storage, headers, admin_token=self.token, enabled=True
+            )
+        # Default single-user local mode: shared-token check, no principal.
         if self.token is None:
-            return
+            return None
         expected = f"Bearer {self.token}"
         for key, value in (headers or {}).items():
             if key.lower() == "authorization" and hmac.compare_digest(
                 str(value).encode(), expected.encode()
             ):
-                return
+                return None
         raise ServiceError("unauthorized", "Missing or invalid authorization token.", 401)
 
     def _authorize_stream(
@@ -1771,6 +1815,9 @@ def create_app(
     token: str | None = None,
     *,
     dist_root: str | Path | None = None,
+    auth_enabled: bool | None = None,
 ) -> ServiceApp:
-    return ServiceApp(db_path, token=token, dist_root=dist_root)
+    return ServiceApp(
+        db_path, token=token, dist_root=dist_root, auth_enabled=auth_enabled
+    )
 

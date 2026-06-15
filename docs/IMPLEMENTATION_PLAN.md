@@ -13,6 +13,25 @@ criteria, tests, and dependencies.
 
 ---
 
+## Delivered so far (branch `claude/sarathi-webui-cockpit-511ubm`)
+
+- **M1 — Web cockpit (read):** live read-only cockpit across all v1 surfaces.
+- **M2 — Governed actions:** approvals, transition/dispatch/schedule controls,
+  chat broadcast, and delivery-spine/handoff wired end-to-end (service + web
+  Task Studio). NCP prior-findings fetch + memory/cost persistence wired into
+  subtask dispatch (gated on a workspace `.ncp/` bridge; inert otherwise).
+- **M3 — Model & execution breadth:**
+  - **T3.1 Gateway provider** — pure-Python `GatewayProviderAdapter` for any
+    OpenAI-compatible endpoint (Ollama/vLLM/OpenRouter/Azure) over `httpx`,
+    key-from-env-var, keyless support, routed + validated, documented.
+  - **T3.2 Sandbox executor** — opt-in Docker `SandboxExecutor` for VERIFY
+    (workspace bind-mounted, evidence flows back), interface ready for
+    Modal/Daytona. Verified without a Docker daemon via a fake executor +
+    argv-shape tests; the two real-container tests skip until run on a Docker
+    host.
+
+---
+
 ## 0. Goal & guardrails
 
 **Goal:** reach omnigent's surface area (web cockpit, collaboration, model

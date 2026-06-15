@@ -163,7 +163,12 @@ Config keys:
   `Authorization: Bearer <value>`. Omit it for keyless backends like Ollama.
 - `timeout_seconds` (optional, default 120)
 
-```yaml
+> Note: the block below is illustrative and is intentionally **not** a ```yaml
+> fence — the policy compiler merges every ```yaml block in this file, so an
+> active gateway block would override the routing above. To use a gateway,
+> set `provider:` and a `providers:` entry in the active block above.
+
+```text
 provider: ollama
 
 providers:

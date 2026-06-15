@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -630,6 +631,21 @@ def main() -> None:
     )
     subparsers.add_parser("agents", help="Show Sarathi agent role names and phase mapping")
 
+    # Attach command (join a shared session)
+    attach_parser = subparsers.add_parser(
+        "attach", help="Attach to a shared Sarathi session via its share token"
+    )
+    attach_parser.add_argument("share_token", help="The session share token (from a share link)")
+    attach_parser.add_argument(
+        "--user", default=None, help="Your participant identifier (default: $USER or 'local')"
+    )
+    attach_parser.add_argument(
+        "--role",
+        default="observer",
+        choices=["observer", "driver"],
+        help="Join as observer (read-only) or driver",
+    )
+
     if len(sys.argv) > 1 and sys.argv[1] == "desktop":
         args, _desktop_passthrough = parser.parse_known_args()
         setattr(args, "desktop_args", sys.argv[2:])
@@ -665,6 +681,8 @@ def main() -> None:
         handle_proposals(args)
     elif args.command == "reuse":
         handle_reuse(args)
+    elif args.command == "attach":
+        handle_attach(args)
     elif args.command == "agents":
         handle_agents()
 
@@ -990,6 +1008,46 @@ def _service_get_json(service_url: str, path: str, *, token: str | None = None) 
     return data
 
 
+def _service_post_json(
+    service_url: str,
+    path: str,
+    body: dict[str, Any],
+    *,
+    token: str | None = None,
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{service_url.rstrip('/')}{path}",
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+    )
+    request.add_header("Content-Type", "application/json")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        message = None
+        try:
+            error_payload = json.loads(error.read().decode("utf-8"))
+            if isinstance(error_payload, dict):
+                err = error_payload.get("error") or {}
+                if isinstance(err, dict):
+                    message = err.get("message")
+        except Exception:
+            message = None
+        raise RuntimeError(str(message or f"Service request failed (HTTP {error.code})."))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected service response.")
+    if not payload.get("ok"):
+        error = payload.get("error") or {}
+        raise RuntimeError(str(error.get("message") or "Service request failed."))
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("Service response did not contain a data object.")
+    return data
+
+
 def _desktop_launcher_main():
     try:
         from .service.desktop import main as desktop_main
@@ -1108,6 +1166,69 @@ def handle_reuse(args: argparse.Namespace) -> None:
             print(line)
     else:
         print("  No learned playbooks recorded yet.")
+
+
+def handle_attach(args: argparse.Namespace) -> None:
+    """Attach to a shared Sarathi session via its share token."""
+    info = _read_service_discovery()
+    service_url = info.get("url") if isinstance(info, dict) else None
+    token = _service_auth_token(info)
+    if not service_url:
+        print(
+            "No running Sarathi service found. Start it with: "
+            "python3 -m src.service --db ~/.sarathi/sarathi.db --port 8765"
+        )
+        return
+
+    user = args.user or os.environ.get("USER") or "local"
+
+    try:
+        data = _service_post_json(
+            service_url,
+            "/api/sessions/attach",
+            {"share_token": args.share_token, "user": user, "role": args.role},
+            token=token,
+        )
+    except RuntimeError as exc:
+        print(f"Could not attach: {exc}")
+        return
+
+    session = data["session"]
+    participant = data["participant"]
+    role = participant.get("role", args.role)
+
+    print(f"Attached to session {session['id']}")
+    print(f"  task: {session['task_id']}")
+    print(f"  role: {role}")
+    print(f"  visibility: {session.get('visibility', 'unknown')}")
+
+    try:
+        detail = _service_get_json(service_url, f"/api/sessions/{session['id']}", token=token)
+        participants = detail.get("participants", [])
+        print("\nParticipants:")
+        if participants:
+            for member in participants:
+                print(
+                    f"  - {member.get('user')} ({member.get('role')}) "
+                    f"[{member.get('status')}]"
+                )
+        else:
+            print("  (none)")
+
+        msgs = _service_get_json(
+            service_url, f"/api/sessions/{session['id']}/messages", token=token
+        ).get("messages", [])
+        print("\nRecent messages:")
+        if msgs:
+            for message in msgs[-10:]:
+                print(f"  {message.get('role')}: {message.get('content')}")
+        else:
+            print("  (no messages yet)")
+    except RuntimeError as exc:
+        print(f"\n(Could not load session details: {exc})")
+
+    if role == "observer":
+        print("\nNote: observers are read-only and cannot drive the session.")
 
 
 def handle_proposals(args: argparse.Namespace | None = None) -> None:

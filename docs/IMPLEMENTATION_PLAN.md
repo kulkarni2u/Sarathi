@@ -40,6 +40,13 @@ criteria, tests, and dependencies.
     a `sarathi fork` CLI. NCP warm-start: the fork carries the parent task's
     persisted findings into the new task and writes a ForkSeed lineage chunk
     (verified live against a real NCP SQLite bridge; inert without one).
+  - **T4.3 Optional auth / multi-user** — opt-in `SARATHI_AUTH_ENABLED=1`:
+    `users` table (migration 010) + `src/service/auth.py` (Principal resolution).
+    Auth off is unchanged (single shared token); auth on requires an admin or
+    active user token per request, threads the Principal through routing,
+    provides admin-only `POST/GET /users`, and enforces roles against the
+    authenticated identity (an observer cannot post by spoofing a driver's user
+    id). OIDC remains a future follow-up.
 
 ---
 

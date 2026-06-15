@@ -82,6 +82,14 @@ from .review import (
     _record_repository_action,
     _run_task_review,
 )
+from .sessions import (
+    attach_via_share_token,
+    create_task_session,
+    join_session,
+    leave_session,
+    post_session_message,
+    update_task_session,
+)
 from .scheduling import (
     _create_graph_draft,
     _graph_for_task,
@@ -198,6 +206,7 @@ class ServiceApp:
         "chat",
         "events",
         "brainstorm",
+        "sessions",
     }
 
     def handle(
@@ -1443,6 +1452,132 @@ class ServiceApp:
                     409,
                 )
             return 201, _dispatch_subtask(storage, subtask, body)
+
+        # ── Sessions (sharing & co-drive) ────────────────────────────────────
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "tasks"
+            and parts[2] == "sessions"
+        ):
+            task = storage.get_task(parts[1])
+            if task is None:
+                raise ServiceError("not_found", "Task not found.", 404)
+            session = create_task_session(
+                storage,
+                task,
+                owner=_optional_text(body, "owner") or "local",
+                visibility=_optional_text(body, "visibility") or "private",
+            )
+            return 201, {"session": session}
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "tasks"
+            and parts[2] == "sessions"
+        ):
+            task = storage.get_task(parts[1])
+            if task is None:
+                raise ServiceError("not_found", "Task not found.", 404)
+            return 200, {"sessions": storage.list_sessions_for_task(parts[1])}
+
+        if method == "POST" and parts == ["sessions", "attach"]:
+            result = attach_via_share_token(
+                storage,
+                share_token=_required_text(body, "share_token"),
+                user=_required_text(body, "user"),
+                role=_optional_text(body, "role") or "observer",
+            )
+            return 201, result
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "participants"
+        ):
+            session = storage.get_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Session not found.", 404)
+            return 200, {"participants": storage.list_session_participants(parts[1])}
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "participants"
+        ):
+            session = storage.get_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Session not found.", 404)
+            participant = join_session(
+                storage,
+                parts[1],
+                user=_required_text(body, "user"),
+                role=_optional_text(body, "role") or "observer",
+            )
+            return 201, {"participant": participant}
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "leave"
+        ):
+            participant = leave_session(
+                storage,
+                parts[1],
+                user=_required_text(body, "user"),
+            )
+            return 200, {"participant": participant}
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "messages"
+        ):
+            session = storage.get_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Session not found.", 404)
+            return 200, {"messages": storage.list_messages(session_id=parts[1])}
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "messages"
+        ):
+            session = storage.get_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Session not found.", 404)
+            message = post_session_message(
+                storage,
+                session,
+                user=_required_text(body, "user"),
+                content=_required_text(body, "content"),
+                role=_optional_text(body, "role"),
+            )
+            return 201, {"message": message}
+
+        if method == "GET" and len(parts) == 2 and parts[0] == "sessions":
+            session = storage.get_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Session not found.", 404)
+            return 200, {
+                "session": session,
+                "participants": storage.list_session_participants(parts[1]),
+            }
+
+        if method == "PATCH" and len(parts) == 2 and parts[0] == "sessions":
+            session = update_task_session(
+                storage,
+                parts[1],
+                visibility=_optional_text(body, "visibility"),
+                status=_optional_text(body, "status"),
+            )
+            return 200, {"session": session}
 
         if method == "GET" and parts == ["providers"]:
             workspace_id = _first_query(query, "workspace_id")

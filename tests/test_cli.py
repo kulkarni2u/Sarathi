@@ -761,3 +761,45 @@ def test_handle_resume_exits_cleanly_when_policy_pack_missing(tmp_path, capsys):
     output = capsys.readouterr().out
     assert error.value.code == 1
     assert "Error: No policy pack found." in output
+
+
+def test_handle_validate_reports_policy_caps_from_budget_section(tmp_path, capsys):
+    policy_dir = tmp_path / "policy-pack"
+    _write_policy_pack(policy_dir)
+    (policy_dir / "escalation.md").write_text(
+        """# Escalation
+
+```yaml
+budget:
+  max_total_tokens: 200000
+  max_tool_calls: 50
+
+never_auto_approve_gates:
+  - Repository action
+  - Final handoff
+```
+"""
+    )
+
+    args = Namespace(policy_pack=str(policy_dir), verbose=False)
+    cli.handle_validate(args)
+    output = capsys.readouterr().out
+
+    assert "Policy caps (server tier):" in output
+    assert "cost_budget_tokens: 200000" in output
+    assert "max_tool_calls: 50" in output
+    assert "required_approval_gates: ['Repository action', 'Final handoff']" in output
+
+
+def test_handle_validate_reports_uncapped_when_no_budget_section(tmp_path, capsys):
+    policy_dir = tmp_path / "policy-pack"
+    _write_policy_pack(policy_dir)
+
+    args = Namespace(policy_pack=str(policy_dir), verbose=False)
+    cli.handle_validate(args)
+    output = capsys.readouterr().out
+
+    assert "Policy caps (server tier):" in output
+    assert "cost_budget_tokens: uncapped" in output
+    assert "max_tool_calls: uncapped" in output
+    assert "required_approval_gates: none" in output

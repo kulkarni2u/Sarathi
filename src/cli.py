@@ -12,6 +12,8 @@ from typing import Any
 try:
     from .evolve import Evolver, ProposalReviewStore
     from .init import InitWorkflow
+    from .policy import compile_policy_pack
+    from .policy.layering import extract_server_caps
     from .runtime import UsageRecord, list_agent_roles, list_phase_agent_roles
     from .task_graph import (
         graph_summary,
@@ -28,6 +30,8 @@ except ImportError:
     # Support direct execution via sarathi.py, which prepends src/ to sys.path.
     from evolve import Evolver, ProposalReviewStore
     from init import InitWorkflow
+    from policy import compile_policy_pack
+    from policy.layering import extract_server_caps
     from runtime import UsageRecord, list_agent_roles, list_phase_agent_roles
     from task_graph import (
         graph_summary,
@@ -828,6 +832,21 @@ def handle_validate(args: argparse.Namespace) -> None:
     drifted = sum(1 for r in results if r.status.value == "DRIFT")
 
     print(f"\nSummary: {passed} PASS, {drifted} DRIFT, {todo} TODO")
+
+    try:
+        compiled = compile_policy_pack(str(path))
+        caps = extract_server_caps(compiled)
+    except Exception:
+        caps = None
+
+    if caps is not None:
+        print("\nPolicy caps (server tier):")
+        budget = caps["cost_budget_tokens"]
+        print(f"  cost_budget_tokens: {budget if budget is not None else 'uncapped'}")
+        max_calls = caps["max_tool_calls"]
+        print(f"  max_tool_calls: {max_calls if max_calls is not None else 'uncapped'}")
+        gates = caps["required_approval_gates"]
+        print(f"  required_approval_gates: {gates if gates else 'none'}")
 
     if args.verbose:
         print("\nDetailed Results:")

@@ -39,6 +39,12 @@ from .intake import (
     _write_brainstorm_spec,
 )
 from .openapi import build_openapi_spec
+from .policy_layers import (
+    get_session_policy,
+    get_workspace_policy,
+    set_session_policy_overrides,
+    set_workspace_policy_overrides,
+)
 from .preferences import (
     _effective_auto_approve_preference,
     _evaluate_threshold,
@@ -1611,6 +1617,12 @@ class ServiceApp:
             )
             return 200, {"session": session}
 
+        if method == "GET" and len(parts) == 3 and parts[0] == "sessions" and parts[2] == "policy":
+            return 200, get_session_policy(storage, parts[1])
+
+        if method == "PATCH" and len(parts) == 3 and parts[0] == "sessions" and parts[2] == "policy":
+            return 200, set_session_policy_overrides(storage, parts[1], body.get("overrides"))
+
         # ── Users (opt-in multi-user auth: admin-only provisioning) ──────────
         if method == "POST" and parts == ["users"]:
             require_admin(principal)
@@ -1668,6 +1680,12 @@ class ServiceApp:
                 raise ServiceError("not_found", "Workspace not found.", 404)
             filename = parts[3]
             return 200, _put_policy_pack_file(storage, workspace_id, filename, body)
+
+        if method == "GET" and len(parts) == 3 and parts[0] == "workspaces" and parts[2] == "policy":
+            return 200, get_workspace_policy(storage, parts[1])
+
+        if method == "PATCH" and len(parts) == 3 and parts[0] == "workspaces" and parts[2] == "policy":
+            return 200, set_workspace_policy_overrides(storage, parts[1], body.get("overrides"))
 
         # ── Brainstorm sessions ──────────────────────────────────────────────
         if method == "POST" and len(parts) == 2 and parts[0] == "brainstorm" and parts[1] == "sessions":

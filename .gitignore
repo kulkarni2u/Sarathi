@@ -24,6 +24,8 @@ data/
 
 # Build artifacts
 sarathi.egg-info/
+/build/
+/dist/
 desktop/tsconfig.tsbuildinfo
 desktop/dist/
 

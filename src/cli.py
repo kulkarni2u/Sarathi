@@ -15,6 +15,7 @@ try:
     from .policy import compile_policy_pack
     from .policy.layering import extract_server_caps
     from .runtime import UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
+    from .runtime import TaskGraphExecutor, load_recipe, load_recipes
     from .runtime.agent_spec import load_agent_specs
     from .task_graph import (
         graph_summary,
@@ -34,6 +35,7 @@ except ImportError:
     from policy import compile_policy_pack
     from policy.layering import extract_server_caps
     from runtime import UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
+    from runtime import TaskGraphExecutor, load_recipe, load_recipes
     from runtime.agent_spec import load_agent_specs
     from task_graph import (
         graph_summary,
@@ -551,6 +553,11 @@ def main() -> None:
         default=None,
         help="Directory containing agent spec files (default: <policy-pack>/agents)",
     )
+    run_parser.add_argument(
+        "--recipe",
+        default=None,
+        help="Path to a recipe dir/file to execute as a FANOUT/JUDGE workflow graph (instead of the standard lifecycle)",
+    )
 
     # NCP Integration
     run_parser.add_argument(
@@ -647,6 +654,13 @@ def main() -> None:
     )
     subparsers.add_parser("agents", help="Show Sarathi agent role names and phase mapping")
 
+    recipes_parser = subparsers.add_parser("recipes", help="List reference recipes (FANOUT/JUDGE workflow packs)")
+    recipes_parser.add_argument(
+        "--recipes-dir",
+        default="policy-pack/RECIPES",
+        help="Directory containing recipe sub-packs (default: policy-pack/RECIPES)",
+    )
+
     # Attach command (join a shared session)
     attach_parser = subparsers.add_parser(
         "attach", help="Attach to a shared Sarathi session via its share token"
@@ -712,6 +726,8 @@ def main() -> None:
         handle_fork(args)
     elif args.command == "agents":
         handle_agents()
+    elif args.command == "recipes":
+        handle_recipes(args)
 
 
 def handle_init(args: argparse.Namespace) -> None:
@@ -872,6 +888,59 @@ def handle_validate(args: argparse.Namespace) -> None:
                 print(f"      → {r.issue}")
 
 
+def handle_recipes(args: argparse.Namespace) -> None:
+    """List reference recipes discovered under the recipes directory."""
+    recipes_dir = Path(args.recipes_dir)
+    recipes = load_recipes(recipes_dir)
+    if not recipes:
+        print(f"No recipes found under {recipes_dir}")
+        return
+    print(f"Recipes in {recipes_dir}:\n")
+    for key, recipe in recipes.items():
+        node_count = len(recipe.workflow.get("nodes", []))
+        providers = ", ".join(recipe.providers) or "(default)"
+        print(f"  {key:<16} {recipe.name}")
+        print(f"      {recipe.description}")
+        print(f"      providers: {providers}  |  nodes: {node_count}")
+        print()
+
+
+def _run_recipe(args: argparse.Namespace, policy_pack: str) -> None:
+    """Execute a recipe's FANOUT/JUDGE workflow graph and print a measured summary."""
+    recipe = load_recipe(args.recipe)
+    print(f"\nRunning recipe: {recipe.name} ({recipe.key})")
+    print(f"  {recipe.description}")
+    print(f"  Declared providers: {', '.join(recipe.providers) or '(policy default)'}")
+
+    engine = Engine(
+        policy_pack_path=policy_pack,
+        enforce_preflight=False,
+        ncp_enabled=_resolve_workspace_ncp(args, os.getcwd()),
+        ncp_mode=args.ncp_mode,
+        ncp_router=args.ncp_router,
+    )
+    graph = recipe.build_graph().to_artifact()
+    executor = TaskGraphExecutor(dispatcher=engine.dispatcher)
+    result = executor.execute_all(graph).to_artifact()
+
+    state = result["graph_state"]
+    providers_used = set()
+    total_tokens = 0
+    for event in result["events"]:
+        pr = event.get("provider_result") or {}
+        usage = pr.get("usage") or {}
+        total_tokens += int(usage.get("total_tokens", 0) or 0)
+    # Derive providers used from the executed branch nodes' pattern_config
+    for node in state.get("nodes", []):
+        prov = (node.get("pattern_config") or {}).get("provider")
+        if prov:
+            providers_used.add(prov)
+
+    print(f"\n✓ Recipe complete: {len(state.get('completed_nodes', []))} nodes")
+    print(f"  Providers used (fan-out): {', '.join(sorted(providers_used)) or '(single/default)'}")
+    print(f"  Measured token cost: {total_tokens}")
+
+
 def handle_run(args: argparse.Namespace) -> None:
     """Handle the run command."""
     # Auto-discover policy pack
@@ -885,6 +954,10 @@ def handle_run(args: argparse.Namespace) -> None:
             sys.exit(1)
     else:
         policy_pack = str(Path.cwd() / policy_pack)
+
+    if getattr(args, "recipe", None):
+        _run_recipe(args, policy_pack)
+        return
 
     # Resolve declarative user agent (--agent), if requested
     agent_spec = None

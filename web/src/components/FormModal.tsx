@@ -9,6 +9,7 @@ export interface FormField {
   required?: boolean;
   defaultValue?: string;
   hint?: string;
+  type?: "text" | "password";
 }
 
 interface FormModalProps {
@@ -64,9 +65,11 @@ export function FormModal({ title, fields, submitLabel, onSubmit, onClose }: For
               </span>
               <input
                 className="fm-input"
+                type={field.type ?? "text"}
                 value={values[field.name] ?? ""}
                 placeholder={field.placeholder}
                 autoFocus={index === 0}
+                autoComplete={field.type === "password" ? "new-password" : "off"}
                 onChange={(e) =>
                   setValues((prev) => ({ ...prev, [field.name]: e.target.value }))
                 }

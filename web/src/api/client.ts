@@ -44,6 +44,7 @@ import type {
   TaskPanelData,
   TaskReviewsData,
   TaskStudioData,
+  TestProviderData,
   UsageStatsData,
   WikiIndexData,
   WikiPageData,
@@ -214,6 +215,22 @@ export const api = {
       query: { workspace_id: workspaceId },
       signal,
     });
+  },
+
+  /**
+   * POST /workspaces/{id}/providers/{provider_id}/test — test a provider's
+   * connection and persist its config. Only the fields present in `input` are
+   * updated; omit `api_key` to keep the stored secret unchanged.
+   */
+  testProvider(
+    workspaceId: string,
+    providerId: string,
+    input: { path?: string; api_key?: string; base_url?: string; model?: string } = {},
+  ): Promise<TestProviderData> {
+    return request<TestProviderData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/providers/${encodeURIComponent(providerId)}/test`,
+      { method: "POST", body: input },
+    );
   },
 
   /** GET /events?workspace_id&task_id (polling fallback for the SSE helper) */

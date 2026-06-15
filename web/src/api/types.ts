@@ -73,6 +73,11 @@ export interface ProvidersData {
   providers: ProviderHealth[];
 }
 
+/** POST /workspaces/{id}/providers/{provider_id}/test */
+export interface TestProviderData {
+  provider: ProviderHealth;
+}
+
 export interface HealthData {
   status: "ok" | string;
 }

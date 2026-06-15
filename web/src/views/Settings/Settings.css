@@ -42,9 +42,29 @@
   border-top: 1px solid var(--border-soft);
 }
 
-.settings-prov:first-of-type {
+.settings-prov-wrap:first-of-type .settings-prov {
   border-top: none;
   padding-top: 0;
+}
+
+.settings-prov-actions {
+  display: flex;
+  gap: 7px;
+  flex: none;
+}
+
+.settings-prov-actions .btn {
+  padding: 5px 11px;
+  font-size: 12px;
+}
+
+.settings-prov-error {
+  color: var(--red);
+  background: var(--redb);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 11.5px;
+  margin: 0 0 10px;
 }
 
 .settings-prov .settings-pic {

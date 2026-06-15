@@ -12,6 +12,14 @@ try:
 except ImportError:
     from task_class import TaskClass, AssemblyDefaults, TASK_CLASS_DEFAULTS
 
+try:
+    from .runtime.agent_spec import AgentSpec
+except ImportError:
+    try:
+        from runtime.agent_spec import AgentSpec
+    except ImportError:
+        AgentSpec = Any  # type: ignore[assignment,misc]
+
 
 @dataclass
 class AgentBinding:
@@ -68,6 +76,10 @@ class HarnessConfig:
     trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     quality_signals: list[QualitySignalDef] = field(default_factory=list)
 
+    # Declarative user-agent bindings (T5.2)
+    tool_bindings: list[dict[str, Any]] = field(default_factory=list)
+    agent_spec_key: str | None = None
+
     # Assembly defaults snapshot
     defaults: AssemblyDefaults | None = None
 
@@ -83,6 +95,8 @@ class HarnessConfig:
         d = json.loads(data)
         d["task_class"] = TaskClass(d["task_class"])
         d.setdefault("assembly_mode", "STANDARD")
+        d.setdefault("tool_bindings", [])
+        d.setdefault("agent_spec_key", None)
 
         if d.get("primary_agent"):
             d["primary_agent"] = AgentBinding(**d["primary_agent"])
@@ -136,6 +150,50 @@ class HarnessConfig:
             defaults=defaults,
             primary_agent=primary_agent,
             fallback_agents=fallback_agents,
+        )
+
+    @classmethod
+    def from_agent_spec(
+        cls,
+        spec: "AgentSpec",
+        task_id: str,
+        ncp_enabled: bool = False,
+        available_providers: list[str] | None = None,
+        health_scores: dict[str, float] | None = None,
+    ) -> HarnessConfig:
+        """Build a HarnessConfig from a declarative AgentSpec."""
+        defaults = TASK_CLASS_DEFAULTS[spec.task_class]
+        signals = [QualitySignalDef(name=name) for name in defaults.quality_signals]
+        if spec.provider:
+            primary_agent = AgentBinding(agent_id=spec.provider, model=spec.model)
+            if health_scores and spec.provider in health_scores:
+                primary_agent.health_score = health_scores[spec.provider]
+        else:
+            primary_agent = resolve_agent_binding(
+                defaults.agent_preference,
+                available_providers=available_providers,
+                health_scores=health_scores,
+            )
+            if spec.model:
+                primary_agent.model = spec.model
+        fallback_agents = _build_fallback_agents(
+            primary_agent.agent_id,
+            available_providers=available_providers,
+            health_scores=health_scores,
+        )
+        return cls(
+            task_id=task_id,
+            task_class=spec.task_class,
+            context_scope=defaults.context_scope,
+            permission_scope=defaults.permission_scope,
+            requires_human_approval=defaults.human_in_loop,
+            ncp_enabled=ncp_enabled,
+            quality_signals=signals,
+            defaults=defaults,
+            primary_agent=primary_agent,
+            fallback_agents=fallback_agents,
+            tool_bindings=[tool.to_artifact() for tool in spec.tools],
+            agent_spec_key=spec.key,
         )
 
 

@@ -1,14 +1,16 @@
 """Tests for HarnessConfig, HarnessOutcome, and related types."""
 import json
 import pytest
-from src.task_class import TaskClass
+from src.task_class import TaskClass, TASK_CLASS_DEFAULTS
 from src.harness import (
     AgentBinding,
     SkillBinding,
     QualitySignalDef,
     HarnessConfig,
     HarnessOutcome,
+    resolve_agent_binding,
 )
+from src.runtime.agent_spec import AgentSpec, ToolSpec
 
 
 def test_harness_config_defaults():
@@ -115,3 +117,75 @@ def test_ncp_enabled_propagated():
     assert hc.ncp_enabled is True
     restored = HarnessConfig.from_json(hc.to_json())
     assert restored.ncp_enabled is True
+
+
+# ---------------------------------------------------------------------------
+# HarnessConfig.from_agent_spec (T5.2)
+# ---------------------------------------------------------------------------
+
+def _minimal_agent_spec(**overrides) -> AgentSpec:
+    defaults = dict(
+        key="my-agent",
+        name="My Agent",
+        prompt="You are a helpful agent.",
+        task_class=TaskClass.CODEGEN_PATCH,
+        tools=[
+            ToolSpec(
+                name="read_file",
+                description="Read a file",
+                callable_path="os.path:basename",
+                parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            )
+        ],
+    )
+    defaults.update(overrides)
+    return AgentSpec(**defaults)
+
+
+def test_from_agent_spec_without_provider_uses_task_class_defaults():
+    spec = _minimal_agent_spec()
+    hc = HarnessConfig.from_agent_spec(spec, "task-100")
+
+    assert hc.task_id == "task-100"
+    assert hc.task_class == TaskClass.CODEGEN_PATCH
+
+    defaults = TASK_CLASS_DEFAULTS[TaskClass.CODEGEN_PATCH]
+    expected_primary = resolve_agent_binding(defaults.agent_preference)
+    assert hc.primary_agent == expected_primary
+
+    assert hc.tool_bindings == [tool.to_artifact() for tool in spec.tools]
+    assert hc.agent_spec_key == spec.key
+
+    assert hc.context_scope == defaults.context_scope
+    assert hc.permission_scope == defaults.permission_scope
+    assert [s.name for s in hc.quality_signals] == defaults.quality_signals
+
+
+def test_from_agent_spec_with_explicit_provider_and_model():
+    spec = _minimal_agent_spec(provider="acme", model="acme-large")
+    hc = HarnessConfig.from_agent_spec(spec, "task-101")
+
+    assert hc.primary_agent == AgentBinding(agent_id="acme", model="acme-large")
+    assert hc.primary_agent.health_score == 1.0
+
+
+def test_from_agent_spec_to_json_roundtrip_preserves_tool_bindings_and_key():
+    spec = _minimal_agent_spec()
+    hc = HarnessConfig.from_agent_spec(spec, "task-102")
+
+    restored = HarnessConfig.from_json(hc.to_json())
+
+    assert restored.tool_bindings == hc.tool_bindings
+    assert restored.agent_spec_key == hc.agent_spec_key == spec.key
+
+
+def test_from_json_handles_old_format_without_new_fields():
+    hc = HarnessConfig.from_task_class(TaskClass.CODEGEN_PATCH, "task-103")
+    d = json.loads(hc.to_json())
+    d.pop("tool_bindings", None)
+    d.pop("agent_spec_key", None)
+
+    restored = HarnessConfig.from_json(json.dumps(d))
+
+    assert restored.tool_bindings == []
+    assert restored.agent_spec_key is None

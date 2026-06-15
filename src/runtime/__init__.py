@@ -2,11 +2,23 @@
 
 from .agent_roles import (
     AgentRole,
+    clear_registered_agent_roles,
     get_agent_role,
     get_phase_agent_role,
     list_agent_roles,
     list_phase_agent_roles,
     phase_agent_role_artifact,
+    register_agent_role,
+    registered_agent_roles,
+)
+from .agent_spec import (
+    AgentSpec,
+    ToolSpec,
+    build_tool_schema,
+    load_agent_spec,
+    load_agent_specs,
+    parse_agent_spec_dict,
+    resolve_tool_callable,
 )
 from .artifacts import ArtifactStore
 from .budget import TaskBudget
@@ -50,6 +62,16 @@ from .workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
 
 __all__ = [
     "AgentRole",
+    "AgentSpec",
+    "ToolSpec",
+    "build_tool_schema",
+    "load_agent_spec",
+    "load_agent_specs",
+    "parse_agent_spec_dict",
+    "resolve_tool_callable",
+    "register_agent_role",
+    "registered_agent_roles",
+    "clear_registered_agent_roles",
     "ArtifactStore",
     "TaskBudget",
     "CommandResult",

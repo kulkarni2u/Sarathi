@@ -90,6 +90,76 @@ def test_handle_run_dry_run_prints_phases(tmp_path, capsys):
     assert "PlanningAdvisor" in output
 
 
+def test_handle_run_dry_run_unknown_agent_exits(tmp_path, capsys):
+    policy_dir = tmp_path / "policy-pack"
+    _write_policy_pack(policy_dir)
+    args = Namespace(
+        task_description="Add auth flow",
+        policy_pack=str(policy_dir),
+        complexity="high",
+        dry_run=True,
+        ncp_mode="direct",
+        ncp_router=False,
+        agent="does-not-exist",
+        agents_dir=None,
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.handle_run(args)
+
+    assert exc_info.value.code == 1
+    output = capsys.readouterr().out
+    assert "Error: Unknown agent 'does-not-exist'" in output
+    assert "(none found)" in output
+
+
+def test_handle_run_dry_run_known_agent_dispatches(tmp_path, capsys):
+    policy_dir = tmp_path / "policy-pack"
+    _write_policy_pack(policy_dir)
+
+    agents_dir = policy_dir / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "patch-bot.md").write_text(
+        """# Patch Bot
+
+```yaml
+name: Patch Bot
+key: patch-bot
+purpose: custom patch agent
+description: Applies small scoped patches.
+task_class: codegen/patch
+tools:
+  - name: apply_patch
+    callable: os.path:basename
+    description: Apply a unified diff
+```
+
+```yaml
+prompt: |
+  You fix small, scoped bugs.
+```
+"""
+    )
+
+    args = Namespace(
+        task_description="Fix the off-by-one bug",
+        policy_pack=str(policy_dir),
+        complexity="low",
+        dry_run=True,
+        ncp_mode="direct",
+        ncp_router=False,
+        agent="patch-bot",
+        agents_dir=None,
+    )
+
+    cli.handle_run(args)
+    output = capsys.readouterr().out
+
+    assert "Using declarative agent: Patch Bot (patch-bot)" in output
+    assert "Tools: apply_patch" in output
+    assert "Running task: Fix the off-by-one bug" in output
+
+
 def test_handle_run_blocks_on_preflight(tmp_path, capsys):
     policy_dir = tmp_path / "policy-pack"
     _write_policy_pack(policy_dir, minimal=True)

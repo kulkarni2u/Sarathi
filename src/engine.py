@@ -46,6 +46,7 @@ try:
     )
     from .policy import compile_policy_pack
     from .runtime import (
+        AgentSpec,
         ArtifactStore,
         apply_learning_feedback_to_provider_routing,
         build_sandbox_executor,
@@ -56,6 +57,7 @@ try:
         PreflightPolicy,
         ProviderHealthStore,
         RecoveryRunner,
+        register_agent_role,
         TaskBudget,
         phase_agent_role_artifact,
         ContextCompiler,
@@ -78,6 +80,7 @@ except ImportError:
     )
     from policy import compile_policy_pack
     from runtime import (
+        AgentSpec,
         ArtifactStore,
         apply_learning_feedback_to_provider_routing,
         build_sandbox_executor,
@@ -88,6 +91,7 @@ except ImportError:
         PreflightPolicy,
         ProviderHealthStore,
         RecoveryRunner,
+        register_agent_role,
         TaskBudget,
         phase_agent_role_artifact,
         ContextCompiler,
@@ -229,36 +233,46 @@ class RouteHandler(PhaseHandler):
 
     def execute(self, task: TaskContext, phase: Phase) -> PhaseResult:
         """Route the task — classify TaskClass, select assembly mode, emit HarnessConfig."""
-        task_class = classify_task_class(task.description)
+        agent_spec = getattr(task, "agent_spec", None)
         legacy_type = self._classify_task_type(task.description)
         workflow_path = self._select_workflow_path(task, legacy_type)
 
-        # Assembly mode: DEEP for mutation/evolution, FAST for cache hit, STANDARD otherwise
-        is_deep = task_class.value.startswith(("mutation/", "evolution/"))
-        cache_hit = None if is_deep else self._harness_cache.get(task_class.value)
-
-        if is_deep:
-            assembly_mode = "DEEP"
-        elif cache_hit is not None:
-            assembly_mode = "FAST"
-        else:
+        if agent_spec is not None:
+            task_class = agent_spec.task_class
             assembly_mode = "STANDARD"
-
-        if assembly_mode == "FAST":
-            # Reuse cached config skeleton — freshen identity fields only
-            harness = HarnessConfig.from_json(cache_hit.to_json())
-            harness.harness_id = str(uuid.uuid4())[:8]
-            harness.task_id = task.task_id
-            harness.assembled_at = datetime.utcnow().isoformat()
-            harness.trace_id = str(uuid.uuid4())
-            harness.assembly_mode = "FAST"
-        else:
-            harness = HarnessConfig.from_task_class(task_class, task.task_id, ncp_enabled=self.ncp_enabled)
+            harness = HarnessConfig.from_agent_spec(agent_spec, task.task_id, ncp_enabled=self.ncp_enabled)
             harness.assembly_mode = assembly_mode
             perm_scope = build_permission_scope(task_class)
             harness.requires_human_approval = perm_scope.requires_human_approval
-            if assembly_mode == "STANDARD":
-                self._harness_cache[task_class.value] = harness
+        else:
+            task_class = classify_task_class(task.description)
+
+            # Assembly mode: DEEP for mutation/evolution, FAST for cache hit, STANDARD otherwise
+            is_deep = task_class.value.startswith(("mutation/", "evolution/"))
+            cache_hit = None if is_deep else self._harness_cache.get(task_class.value)
+
+            if is_deep:
+                assembly_mode = "DEEP"
+            elif cache_hit is not None:
+                assembly_mode = "FAST"
+            else:
+                assembly_mode = "STANDARD"
+
+            if assembly_mode == "FAST":
+                # Reuse cached config skeleton — freshen identity fields only
+                harness = HarnessConfig.from_json(cache_hit.to_json())
+                harness.harness_id = str(uuid.uuid4())[:8]
+                harness.task_id = task.task_id
+                harness.assembled_at = datetime.utcnow().isoformat()
+                harness.trace_id = str(uuid.uuid4())
+                harness.assembly_mode = "FAST"
+            else:
+                harness = HarnessConfig.from_task_class(task_class, task.task_id, ncp_enabled=self.ncp_enabled)
+                harness.assembly_mode = assembly_mode
+                perm_scope = build_permission_scope(task_class)
+                harness.requires_human_approval = perm_scope.requires_human_approval
+                if assembly_mode == "STANDARD":
+                    self._harness_cache[task_class.value] = harness
 
         harness_dict = json.loads(harness.to_json())
 
@@ -273,17 +287,23 @@ class RouteHandler(PhaseHandler):
             "cache_hit": assembly_mode == "FAST",
         }
 
+        artifacts = {
+            "routing_decision": workflow_path,
+            "task_class": task_class.value,
+            "harness_config": harness_dict,
+            "permission_scope": task_class.value,
+            "assembly_mode": assembly_mode,
+        }
+
+        if agent_spec is not None:
+            evidence["agent_spec_key"] = agent_spec.key
+            artifacts["agent_spec_key"] = agent_spec.key
+
         return PhaseResult(
             phase=phase,
             outcome="pass",
             evidence=evidence,
-            artifacts={
-                "routing_decision": workflow_path,
-                "task_class": task_class.value,
-                "harness_config": harness_dict,
-                "permission_scope": task_class.value,
-                "assembly_mode": assembly_mode,
-            },
+            artifacts=artifacts,
         )
 
     def _classify_task_type(self, description: str) -> str:
@@ -463,6 +483,9 @@ class TaskContext:
     gate_retry_hint: dict | None = field(default=None)
     budget_snapshot: dict[str, Any] | None = None
     crash_reconciliation: list[dict[str, Any]] | None = None
+    # Declarative user agent (set by the CLI for `--agent <name>` runs).
+    # Transient: not persisted by PersistenceManager.save_task/load_task.
+    agent_spec: AgentSpec | None = None
 
     def get_completed_phases(self) -> set[Phase]:
         """Get set of phases that have been completed."""

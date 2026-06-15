@@ -14,7 +14,8 @@ try:
     from .init import InitWorkflow
     from .policy import compile_policy_pack
     from .policy.layering import extract_server_caps
-    from .runtime import UsageRecord, list_agent_roles, list_phase_agent_roles
+    from .runtime import UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
+    from .runtime.agent_spec import load_agent_specs
     from .task_graph import (
         graph_summary,
         latest_completed_node,
@@ -32,7 +33,8 @@ except ImportError:
     from init import InitWorkflow
     from policy import compile_policy_pack
     from policy.layering import extract_server_caps
-    from runtime import UsageRecord, list_agent_roles, list_phase_agent_roles
+    from runtime import UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
+    from runtime.agent_spec import load_agent_specs
     from task_graph import (
         graph_summary,
         latest_completed_node,
@@ -539,7 +541,17 @@ def main() -> None:
         action="store_true",
         help="Show phase sequence without executing",
     )
-    
+    run_parser.add_argument(
+        "--agent",
+        default=None,
+        help="Name (key) of a declarative user agent to dispatch this run through (see agents/<name>.md in the policy pack)",
+    )
+    run_parser.add_argument(
+        "--agents-dir",
+        default=None,
+        help="Directory containing agent spec files (default: <policy-pack>/agents)",
+    )
+
     # NCP Integration
     run_parser.add_argument(
         "--ncp",
@@ -874,6 +886,22 @@ def handle_run(args: argparse.Namespace) -> None:
     else:
         policy_pack = str(Path.cwd() / policy_pack)
 
+    # Resolve declarative user agent (--agent), if requested
+    agent_spec = None
+    if getattr(args, "agent", None):
+        agents_dir_arg = getattr(args, "agents_dir", None)
+        agents_dir = Path(agents_dir_arg) if agents_dir_arg else Path(policy_pack) / "agents"
+        specs = load_agent_specs(agents_dir)
+        if args.agent not in specs:
+            available = ", ".join(sorted(specs)) or "(none found)"
+            print(f"Error: Unknown agent '{args.agent}'. Available agents in {agents_dir}: {available}")
+            sys.exit(1)
+        agent_spec = specs[args.agent]
+        register_agent_role(agent_spec.to_role())
+        print(f"Using declarative agent: {agent_spec.name} ({agent_spec.key})")
+        if agent_spec.tools:
+            print(f"  Tools: {', '.join(tool.name for tool in agent_spec.tools)}")
+
     # Auto-calculate or use provided complexity
     if args.complexity == "auto":
         complexity = calculate_complexity(args.task_description)
@@ -900,6 +928,8 @@ def handle_run(args: argparse.Namespace) -> None:
         description=args.task_description,
         complexity=complexity,
     )
+    if agent_spec is not None:
+        task.agent_spec = agent_spec
 
     if args.dry_run:
         phase = Phase.ROUTE

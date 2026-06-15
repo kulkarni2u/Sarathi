@@ -570,12 +570,86 @@ def test_migration_8_applies_on_top_of_v7_db(tmp_path):
         assert versions == list(range(1, LATEST_SCHEMA_VERSION + 1))
 
 
+def test_migration_10_creates_users_table_on_fresh_db(tmp_path):
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        assert LATEST_SCHEMA_VERSION == 10
+
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "users" in tables
+
+        user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        assert {"username", "token"} <= user_columns
+
+
+def test_migration_10_applies_on_top_of_v9_db(tmp_path):
+    from src.storage import (
+        _MIGRATION_001,
+        _MIGRATION_002,
+        _MIGRATION_003,
+        _MIGRATION_004,
+        _MIGRATION_005,
+        _MIGRATION_006,
+        _MIGRATION_007,
+        _MIGRATION_008,
+        _MIGRATION_009,
+        _utc_now,
+    )
+
+    db_path = tmp_path / "sarathi.db"
+    with connect(db_path) as conn:
+        for version, script in (
+            (1, _MIGRATION_001),
+            (2, _MIGRATION_002),
+            (3, _MIGRATION_003),
+            (4, _MIGRATION_004),
+            (5, _MIGRATION_005),
+            (6, _MIGRATION_006),
+            (7, _MIGRATION_007),
+            (8, _MIGRATION_008),
+            (9, _MIGRATION_009),
+        ):
+            conn.executescript(script)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, _utc_now()),
+            )
+            conn.commit()
+
+        assert current_schema_version(conn) == 9
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "users" not in tables
+
+    with connect(db_path) as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "users" in tables
+
+        versions = [
+            row["version"]
+            for row in conn.execute("SELECT version FROM schema_version ORDER BY version")
+        ]
+        assert versions == list(range(1, LATEST_SCHEMA_VERSION + 1))
+
+
 def test_migration_9_creates_session_tables_on_fresh_db(tmp_path):
     with connect(tmp_path / "sarathi.db") as conn:
         run_migrations(conn)
 
         assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
-        assert LATEST_SCHEMA_VERSION == 9
 
         tables = {
             row["name"]

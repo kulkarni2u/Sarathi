@@ -11,7 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 
-LATEST_SCHEMA_VERSION = 9
+LATEST_SCHEMA_VERSION = 10
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -107,6 +107,13 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
             (9, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 10:
+        conn.executescript(_MIGRATION_010)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (10, _utc_now()),
         )
         conn.commit()
 
@@ -1002,6 +1009,120 @@ class Storage:
         assert session is not None
         return session
 
+    def create_user(
+        self,
+        *,
+        username: str,
+        token: str | None = None,
+        display_name: str | None = None,
+        status: str = "active",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        user_id = _new_id()
+        now = _utc_now()
+        if token is None:
+            token = secrets.token_urlsafe(24)
+        self.conn.execute(
+            """
+            INSERT INTO users (
+                id, username, token, display_name, status,
+                metadata, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                username,
+                token,
+                display_name,
+                status,
+                _dump_json(metadata),
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        user = self.get_user(user_id)
+        assert user is not None
+        return user
+
+    def get_user(self, user_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, username, token, display_name, status,
+                   metadata, created_at, updated_at
+            FROM users
+            WHERE id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        return _user_from_row(row) if row is not None else None
+
+    def get_user_by_token(self, token: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, username, token, display_name, status,
+                   metadata, created_at, updated_at
+            FROM users
+            WHERE token = ?
+            """,
+            (token,),
+        ).fetchone()
+        return _user_from_row(row) if row is not None else None
+
+    def get_user_by_username(self, username: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, username, token, display_name, status,
+                   metadata, created_at, updated_at
+            FROM users
+            WHERE username = ?
+            """,
+            (username,),
+        ).fetchone()
+        return _user_from_row(row) if row is not None else None
+
+    def list_users(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, username, token, display_name, status,
+                   metadata, created_at, updated_at
+            FROM users
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+        return [_user_from_row(row) for row in rows]
+
+    def update_user(
+        self,
+        user_id: str,
+        *,
+        display_name: str | None = None,
+        status: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_user(user_id)
+        if existing is None:
+            raise KeyError(user_id)
+        now = _utc_now()
+        next_display_name = (
+            display_name if display_name is not None else existing["display_name"]
+        )
+        next_status = status if status is not None else existing["status"]
+        next_metadata = metadata if metadata is not None else existing["metadata"]
+        self.conn.execute(
+            """
+            UPDATE users
+            SET display_name = ?, status = ?, metadata = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (next_display_name, next_status, _dump_json(next_metadata), now, user_id),
+        )
+        self.conn.commit()
+        user = self.get_user(user_id)
+        assert user is not None
+        return user
+
     def add_session_participant(
         self,
         *,
@@ -1790,6 +1911,19 @@ def _session_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _user_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "token": row["token"],
+        "display_name": row["display_name"],
+        "status": row["status"],
+        "metadata": _load_json(row["metadata"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 def _session_participant_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -2464,4 +2598,20 @@ CREATE TABLE IF NOT EXISTS session_participants (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_participants_unique ON session_participants(session_id, user);
 
 ALTER TABLE messages ADD COLUMN session_id TEXT;
+"""
+
+
+_MIGRATION_010 = """
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    token TEXT NOT NULL,
+    display_name TEXT,
+    status TEXT NOT NULL DEFAULT 'active',   -- 'active' | 'disabled'
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_token ON users(token);
 """

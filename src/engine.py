@@ -48,6 +48,8 @@ try:
     from .runtime import (
         ArtifactStore,
         apply_learning_feedback_to_provider_routing,
+        build_sandbox_executor,
+        CommandRunner,
         DispatchJournal,
         DispatchRequest,
         GateResult,
@@ -78,6 +80,8 @@ except ImportError:
     from runtime import (
         ArtifactStore,
         apply_learning_feedback_to_provider_routing,
+        build_sandbox_executor,
+        CommandRunner,
         DispatchJournal,
         DispatchRequest,
         GateResult,
@@ -829,7 +833,7 @@ class Engine:
                 ncp_whisper_router=ncp_whi,
                 ncp_persistence_adapter=ncp_per,
             ),
-            Phase.VERIFY: VerifyHandler(self.policy_pack, self.dispatcher),
+            Phase.VERIFY: VerifyHandler(self.policy_pack, self.dispatcher, command_runner=CommandRunner(sandbox=build_sandbox_executor(self.compiled_policy.get("execution") if isinstance(self.compiled_policy, dict) else None))),
             Phase.REVIEW: ReviewHandler(self.policy_pack, self.dispatcher),
             Phase.TASK_TRACKING: TaskTrackingHandler(self.policy_pack, self.dispatcher),
             Phase.RISK_CHECK: RiskCheckHandler(self.policy_pack, self.dispatcher),

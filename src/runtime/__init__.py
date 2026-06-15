@@ -38,6 +38,13 @@ from .providers import (
 from .quality_policy import QualityLoopPolicy, validate_quality_loop_config
 from .recovery import RecoveryAction, RecoveryRunner
 from .review import ReviewFinding, ReviewRunner, ReviewVerdict
+from .sandbox import (
+    build_sandbox_executor,
+    docker_available,
+    DockerSandboxExecutor,
+    SandboxExecutor,
+    SandboxResult,
+)
 from .scheduler import SchedulerRun, TaskScheduler
 from .workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
 
@@ -89,6 +96,11 @@ __all__ = [
     "ReviewFinding",
     "ReviewRunner",
     "ReviewVerdict",
+    "SandboxExecutor",
+    "SandboxResult",
+    "DockerSandboxExecutor",
+    "docker_available",
+    "build_sandbox_executor",
     "SchedulerRun",
     "TaskScheduler",
     "get_agent_role",

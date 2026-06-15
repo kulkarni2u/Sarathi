@@ -47,6 +47,19 @@ criteria, tests, and dependencies.
     provides admin-only `POST/GET /users`, and enforces roles against the
     authenticated identity (an observer cannot post by spoofing a driver's user
     id). OIDC remains a future follow-up.
+  - **T4.4 One-line installer + Homebrew** — `scripts/install.sh` (Python
+    detection, venv at `$SARATHI_HOME`, pip install from checkout/git, smoke
+    test, `--dry-run`) and `Formula/sarathi.rb` (`--HEAD` install, real PyPI
+    sha256s). Verified by a real install to a temp prefix producing working
+    `sarathi`/`sarathi-desktop`.
+  - **T4.5 Electron packaging** — `desktop/` Electron app that spawns the
+    service, polls `/api/health`, and opens the cockpit at the same-origin URL,
+    managing the service child lifecycle. Syntax-verified (node --check, valid
+    package.json); the actual electron-builder packaged build is unverified
+    here (no macOS/Electron toolchain) — documented in `desktop/README.md`.
+
+**M4 status:** T4.1–T4.5 delivered. Real-build verification pending for T4.5
+(Electron) on a macOS/toolchain host.
 
 ---
 

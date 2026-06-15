@@ -222,6 +222,36 @@ def test_command_runner_resolves_podman_from_environment(tmp_path: Path, monkeyp
     assert runner.sandbox.kind == "podman"
 
 
+def test_command_runner_resolves_sandbox_runtime_path_from_environment(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("SARATHI_SANDBOX", "docker")
+    monkeypatch.setenv("SARATHI_SANDBOX_RUNTIME", "/custom/bin/podman")
+    runner = CommandRunner(
+        execute_enabled=True,
+        workdir=str(tmp_path),
+        timeout_seconds=5,
+    )
+
+    assert isinstance(runner.sandbox, DockerSandboxExecutor)
+    assert runner.sandbox.docker_path == "/custom/bin/podman"
+    assert runner.sandbox.kind == "podman"
+
+
+def test_command_runner_runtime_path_alone_does_not_enable_sandbox(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.delenv("SARATHI_SANDBOX", raising=False)
+    monkeypatch.setenv("SARATHI_SANDBOX_RUNTIME", "/custom/bin/podman")
+    runner = CommandRunner(
+        execute_enabled=True,
+        workdir=str(tmp_path),
+        timeout_seconds=5,
+    )
+
+    assert runner.sandbox is None
+
+
 def test_command_runner_sandbox_infra_error_is_shell_error(tmp_path: Path):
     fake = _FakeSandboxExecutor(
         SandboxResult(error="docker missing", exit_code=None),

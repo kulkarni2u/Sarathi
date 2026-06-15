@@ -118,6 +118,21 @@ export SARATHI_COMMAND_TIMEOUT=600     # optional; seconds
 sarathi run "…" --policy-pack ./policy-pack
 ```
 
+To run those commands inside a local container sandbox, choose a Docker-compatible
+runtime. Docker is the default when sandboxing is enabled; Podman is also
+supported. If the executable is not on `PATH`, set `SARATHI_SANDBOX_RUNTIME` to
+the machine-local binary path instead of hardcoding it in policy or source.
+
+```bash
+export SARATHI_SANDBOX=docker
+
+# Or:
+export SARATHI_SANDBOX=podman
+
+# Optional, only when the runtime binary is not on PATH:
+export SARATHI_SANDBOX_RUNTIME=/path/to/docker-or-podman
+```
+
 ### Optional: live provider smoke tests
 
 `tests/live/` exercises the real provider CLIs (e.g. `claude -p --output-format json`)

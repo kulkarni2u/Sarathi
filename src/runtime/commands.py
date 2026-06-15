@@ -86,7 +86,11 @@ class CommandRunner:
         self.workdir = workdir or os.environ.get("SARATHI_WORKDIR", os.getcwd())
         self.timeout_seconds = timeout_seconds or int(os.environ.get("SARATHI_COMMAND_TIMEOUT", "600"))
         if sandbox is None:
-            sandbox = build_sandbox_executor(os.environ.get("SARATHI_SANDBOX"))
+            sandbox_spec: object = os.environ.get("SARATHI_SANDBOX")
+            sandbox_runtime = os.environ.get("SARATHI_SANDBOX_RUNTIME")
+            if sandbox_spec and sandbox_runtime:
+                sandbox_spec = {"sandbox": sandbox_spec, "runtime": sandbox_runtime}
+            sandbox = build_sandbox_executor(sandbox_spec)
         self.sandbox = sandbox
 
     @staticmethod

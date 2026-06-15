@@ -6,7 +6,7 @@ except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib
 
 from src.dispatch import LocalDispatcher
-from src.engine import Complexity, Engine, Phase, TaskContext
+from src.engine import Complexity, Engine, PersistenceManager, Phase, TaskContext
 from src.policy import CompiledPolicyData, compile_policy_pack
 from src.runtime import ArtifactStore, DispatchRequest, DispatchResponse, GateResult
 
@@ -142,7 +142,7 @@ test:
         complexity=Complexity.HIGH,
     )
     engine = Engine(policy_pack_path=str(policy_dir), dispatcher=LocalDispatcher())
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
     engine.artifact_store = ArtifactStore(str(tmp_path / "artifacts"))
 
     result = engine.run_task(task)

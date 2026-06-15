@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 
-from src.engine import Complexity, Engine, Phase, TaskContext
+from src.engine import Complexity, Engine, PersistenceManager, Phase, TaskContext
 
 
 def _build_engine(tmp_path: Path) -> Engine:
@@ -20,7 +20,7 @@ def _build_engine(tmp_path: Path) -> Engine:
         (policy_dir / filename).write_text(content)
 
     engine = Engine(policy_pack_path=str(policy_dir))
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
     return engine
 
 

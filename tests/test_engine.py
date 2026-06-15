@@ -2,7 +2,7 @@ from pathlib import Path
 import sys
 
 import pytest
-from src.engine import Engine, Phase, Complexity, TaskContext, PhaseResult
+from src.engine import Engine, Phase, Complexity, TaskContext, PhaseResult, PersistenceManager
 
 
 def test_engine_initialization():
@@ -53,7 +53,7 @@ def test_engine_preflight_records_summary_without_blocking(tmp_path: Path):
         complexity=Complexity.LOW,
     )
     engine = Engine(policy_pack_path=str(policy_dir))
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
 
     result = engine.run_task(task)
 
@@ -74,7 +74,7 @@ def test_engine_enforced_preflight_blocks_on_todo(tmp_path: Path):
         complexity=Complexity.MEDIUM,
     )
     engine = Engine(policy_pack_path=str(policy_dir), enforce_preflight=True)
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
 
     result = engine.run_task(task)
 
@@ -103,7 +103,7 @@ def test_engine_persists_completed_task_graph_state(tmp_path: Path):
         complexity=Complexity.LOW,
     )
     engine = Engine(policy_pack_path=str(policy_dir))
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
 
     result = engine.run_task(task)
 
@@ -133,7 +133,7 @@ def test_engine_can_persist_partial_task_graph_state(tmp_path: Path, monkeypatch
         complexity=Complexity.LOW,
     )
     engine = Engine(policy_pack_path=str(policy_dir))
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
 
     result = engine.run_task(task)
 
@@ -166,7 +166,7 @@ def test_engine_resume_advances_paused_build_task(tmp_path: Path, monkeypatch):
         complexity=Complexity.LOW,
     )
     engine = Engine(policy_pack_path=str(policy_dir))
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
 
     first_pass = engine.run_task(task)
     assert first_pass.current_phase == Phase.BUILD
@@ -200,7 +200,7 @@ def test_engine_resume_retries_failed_build_node(tmp_path: Path, monkeypatch):
         complexity=Complexity.LOW,
     )
     engine = Engine(policy_pack_path=str(policy_dir))
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
 
     first_pass = engine.run_task(task)
 
@@ -245,7 +245,7 @@ graph_execution:
         complexity=Complexity.LOW,
     )
     engine = Engine(policy_pack_path=str(policy_dir))
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
 
     result = engine.run_task(task)
 
@@ -285,7 +285,7 @@ graph_execution:
         complexity=Complexity.LOW,
     )
     engine = Engine(policy_pack_path=str(policy_dir))
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
 
     result = engine.run_task(task)
 
@@ -330,7 +330,7 @@ quality_loop:
         complexity=Complexity.LOW,
     )
     engine = Engine(policy_pack_path=str(policy_dir))
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
 
     result = engine.run_task(task)
 
@@ -368,7 +368,7 @@ def test_engine_attaches_agent_roles_to_executed_and_skipped_phases(tmp_path: Pa
         complexity=Complexity.LOW,
     )
     engine = Engine(policy_pack_path=str(policy_dir))
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
 
     result = engine.run_task(task)
 

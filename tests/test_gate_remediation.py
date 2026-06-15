@@ -10,6 +10,7 @@ import pytest
 from src.engine import (
     Complexity,
     Engine,
+    PersistenceManager,
     Phase,
     PhaseResult,
     PolicyPack,
@@ -36,7 +37,7 @@ def _minimal_policy_dir(tmp_path: Path) -> Path:
 
 def _engine(tmp_path: Path) -> Engine:
     engine = Engine(policy_pack_path=str(_minimal_policy_dir(tmp_path)), ncp_enabled=False)
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
     return engine
 
 

@@ -2,7 +2,7 @@
 
 **Status:** Approved for execution
 **Date:** 2026-06-14
-**Branch:** `claude/sarathi-omnigent-comparison-511ubm`
+**Branch:** `claude/sarathi-webui-cockpit-511ubm`
 **Companion docs:** `docs/omnigent-parity-design.md` (parity roadmap),
 `docs/webui-v1-design.md` (UI surface design).
 
@@ -13,53 +13,60 @@ criteria, tests, and dependencies.
 
 ---
 
-## Delivered so far (branch `claude/sarathi-webui-cockpit-511ubm`)
+## Current implementation status (branch `claude/sarathi-webui-cockpit-511ubm`)
 
-- **M1 — Web cockpit (read):** live read-only cockpit across all v1 surfaces.
-- **M2 — Governed actions:** approvals, transition/dispatch/schedule controls,
-  chat broadcast, and delivery-spine/handoff wired end-to-end (service + web
-  Task Studio). NCP prior-findings fetch + memory/cost persistence wired into
-  subtask dispatch (gated on a workspace `.ncp/` bridge; inert otherwise).
-- **M3 — Model & execution breadth:**
-  - **T3.1 Gateway provider** — pure-Python `GatewayProviderAdapter` for any
-    OpenAI-compatible endpoint (Ollama/vLLM/OpenRouter/Azure) over `httpx`,
-    key-from-env-var, keyless support, routed + validated, documented.
-  - **T3.2 Sandbox executor** — opt-in Docker `SandboxExecutor` for VERIFY
-    (workspace bind-mounted, evidence flows back), interface ready for
-    Modal/Daytona. Verified without a Docker daemon via a fake executor +
-    argv-shape tests; the two real-container tests skip until run on a Docker
+Verified on 2026-06-15 against the current branch contents, commit history, and
+targeted test suites.
+
+- **M0 — Foundations:** delivered. Queue-state projections, project grouping,
+  OpenAPI 3.1, and SSE stream plumbing are present and covered by targeted tests.
+- **M1 — Web cockpit (read):** delivered. The Vite web cockpit includes the
+  shell, workspace/theme plumbing, Dashboard, Task Studio, History, Agents,
+  Usage Stats, Wiki, Settings, typed API helpers, and SSE client hooks.
+- **M2 — Governed actions:** delivered. Approvals, transition/dispatch/schedule
+  controls, chat broadcast, delivery spine, handoff, and repo-action governance
+  are wired through the service and web Task Studio. NCP prior-findings fetch and
+  memory/cost persistence are wired into subtask dispatch behind the workspace
+  `.ncp/` bridge and remain inert when the bridge is absent.
+- **M3 — Model & execution breadth:** delivered.
+  - **T3.1 Gateway provider:** pure-Python `GatewayProviderAdapter` for
+    OpenAI-compatible endpoints (Ollama/vLLM/OpenRouter/Azure) over `httpx`,
+    with env-var API keys, keyless support, routing, validation, docs, and tests.
+  - **T3.2 Sandbox executor:** opt-in Docker `SandboxExecutor` for VERIFY with
+    workspace bind mounting and evidence flow-back. Fake-executor and argv-shape
+    tests pass; real Docker container tests skip cleanly until run on a Docker
     host.
-- **M4 — Collaboration & distribution (in progress):**
-  - **T4.1 Session model (sharing & co-drive)** — `sessions` +
-    `session_participants` (migration 009), 10 service endpoints (create share
-    link, attach via token, join/leave, scope chat to a session), observers
-    read-only, all participation logged to `lifecycle_events`, and a
-    `sarathi attach` CLI. Storage + service + CLI.
-  - **T4.2 Session forking** — `POST /sessions/{id}/fork` clones history into a
-    new independent task + session (own LEARN) with a checkpoint capsule, plus
-    a `sarathi fork` CLI. NCP warm-start: the fork carries the parent task's
-    persisted findings into the new task and writes a ForkSeed lineage chunk
-    (verified live against a real NCP SQLite bridge; inert without one).
-  - **T4.3 Optional auth / multi-user** — opt-in `SARATHI_AUTH_ENABLED=1`:
-    `users` table (migration 010) + `src/service/auth.py` (Principal resolution).
-    Auth off is unchanged (single shared token); auth on requires an admin or
-    active user token per request, threads the Principal through routing,
-    provides admin-only `POST/GET /users`, and enforces roles against the
-    authenticated identity (an observer cannot post by spoofing a driver's user
-    id). OIDC remains a future follow-up.
-  - **T4.4 One-line installer + Homebrew** — `scripts/install.sh` (Python
-    detection, venv at `$SARATHI_HOME`, pip install from checkout/git, smoke
-    test, `--dry-run`) and `Formula/sarathi.rb` (`--HEAD` install, real PyPI
-    sha256s). Verified by a real install to a temp prefix producing working
-    `sarathi`/`sarathi-desktop`.
-  - **T4.5 Electron packaging** — `desktop/` Electron app that spawns the
-    service, polls `/api/health`, and opens the cockpit at the same-origin URL,
-    managing the service child lifecycle. Syntax-verified (node --check, valid
-    package.json); the actual electron-builder packaged build is unverified
-    here (no macOS/Electron toolchain) — documented in `desktop/README.md`.
+- **M4 — Collaboration & distribution:** delivered with one verification caveat.
+  - **T4.1 Session model (sharing & co-drive):** delivered. `sessions` and
+    `session_participants` storage, share/attach/participant/message endpoints,
+    observer read-only behavior, lifecycle audit logging, and `sarathi attach`
+    CLI are implemented.
+  - **T4.2 Session forking:** delivered. `POST /sessions/{id}/fork` and
+    `sarathi fork` clone context into an independent task/session with NCP
+    warm-start lineage when an NCP SQLite bridge exists.
+  - **T4.3 Optional auth / multi-user:** delivered. `SARATHI_AUTH_ENABLED=1`
+    enables user storage, Principal resolution, admin-only user provisioning,
+    token enforcement, and role checks; auth-off behavior stays unchanged. OIDC
+    remains a future follow-up.
+  - **T4.4 One-line installer + Homebrew:** delivered. `scripts/install.sh` and
+    `Formula/sarathi.rb` exist and were verified with a real temporary-prefix
+    install producing working `sarathi` and `sarathi-desktop` commands.
+  - **T4.5 Electron packaging:** scaffold delivered. `desktop/` starts the
+    service, polls `/api/health`, opens the cockpit, and manages service child
+    lifecycle. Syntax/package validation is done; the actual `electron-builder`
+    packaged build remains unverified on a macOS/Electron toolchain host.
+- **M5 — Governance depth & ecosystem:** partially delivered.
+  - **T5.1 Three-tier policy layering:** delivered in commit `9f7509b`.
+  - **T5.2 Declarative user agents + function-tools:** delivered in commit
+    `e64d9f3`.
+  - **T5.3 Reference recipes:** delivered in commit `910bb0a`.
+  - **T5.4 Knowledge Center & Skills depth:** still pending as the main remaining
+    planned implementation slice. Proposal/knowledge pieces exist, but the full
+    T5.4 scope (unified proposal review, context inspector, skills registry,
+    routing/roles/evolution, and proposal-backed wiki edits) is not yet complete.
 
-**M4 status:** T4.1–T4.5 delivered. Real-build verification pending for T4.5
-(Electron) on a macOS/toolchain host.
+**Verification snapshot:** plan-area targeted tests passed with `125 passed, 3
+skipped`; M5 targeted tests passed with `102 passed, 2 warnings`.
 
 ---
 

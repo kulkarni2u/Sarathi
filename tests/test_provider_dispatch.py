@@ -1316,3 +1316,188 @@ def test_dispatch_omits_ncp_metadata_when_workspace_has_no_ncp_config(tmp_path):
     assert status == 201
     assert "ncp" not in data["dispatch"]["metadata"]
     assert "ncp_prior_findings" not in data["dispatch"]["metadata"]["context_pack"]["compilation"]
+
+
+import json as _json
+import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from src.runtime.providers import GatewayProviderAdapter, ConfiguredProviderAdapter
+from src.runtime.contracts import DispatchRequest as _GatewayDispatchRequest
+from src.runtime.providers.configured import validate_provider_routing_config
+
+
+@contextmanager
+def _stub_openai_server():
+    """Start a threaded OpenAI-compatible stub server on a free 127.0.0.1 port.
+
+    Records the Authorization header observed on the most recent POST in
+    ``recorder`` and always responds 200 with a fixed chat-completions payload.
+    """
+    recorder = {"auth_present": False, "auth_value": None}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence stderr noise
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            self.rfile.read(length)
+            auth = self.headers.get("Authorization")
+            recorder["auth_present"] = auth is not None
+            recorder["auth_value"] = auth
+            body = _json.dumps(
+                {
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "gateway says hello"}}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 11,
+                        "completion_tokens": 7,
+                        "total_tokens": 18,
+                    },
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    host, port = server.server_address
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://{host}:{port}/v1"
+    try:
+        yield base_url, recorder, server
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_gateway_provider_completes_dispatch_and_records_reported_usage():
+    with _stub_openai_server() as (base_url, _recorder, _server):
+        adapter = GatewayProviderAdapter(name="gateway", base_url=base_url, model="llama3")
+        response = adapter.dispatch(
+            _GatewayDispatchRequest(
+                mode="execute",
+                task_id="t-gateway",
+                phase="Build",
+                prompt="hello gateway",
+            )
+        )
+
+    assert response.success is True
+    assert response.outputs["messages"] == ["gateway says hello"]
+    assert response.usage is not None
+    assert response.usage.input_tokens == 11
+    assert response.usage.output_tokens == 7
+    assert response.usage.usage_source == "reported"
+    assert response.usage.estimated is False
+    assert response.artifacts["transport_kind"] == "api"
+
+
+def test_gateway_provider_sends_bearer_when_api_key_env_set(monkeypatch):
+    monkeypatch.setenv("SARATHI_GATEWAY_KEY", "secret-token-123")
+    with _stub_openai_server() as (base_url, recorder, _server):
+        adapter = GatewayProviderAdapter(
+            name="gateway",
+            base_url=base_url,
+            model="gpt-4o-mini",
+            api_key_env="SARATHI_GATEWAY_KEY",
+        )
+        response = adapter.dispatch(
+            _GatewayDispatchRequest(
+                mode="execute",
+                task_id="t-gateway-auth",
+                phase="Build",
+                prompt="hello with key",
+            )
+        )
+
+    assert response.success is True
+    assert recorder["auth_present"] is True
+    assert recorder["auth_value"] == "Bearer secret-token-123"
+
+
+def test_gateway_provider_omits_auth_when_no_api_key_env():
+    with _stub_openai_server() as (base_url, recorder, _server):
+        adapter = GatewayProviderAdapter(name="gateway", base_url=base_url, model="llama3")
+        response = adapter.dispatch(
+            _GatewayDispatchRequest(
+                mode="execute",
+                task_id="t-gateway-keyless",
+                phase="Build",
+                prompt="hello ollama",
+            )
+        )
+
+    assert response.success is True
+    assert recorder["auth_present"] is False
+    assert recorder["auth_value"] is None
+
+
+def test_gateway_provider_dispatch_failure_returns_error():
+    # Start then immediately shut down the server to free the port.
+    with _stub_openai_server() as (base_url, _recorder, server):
+        server.shutdown()
+        server.server_close()
+        adapter = GatewayProviderAdapter(
+            name="gateway",
+            base_url=base_url,
+            model="llama3",
+            timeout_seconds=2,
+        )
+        response = adapter.dispatch(
+            _GatewayDispatchRequest(
+                mode="execute",
+                task_id="t-gateway-fail",
+                phase="Build",
+                prompt="this should fail",
+            )
+        )
+
+    assert response.success is False
+    assert isinstance(response.error, str) and response.error
+    assert response.artifacts["transport_kind"] == "api"
+
+
+def test_configured_provider_routes_to_gateway():
+    with _stub_openai_server() as (base_url, _recorder, _server):
+        adapter = ConfiguredProviderAdapter(
+            config={
+                "provider": "gw",
+                "providers": {
+                    "gw": {"type": "gateway", "base_url": base_url, "model": "llama3"}
+                },
+            }
+        )
+        response = adapter.dispatch(
+            _GatewayDispatchRequest(
+                mode="execute",
+                task_id="t-gw",
+                phase="Build",
+                prompt="hello",
+            )
+        )
+
+    assert response.success is True
+    assert response.outputs["messages"] == ["gateway says hello"]
+    assert response.usage is not None
+    assert response.usage.input_tokens == 11
+    assert response.usage.output_tokens == 7
+    assert response.usage.usage_source == "reported"
+
+
+def test_validate_provider_routing_flags_gateway_missing_fields():
+    issues = validate_provider_routing_config(
+        {
+            "provider": "gw",
+            "providers": {"gw": {"type": "gateway"}},
+        }
+    )
+
+    assert any("gw.base_url" in issue for issue in issues)
+    assert any("gw.model" in issue for issue in issues)

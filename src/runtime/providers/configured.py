@@ -15,6 +15,7 @@ except ImportError:
 
 from .base import ProviderAdapter, ProviderCapabilities
 from .anthropic_sdk import AnthropicSdkProviderAdapter
+from .gateway import GatewayProviderAdapter
 from .local import LocalProviderAdapter
 from .openai_sdk import OpenAISdkProviderAdapter
 from .opencode_sdk import OpenCodeSdkProviderAdapter
@@ -379,6 +380,23 @@ class ConfiguredProviderAdapter(ProviderAdapter):
                     command,
                     timeout_seconds=int(provider_cfg.get("timeout_seconds", 60) or 60),
                 )
+        if isinstance(provider_cfg, Mapping) and provider_cfg.get("type") == "gateway":
+            base_url = provider_cfg.get("base_url")
+            model = provider_cfg.get("model")
+            if (
+                isinstance(base_url, str)
+                and base_url
+                and isinstance(model, str)
+                and model
+            ):
+                api_key_env = provider_cfg.get("api_key_env")
+                return GatewayProviderAdapter(
+                    name=provider_name,
+                    base_url=base_url,
+                    model=model,
+                    api_key_env=str(api_key_env) if isinstance(api_key_env, str) and api_key_env else None,
+                    timeout_seconds=int(provider_cfg.get("timeout_seconds", 120) or 120),
+                )
         return ExternalProviderAdapter(provider_name)
 
 
@@ -418,6 +436,17 @@ def validate_provider_routing_config(config: Any) -> list[str]:
                 command = provider_cfg.get("command")
                 if not isinstance(command, (str, list, tuple)):
                     issues.append(f"model_routing.providers.{provider_name}.command must be a string or list")
+            if isinstance(provider_cfg, Mapping) and provider_cfg.get("type") == "gateway":
+                base_url = provider_cfg.get("base_url")
+                if not isinstance(base_url, str) or not base_url:
+                    issues.append(f"model_routing.providers.{provider_name}.base_url must be a non-empty string")
+                model = provider_cfg.get("model")
+                if not isinstance(model, str) or not model:
+                    issues.append(f"model_routing.providers.{provider_name}.model must be a non-empty string")
+                if "api_key_env" in provider_cfg:
+                    api_key_env = provider_cfg.get("api_key_env")
+                    if not isinstance(api_key_env, str) or not api_key_env:
+                        issues.append(f"model_routing.providers.{provider_name}.api_key_env must be a non-empty string")
     if isinstance(phase_providers, Mapping):
         for phase_name, provider_name in phase_providers.items():
             if not isinstance(phase_name, str) or not phase_name:

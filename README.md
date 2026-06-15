@@ -10,6 +10,38 @@ It gives teams a consistent, auditable lifecycle for planning, building, verifyi
 - A phase-based engine that can scale from simple tasks to complex work
 - A portable agent skill pack (in `skill/SKILL.md`) for Claude Code, Codex, Copilot, and OpenCode
 
+## Install
+
+Pick whichever fits your setup. Sarathi targets Python 3.10+.
+
+**One-line installer (recommended).** Creates an isolated venv and installs the CLI plus the `sarathi-desktop` cockpit:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kulkarni2u/Sarathi/main/scripts/install.sh | bash
+```
+
+The installer puts everything under `$SARATHI_HOME` (default `~/.sarathi`, override by exporting `SARATHI_HOME` first) and prints how to add `~/.sarathi/venv/bin` to your `PATH`. Pass `--dry-run` (or set `SARATHI_DRY_RUN=1`) to preview the plan without changing anything.
+
+**pip from GitHub.** Into any environment you manage yourself:
+
+```bash
+pip install "git+https://github.com/kulkarni2u/Sarathi.git"
+```
+
+**Homebrew.** Sarathi has no tagged release yet, so install from HEAD via a tap that carries `Formula/sarathi.rb`:
+
+```bash
+brew install --HEAD <your-tap>/sarathi
+```
+
+(The `--HEAD` flag is required until a versioned release is published.)
+
+**Launch the desktop cockpit** once installed:
+
+```bash
+sarathi-desktop
+```
+
 ## Quick Start
 
 ```bash

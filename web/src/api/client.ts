@@ -14,6 +14,8 @@ import type {
   ApprovalActionData,
   ContextBundlesData,
   CreateHandoffResult,
+  CreateProjectData,
+  CreateWorkspaceData,
   EventsData,
   GetWorkspaceData,
   GraphDraftData,
@@ -183,6 +185,15 @@ export const api = {
   /** GET /workspaces/{id} */
   getWorkspace(workspaceId: string, signal?: AbortSignal): Promise<GetWorkspaceData> {
     return request<GetWorkspaceData>(`/workspaces/${encodeURIComponent(workspaceId)}`, { signal });
+  },
+
+  /** POST /workspaces — create a new workspace. */
+  createWorkspace(input: {
+    name: string;
+    root_path: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<CreateWorkspaceData> {
+    return request<CreateWorkspaceData>("/workspaces", { method: "POST", body: input });
   },
 
   /** GET /workspaces/{id}/task-dashboard?project_id= */
@@ -440,6 +451,17 @@ export const api = {
     return request<ProjectsData>(`/workspaces/${encodeURIComponent(workspaceId)}/projects`, {
       signal,
     });
+  },
+
+  /** POST /workspaces/{id}/projects — create a new project. */
+  createProject(
+    workspaceId: string,
+    input: { name: string; description?: string; metadata?: Record<string, unknown> },
+  ): Promise<CreateProjectData> {
+    return request<CreateProjectData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/projects`,
+      { method: "POST", body: input },
+    );
   },
 
   /** GET /workspaces/{id}/proposals */

@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { api, ApiClientError } from "../../api/client";
 import type { TaskDashboardRow } from "../../api/types";
 import { useWorkspace } from "../../context/WorkspaceContext";
+import { FormModal } from "../../components/FormModal";
 import "./Dashboard.css";
 
 /**
@@ -164,13 +165,14 @@ function formatUpdatedAt(value: unknown): string | undefined {
 type ViewMode = "board" | "list";
 
 export default function Dashboard() {
-  const { currentWorkspace, currentWorkspaceId, serviceStatus } = useWorkspace();
+  const { currentWorkspace, currentWorkspaceId, serviceStatus, refresh } = useWorkspace();
   const navigate = useNavigate();
   const [tasks, setTasks] = useState<TaskDashboardRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("board");
   const [projectFilter, setProjectFilter] = useState<string | null>(null);
+  const [showNewProject, setShowNewProject] = useState(false);
 
   useEffect(() => {
     if (!currentWorkspaceId) {
@@ -261,7 +263,13 @@ export default function Dashboard() {
               List
             </button>
           </div>
-          <button className="btn primary" type="button">
+          <button
+            className="btn primary"
+            type="button"
+            disabled={!currentWorkspaceId}
+            title={currentWorkspaceId ? undefined : "Select or create a workspace first"}
+            onClick={() => setShowNewProject(true)}
+          >
             ＋ New project
           </button>
         </div>
@@ -434,6 +442,29 @@ export default function Dashboard() {
             </div>
           )}
         </>
+      )}
+
+      {showNewProject && currentWorkspaceId && (
+        <FormModal
+          title="New project"
+          submitLabel="Create project"
+          fields={[
+            { name: "name", label: "Name", required: true, placeholder: "My project" },
+            {
+              name: "description",
+              label: "Description",
+              placeholder: "Optional short description",
+            },
+          ]}
+          onSubmit={async (values) => {
+            await api.createProject(currentWorkspaceId, {
+              name: values.name,
+              description: values.description || undefined,
+            });
+            refresh();
+          }}
+          onClose={() => setShowNewProject(false)}
+        />
       )}
     </section>
   );

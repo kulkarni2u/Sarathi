@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useWorkspace } from "../context/WorkspaceContext";
 import { api } from "../api/client";
+import { FormModal } from "./FormModal";
 import type { Project, Workspace } from "../api/types";
 
 // Icons are inlined (stroke="currentColor") to match the mockup's lightweight
@@ -148,14 +149,18 @@ function projectName(project: Project, index: number): string {
 }
 
 export function Sidebar() {
-  const { workspaces, currentWorkspace, currentWorkspaceId, setCurrentWorkspaceId, serviceStatus } = useWorkspace();
+  const { workspaces, currentWorkspace, currentWorkspaceId, setCurrentWorkspaceId, serviceStatus, refresh } =
+    useWorkspace();
   const [menuOpen, setMenuOpen] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(false);
+  const [showNewWorkspace, setShowNewWorkspace] = useState(false);
   const navigate = useNavigate();
 
   // Load the active workspace's projects for the "Pinned projects" list.
-  // Re-fetches whenever the current workspace changes.
+  // Re-fetches whenever the current workspace changes, or when the workspace
+  // list is refreshed (e.g. after creating a project) — `workspaces` gets a
+  // new array reference on each context refresh.
   useEffect(() => {
     if (!currentWorkspaceId) {
       setProjects([]);
@@ -185,7 +190,7 @@ export function Sidebar() {
       cancelled = true;
       controller.abort();
     };
-  }, [currentWorkspaceId]);
+  }, [currentWorkspaceId, workspaces]);
 
   function openProject(project: Project) {
     if (project.id) {
@@ -242,7 +247,15 @@ export function Sidebar() {
                 No workspaces yet
               </div>
             )}
-            <button className="om new">+ New workspace</button>
+            <button
+              className="om new"
+              onClick={() => {
+                setMenuOpen(false);
+                setShowNewWorkspace(true);
+              }}
+            >
+              + New workspace
+            </button>
             <NavLink to="/workspace" className="om" style={{ color: "var(--muted)" }} onClick={() => setMenuOpen(false)}>
               ⚙ Manage workspace…
             </NavLink>
@@ -347,6 +360,32 @@ export function Sidebar() {
         <span className="pill">LOCAL</span>
         <button className="more">⋯</button>
       </div>
+
+      {showNewWorkspace && (
+        <FormModal
+          title="New workspace"
+          submitLabel="Create workspace"
+          fields={[
+            { name: "name", label: "Name", required: true, placeholder: "My workspace" },
+            {
+              name: "root_path",
+              label: "Root path",
+              required: true,
+              placeholder: "/path/to/project",
+              hint: "Absolute path to the workspace's root directory.",
+            },
+          ]}
+          onSubmit={async (values) => {
+            const { workspace } = await api.createWorkspace({
+              name: values.name,
+              root_path: values.root_path,
+            });
+            if (typeof workspace?.id === "string") setCurrentWorkspaceId(workspace.id);
+            refresh();
+          }}
+          onClose={() => setShowNewWorkspace(false)}
+        />
+      )}
     </aside>
   );
 }

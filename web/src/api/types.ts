@@ -48,6 +48,11 @@ export interface GetWorkspaceData {
   workspace: Workspace;
 }
 
+/** POST /workspaces */
+export interface CreateWorkspaceData {
+  workspace: Workspace;
+}
+
 export interface TaskDashboardRow extends AnyRecord {
   id: string;
   title?: string;
@@ -415,4 +420,9 @@ export interface Project extends AnyRecord {
 /** GET /workspaces/{id}/projects */
 export interface ProjectsData {
   projects: Project[];
+}
+
+/** POST /workspaces/{id}/projects */
+export interface CreateProjectData {
+  project: Project;
 }

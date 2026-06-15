@@ -85,6 +85,7 @@ from .review import (
 from .sessions import (
     attach_via_share_token,
     create_task_session,
+    fork_session,
     join_session,
     leave_session,
     post_session_message,
@@ -1531,6 +1532,18 @@ class ServiceApp:
                 user=_required_text(body, "user"),
             )
             return 200, {"participant": participant}
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "fork"
+        ):
+            return 201, fork_session(
+                storage,
+                parts[1],
+                owner=_optional_text(body, "owner"),
+            )
 
         if (
             method == "GET"

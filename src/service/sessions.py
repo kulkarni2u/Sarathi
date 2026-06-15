@@ -8,6 +8,8 @@ on bad input, and returns plain dict/list payloads. The route branches in
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 from src.storage import Storage
@@ -218,3 +220,181 @@ def update_task_session(
         },
     )
     return session
+
+
+def fork_session(
+    storage: Storage,
+    session_id: str,
+    *,
+    owner: str | None = None,
+) -> dict[str, Any]:
+    """Fork a session into a new, independent task + session.
+
+    Clones the source session's message history into the new session, records
+    a checkpoint capsule of the source task, and — when the workspace has an
+    NCP bridge (``.ncp/config.toml`` + ``.ncp/run.py``) — seeds the fork with
+    the parent task's persisted findings (warm start) and writes a fork-lineage
+    memory chunk. The new task has its own id, so it measures/LEARNs
+    independently. NCP wiring is additive: when no bridge is present, the
+    ``ncp`` block is omitted entirely.
+    """
+    source_session = storage.get_session(session_id)
+    if source_session is None:
+        raise ServiceError("not_found", "Session not found.", 404)
+    source_task = storage.get_task(source_session["task_id"])
+    if source_task is None:
+        raise ServiceError("not_found", "Source task not found.", 404)
+
+    fork_owner = owner or source_session["owner"]
+    workspace_id = source_task["workspace_id"]
+
+    # --- NCP gate + parent-findings fetch (before creating the new task so the
+    # findings can be baked into its metadata). ---
+    workspace = storage.get_workspace(workspace_id)
+    workspace_root = (
+        Path(workspace["root_path"]).expanduser() if workspace is not None else None
+    )
+    ncp_run_path = workspace_root / ".ncp" / "run.py" if workspace_root is not None else None
+    ncp_config_present = bool(
+        workspace_root is not None
+        and (workspace_root / ".ncp" / "config.toml").exists()
+        and ncp_run_path is not None
+        and ncp_run_path.exists()
+    )
+    ncp_adapter = None
+    ncp_available = False
+    seed_findings: list[str] = []
+    if ncp_config_present:
+        from src.ncp_adapter.persistence_adapter import NCPPersistenceAdapter
+
+        ncp_adapter = NCPPersistenceAdapter(run_path=ncp_run_path)
+        try:
+            chunks = ncp_adapter._call_fetch(source_task.get("title") or "", k=5)
+            ncp_available = True
+            for chunk in chunks:
+                text = ncp_adapter._reconstruct_chunk_text(chunk).strip()
+                if not text:
+                    continue
+                seed_findings.append(text[:200])
+                if len(seed_findings) >= 8:
+                    break
+        except Exception:
+            ncp_available = False
+            seed_findings = []
+
+    # --- New task (independent measurement/LEARN) ---
+    fork_metadata = dict(source_task.get("metadata") or {})
+    fork_block: dict[str, Any] = {
+        "forked_from_task": source_task["id"],
+        "forked_from_session": session_id,
+    }
+    if ncp_config_present:
+        fork_block["ncp_seed_findings"] = seed_findings
+    fork_metadata["fork"] = fork_block
+
+    new_task = storage.create_task(
+        workspace_id=workspace_id,
+        title=(source_task.get("title") or "Task") + " (fork)",
+        description=source_task.get("description"),
+        status="pending",
+        metadata=fork_metadata,
+        project_id=source_task.get("project_id"),
+    )
+
+    # --- Checkpoint capsule of the source (reuse checkpoint_capsules). ---
+    checkpoint = storage.create_checkpoint_capsule(
+        workspace_id=workspace_id,
+        task_id=source_task["id"],
+        summary=f"Fork checkpoint from session {session_id}",
+        key_decisions=[],
+        evidence_refs=[],
+        repository_action_preference={},
+        next_start_point="forked",
+        created_by=fork_owner,
+        project_id=source_task.get("project_id"),
+    )
+
+    # --- New session on the new task. ---
+    new_session = storage.create_session(
+        workspace_id=workspace_id,
+        task_id=new_task["id"],
+        owner=fork_owner,
+        visibility="private",
+    )
+
+    # --- Copy message history into the new session. ---
+    messages_copied = 0
+    for message in storage.list_messages(session_id=session_id):
+        storage.create_message(
+            workspace_id=new_task["workspace_id"],
+            task_id=new_task["id"],
+            session_id=new_session["id"],
+            role=message["role"],
+            content=message["content"],
+            metadata={"forked_from_message": message["id"]},
+        )
+        messages_copied += 1
+
+    # --- NCP seed write (after the new task exists). ---
+    ncp_block: dict[str, Any] | None = None
+    if ncp_config_present:
+        seed_written = False
+        if ncp_available and ncp_adapter is not None:
+            try:
+                ncp_adapter._call_write_memory(
+                    json.dumps(
+                        {
+                            "_sarathi_type": "ForkSeed",
+                            "task_id": new_task["id"],
+                            "forked_from_task": source_task["id"],
+                            "checkpoint": checkpoint["id"],
+                            "summary": f"Fork of '{source_task.get('title')}'",
+                        }
+                    ),
+                    "episodic",
+                    "tool_result",
+                    f"sarathi.fork.{new_task['id']}",
+                )
+                seed_written = True
+            except Exception:
+                seed_written = False
+        ncp_block = {
+            "config_present": True,
+            "available": ncp_available,
+            "parent_findings_carried": len(seed_findings),
+            "seed_written": seed_written,
+        }
+
+    # --- Lifecycle events. ---
+    storage.create_lifecycle_event(
+        workspace_id=workspace_id,
+        task_id=source_task["id"],
+        event_type="session.forked",
+        payload={
+            "object_id": session_id,
+            "new_task_id": new_task["id"],
+            "new_session_id": new_session["id"],
+            "checkpoint_id": checkpoint["id"],
+            **({"ncp": ncp_block} if ncp_block else {}),
+        },
+    )
+    storage.create_lifecycle_event(
+        workspace_id=workspace_id,
+        task_id=new_task["id"],
+        event_type="task.forked_created",
+        payload={
+            "object_id": new_task["id"],
+            "forked_from_task": source_task["id"],
+            "forked_from_session": session_id,
+            "messages_copied": messages_copied,
+        },
+    )
+
+    return {
+        "source_session_id": session_id,
+        "task": new_task,
+        "session": new_session,
+        "checkpoint": checkpoint,
+        "messages_copied": messages_copied,
+        **({"ncp": ncp_block} if ncp_block else {}),
+    }

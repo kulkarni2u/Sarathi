@@ -646,6 +646,15 @@ def main() -> None:
         help="Join as observer (read-only) or driver",
     )
 
+    # Fork command (fork a session into a new independent task)
+    fork_parser = subparsers.add_parser(
+        "fork", help="Fork a session into a new independent task"
+    )
+    fork_parser.add_argument("session_id", help="The session id to fork")
+    fork_parser.add_argument(
+        "--owner", default=None, help="Owner for the forked session (default: source owner)"
+    )
+
     if len(sys.argv) > 1 and sys.argv[1] == "desktop":
         args, _desktop_passthrough = parser.parse_known_args()
         setattr(args, "desktop_args", sys.argv[2:])
@@ -683,6 +692,8 @@ def main() -> None:
         handle_reuse(args)
     elif args.command == "attach":
         handle_attach(args)
+    elif args.command == "fork":
+        handle_fork(args)
     elif args.command == "agents":
         handle_agents()
 
@@ -1229,6 +1240,53 @@ def handle_attach(args: argparse.Namespace) -> None:
 
     if role == "observer":
         print("\nNote: observers are read-only and cannot drive the session.")
+
+
+def handle_fork(args: argparse.Namespace) -> None:
+    """Fork a session into a new independent task via the running service."""
+    info = _read_service_discovery()
+    service_url = info.get("url") if isinstance(info, dict) else None
+    token = _service_auth_token(info)
+    if not service_url:
+        print(
+            "No running Sarathi service found. Start it with: "
+            "python3 -m src.service --db ~/.sarathi/sarathi.db --port 8765"
+        )
+        return
+
+    body: dict[str, Any] = {}
+    if args.owner:
+        body["owner"] = args.owner
+
+    try:
+        data = _service_post_json(
+            service_url,
+            f"/api/sessions/{args.session_id}/fork",
+            body,
+            token=token,
+        )
+    except RuntimeError as exc:
+        print(f"Could not fork: {exc}")
+        return
+
+    task = data["task"]
+    session = data["session"]
+    checkpoint = data.get("checkpoint") or {}
+
+    print(f"Forked session {args.session_id}")
+    print(f"  new task:    {task['id']}")
+    print(f"  new session: {session['id']}")
+    if checkpoint.get("id"):
+        print(f"  checkpoint:  {checkpoint['id']}")
+    print(f"  messages copied: {data.get('messages_copied', 0)}")
+
+    ncp = data.get("ncp")
+    if isinstance(ncp, dict):
+        print(
+            "  NCP seed: "
+            f"{ncp.get('parent_findings_carried', 0)} parent finding(s) carried, "
+            f"seed_written={ncp.get('seed_written')}"
+        )
 
 
 def handle_proposals(args: argparse.Namespace | None = None) -> None:

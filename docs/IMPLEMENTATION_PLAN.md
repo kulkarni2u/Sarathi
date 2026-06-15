@@ -29,6 +29,17 @@ criteria, tests, and dependencies.
     Modal/Daytona. Verified without a Docker daemon via a fake executor +
     argv-shape tests; the two real-container tests skip until run on a Docker
     host.
+- **M4 — Collaboration & distribution (in progress):**
+  - **T4.1 Session model (sharing & co-drive)** — `sessions` +
+    `session_participants` (migration 009), 10 service endpoints (create share
+    link, attach via token, join/leave, scope chat to a session), observers
+    read-only, all participation logged to `lifecycle_events`, and a
+    `sarathi attach` CLI. Storage + service + CLI.
+  - **T4.2 Session forking** — `POST /sessions/{id}/fork` clones history into a
+    new independent task + session (own LEARN) with a checkpoint capsule, plus
+    a `sarathi fork` CLI. NCP warm-start: the fork carries the parent task's
+    persisted findings into the new task and writes a ForkSeed lineage chunk
+    (verified live against a real NCP SQLite bridge; inert without one).
 
 ---
 

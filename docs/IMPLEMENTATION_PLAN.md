@@ -32,10 +32,13 @@ targeted test suites.
   - **T3.1 Gateway provider:** pure-Python `GatewayProviderAdapter` for
     OpenAI-compatible endpoints (Ollama/vLLM/OpenRouter/Azure) over `httpx`,
     with env-var API keys, keyless support, routing, validation, docs, and tests.
-  - **T3.2 Sandbox executor:** opt-in Docker `SandboxExecutor` for VERIFY with
-    workspace bind mounting and evidence flow-back. Fake-executor and argv-shape
-    tests pass; real Docker container tests skip cleanly until run on a Docker
-    host.
+  - **T3.2 Sandbox executor:** opt-in Docker-compatible `SandboxExecutor` for
+    VERIFY with workspace bind mounting and evidence flow-back. Docker remains
+    the default runtime; Podman is supported via `SARATHI_SANDBOX=podman` or
+    `{"sandbox": "docker", "runtime": "podman"}`. Fake-executor, argv-shape,
+    factory, and environment-resolution tests pass; real Docker and Podman
+    container tests were verified locally on 2026-06-15. Docker/Podman tests
+    still skip cleanly on hosts where the matching runtime daemon is unavailable.
 - **M4 — Collaboration & distribution:** delivered with one verification caveat.
   - **T4.1 Session model (sharing & co-drive):** delivered. `sessions` and
     `session_participants` storage, share/attach/participant/message endpoints,

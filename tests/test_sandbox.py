@@ -1,10 +1,11 @@
 """Tests for the sandbox executor abstraction (T3.2).
 
-These tests are designed to pass WITH and WITHOUT a running Docker daemon.
-Real-container tests are gated behind ``docker_available()`` and skip cleanly
-when the daemon is unavailable. The integration logic (CommandRunner ->
-SandboxExecutor delegation, argv shape, factory resolution) is verified
-without Docker via a fake in-process executor and argv-shape assertions.
+These tests are designed to pass WITH and WITHOUT a running container daemon.
+Real-container tests are gated behind ``docker_available()`` for Docker and
+``docker_available("podman")`` for Podman, skipping cleanly when either runtime
+is unavailable. The integration logic (CommandRunner -> SandboxExecutor
+delegation, argv shape, factory resolution) is verified without containers via a
+fake in-process executor and argv-shape assertions.
 """
 from __future__ import annotations
 
@@ -73,6 +74,39 @@ def test_docker_executor_workspace_changes_flow_back(tmp_path: Path):
     assert created.exists()
 
 
+@pytest.mark.skipif(not docker_available("podman"), reason="podman unavailable")
+def test_podman_executor_runs_command(tmp_path: Path):
+    executor = build_sandbox_executor("podman")
+    assert isinstance(executor, DockerSandboxExecutor)
+
+    result = executor.run(
+        ["sh", "-c", "echo hi from podman"],
+        workdir=str(tmp_path),
+        timeout_seconds=120,
+    )
+
+    assert result.succeeded
+    assert result.exit_code == 0
+    assert "hi from podman" in result.stdout
+    assert executor.kind == "podman"
+
+
+@pytest.mark.skipif(not docker_available("podman"), reason="podman unavailable")
+def test_podman_executor_workspace_changes_flow_back(tmp_path: Path):
+    executor = build_sandbox_executor({"sandbox": "podman"})
+    assert isinstance(executor, DockerSandboxExecutor)
+
+    result = executor.run(
+        ["sh", "-c", "echo written > /workspace/created_with_podman.txt"],
+        workdir=str(tmp_path),
+        timeout_seconds=120,
+    )
+
+    assert result.succeeded
+    created = tmp_path / "created_with_podman.txt"
+    assert created.exists()
+
+
 # ---------------------------------------------------------------------------
 # No-Docker tests (always run)
 # ---------------------------------------------------------------------------
@@ -89,6 +123,22 @@ def test_build_sandbox_executor_resolves_docker_and_none():
         build_sandbox_executor({"sandbox": "docker"}), DockerSandboxExecutor
     )
     assert build_sandbox_executor("nope") is None
+
+
+def test_build_sandbox_executor_resolves_podman_runtime():
+    executor = build_sandbox_executor("podman")
+
+    assert isinstance(executor, DockerSandboxExecutor)
+    assert executor.docker_path == "podman"
+    assert executor.kind == "podman"
+
+
+def test_build_sandbox_executor_resolves_explicit_runtime_path():
+    executor = build_sandbox_executor({"sandbox": "docker", "runtime": "podman"})
+
+    assert isinstance(executor, DockerSandboxExecutor)
+    assert executor.docker_path == "podman"
+    assert executor.kind == "podman"
 
 
 def test_docker_argv_shape():
@@ -109,6 +159,14 @@ def test_docker_argv_shape():
         assert token in argv
 
     assert argv[-2:] == ["pytest", "-q"]
+
+
+def test_empty_container_runtime_path_defaults_to_docker():
+    executor = DockerSandboxExecutor(docker_path="")
+
+    assert executor.docker_path == "docker"
+    assert executor.kind == "docker"
+    assert executor._build_docker_argv(["true"], workdir="/tmp/ws")[0] == "docker"
 
 
 def test_command_runner_delegates_to_sandbox(tmp_path: Path):
@@ -149,6 +207,19 @@ def test_command_runner_without_sandbox_runs_on_host(tmp_path: Path, monkeypatch
     assert result.source == "shell"
     assert result.succeeded
     assert result.executor in (None, "host")
+
+
+def test_command_runner_resolves_podman_from_environment(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SARATHI_SANDBOX", "podman")
+    runner = CommandRunner(
+        execute_enabled=True,
+        workdir=str(tmp_path),
+        timeout_seconds=5,
+    )
+
+    assert isinstance(runner.sandbox, DockerSandboxExecutor)
+    assert runner.sandbox.docker_path == "podman"
+    assert runner.sandbox.kind == "podman"
 
 
 def test_command_runner_sandbox_infra_error_is_shell_error(tmp_path: Path):

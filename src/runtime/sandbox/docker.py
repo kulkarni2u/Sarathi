@@ -1,12 +1,14 @@
-"""Docker-backed sandbox executor.
+"""Docker-compatible sandbox executor.
 
 Runs a command inside an ephemeral container with the host workspace
 bind-mounted, so the command observes real files and any writes flow back
 to the host workspace directory. No host filesystem state outside the
-mounted workspace is mutated.
+mounted workspace is mutated. Docker is the default CLI; Podman works through
+the same Docker-compatible command surface.
 """
 from __future__ import annotations
 
+from pathlib import Path
 import subprocess
 
 try:
@@ -16,9 +18,9 @@ except ImportError:  # pragma: no cover - direct module import fallback
 
 
 def docker_available(docker_path: str = "docker") -> bool:
-    """Return True only if the docker CLI exists AND the daemon responds.
+    """Return True only if the container CLI exists AND the daemon responds.
 
-    Implemented by running ``docker info`` with a short timeout. Returns
+    Implemented by running ``<cli> info`` with a short timeout. Returns
     False on any non-zero exit or exception. Never raises.
     """
     try:
@@ -35,7 +37,7 @@ def docker_available(docker_path: str = "docker") -> bool:
 
 
 class DockerSandboxExecutor(SandboxExecutor):
-    """Execute commands inside an ephemeral Docker container."""
+    """Execute commands inside an ephemeral Docker-compatible container."""
 
     def __init__(
         self,
@@ -48,11 +50,11 @@ class DockerSandboxExecutor(SandboxExecutor):
         self.image = image
         self.network = network
         self.mount_target = mount_target
-        self.docker_path = docker_path
+        self.docker_path = docker_path.strip() or "docker"
 
     @property
     def kind(self) -> str:
-        return "docker"
+        return Path(self.docker_path).name or "docker"
 
     def _build_docker_argv(self, argv: list[str], *, workdir: str) -> list[str]:
         """Build the full ``docker run`` argv. Exposed for unit testing."""

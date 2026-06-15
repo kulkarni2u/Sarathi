@@ -255,8 +255,156 @@ export interface WorkspaceRepositoriesData {
   repositories: WorkspaceRepository[];
 }
 
-/** GET /workspaces/{id}/proposals — "Proposals payload", `additionalProperties: true`. */
-export type ProposalsData = AnyRecord;
+export interface PolicyProposal {
+  id: string;
+  title: string;
+  policy_file: string;
+  proposal_kind: string; // "policy_note" | "routing_hint" | "wiki_update" | "skill_update" | "context_update"
+  impacted_assets: string[];
+  risk_level: string; // "low" | "medium" | "high"
+  rationale: string;
+  suggested_change: string;
+  evidence_refs: string[];
+  confidence: number;
+  source: string;
+  routing_hint?: unknown;
+  [key: string]: unknown;
+}
+
+export interface ReviewedProposalDecision {
+  id: string;
+  status: string; // "accepted" | "rejected"
+  policy_file: string;
+  title: string;
+  source: string;
+  proposal_kind: string;
+  impacted_assets: string[];
+  risk_level: string;
+  confidence: number;
+  suggested_change: string;
+  evidence_refs: string[];
+  reason?: string | null;
+  reviewed_at: string;
+  [key: string]: unknown;
+}
+
+export interface ProposalsData {
+  workspace_id: string;
+  proposals: PolicyProposal[];
+  reviewed_history: ReviewedProposalDecision[];
+  status: string;
+  source?: string;
+  [key: string]: unknown;
+}
+
+export interface ProposalPolicyPreview {
+  path: string;
+  exists: boolean;
+  current_content: string;
+  accepted_preview: string;
+  [key: string]: unknown;
+}
+
+export interface ProposalDetailData {
+  workspace_id: string;
+  proposal: PolicyProposal;
+  policy_preview: ProposalPolicyPreview;
+}
+
+export interface ProposalDecisionData {
+  workspace_id: string;
+  proposal_id: string;
+  decision: ReviewedProposalDecision;
+}
+
+/** GET /workspaces/{id}/knowledge-center — additionalProperties: true. */
+export type KnowledgeCenterData = AnyRecord;
+
+export interface SkillEntry {
+  name: string;
+  family: string;
+  source: string;
+  description: string;
+  [key: string]: unknown;
+}
+
+export interface SkillRoute {
+  task_type: string;
+  primary: string;
+  secondary: string[];
+  always_invoke: boolean;
+  [key: string]: unknown;
+}
+
+export interface RoleMapping {
+  role: string;
+  phase: string;
+  purpose: string;
+  [key: string]: unknown;
+}
+
+export interface BehaviorAsset {
+  path: string;
+  exists: boolean;
+  purpose: string;
+  [key: string]: unknown;
+}
+
+export interface SkillsData {
+  workspace_id: string;
+  skills: SkillEntry[];
+  routes: SkillRoute[];
+  role_mappings: RoleMapping[];
+  behavior_assets: BehaviorAsset[];
+  evolution_proposals: PolicyProposal[];
+  evolution_history: ReviewedProposalDecision[];
+  path: string;
+  source_content: string;
+  [key: string]: unknown;
+}
+
+export interface ContextBundleSourceArtifact {
+  type?: string;
+  ref?: string;
+  [key: string]: unknown;
+}
+
+export interface ContextBundleAgentInput {
+  objective?: string;
+  constraints?: unknown[];
+  acceptance_criteria?: unknown[];
+  relevant_files?: unknown[];
+  prior_findings?: unknown[];
+  available_tools?: unknown[];
+  token_budget?: number | null;
+  [key: string]: unknown;
+}
+
+export interface ContextBundleContextPack {
+  role?: string;
+  phase?: string;
+  summary?: string;
+  agent_input?: ContextBundleAgentInput;
+  estimated_tokens?: number | null;
+  trimmed_sections?: string[];
+  source_artifacts?: ContextBundleSourceArtifact[];
+  [key: string]: unknown;
+}
+
+export interface ContextBundle {
+  dispatch_id: string;
+  task_id?: string;
+  agent?: string;
+  status?: string;
+  created_at?: string;
+  context_pack: ContextBundleContextPack;
+  [key: string]: unknown;
+}
+
+export interface ContextBundlesData {
+  workspace_id: string;
+  bundles: ContextBundle[];
+}
 
 export interface Project extends AnyRecord {
   id?: string;

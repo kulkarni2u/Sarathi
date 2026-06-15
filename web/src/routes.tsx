@@ -6,6 +6,9 @@ import History from "./views/History";
 import Agents from "./views/Agents";
 import Usage from "./views/Usage";
 import Wiki from "./views/Wiki";
+import Knowledge from "./views/Knowledge";
+import Proposals from "./views/Proposals";
+import Skills from "./views/Skills";
 import Settings from "./views/Settings";
 import WorkspaceManage from "./views/Workspace";
 import NeedsYou from "./views/NeedsYou";
@@ -40,7 +43,10 @@ export const routes: RouteObject[] = [
       { path: "agents", element: <Agents />, handle: { title: "Agents" } },
 
       // Knowledge group
+      { path: "knowledge", element: <Knowledge />, handle: { title: "Knowledge Center" } },
       { path: "wiki", element: <Wiki />, handle: { title: "Wiki" } },
+      { path: "proposals", element: <Proposals />, handle: { title: "Proposals" } },
+      { path: "skills", element: <Skills />, handle: { title: "Skills" } },
       { path: "usage", element: <Usage />, handle: { title: "Usage Stats" } },
 
       // System group

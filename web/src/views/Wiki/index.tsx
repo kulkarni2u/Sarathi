@@ -147,6 +147,11 @@ export default function Wiki() {
   const [pageLoading, setPageLoading] = useState(false);
   const [pageError, setPageError] = useState<string | null>(null);
 
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
   // Load the page index whenever the workspace changes.
   useEffect(() => {
     if (!currentWorkspaceId) {

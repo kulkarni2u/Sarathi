@@ -1,0 +1,268 @@
+/* Proposals — pending self-evolution proposals + reviewed history, with a
+   diff-style detail pane. Layout mirrors Wiki's left-nav/right-pane split. */
+
+.prop-layout {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 0;
+  min-height: calc(100vh - 54px - 44px - 56px);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+
+.prop-nav {
+  padding: 9px;
+  border-right: 1px solid var(--border-soft);
+  overflow: auto;
+}
+
+.prop-section-label {
+  padding: 9px 11px 4px;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.prop-item {
+  padding: 9px 11px;
+  border-radius: 9px;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 12.5px;
+}
+
+.prop-item:hover {
+  background: var(--hover);
+}
+
+.prop-item.on {
+  background: var(--elev2);
+  color: var(--text);
+}
+
+.prop-item .prop-title {
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prop-item .prop-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.prop-tag {
+  font-size: 9px;
+  color: var(--brand1);
+  border: 1px solid var(--brand1);
+  border-radius: 5px;
+  padding: 0 5px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.prop-file {
+  font-size: 10.5px;
+  color: var(--faint);
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prop-risk {
+  font-size: 9px;
+  font-weight: 700;
+  border-radius: 5px;
+  padding: 0 5px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.prop-risk.low {
+  color: var(--green);
+  border: 1px solid var(--green);
+}
+
+.prop-risk.medium {
+  color: var(--amber);
+  border: 1px solid var(--amber);
+}
+
+.prop-risk.high {
+  color: var(--red);
+  border: 1px solid var(--red);
+}
+
+.prop-status {
+  font-size: 9px;
+  font-weight: 700;
+  border-radius: 5px;
+  padding: 0 5px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.prop-status.accepted {
+  color: var(--green);
+  border: 1px solid var(--green);
+}
+
+.prop-status.rejected {
+  color: var(--red);
+  border: 1px solid var(--red);
+}
+
+.prop-history-toggle {
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  color: var(--muted);
+  padding: 9px 11px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+}
+
+.prop-history-toggle:hover {
+  color: var(--text);
+}
+
+.prop-detail {
+  padding: 24px 28px;
+  overflow: auto;
+  min-width: 0;
+}
+
+.prop-detail h2 {
+  margin: 0 0 4px;
+  font-size: 19px;
+}
+
+.prop-detail .prop-detail-meta {
+  color: var(--faint);
+  font-size: 11.5px;
+  margin-bottom: 16px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.prop-detail-section {
+  margin-bottom: 18px;
+}
+
+.prop-detail-section h3 {
+  font-size: 12.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--faint);
+  margin: 0 0 8px;
+}
+
+.prop-detail-section p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+  opacity: 0.88;
+  max-width: 680px;
+  white-space: pre-wrap;
+}
+
+.prop-detail-section ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.prop-diff {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 900px) {
+  .prop-diff {
+    grid-template-columns: 1fr;
+  }
+}
+
+.prop-diff-col h4 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--faint);
+}
+
+.prop-diff-col pre {
+  margin: 0;
+  padding: 12px;
+  background: var(--elev2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-md);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.prop-diff-col.current pre {
+  border-left: 3px solid var(--faint);
+}
+
+.prop-diff-col.accepted pre {
+  border-left: 3px solid var(--green);
+}
+
+.prop-actions {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  margin-top: 18px;
+}
+
+.prop-reject-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.prop-reject-form input {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 8px 11px;
+  color: var(--text);
+  font-size: 12.5px;
+  min-width: 240px;
+}
+
+.prop-empty,
+.prop-loading {
+  padding: 18px;
+  color: var(--muted);
+}

@@ -9,20 +9,26 @@
 
 import { getRuntimeConfig } from "./runtimeConfig";
 import type {
+  AnyRecord,
   ApiEnvelope,
   ApprovalActionData,
+  ContextBundlesData,
   CreateHandoffResult,
   EventsData,
   GetWorkspaceData,
   GraphDraftData,
   HealthData,
+  KnowledgeCenterData,
   ListWorkspacesData,
   OperationalViewsData,
   ProjectsData,
+  ProposalDecisionData,
+  ProposalDetailData,
   ProposalsData,
   ProvidersData,
   RepositoryActionResult,
   ScheduleResult,
+  SkillsData,
   SubtaskDispatchResult,
   SubtaskTransitionResult,
   TaskApprovalsData,
@@ -394,6 +400,14 @@ export const api = {
     );
   },
 
+  /** POST /workspaces/{id}/wiki — direct human edit of a wiki page. */
+  saveWikiPage(workspaceId: string, page: string, content: string): Promise<AnyRecord> {
+    return request<AnyRecord>(`/workspaces/${encodeURIComponent(workspaceId)}/wiki`, {
+      method: "POST",
+      body: { page, content },
+    });
+  },
+
   // -------------------------------------------------------------------
   // Workspace projections: operational views, repositories, proposals,
   // usage stats
@@ -433,6 +447,63 @@ export const api = {
     return request<ProposalsData>(`/workspaces/${encodeURIComponent(workspaceId)}/proposals`, {
       signal,
     });
+  },
+
+  /** GET /workspaces/{id}/proposals/{proposalId} */
+  getProposalDetail(
+    workspaceId: string,
+    proposalId: string,
+    signal?: AbortSignal,
+  ): Promise<ProposalDetailData> {
+    return request<ProposalDetailData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/proposals/${encodeURIComponent(proposalId)}`,
+      { signal },
+    );
+  },
+
+  /** POST /workspaces/{id}/proposals/{proposalId}/accept */
+  acceptProposal(workspaceId: string, proposalId: string): Promise<ProposalDecisionData> {
+    return request<ProposalDecisionData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/proposals/${encodeURIComponent(proposalId)}/accept`,
+      { method: "POST", body: {} },
+    );
+  },
+
+  /** POST /workspaces/{id}/proposals/{proposalId}/reject */
+  rejectProposal(workspaceId: string, proposalId: string, reason?: string): Promise<ProposalDecisionData> {
+    return request<ProposalDecisionData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/proposals/${encodeURIComponent(proposalId)}/reject`,
+      { method: "POST", body: { reason } },
+    );
+  },
+
+  /** GET /workspaces/{id}/knowledge-center */
+  getKnowledgeCenter(workspaceId: string, signal?: AbortSignal): Promise<KnowledgeCenterData> {
+    return request<KnowledgeCenterData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/knowledge-center`,
+      { signal },
+    );
+  },
+
+  /** GET /workspaces/{id}/skills */
+  getSkills(workspaceId: string, signal?: AbortSignal): Promise<SkillsData> {
+    return request<SkillsData>(`/workspaces/${encodeURIComponent(workspaceId)}/skills`, { signal });
+  },
+
+  /** POST /workspaces/{id}/skills */
+  saveSkills(workspaceId: string, content: string): Promise<SkillsData> {
+    return request<SkillsData>(`/workspaces/${encodeURIComponent(workspaceId)}/skills`, {
+      method: "POST",
+      body: { content },
+    });
+  },
+
+  /** GET /workspaces/{id}/context-bundles */
+  getContextBundles(workspaceId: string, signal?: AbortSignal): Promise<ContextBundlesData> {
+    return request<ContextBundlesData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/context-bundles`,
+      { signal },
+    );
   },
 
   /**

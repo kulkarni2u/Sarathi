@@ -48,6 +48,32 @@ function AgentsIcon() {
   );
 }
 
+function KnowledgeIcon() {
+  return (
+    <svg viewBox="0 0 24 24">
+      <path d="M4 5a2 2 0 0 1 2-2h6v18H6a2 2 0 0 1-2-2z" />
+      <path d="M20 5a2 2 0 0 0-2-2h-6v18h6a2 2 0 0 0 2-2z" />
+    </svg>
+  );
+}
+
+function ProposalsIcon() {
+  return (
+    <svg viewBox="0 0 24 24">
+      <path d="M9 11l3 3L22 4" />
+      <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+    </svg>
+  );
+}
+
+function SkillsIcon() {
+  return (
+    <svg viewBox="0 0 24 24">
+      <path d="M12 2l2.4 5.4L20 8.2l-4 4 1 5.8-5-2.8-5 2.8 1-5.8-4-4 5.6-.8z" />
+    </svg>
+  );
+}
+
 function WikiIcon() {
   return (
     <svg viewBox="0 0 24 24">
@@ -252,9 +278,21 @@ export function Sidebar() {
         </NavLink>
 
         <div className="nl">Knowledge</div>
+        <NavLink to="/knowledge" className={({ isActive }) => `ni${isActive ? " active" : ""}`}>
+          <KnowledgeIcon />
+          Knowledge Center
+        </NavLink>
         <NavLink to="/wiki" className={({ isActive }) => `ni${isActive ? " active" : ""}`}>
           <WikiIcon />
           Wiki
+        </NavLink>
+        <NavLink to="/proposals" className={({ isActive }) => `ni${isActive ? " active" : ""}`}>
+          <ProposalsIcon />
+          Proposals
+        </NavLink>
+        <NavLink to="/skills" className={({ isActive }) => `ni${isActive ? " active" : ""}`}>
+          <SkillsIcon />
+          Skills
         </NavLink>
         <NavLink to="/usage" className={({ isActive }) => `ni${isActive ? " active" : ""}`}>
           <UsageIcon />

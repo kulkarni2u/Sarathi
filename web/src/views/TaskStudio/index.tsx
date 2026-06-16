@@ -152,10 +152,12 @@ function nodeStatusInfo(
   if (
     rawStatus === "in_progress" ||
     rawStatus === "running" ||
-    rawStatus === "review" ||
     (id && graph.activeNodes.has(id))
   ) {
     return { key: "running", label: "in progress" };
+  }
+  if (rawStatus === "review") {
+    return { key: "review", label: "review" };
   }
   if (rawStatus === "failed" || rawStatus === "rejected") {
     return { key: "failed", label: "failed" };
@@ -179,6 +181,11 @@ function providerBadge(provider: string | undefined): string | null {
   if (cleaned.length === 0) return provider.slice(0, 2).toUpperCase();
   if (cleaned.length <= 2) return cleaned.toUpperCase();
   return (cleaned[0] + cleaned[cleaned.length - 1]).toUpperCase();
+}
+
+function normalizeProviderId(provider: string | undefined): string | undefined {
+  const normalized = provider?.trim().toLowerCase();
+  return normalized || undefined;
 }
 
 /** Resolve an edge's endpoints across plausible field-name variants
@@ -359,6 +366,19 @@ function formatTimestamp(value: unknown): string {
   return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
+function currentApprovalGates(approvalGates: ApprovalGate[]): ApprovalGate[] {
+  const seen = new Set<string>();
+  const current: ApprovalGate[] = [];
+  for (let index = approvalGates.length - 1; index >= 0; index -= 1) {
+    const gate = approvalGates[index];
+    const name = stringField(gate, "name") ?? "";
+    if (seen.has(name)) continue;
+    seen.add(name);
+    current.push(gate);
+  }
+  return current.reverse();
+}
+
 /** Pretty-print "awaiting_approval" -> "awaiting approval". */
 function humanize(value: string | undefined | null): string {
   if (!value) return "—";
@@ -441,9 +461,12 @@ function ApprovalCard({
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const approveLabel =
+    name === "PRD/AC" ? "Approve & draft graph" : name === "Task graph" ? "Approve & dispatch" : "Approve";
 
   const runApproval = async (decision: "approved" | "rejected") => {
     setLoading(decision);
+    setError(null);
     setNote(null);
     try {
       if (name === "PRD/AC") {
@@ -454,9 +477,17 @@ function ApprovalCard({
       } else if (name === "Task graph") {
         const result = await api.recordApproval(taskId, { name, status: decision });
         const autoSchedule = asRecord(result.auto_schedule);
-        const scheduled = asArray(autoSchedule?.scheduled);
-        if (decision === "approved" && scheduled.length > 0) {
-          setNote(`Scheduled ${scheduled.length} unit(s).`);
+        let scheduled = asArray(autoSchedule?.scheduled);
+        if (decision === "approved" && scheduled.length === 0) {
+          const scheduleResult = await api.scheduleTask(taskId);
+          scheduled = asArray(scheduleResult.scheduled);
+        }
+        if (decision === "approved") {
+          setNote(
+            scheduled.length > 0
+              ? `Scheduled ${scheduled.length} unit(s).`
+              : "Task graph approved. No ready units were available.",
+          );
         }
       } else {
         await api.recordApproval(taskId, { name, status: decision });
@@ -495,7 +526,7 @@ function ApprovalCard({
           disabled={loading !== null}
           onClick={() => runApproval("approved")}
         >
-          {loading === "approved" ? "Working…" : "Approve & dispatch"}
+          {loading === "approved" ? "Working…" : approveLabel}
         </button>
         <button
           type="button"
@@ -657,8 +688,8 @@ export default function TaskStudio() {
   // action) — `loadCore` alone doesn't touch `tabData`.
   const refresh = useCallback(() => {
     loadCore();
-    setTabData((prev) => ({ ...prev, handoff: undefined }));
-  }, [loadCore]);
+    setTabData((prev) => ({ ...prev, [activeTab]: undefined, handoff: undefined }));
+  }, [activeTab, loadCore]);
 
   // -----------------------------------------------------------------
   // Provider options for the graph list view's dispatch controls.
@@ -824,7 +855,7 @@ export default function TaskStudio() {
   // Pending approval gates, used to inject inline approval cards near the
   // end of the conversation (mirrors the mockup's "approval gate" message).
   const pendingApprovals = useMemo(
-    () => approvals.filter((g) => stringField(g, "status") === "pending"),
+    () => currentApprovalGates(approvals).filter((g) => stringField(g, "status") === "pending"),
     [approvals],
   );
 
@@ -1274,7 +1305,7 @@ function GraphListRow({
   const [loading, setLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedProvider, setSelectedProvider] = useState<string>(
-    stringField(node, "provider") ?? providerOptions[0] ?? "local",
+    normalizeProviderId(stringField(node, "provider")) ?? providerOptions[0] ?? "local",
   );
 
   const status = nodeStatusInfo(node, graph);
@@ -1307,7 +1338,7 @@ function GraphListRow({
         disabled={loading !== null}
         onClick={() => runAction("dispatch", () => api.scheduleTask(taskId).then(() => undefined))}
       >
-        {loading === "dispatch" ? "Working…" : "Dispatch"}
+        {loading === "dispatch" ? "Working…" : "Schedule ready work"}
       </button>
     );
   } else if (rawStatus === "in_progress" && nodeId) {
@@ -1446,7 +1477,7 @@ function TabPanel({
     case "evidence":
       return <EvidenceTab data={data} />;
     case "review":
-      return <ReviewTab data={data} />;
+      return <ReviewTab data={data} taskId={taskId} onChanged={onChanged} />;
     case "history":
       return <HistoryTab data={data} />;
     case "handoff":
@@ -1495,14 +1526,61 @@ function EvidenceTab({ data }: { data: unknown }) {
 }
 
 /** GET /tasks/{id}/reviews — `{ task_id, reviews: [...] }`. */
-function ReviewTab({ data }: { data: unknown }) {
+function ReviewTab({
+  data,
+  taskId,
+  onChanged,
+}: {
+  data: unknown;
+  taskId: string;
+  onChanged: () => void;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
   const record = asRecord(data);
   const items = asArray(record?.reviews ?? record);
+
+  const handleRunReview = async () => {
+    setLoading(true);
+    setError(null);
+    setNote(null);
+    try {
+      const result = await api.runTaskReview(taskId, { review_type: "functional" });
+      const review = asRecord(result.review);
+      const status = stringField(review, "status") ?? "recorded";
+      setNote(`Review ${humanize(status)}.`);
+      onChanged();
+    } catch (err) {
+      setError(err instanceof ApiClientError ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   if (items.length === 0) {
-    return <div className="card2 ts-empty">No review runs recorded for this task yet.</div>;
+    return (
+      <div className="card2 ts-empty">
+        <p>No review runs recorded for this task yet.</p>
+        <div className="ts-acts">
+          <button type="button" className="btn ts-ok" disabled={loading} onClick={handleRunReview}>
+            {loading ? "Working…" : "Run review"}
+          </button>
+        </div>
+        {note && <p className="ts-note">{note}</p>}
+        {error && <p className="ts-err">{error}</p>}
+      </div>
+    );
   }
   return (
     <div className="card2 ts-table-wrap">
+      <div className="ts-acts ts-table-actions">
+        <button type="button" className="btn ts-ok" disabled={loading} onClick={handleRunReview}>
+          {loading ? "Working…" : "Run review"}
+        </button>
+        {note && <span className="ts-note ts-inline-note">{note}</span>}
+        {error && <span className="ts-err ts-inline-note">{error}</span>}
+      </div>
       <table>
         <thead>
           <tr>

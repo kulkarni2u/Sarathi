@@ -60,18 +60,20 @@ def _task_draft_metadata(
 def _task_context_project_id(context: Any) -> str | None:
     if not isinstance(context, Mapping):
         return None
-    value = context.get("projectId")
-    if isinstance(value, str) and value.strip():
-        return value
+    for key in ("projectId", "project_id"):
+        value = context.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
     return None
 
 
 def _task_context_workspace_id(context: Any) -> str | None:
     if not isinstance(context, Mapping):
         return None
-    value = context.get("workspaceId")
-    if isinstance(value, str) and value.strip():
-        return value
+    for key in ("workspaceId", "workspace_id"):
+        value = context.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
     return None
 
 
@@ -540,4 +542,3 @@ def _git_lines(repo_path: Path, *args: str) -> list[str]:
     if not output:
         return []
     return output.splitlines()
-

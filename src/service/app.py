@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import unquote
 
+from src.init import bootstrap_workspace
 from src.storage import Storage, connect, run_migrations
 
 from .errors import (
@@ -414,15 +415,28 @@ class ServiceApp:
             return 200, {"workspaces": workspaces}
 
         if method == "POST" and parts == ["workspaces"]:
+            root_path = _required_text(body, "root_path")
+            metadata = _optional_dict(body, "metadata") or {}
+            bootstrap = bootstrap_workspace(root_path)
+            metadata = {
+                **metadata,
+                "bootstrap": bootstrap,
+            }
             workspace = storage.create_workspace(
                 name=_required_text(body, "name"),
-                root_path=_required_text(body, "root_path"),
-                metadata=_optional_dict(body, "metadata"),
+                root_path=bootstrap["root_path"],
+                metadata=metadata,
             )
             storage.create_lifecycle_event(
                 workspace_id=workspace["id"],
                 event_type="workspace.created",
-                payload={"object_id": workspace["id"]},
+                payload={
+                    "object_id": workspace["id"],
+                    "bootstrap": {
+                        "policy_pack": bootstrap["policy_pack"]["status"],
+                        "wiki": bootstrap["wiki"]["status"],
+                    },
+                },
             )
             return 201, {"workspace": workspace}
 
@@ -1838,4 +1852,3 @@ def create_app(
     return ServiceApp(
         db_path, token=token, dist_root=dist_root, auth_enabled=auth_enabled
     )
-

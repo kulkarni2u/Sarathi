@@ -212,7 +212,7 @@ def task_summary_projection(
         "queue_state": task_queue_state(
             task_row,
             subtasks=subtasks,
-            approval_gates=approval_gates,
+            approval_gates=current_gates,
             review_runs=review_runs,
             lifecycle_events=lifecycle_events,
         ),

@@ -235,6 +235,9 @@
 .ts-status-in_progress {
   background: var(--blue);
 }
+.ts-status-review {
+  background: var(--purple);
+}
 .ts-status-waiting,
 .ts-status-blocked,
 .ts-status-queued,
@@ -487,6 +490,10 @@
 .ts-page button:disabled {
   cursor: not-allowed;
   opacity: 0.6;
+}
+
+.ts-table-actions {
+  margin-bottom: 10px;
 }
 
 .ts-note {

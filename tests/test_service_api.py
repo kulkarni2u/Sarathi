@@ -51,9 +51,9 @@ def test_health_returns_ok_with_correlation_id(tmp_path):
     assert data == {"status": "ok"}
 
 
-def test_workspace_lifecycle_is_persisted_without_touching_repo_paths(tmp_path):
+def test_workspace_creation_bootstraps_policy_pack_and_generated_wiki(tmp_path):
     db_path = tmp_path / "state" / "sarathi.db"
-    root_path = tmp_path / "repo-that-service-must-not-create"
+    root_path = tmp_path / "repo-to-bootstrap"
     app = create_app(db_path)
 
     status, data = assert_ok(
@@ -68,12 +68,45 @@ def test_workspace_lifecycle_is_persisted_without_touching_repo_paths(tmp_path):
     assert data["workspace"]["id"]
     assert data["workspace"]["name"] == "Pravaha UI"
     assert data["workspace"]["root_path"] == str(root_path)
-    assert not root_path.exists()
+    assert (root_path / "policy-pack" / "commands.md").exists()
+    assert (root_path / ".sarathi" / "wiki" / "README.md").exists()
+    bootstrap = data["workspace"]["metadata"]["bootstrap"]
+    assert bootstrap["policy_pack"]["status"] == "created"
+    assert bootstrap["wiki"]["status"] == "created"
 
     status, data = assert_ok(request(create_app(db_path), "GET", "/api/workspaces"))
     assert status == 200
     assert len(data["workspaces"]) == 1
     assert data["workspaces"][0]["name"] == "Pravaha UI"
+
+
+def test_workspace_creation_reuses_existing_init_and_human_wiki(tmp_path):
+    db_path = tmp_path / "state" / "sarathi.db"
+    root_path = tmp_path / "existing-repo"
+    policy_dir = root_path / "policy-pack"
+    wiki_dir = root_path / ".sarathi" / "wiki"
+    policy_dir.mkdir(parents=True)
+    wiki_dir.mkdir(parents=True)
+    existing_commands = "# Commands\n\ncustom: true\n"
+    human_notes = "# Human Notes\n\nDo not overwrite this.\n"
+    (policy_dir / "commands.md").write_text(existing_commands, encoding="utf-8")
+    (wiki_dir / "notes.md").write_text(human_notes, encoding="utf-8")
+    app = create_app(db_path)
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Existing", "root_path": str(root_path)},
+        )
+    )
+
+    assert status == 201
+    assert (policy_dir / "commands.md").read_text(encoding="utf-8") == existing_commands
+    assert (wiki_dir / "notes.md").read_text(encoding="utf-8") == human_notes
+    assert data["workspace"]["metadata"]["bootstrap"]["policy_pack"]["status"] == "reused"
+    assert data["workspace"]["metadata"]["bootstrap"]["wiki"]["status"] == "refreshed"
 
 
 def test_workspace_repository_action_preference_can_be_saved(tmp_path):
@@ -561,6 +594,44 @@ def test_chat_and_task_draft_persist_project_context(tmp_path):
     assert status == 201
     _, task_data = assert_ok(request(app, "GET", f"/api/tasks/{chat_data['taskId']}"))
     assert task_data["task"]["metadata"]["project_id"] == project_id
+
+
+def test_task_draft_accepts_snake_case_project_context(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+    _, project_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/projects",
+            {"name": "UI Enhancements"},
+        )
+    )
+    project_id = project_data["project"]["id"]
+
+    status, draft_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {
+                "prompt": "Start a project chat from the cockpit.",
+                "context": {"project_id": project_id},
+            },
+        )
+    )
+
+    assert status == 201
+    assert draft_data["task"]["project_id"] == project_id
+    assert draft_data["task"]["metadata"]["project_id"] == project_id
 
 
 def test_workspace_projects_can_be_created_and_listed(tmp_path):

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
+import type { FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, ApiClientError } from "../../api/client";
-import type { TaskDashboardRow } from "../../api/types";
+import type { Project, TaskDashboardRow } from "../../api/types";
 import { useWorkspace } from "../../context/WorkspaceContext";
 import { FormModal } from "../../components/FormModal";
 import "./Dashboard.css";
@@ -164,15 +165,116 @@ function formatUpdatedAt(value: unknown): string | undefined {
 
 type ViewMode = "board" | "list";
 
+interface ProjectOption {
+  projectId: string;
+  projectName: string;
+}
+
+interface ProjectChatModalProps {
+  projects: ProjectOption[];
+  defaultProjectId: string | null;
+  onSubmit: (values: { projectId: string; title?: string; prompt: string }) => Promise<void>;
+  onClose: () => void;
+}
+
+function ProjectChatModal({ projects, defaultProjectId, onSubmit, onClose }: ProjectChatModalProps) {
+  const [projectId, setProjectId] = useState(defaultProjectId ?? projects[0]?.projectId ?? "");
+  const [title, setTitle] = useState("");
+  const [prompt, setPrompt] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const missingRequired = projectId.trim().length === 0 || prompt.trim().length === 0;
+
+  async function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (submitting || missingRequired) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onSubmit({
+        projectId: projectId.trim(),
+        title: title.trim() || undefined,
+        prompt: prompt.trim(),
+      });
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="fm-overlay" role="dialog" aria-modal="true" onMouseDown={onClose}>
+      <div className="fm-panel dash-chat-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <form onSubmit={handleSubmit}>
+          <div className="fm-head">New project chat</div>
+          <label className="fm-field">
+            <span className="fm-label">
+              Project <span className="fm-req">*</span>
+            </span>
+            <select
+              className="fm-input dash-chat-select"
+              value={projectId}
+              autoFocus
+              onChange={(e) => setProjectId(e.target.value)}
+            >
+              {projects.map((project) => (
+                <option key={project.projectId} value={project.projectId}>
+                  {project.projectName}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="fm-field">
+            <span className="fm-label">Title</span>
+            <input
+              className="fm-input"
+              type="text"
+              value={title}
+              placeholder="Optional task title"
+              autoComplete="off"
+              onChange={(e) => setTitle(e.target.value)}
+            />
+          </label>
+          <label className="fm-field">
+            <span className="fm-label">
+              Message <span className="fm-req">*</span>
+            </span>
+            <textarea
+              className="fm-input dash-chat-textarea"
+              value={prompt}
+              placeholder="Describe what you want Sarathi to help with"
+              onChange={(e) => setPrompt(e.target.value)}
+            />
+          </label>
+          {error && <div className="fm-error">{error}</div>}
+          <div className="fm-actions">
+            <button type="button" className="btn ghost" onClick={onClose} disabled={submitting}>
+              Cancel
+            </button>
+            <button type="submit" className="btn primary" disabled={submitting || missingRequired}>
+              {submitting ? "Starting…" : "Start chat"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const { currentWorkspace, currentWorkspaceId, serviceStatus, refresh } = useWorkspace();
   const navigate = useNavigate();
   const [tasks, setTasks] = useState<TaskDashboardRow[] | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [projectsError, setProjectsError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("board");
   const [projectFilter, setProjectFilter] = useState<string | null>(null);
   const [showNewProject, setShowNewProject] = useState(false);
+  const [showNewChat, setShowNewChat] = useState(false);
 
   useEffect(() => {
     if (!currentWorkspaceId) {
@@ -196,30 +298,51 @@ export default function Dashboard() {
     return () => controller.abort();
   }, [currentWorkspaceId]);
 
-  // Reset the project filter if it no longer matches any loaded project.
   useEffect(() => {
-    if (!projectFilter || !tasks) return;
-    if (!tasks.some((task) => task.project_id === projectFilter)) {
-      setProjectFilter(null);
+    if (!currentWorkspaceId) {
+      setProjects([]);
+      return;
     }
-  }, [tasks, projectFilter]);
+    const controller = new AbortController();
+    setProjectsError(null);
+    api
+      .getProjects(currentWorkspaceId, controller.signal)
+      .then((data) => setProjects(data.projects ?? []))
+      .catch((err) => {
+        if (controller.signal.aborted) return;
+        setProjects([]);
+        setProjectsError(err instanceof ApiClientError ? err.message : String(err));
+      });
+    return () => controller.abort();
+  }, [currentWorkspaceId]);
 
-  // Distinct {project_id, project_name} pairs for the filter chips. The chip
-  // label prefers the human-readable `project_name`, falling back to the
-  // (UUID) `project_id` only when no name is present.
-  const projectChips = useMemo(() => {
-    if (!tasks) return [];
+  const projectOptions = useMemo<ProjectOption[]>(() => {
     const byId = new Map<string, string>();
-    for (const task of tasks) {
-      if (typeof task.project_id !== "string" || !task.project_id) continue;
-      if (byId.has(task.project_id)) continue;
-      const name = typeof task.project_name === "string" && task.project_name ? task.project_name : task.project_id;
-      byId.set(task.project_id, name);
+    for (const project of projects) {
+      if (typeof project.id !== "string" || !project.id) continue;
+      const name = typeof project.name === "string" && project.name ? project.name : project.id;
+      byId.set(project.id, name);
+    }
+    if (tasks) {
+      for (const task of tasks) {
+        if (typeof task.project_id !== "string" || !task.project_id) continue;
+        if (byId.has(task.project_id)) continue;
+        const name = typeof task.project_name === "string" && task.project_name ? task.project_name : task.project_id;
+        byId.set(task.project_id, name);
+      }
     }
     return Array.from(byId.entries())
       .map(([projectId, projectName]) => ({ projectId, projectName }))
       .sort((a, b) => a.projectName.localeCompare(b.projectName));
-  }, [tasks]);
+  }, [projects, tasks]);
+
+  // Reset the project filter if it no longer matches any loaded project.
+  useEffect(() => {
+    if (!projectFilter) return;
+    if (!projectOptions.some((project) => project.projectId === projectFilter)) {
+      setProjectFilter(null);
+    }
+  }, [projectFilter, projectOptions]);
 
   const visibleTasks = useMemo(() => {
     if (!tasks) return [];
@@ -239,8 +362,22 @@ export default function Dashboard() {
   const degraded = serviceStatus === "degraded";
 
   const projectFilterLabel = projectFilter
-    ? projectChips.find((chip) => chip.projectId === projectFilter)?.projectName ?? projectFilter
+    ? projectOptions.find((chip) => chip.projectId === projectFilter)?.projectName ?? projectFilter
     : null;
+
+  const defaultChatProjectId = projectFilter ?? projectOptions[0]?.projectId ?? null;
+
+  async function startProjectChat(values: { projectId: string; title?: string; prompt: string }) {
+    if (!currentWorkspaceId) throw new Error("Select or create a workspace first.");
+    const data = await api.createTaskDraft(currentWorkspaceId, {
+      title: values.title,
+      prompt: values.prompt,
+      context: {
+        project_id: values.projectId,
+      },
+    });
+    navigate(`/task/${data.task.id}`);
+  }
 
   return (
     <section>
@@ -265,6 +402,21 @@ export default function Dashboard() {
           </div>
           <button
             className="btn primary"
+            type="button"
+            disabled={!currentWorkspaceId || projectOptions.length === 0}
+            title={
+              !currentWorkspaceId
+                ? "Select or create a workspace first"
+                : projectOptions.length === 0
+                  ? "Create a project before starting a project chat"
+                  : undefined
+            }
+            onClick={() => setShowNewChat(true)}
+          >
+            ＋ New chat
+          </button>
+          <button
+            className="btn"
             type="button"
             disabled={!currentWorkspaceId}
             title={currentWorkspaceId ? undefined : "Select or create a workspace first"}
@@ -299,7 +451,7 @@ export default function Dashboard() {
             >
               All projects
             </span>
-            {projectChips.map(({ projectId, projectName }) => (
+            {projectOptions.map(({ projectId, projectName }) => (
               <span
                 key={projectId}
                 className={`dash-chip ${projectFilter === projectId ? "on" : ""}`}
@@ -314,6 +466,10 @@ export default function Dashboard() {
 
           {!loading && error && (
             <div className="banner offline">⚠ Failed to load task dashboard: {error}</div>
+          )}
+
+          {projectsError && (
+            <div className="banner warn">⚠ Failed to load projects: {projectsError}</div>
           )}
 
           {!loading && !error && tasks && tasks.length === 0 && (
@@ -457,13 +613,24 @@ export default function Dashboard() {
             },
           ]}
           onSubmit={async (values) => {
-            await api.createProject(currentWorkspaceId, {
+            const data = await api.createProject(currentWorkspaceId, {
               name: values.name,
               description: values.description || undefined,
             });
+            setProjects((prev) => [...prev, data.project]);
+            if (data.project.id) setProjectFilter(data.project.id);
             refresh();
           }}
           onClose={() => setShowNewProject(false)}
+        />
+      )}
+
+      {showNewChat && currentWorkspaceId && (
+        <ProjectChatModal
+          projects={projectOptions}
+          defaultProjectId={defaultChatProjectId}
+          onSubmit={startProjectChat}
+          onClose={() => setShowNewChat(false)}
         />
       )}
     </section>

@@ -11,7 +11,7 @@ from typing import Any
 
 try:
     from .evolve import Evolver, ProposalReviewStore
-    from .init import InitWorkflow
+    from .init import InitWorkflow, bootstrap_workspace
     from .policy import compile_policy_pack
     from .policy.layering import extract_server_caps
     from .runtime import UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
@@ -31,7 +31,7 @@ try:
 except ImportError:
     # Support direct execution via sarathi.py, which prepends src/ to sys.path.
     from evolve import Evolver, ProposalReviewStore
-    from init import InitWorkflow
+    from init import InitWorkflow, bootstrap_workspace
     from policy import compile_policy_pack
     from policy.layering import extract_server_caps
     from runtime import UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
@@ -488,6 +488,11 @@ def main() -> None:
         action="store_true",
         help="Initialize with NCP context protocol (bootstraps .ncp/ directory required for auto-detect)",
     )
+    init_parser.add_argument(
+        "--no-wiki",
+        action="store_true",
+        help="Skip generated .sarathi/wiki creation.",
+    )
 
     # Validate command
     validate_parser = subparsers.add_parser("validate", help="Validate a policy pack")
@@ -735,28 +740,24 @@ def handle_init(args: argparse.Namespace) -> None:
     print(f"Initializing Sarathi policy pack at: {args.target_path}")
     print(f"Using engine: {args.engine}")
 
-    workflow = InitWorkflow(
-        target_path=args.target_path,
-        engine_path=args.engine
-    )
-
     # Phase 1: Inspect
     print("\n[1/5] Inspect: Scanning repository...")
+    workflow = InitWorkflow(target_path=args.target_path, engine_path=args.engine)
     inspection = workflow.inspect()
     print(f"  Detected: {inspection.get('languages', [])}")
     print(f"  Build tools: {inspection.get('build_tools', [])}")
     print(f"  Test patterns: {inspection.get('test_patterns', [])}")
 
-    # Phase 2: Interview
-    print("\n[2/5] Interview: Gathering policy preferences...")
-    interview = workflow.interview(inspection)
-    print("  Policy keys: configured")
-    print("  Task tracking: configured")
-
-    # Phase 3: Generate
-    print("\n[3/5] Generate: Creating policy pack...")
-    policy_path = workflow.generate(inspection, interview)
-    print(f"  Created: {policy_path}")
+    # Phases 2-3: bootstrap policy pack and wiki.
+    print("\n[2/5] Bootstrap: Creating or reusing workspace artifacts...")
+    bootstrap = bootstrap_workspace(
+        args.target_path,
+        engine_path=args.engine,
+        with_wiki=not getattr(args, "no_wiki", False),
+    )
+    policy_path = Path(bootstrap["policy_pack"]["path"])
+    print(f"  Policy pack: {bootstrap['policy_pack']['status']} → {policy_path}")
+    print(f"  Wiki: {bootstrap['wiki']['status']} → {bootstrap['wiki']['path']}")
     # Write provider-native permission config files from the generated permissions.md
     try:
         from .runtime.providers.cli_bridge import ensure_provider_permissions
@@ -767,13 +768,13 @@ def handle_init(args: argparse.Namespace) -> None:
         print(f"  Wrote {provider} permissions → {config_path}")
 
     # Phase 4: Validate
-    print("\n[4/5] Validate: Checking policy pack...")
+    print("\n[3/5] Validate: Checking policy pack...")
     validation_results = workflow.validate(policy_path)
     passed = sum(1 for r in validation_results if r.status.value == "PASS")
     print(f"  Passed: {passed}/{len(validation_results)}")
 
     # Phase 5: Evolve
-    print("\n[5/5] Evolve: Learning from setup...")
+    print("\n[4/5] Evolve: Learning from setup...")
     workflow.evolve()
 
     # NCP Integration
@@ -781,7 +782,6 @@ def handle_init(args: argparse.Namespace) -> None:
         print("\n[6/6] NCP: Initializing Neural Context Protocol...")
         import subprocess
         import sys
-        from pathlib import Path
 
         # Determine init target — use explicit target_path or CWD
         init_target = Path(args.target_path)

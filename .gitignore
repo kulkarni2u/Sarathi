@@ -41,3 +41,6 @@ desktop/public/sarathi-runtime.js
 
 # Claude Code session worktrees (agent sandboxes)
 .claude/worktrees/
+build/
+dist/
+*.egg-info/

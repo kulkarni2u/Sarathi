@@ -59,6 +59,13 @@ export interface TaskDashboardRow extends AnyRecord {
   [key: string]: unknown;
 }
 
+export interface Task extends AnyRecord {
+  id: string;
+  title?: string;
+  project_id?: string | null;
+  [key: string]: unknown;
+}
+
 export interface TaskDashboardData {
   tasks: TaskDashboardRow[];
 }
@@ -122,6 +129,9 @@ export type TaskEvidenceData = AnyRecord;
 /** GET /tasks/{id}/reviews — `additionalProperties: true` in openapi.json. */
 export type TaskReviewsData = AnyRecord;
 
+/** POST /tasks/{id}/reviews/run — `{ review, completed_subtasks, requeued_subtasks }`. */
+export type TaskReviewRunResult = AnyRecord;
+
 /**
  * GET /tasks/{id}/handoff — "Latest handoff (or null)" per openapi.json.
  * `additionalProperties: true` when present.
@@ -159,6 +169,13 @@ export interface GraphDraftData extends AnyRecord {
 /** POST /tasks/{id}/messages — `{ message }`. */
 export interface TaskMessageResult extends AnyRecord {
   message: TaskMessage;
+}
+
+/** POST /workspaces/{id}/task-drafts — project/task-backed chat start. */
+export interface TaskDraftData extends AnyRecord {
+  task: Task;
+  approval_gate: ApprovalGate;
+  messages: TaskMessage[];
 }
 
 /**

@@ -1047,12 +1047,23 @@ def _task_studio_header(
     workspace: dict[str, Any] | None,
 ) -> dict[str, Any]:
     handoff_state = _handoff_state(handoff)
-    queue_state = _task_studio_queue_state(task, graph, approvals, reviews, handoff_state)
+    current_approvals = _current_approval_gates(approvals)
+    queue_state = _task_studio_queue_state(
+        task,
+        graph,
+        current_approvals,
+        reviews,
+        handoff_state,
+    )
     repository_action_preference = _effective_repository_action_preference(task, workspace)
     return {
         "queue_state": queue_state,
-        "approval_state": _approval_state(approvals),
-        "next_safe_action": _task_studio_next_safe_action(queue_state, approvals, checkpoint),
+        "approval_state": _approval_state(current_approvals),
+        "next_safe_action": _task_studio_next_safe_action(
+            queue_state,
+            current_approvals,
+            checkpoint,
+        ),
         "repository_action_mode": repository_action_preference["mode"],
         "checkpoint_ready": checkpoint is not None,
         "handoff_state": handoff_state,
@@ -1111,4 +1122,3 @@ def _task_studio_next_safe_action(
     if queue_state == "ready":
         return "Dispatch ready work"
     return "Open task"
-

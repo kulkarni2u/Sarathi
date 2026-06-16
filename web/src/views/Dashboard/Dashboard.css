@@ -33,6 +33,20 @@
   font-weight: 600;
 }
 
+.dash-chat-modal {
+  max-width: 520px;
+}
+
+.dash-chat-select {
+  min-height: 38px;
+}
+
+.dash-chat-textarea {
+  min-height: 132px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
 /* ---------- board ---------- */
 .board {
   display: grid;

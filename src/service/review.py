@@ -272,7 +272,6 @@ def _run_task_review(
 ) -> dict[str, Any]:
     review_type = _optional_text(body, "review_type") or "code"
     subtasks = storage.list_subtasks_for_task(task["id"])
-    review_units = [subtask for subtask in subtasks if subtask["status"] == "review"]
     evidence = storage.list_evidence_artifacts_for_task(task["id"])
     evidence_by_id = {item["id"]: item for item in evidence}
     evidenced_subtask_ids = {
@@ -280,6 +279,13 @@ def _run_task_review(
         for item in evidence
         if item["metadata"].get("subtask_id")
     }
+    review_units = [subtask for subtask in subtasks if subtask["status"] == "review"]
+    if not review_units:
+        review_units = [
+            subtask
+            for subtask in subtasks
+            if subtask["status"] in {"complete", "done"} and subtask["id"] in evidenced_subtask_ids
+        ]
     missing_evidence = [
         subtask["id"] for subtask in review_units if subtask["id"] not in evidenced_subtask_ids
     ]
@@ -298,7 +304,10 @@ def _run_task_review(
 
     if review_units and not missing_evidence and not blocking_findings and not coverage_gaps:
         completed = [
-            storage.update_subtask(subtask["id"], status="complete") for subtask in review_units
+            subtask
+            if subtask["status"] in {"complete", "done"}
+            else storage.update_subtask(subtask["id"], status="complete")
+            for subtask in review_units
         ]
         review = storage.create_review_run(
             workspace_id=task["workspace_id"],
@@ -908,4 +917,3 @@ def _review_requeue_subtask_ids(
     if coverage_gaps:
         return review_unit_ids
     return matched
-

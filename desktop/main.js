@@ -92,6 +92,31 @@ function resolvePythonBin() {
   );
 }
 
+function resolveServiceDiscoveryPath() {
+  return path.join(app.getPath("home"), ".sarathi", "service.json");
+}
+
+function readServiceDiscovery() {
+  const discoveryPath = resolveServiceDiscoveryPath();
+  if (!fs.existsSync(discoveryPath)) {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(fs.readFileSync(discoveryPath, "utf8"));
+    const token = payload && payload.auth && payload.auth.type === "bearer" ? payload.auth.token : null;
+    if (typeof payload.url === "string" && typeof token === "string" && token.length > 0) {
+      return { url: payload.url.replace(/\/+$/, ""), token, dbPath: payload.db_path };
+    }
+  } catch (err) {
+    console.warn(`[sarathi] ignoring unreadable service discovery: ${err.message}`);
+  }
+  return null;
+}
+
+function resolveSharedDbPath() {
+  return path.join(app.getPath("home"), ".sarathi", "sarathi.db");
+}
+
 // Find a free TCP port. Falls back to DEFAULT_PORT on any error.
 function choosePort() {
   return new Promise((resolve) => {
@@ -147,16 +172,17 @@ function spawnService({ port, token, repoRoot, dbPath }) {
 }
 
 // Poll /api/health until the service reports ok or we time out.
-function waitForService({ port, token }) {
+function waitForService({ baseUrl, token }) {
   const deadline = Date.now() + HEALTH_TIMEOUT_MS;
+  const healthUrl = new URL("/api/health", baseUrl);
 
   return new Promise((resolve, reject) => {
     const attempt = () => {
       const req = http.request(
         {
-          host: "127.0.0.1",
-          port,
-          path: "/api/health",
+          host: healthUrl.hostname,
+          port: healthUrl.port,
+          path: healthUrl.pathname,
           method: "GET",
           headers: { Authorization: `Bearer ${token}` },
           timeout: 1500,
@@ -202,7 +228,25 @@ function waitForService({ port, token }) {
   });
 }
 
-function createWindow(port) {
+async function discoverRunningService() {
+  const discovered = readServiceDiscovery();
+  if (!discovered) {
+    return null;
+  }
+  try {
+    await waitForService({
+      baseUrl: discovered.url,
+      token: discovered.token,
+    });
+    console.log(`[sarathi] attached to discovered service at ${discovered.url}`);
+    return discovered;
+  } catch (err) {
+    console.warn(`[sarathi] discovered service is not healthy: ${err.message}`);
+    return null;
+  }
+}
+
+function createWindow(baseUrl) {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 860,
@@ -214,7 +258,7 @@ function createWindow(port) {
     },
   });
 
-  mainWindow.loadURL(`http://127.0.0.1:${port}/`);
+  mainWindow.loadURL(`${baseUrl.replace(/\/+$/, "")}/`);
 
   mainWindow.on("closed", () => {
     mainWindow = null;
@@ -236,16 +280,24 @@ function terminateService() {
 }
 
 async function bootstrap() {
+  const discovered = await discoverRunningService();
+  if (discovered) {
+    activePort = Number(new URL(discovered.url).port) || null;
+    createWindow(discovered.url);
+    return;
+  }
+
   const port = await choosePort();
   activePort = port;
   const token = crypto.randomBytes(24).toString("hex");
+  const baseUrl = `http://127.0.0.1:${port}`;
   const repoRoot = resolveRepoRoot();
-  const dbPath = path.join(app.getPath("userData"), "sarathi.db");
+  const dbPath = resolveSharedDbPath();
 
   serviceChild = spawnService({ port, token, repoRoot, dbPath });
 
   try {
-    await waitForService({ port, token });
+    await waitForService({ baseUrl, token });
   } catch (err) {
     console.error(`[sarathi] ${err.message}`);
     dialog.showErrorBox(
@@ -258,7 +310,7 @@ async function bootstrap() {
     return;
   }
 
-  createWindow(port);
+  createWindow(baseUrl);
 }
 
 app.whenReady().then(bootstrap);
@@ -271,7 +323,7 @@ app.on("activate", () => {
     const serviceAlive =
       serviceChild && serviceChild.exitCode === null && serviceChild.signalCode === null;
     if (serviceAlive && activePort !== null) {
-      createWindow(activePort);
+      createWindow(`http://127.0.0.1:${activePort}`);
     } else {
       bootstrap();
     }

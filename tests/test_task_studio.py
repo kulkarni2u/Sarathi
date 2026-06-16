@@ -133,6 +133,32 @@ def test_task_studio_exposes_header_state_posture(tmp_path):
     assert header["approval_state"] == "approval_pending"
 
 
+def test_task_studio_header_ignores_superseded_pending_approval_gates(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_graph(app, tmp_path)
+
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task['id']}/approve",
+            {"name": "Task graph", "status": "approved"},
+        )
+    )
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+
+    status, data = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+
+    assert status == 200
+    task_graph_gate_statuses = [
+        gate["status"] for gate in data["approval_gates"] if gate["name"] == "Task graph"
+    ]
+    assert task_graph_gate_statuses == ["pending", "approved"]
+    assert data["header"]["approval_state"] == "approved"
+    assert data["header"]["queue_state"] == "running"
+    assert data["header"]["next_safe_action"] == "Monitor execution"
+
+
 def create_task_with_graph(app, tmp_path):
     _, workspace_data = assert_ok(
         request(

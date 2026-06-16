@@ -12,15 +12,19 @@ plumbing in the renderer.
 
 1. Picks a free TCP port (or falls back to `8765`) and generates a random
    bearer token with `crypto.randomBytes`.
-2. Spawns the Python service:
-   `python3 -m src.service --db <userData>/sarathi.db --token <token> --host 127.0.0.1 --port <port>`
-   with the repo root as the working directory.
-3. Polls `http://127.0.0.1:<port>/api/health` (sending
+2. Checks `~/.sarathi/service.json`; if a healthy local Sarathi service is
+   already running, the Electron shell attaches to it instead of starting a
+   second isolated service.
+3. If no healthy service is discovered, spawns the Python service:
+   `python3 -m src.service --db ~/.sarathi/sarathi.db --token <token> --host 127.0.0.1 --port <port>`
+   with the bundled resources directory as the working directory.
+4. Polls `http://127.0.0.1:<port>/api/health` (sending
    `Authorization: Bearer <token>`) until the service reports healthy or a ~20s
    timeout elapses.
-4. Opens a `BrowserWindow` (with `contextIsolation: true`,
+5. Opens a `BrowserWindow` (with `contextIsolation: true`,
    `nodeIntegration: false`, and `preload.js`) at `http://127.0.0.1:<port>/`.
-5. Terminates the service child process on quit.
+6. Terminates only the service child process it started itself; discovered
+   services are left running for CLI/TUI/WebUI clients.
 
 `preload.js` exposes a tiny, frozen, read-only `window.sarathi`
 (`{ desktop: true, version: "0.2.0" }`) so the SPA can detect the desktop shell.
@@ -50,7 +54,7 @@ npm install
 npm start          # runs `electron .`
 ```
 
-In dev mode the repo root is resolved as two levels up from `desktop/`, so the
+In dev mode the repo root is resolved as two levels up from `desktop/`, so a
 spawned service uses the working tree's `src` package and `web/dist` directly.
 
 ## Build a macOS artifact
@@ -72,6 +76,9 @@ packaged build `main.js` resolves the repo root from `process.resourcesPath`.
   follow-up. The packaged app will fail to start on a machine without a
   compatible Python 3 and the `sarathi` package importable from the bundled
   `src` directory.
+- **One service is preferred.** The Electron shell attaches to a healthy
+  `~/.sarathi/service.json` service first. If it has to start one, it uses
+  `~/.sarathi/sarathi.db` so CLI/WebUI clients discover the same service state.
 - **First cut targets macOS `.dmg`.** Windows/Linux installers are not yet
   configured.
 - **A real packaged build needs the full toolchain.** Producing an installer

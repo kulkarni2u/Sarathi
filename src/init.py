@@ -4,6 +4,11 @@ from pathlib import Path
 from typing import Any
 import os
 
+try:
+    from .repo_wiki import generate_repo_wiki
+except ImportError:  # pragma: no cover - direct execution fallback
+    from repo_wiki import generate_repo_wiki
+
 
 @dataclass
 class InitWorkflow:
@@ -551,3 +556,43 @@ permissions:
     def evolve(self) -> dict[str, Any]:
         """Run learning loop + skill-evolve."""
         return {"status": "completed", "message": "Evolution completed"}
+
+
+def bootstrap_workspace(
+    target_path: str,
+    *,
+    engine_path: str = "markdown",
+    with_wiki: bool = True,
+    overwrite_policy_pack: bool = False,
+) -> dict[str, Any]:
+    """Initialize or reuse Sarathi workspace artifacts for a root path."""
+
+    target = Path(target_path).expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    workflow = InitWorkflow(target_path=str(target), engine_path=engine_path)
+    inspection = workflow.inspect()
+    policy_path = target / "policy-pack"
+    policy_status = "reused"
+    if overwrite_policy_pack or not policy_path.exists():
+        interview = workflow.interview(inspection)
+        policy_path = workflow.generate(inspection, interview)
+        policy_status = "created"
+    wiki_result = (
+        generate_repo_wiki(target)
+        if with_wiki
+        else {"status": "skipped", "path": str(target / ".sarathi" / "wiki")}
+    )
+    return {
+        "root_path": str(target),
+        "policy_pack": {
+            "status": policy_status,
+            "path": str(policy_path),
+        },
+        "wiki": wiki_result,
+        "inspection": {
+            "languages": inspection.get("languages", []),
+            "frameworks": inspection.get("frameworks", []),
+            "build_tools": inspection.get("build_tools", []),
+            "test_patterns": inspection.get("test_patterns", []),
+        },
+    }

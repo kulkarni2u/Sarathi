@@ -39,9 +39,11 @@ import type {
   TaskEvidenceData,
   TaskGraphData,
   TaskHandoffData,
+  TaskDraftData,
   TaskMessageResult,
   TaskMessagesData,
   TaskPanelData,
+  TaskReviewRunResult,
   TaskReviewsData,
   TaskStudioData,
   TestProviderData,
@@ -209,6 +211,22 @@ export const api = {
     );
   },
 
+  /** POST /workspaces/{id}/task-drafts — start a project/task-backed chat. */
+  createTaskDraft(
+    workspaceId: string,
+    input: {
+      prompt: string;
+      title?: string;
+      context?: Record<string, unknown>;
+    },
+    signal?: AbortSignal,
+  ): Promise<TaskDraftData> {
+    return request<TaskDraftData>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/task-drafts`,
+      { method: "POST", body: input, signal },
+    );
+  },
+
   /** GET /providers?workspace_id= */
   getProviders(workspaceId?: string, signal?: AbortSignal): Promise<ProvidersData> {
     return request<ProvidersData>("/providers", {
@@ -271,6 +289,19 @@ export const api = {
   /** GET /tasks/{id}/reviews */
   getTaskReviews(taskId: string, signal?: AbortSignal): Promise<TaskReviewsData> {
     return request<TaskReviewsData>(`/tasks/${encodeURIComponent(taskId)}/reviews`, { signal });
+  },
+
+  /** POST /tasks/{id}/reviews/run — run the governed review loop. */
+  runTaskReview(
+    taskId: string,
+    body: { review_type?: string } = {},
+    signal?: AbortSignal,
+  ): Promise<TaskReviewRunResult> {
+    return request<TaskReviewRunResult>(`/tasks/${encodeURIComponent(taskId)}/reviews/run`, {
+      method: "POST",
+      body,
+      signal,
+    });
   },
 
   /** GET /tasks/{id}/handoff (latest handoff, or null) */

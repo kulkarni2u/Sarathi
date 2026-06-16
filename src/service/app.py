@@ -64,6 +64,7 @@ from .providers import (
     _claim_is_fresh,
     _dispatch_subtask,
     _handle_chat,
+    _invoke_task_chat_provider,
     _provider_health,
     _test_and_store_provider,
 )
@@ -155,6 +156,15 @@ def _sse_response(status: int, body: str) -> RawResponse:
         body.encode("utf-8"),
         headers={"cache-control": "no-cache"},
     )
+
+
+def _optional_bool(body: Mapping[str, Any], key: str, *, default: bool = False) -> bool:
+    value = body.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ServiceError("invalid_request", f"Field '{key}' must be a boolean.", 400)
 
 
 _DOCS_HTML = """<!DOCTYPE html>
@@ -986,16 +996,6 @@ class ServiceApp:
                 content=prompt,
                 metadata={"target": "Sarathi", "source": "orchestrator_chat"},
             )
-            sarathi_message = storage.create_message(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                role="sarathi",
-                content=(
-                    "I drafted the PRD/AC shell and opened the PRD/AC approval gate "
-                    "before graph generation."
-                ),
-                metadata={"draft_task_id": task["id"], "gate": "PRD/AC"},
-            )
             gate = storage.create_approval_gate(
                 workspace_id=workspace_id,
                 task_id=task["id"],
@@ -1019,10 +1019,27 @@ class ServiceApp:
                 event_type="approval.requested",
                 payload={"object_id": gate["id"], "name": gate["name"]},
             )
+            if _optional_bool(body, "invoke_provider", default=False):
+                reply_result = _invoke_task_chat_provider(
+                    storage, task, user_message, target="Sarathi"
+                )
+                messages = [user_message, reply_result["message"]]
+            else:
+                sarathi_message = storage.create_message(
+                    workspace_id=workspace_id,
+                    task_id=task["id"],
+                    role="sarathi",
+                    content=(
+                        "I drafted the PRD/AC shell and opened the PRD/AC approval gate "
+                        "before graph generation."
+                    ),
+                    metadata={"draft_task_id": task["id"], "gate": "PRD/AC"},
+                )
+                messages = [user_message, sarathi_message]
             return 201, {
                 "task": task,
                 "approval_gate": gate,
-                "messages": [user_message, sarathi_message],
+                "messages": messages,
             }
 
         if (
@@ -1205,7 +1222,18 @@ class ServiceApp:
                 event_type="message.created",
                 payload={"object_id": message["id"], "target": message["metadata"]["target"]},
             )
-            return 201, {"message": message}
+            reply_result = None
+            if _optional_bool(body, "invoke_provider", default=False):
+                reply_result = _invoke_task_chat_provider(
+                    storage,
+                    task,
+                    message,
+                    target=str(message["metadata"]["target"]),
+                )
+            return 201, {
+                "message": message,
+                **({"reply": reply_result["message"], "agent": reply_result["agent"]} if reply_result else {}),
+            }
 
         if (
             method == "POST"

@@ -20,6 +20,7 @@ from src.runtime import (
 )
 from src.storage import Storage
 from src.task_class import TASK_CLASS_DEFAULTS, TaskClass, classify_task_class, from_legacy_type
+from src.tui_data import ChatSession, is_error_reply
 
 from .errors import ServiceError
 from .intake import _task_context_project_id, _task_context_workspace_id, _task_draft_metadata
@@ -290,6 +291,70 @@ def _dispatch_subtask(
         "dispatch": dispatch,
         "evidence": evidence,
     }
+
+
+def _invoke_task_chat_provider(
+    storage: Storage,
+    task: Mapping[str, Any],
+    user_message: Mapping[str, Any],
+    *,
+    target: str = "Current task agents",
+) -> dict[str, Any]:
+    """Invoke the same free-form provider chat path used by the TUI.
+
+    This is intentionally separate from TaskTracking dispatch: chat messages
+    should get conversational provider replies, while graph nodes still use the
+    governed subtask dispatch contract.
+    """
+    workspace = storage.get_workspace(str(task["workspace_id"]))
+    workspace_root = workspace["root_path"] if workspace is not None else None
+    session = ChatSession(workspace_root=workspace_root)
+    preferred_provider = _prefer_chat_session_provider(storage, str(task["workspace_id"]), session)
+    reply_text = session.send(str(user_message["content"]))
+    provider = (session.provider[0] if session.provider else preferred_provider) or "unavailable"
+    error = is_error_reply(reply_text) or provider == "unavailable"
+    reply = storage.create_message(
+        workspace_id=str(task["workspace_id"]),
+        task_id=str(task["id"]),
+        role=provider if provider != "unavailable" else "sarathi",
+        content=reply_text,
+        metadata={
+            "source": "provider_chat",
+            "provider": provider,
+            "target": target,
+            "reply_to": user_message["id"],
+            **({"error": True} if error else {}),
+        },
+    )
+    storage.create_lifecycle_event(
+        workspace_id=str(task["workspace_id"]),
+        task_id=str(task["id"]),
+        event_type="message.provider_replied",
+        payload={
+            "object_id": reply["id"],
+            "reply_to": user_message["id"],
+            "provider": provider,
+            "status": "error" if error else "completed",
+        },
+    )
+    return {
+        "message": reply,
+        "agent": provider,
+        "status": "error" if error else "completed",
+    }
+
+
+def _prefer_chat_session_provider(
+    storage: Storage,
+    workspace_id: str,
+    session: ChatSession,
+) -> str | None:
+    priority = [provider for provider in _get_provider_priority(storage, workspace_id) if provider in ChatSession.PROVIDERS]
+    for provider in priority:
+        if session.set_provider(provider):
+            return provider
+    resolved = session.resolve_provider()
+    return resolved[0] if resolved else None
 
 
 _READ_ONLY_ROLES = {"disha", "vichara", "prajna", "nirnaya", "marga", "sahayaka"}
@@ -621,15 +686,24 @@ def _handle_chat(storage: Storage, body: Mapping[str, Any]) -> dict[str, Any]:
     provider = _select_available_provider(storage, workspace_id, priority)
     if provider is None:
         provider = priority[0] if priority else "local"
+    metadata = _task_draft_metadata(
+        message,
+        project_id=_task_context_project_id(context),
+    )
     task = storage.create_task(
         workspace_id=workspace_id,
         title=message[:100],
         status="prd_pending",
         description=message,
-        metadata=_task_draft_metadata(
-            message,
-            project_id=_task_context_project_id(context),
-        ),
+        metadata=metadata,
+        project_id=metadata.get("project_id"),
+    )
+    user_message = storage.create_message(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        role="user",
+        content=message,
+        metadata={"target": "Current task agents", "source": "service_chat"},
     )
     storage.create_lifecycle_event(
         workspace_id=workspace_id,
@@ -637,7 +711,14 @@ def _handle_chat(storage: Storage, body: Mapping[str, Any]) -> dict[str, Any]:
         event_type="task.chat_created",
         payload={"object_id": task["id"], "agent": provider},
     )
-    return {"taskId": task["id"], "agent": provider, "status": "started"}
+    provider_reply = _invoke_task_chat_provider(storage, task, user_message)
+    return {
+        "taskId": task["id"],
+        "agent": provider_reply["agent"],
+        "status": provider_reply["status"],
+        "message": user_message,
+        "reply": provider_reply["message"],
+    }
 
 
 def _get_provider_priority(storage: Storage, workspace_id: str) -> list[str]:

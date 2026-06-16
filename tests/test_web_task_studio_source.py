@@ -46,3 +46,14 @@ def test_task_studio_action_labels_describe_actual_work():
     assert "\"Approve & draft graph\"" in source
     assert "\"Approve & dispatch\"" in source
     assert "\"Schedule ready work\"" in source
+
+
+def test_web_chat_requests_invoke_provider_replies():
+    dashboard = Path("web/src/views/Dashboard/index.tsx").read_text(encoding="utf-8")
+    task_studio = Path("web/src/views/TaskStudio/index.tsx").read_text(encoding="utf-8")
+    client = Path("web/src/api/client.ts").read_text(encoding="utf-8")
+
+    assert "invoke_provider?: boolean" in client
+    assert "invoke_provider: true" in dashboard
+    assert "invoke_provider: true" in task_studio
+    assert "result.reply" in task_studio

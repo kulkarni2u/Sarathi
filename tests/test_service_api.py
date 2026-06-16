@@ -10,6 +10,7 @@ import pytest
 from src.service import create_app, create_http_server
 from src.service.app import RawResponse
 from src.service.openapi import build_openapi_spec
+from src.service import providers as service_providers
 from src.storage import Storage, connect, run_migrations
 
 
@@ -40,6 +41,29 @@ def assert_error(response, *, status, code, correlation_id="corr-test"):
     assert payload["error"]["status"] == status
     assert payload["error"]["message"]
     assert "data" not in payload
+
+
+class FakeChatSession:
+    PROVIDERS = ("claude", "opencode", "codex")
+    sent: list[str] = []
+
+    def __init__(self, workspace_root=None):
+        self.workspace_root = workspace_root
+        self.provider = None
+
+    def set_provider(self, name):
+        self.provider = (name, f"/fake/{name}")
+        return True
+
+    def resolve_provider(self):
+        if self.provider is None:
+            self.provider = ("claude", "/fake/claude")
+        return self.provider
+
+    def send(self, message):
+        self.resolve_provider()
+        self.sent.append(message)
+        return f"provider reply: {message}"
 
 
 def test_health_returns_ok_with_correlation_id(tmp_path):
@@ -551,7 +575,9 @@ def test_approval_endpoint_persists_gate_and_event(tmp_path):
     assert events_data["events"][-1]["object_id"] == approval["id"]
 
 
-def test_chat_and_task_draft_persist_project_context(tmp_path):
+def test_chat_and_task_draft_persist_project_context(tmp_path, monkeypatch):
+    FakeChatSession.sent = []
+    monkeypatch.setattr(service_providers, "ChatSession", FakeChatSession)
     app = create_app(tmp_path / "sarathi.db")
     _, workspace_data = assert_ok(
         request(
@@ -594,6 +620,89 @@ def test_chat_and_task_draft_persist_project_context(tmp_path):
     assert status == 201
     _, task_data = assert_ok(request(app, "GET", f"/api/tasks/{chat_data['taskId']}"))
     assert task_data["task"]["metadata"]["project_id"] == project_id
+
+
+def test_service_chat_invokes_provider_and_persists_reply(tmp_path, monkeypatch):
+    FakeChatSession.sent = []
+    monkeypatch.setattr(service_providers, "ChatSession", FakeChatSession)
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/chat",
+            {
+                "message": "Talk to the model from the service.",
+                "context": {"workspaceId": workspace_id},
+            },
+        )
+    )
+
+    assert status == 201
+    assert data["agent"] == "claude"
+    assert data["status"] == "completed"
+    assert FakeChatSession.sent == ["Talk to the model from the service."]
+    assert data["reply"]["content"] == "provider reply: Talk to the model from the service."
+    _, messages = assert_ok(request(app, "GET", f"/api/tasks/{data['taskId']}/messages"))
+    assert [message["role"] for message in messages["messages"]] == ["user", "claude"]
+
+
+def test_task_message_can_invoke_provider_and_return_reply(tmp_path, monkeypatch):
+    FakeChatSession.sent = []
+    monkeypatch.setattr(service_providers, "ChatSession", FakeChatSession)
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+    _, task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/tasks",
+            {"title": "Provider-backed task chat"},
+        )
+    )
+    task_id = task_data["task"]["id"]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task_id}/messages",
+            {
+                "content": "Continue this task with an agent.",
+                "target": "Current task agents",
+                "invoke_provider": True,
+            },
+        )
+    )
+
+    assert status == 201
+    assert data["agent"] == "claude"
+    assert FakeChatSession.sent == ["Continue this task with an agent."]
+    assert data["reply"]["content"] == "provider reply: Continue this task with an agent."
+    _, messages = assert_ok(request(app, "GET", f"/api/tasks/{task_id}/messages"))
+    assert [message["role"] for message in messages["messages"]] == ["user", "claude"]
+    _, events = assert_ok(request(app, "GET", f"/api/events?task_id={task_id}"))
+    event_types = {event["event_type"] for event in events["events"]}
+    assert "message.created" in event_types
+    assert "message.provider_replied" in event_types
 
 
 def test_task_draft_accepts_snake_case_project_context(tmp_path):

@@ -1,4 +1,5 @@
 from src.service import create_app
+from src.service import providers as service_providers
 from src.storage import Storage, connect, run_migrations
 
 
@@ -17,6 +18,29 @@ def assert_ok(response, correlation_id="corr-task-create"):
     assert payload["correlation_id"] == correlation_id
     assert "data" in payload
     return status, payload["data"]
+
+
+class FakeChatSession:
+    PROVIDERS = ("claude", "opencode", "codex")
+    sent: list[str] = []
+
+    def __init__(self, workspace_root=None):
+        self.workspace_root = workspace_root
+        self.provider = None
+
+    def set_provider(self, name):
+        self.provider = (name, f"/fake/{name}")
+        return True
+
+    def resolve_provider(self):
+        if self.provider is None:
+            self.provider = ("claude", "/fake/claude")
+        return self.provider
+
+    def send(self, message):
+        self.resolve_provider()
+        self.sent.append(message)
+        return f"provider reply: {message}"
 
 
 def test_storage_can_create_and_list_task_messages(tmp_path):
@@ -141,6 +165,43 @@ def test_service_creates_task_draft_from_orchestrator_prompt(tmp_path):
     event_types = [event["event_type"] for event in events_data["events"]]
     assert "task.draft_created" in event_types
     assert "approval.requested" in event_types
+
+
+def test_task_draft_can_invoke_provider_chat_reply(tmp_path, monkeypatch):
+    FakeChatSession.sent = []
+    monkeypatch.setattr(service_providers, "ChatSession", FakeChatSession)
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sarathi App", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {
+                "prompt": "Start a provider-backed project chat.",
+                "invoke_provider": True,
+            },
+        )
+    )
+
+    assert status == 201
+    assert FakeChatSession.sent == ["Start a provider-backed project chat."]
+    assert [message["role"] for message in data["messages"]] == ["user", "claude"]
+    reply = data["messages"][1]
+    assert reply["content"] == "provider reply: Start a provider-backed project chat."
+    assert reply["metadata"]["source"] == "provider_chat"
+    assert reply["metadata"]["provider"] == "claude"
+    _, events_data = assert_ok(request(app, "GET", f"/api/events?workspace_id={workspace_id}"))
+    assert "message.provider_replied" in {event["event_type"] for event in events_data["events"]}
 
 
 def test_service_imports_github_issue_as_task_draft_with_repository_metadata(tmp_path):

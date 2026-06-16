@@ -218,6 +218,7 @@ export const api = {
       prompt: string;
       title?: string;
       context?: Record<string, unknown>;
+      invoke_provider?: boolean;
     },
     signal?: AbortSignal,
   ): Promise<TaskDraftData> {
@@ -335,7 +336,7 @@ export const api = {
    */
   postTaskMessage(
     taskId: string,
-    body: { content: string; role?: string; target?: string },
+    body: { content: string; role?: string; target?: string; invoke_provider?: boolean },
     signal?: AbortSignal,
   ): Promise<TaskMessageResult> {
     return request<TaskMessageResult>(`/tasks/${encodeURIComponent(taskId)}/messages`, {

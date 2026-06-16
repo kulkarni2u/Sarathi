@@ -375,6 +375,7 @@ export default function Dashboard() {
       context: {
         project_id: values.projectId,
       },
+      invoke_provider: true,
     });
     navigate(`/task/${data.task.id}`);
   }

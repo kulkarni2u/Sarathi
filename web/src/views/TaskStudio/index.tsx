@@ -878,8 +878,10 @@ export default function TaskStudio() {
         content,
         role: composerRole,
         target: "Current task agents",
+        invoke_provider: true,
       });
-      setMessages((prev) => [...prev, result.message]);
+      const reply = asRecord(result.reply);
+      setMessages((prev) => [...prev, result.message, ...(reply ? [reply as TaskMessage] : [])]);
       setComposerText("");
     } catch (err) {
       setComposerError(err instanceof ApiClientError ? err.message : String(err));

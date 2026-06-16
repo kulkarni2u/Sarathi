@@ -20,12 +20,12 @@ logger = logging.getLogger("sarathi.engine")
 # Harness Engine imports
 try:
     from .task_class import TaskClass, classify_task_class, from_legacy_type
-    from .harness import HarnessConfig, HarnessOutcome
+    from .harness import HarnessConfig, HarnessOutcome, derive_permission_mode
     from .permissions import PermissionScope, build_permission_scope
     from .trust_gate import TrustGate, TrustGateResult, arbitrate
 except ImportError:
     from task_class import TaskClass, classify_task_class, from_legacy_type
-    from harness import HarnessConfig, HarnessOutcome
+    from harness import HarnessConfig, HarnessOutcome, derive_permission_mode
     from permissions import PermissionScope, build_permission_scope
     from trust_gate import TrustGate, TrustGateResult, arbitrate
 
@@ -291,7 +291,8 @@ class RouteHandler(PhaseHandler):
             "routing_decision": workflow_path,
             "task_class": task_class.value,
             "harness_config": harness_dict,
-            "permission_scope": task_class.value,
+            "permission_scope": harness.permission_scope,
+            "permission_mode": derive_permission_mode(harness.permission_scope).value,
             "assembly_mode": assembly_mode,
         }
 
@@ -525,6 +526,7 @@ class _HarnessAwareDispatcher:
     def __init__(self, base: Any) -> None:
         self._base = base
         self.preferred_agent: str | None = None
+        self.preferred_permission_mode: str | None = None
         self.claude_session_id: str | None = None
         self.fallback_agents: list[str] = []
         self.journal: Any | None = None
@@ -533,6 +535,7 @@ class _HarnessAwareDispatcher:
     def reset_task_state(self) -> None:
         """Clear per-task routing/session state before a new task starts."""
         self.preferred_agent = None
+        self.preferred_permission_mode = None
         self.claude_session_id = None
         self.fallback_agents = []
 
@@ -548,6 +551,14 @@ class _HarnessAwareDispatcher:
             request = _dc_replace(
                 request,
                 constraints={**request.constraints, "claude_session_id": self.claude_session_id},
+            )
+        if self.preferred_permission_mode and not request.constraints.get("permission_mode"):
+            request = _dc_replace(
+                request,
+                constraints={
+                    **request.constraints,
+                    "permission_mode": self.preferred_permission_mode,
+                },
             )
         # CLI-backed providers flake more than the deterministic local one —
         # give a non-local provider one retry inside LocalDispatcher when the
@@ -1430,6 +1441,10 @@ class Engine:
                     if hasattr(self.dispatcher, "preferred_agent"):
                         agent_id = task.harness_config.primary_agent.agent_id
                         self.dispatcher.preferred_agent = agent_id if agent_id != "local" else None
+                    if hasattr(self.dispatcher, "preferred_permission_mode"):
+                        self.dispatcher.preferred_permission_mode = derive_permission_mode(
+                            task.harness_config.permission_scope
+                        ).value
                     if hasattr(self.dispatcher, "fallback_agents"):
                         self.dispatcher.fallback_agents = [
                             b.agent_id for b in task.harness_config.fallback_agents

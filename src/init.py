@@ -465,37 +465,66 @@ background_unblock:
         # Generate permissions.md
         permissions_md = """# Permissions
 
-Declares the tool allowlist for each provider Sarathi invokes as a subprocess.
-`sarathi init` writes these as provider-native config files so no runtime
-permission-bypass flags are needed.
+Declares mode-specific tool permissions for each provider Sarathi invokes as a
+subprocess. `sarathi init` writes these as provider-native config files, and
+provider dispatch refreshes them from the current Sarathi permission mode.
+
+Sarathi derives the mode from the harness permission scope:
+
+- `read_only` — inspect/search/read only.
+- `read_write` — repo file edits plus build/test commands.
+- `full` — broad tool use for approved mutation/evolution work.
 
 ## Provider tool grants
 
 ```yaml
 permissions:
-  # Claude Code: written to .claude/settings.json (permissions.allow)
   claude:
-    allowed_tools:
-      - Bash
-      - Read
-      - Write
-      - Edit
-      - Glob
-      - Grep
-      - LS
-      - WebFetch
-      - WebSearch
-      - TodoRead
-      - TodoWrite
+    modes:
+      read_only:
+        allowed_tools: [Read, Glob, Grep, LS, WebFetch, WebSearch, TodoRead]
+      read_write:
+        allowed_tools: [Read, Write, Edit, Glob, Grep, LS, WebFetch, WebSearch, TodoRead, TodoWrite]
+      full:
+        allowed_tools: [Bash, Read, Write, Edit, Glob, Grep, LS, WebFetch, WebSearch, TodoRead, TodoWrite]
 
-  # Codex: written to ~/.codex/config.yaml
   codex:
-    full_auto: true
-    disable_sandbox: false
+    modes:
+      read_only:
+        full_auto: false
+        disable_sandbox: false
+      read_write:
+        full_auto: true
+        disable_sandbox: false
+      full:
+        full_auto: true
+        disable_sandbox: true
 
-  # OpenCode: written to opencode.json at workspace root
   opencode:
-    auto_approve: true
+    modes:
+      read_only:
+        permission:
+          read: allow
+          grep: allow
+          glob: allow
+          list: allow
+      read_write:
+        permission:
+          read: allow
+          grep: allow
+          glob: allow
+          list: allow
+          edit: allow
+          write: allow
+      full:
+        permission:
+          read: allow
+          grep: allow
+          glob: allow
+          list: allow
+          edit: allow
+          write: allow
+          bash: allow
 ```
 """
         (policy_path / "permissions.md").write_text(permissions_md)

@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from src.dispatch import LocalDispatcher
+from src.harness import derive_permission_mode
+from src.permissions import PermissionMode
 from src.runtime import (
     ContextCompiler,
     DispatchRequest,
@@ -17,6 +19,7 @@ from src.runtime import (
     normalize_agent_output,
 )
 from src.storage import Storage
+from src.task_class import TASK_CLASS_DEFAULTS, TaskClass, classify_task_class, from_legacy_type
 
 from .errors import ServiceError
 from .intake import _task_context_project_id, _task_context_workspace_id, _task_draft_metadata
@@ -154,6 +157,7 @@ def _dispatch_subtask(
             constraints={
                 "purpose": "child_task_execution",
                 "provider": provider,
+                "permission_mode": _permission_mode_for_service_dispatch(task, subtask),
                 **(
                     {
                         "ncp_handoff_enabled": True,
@@ -286,6 +290,92 @@ def _dispatch_subtask(
         "dispatch": dispatch,
         "evidence": evidence,
     }
+
+
+_READ_ONLY_ROLES = {"disha", "vichara", "prajna", "nirnaya", "marga", "sahayaka"}
+_EXECUTOR_ROLES = {"pravaha", "samanvaya"}
+
+
+def _permission_mode_for_service_dispatch(
+    task: Mapping[str, Any],
+    subtask: Mapping[str, Any],
+) -> str:
+    """Derive provider permissions for service-triggered child-agent dispatch."""
+    subtask_metadata = _mapping(subtask.get("metadata"))
+    task_metadata = _mapping(task.get("metadata"))
+
+    explicit = _explicit_permission_mode(subtask_metadata)
+    if explicit is not None:
+        return explicit.value
+
+    role = str(subtask_metadata.get("role") or "").strip().lower()
+    if role in _READ_ONLY_ROLES:
+        return PermissionMode.READ_ONLY.value
+    if role in _EXECUTOR_ROLES:
+        return _task_permission_mode(task, task_metadata, default=PermissionMode.READ_WRITE).value
+
+    explicit = _explicit_permission_mode(task_metadata)
+    if explicit is not None:
+        return explicit.value
+    return _task_permission_mode(task, task_metadata, default=PermissionMode.READ_ONLY).value
+
+
+def _task_permission_mode(
+    task: Mapping[str, Any],
+    task_metadata: Mapping[str, Any],
+    *,
+    default: PermissionMode,
+) -> PermissionMode:
+    harness_config = _mapping(task_metadata.get("harness_config"))
+    mode = _explicit_permission_mode(harness_config)
+    if mode is not None:
+        return mode
+
+    task_class = _task_class_from_metadata(task_metadata)
+    if task_class is None:
+        task_class = classify_task_class(
+            " ".join(
+                str(part)
+                for part in [
+                    task_metadata.get("source_prompt"),
+                    task.get("description"),
+                    task.get("title"),
+                ]
+                if part
+            )
+        )
+    defaults = TASK_CLASS_DEFAULTS.get(task_class)
+    if defaults is None:
+        return default
+    return derive_permission_mode(defaults.permission_scope)
+
+
+def _explicit_permission_mode(metadata: Mapping[str, Any]) -> PermissionMode | None:
+    raw_mode = metadata.get("permission_mode")
+    if isinstance(raw_mode, str):
+        normalized = raw_mode.strip().lower()
+        for mode in PermissionMode:
+            if normalized == mode.value:
+                return mode
+    raw_scope = metadata.get("permission_scope")
+    if isinstance(raw_scope, str) and raw_scope.strip():
+        return derive_permission_mode(raw_scope)
+    return None
+
+
+def _task_class_from_metadata(metadata: Mapping[str, Any]) -> TaskClass | None:
+    raw_task_class = metadata.get("task_class")
+    if not isinstance(raw_task_class, str) or not raw_task_class.strip():
+        return None
+    value = raw_task_class.strip()
+    try:
+        return TaskClass(value)
+    except ValueError:
+        return from_legacy_type(value)
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
 
 
 def _provider_dispatch_adapter_config(
@@ -749,4 +839,3 @@ def _provider_view(
         "last_checked_at": override.get("last_checked_at"),
         "last_error": override.get("last_error"),
     }
-

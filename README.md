@@ -258,7 +258,12 @@ Workspace provider settings feed service-side routing:
 - `opencode` — HTTP bridge via `opencode serve`; starts a local server, creates a session, and reads the SSE stream for the response
 - Any provider can also point at a custom executable that reads Sarathi JSON from stdin and returns a normalized JSON result on stdout
 
-Provider tool permissions are declared in `policy-pack/permissions.md` and written as native config files by `sarathi init` (`.claude/settings.json`, `~/.codex/config.yaml`, `opencode.json`). No runtime permission-bypass flags are used.
+Provider tool permissions are declared in `policy-pack/permissions.md` as
+mode-specific grants: `read_only`, `read_write`, and `full`. `sarathi init`
+writes the initial native config files (`.claude/settings.json`,
+`~/.codex/config.yaml`, `opencode.json`), and provider dispatch refreshes those
+configs from the current harness permission mode before invoking
+Claude/Codex/OpenCode. No runtime permission-bypass flags are used.
 
 To wire real CLI providers in a policy pack:
 

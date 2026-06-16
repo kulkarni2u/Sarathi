@@ -13,6 +13,11 @@ except ImportError:
     from task_class import TaskClass, AssemblyDefaults, TASK_CLASS_DEFAULTS
 
 try:
+    from .permissions import PermissionMode
+except ImportError:
+    from permissions import PermissionMode
+
+try:
     from .runtime.agent_spec import AgentSpec
 except ImportError:
     try:
@@ -206,6 +211,29 @@ _PREFERENCE_TO_PROVIDER: dict[str, str] = {
 
 # Static preference order for fallback candidates when a primary agent fails.
 _FALLBACK_PROVIDER_ORDER: list[str] = ["claude", "codex", "opencode"]
+
+
+_PERMISSION_MODE_BY_SCOPE: dict[str, PermissionMode] = {
+    "read_only": PermissionMode.READ_ONLY,
+    "read_plus_idempotent": PermissionMode.READ_ONLY,
+    "repo_write": PermissionMode.READ_WRITE,
+    "repo_write_scoped": PermissionMode.READ_WRITE,
+    "config_write_declared": PermissionMode.READ_WRITE,
+    "infra_write_declared": PermissionMode.FULL,
+    "data_write_declared": PermissionMode.FULL,
+    "child_scope_union": PermissionMode.FULL,
+    "harness_engine_write": PermissionMode.FULL,
+    "ncp_store_write": PermissionMode.FULL,
+}
+
+
+def derive_permission_mode(permission_scope: str | PermissionMode | None) -> PermissionMode:
+    """Collapse detailed Sarathi permission scopes into provider-native modes."""
+    if isinstance(permission_scope, PermissionMode):
+        return permission_scope
+    if not isinstance(permission_scope, str):
+        return PermissionMode.READ_ONLY
+    return _PERMISSION_MODE_BY_SCOPE.get(permission_scope.strip(), PermissionMode.READ_ONLY)
 
 
 def resolve_agent_binding(

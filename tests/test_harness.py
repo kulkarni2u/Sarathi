@@ -8,8 +8,10 @@ from src.harness import (
     QualitySignalDef,
     HarnessConfig,
     HarnessOutcome,
+    derive_permission_mode,
     resolve_agent_binding,
 )
+from src.permissions import PermissionMode
 from src.runtime.agent_spec import AgentSpec, ToolSpec
 
 
@@ -37,6 +39,19 @@ def test_from_task_class_mutation_infra_sets_human_approval():
     hc = HarnessConfig.from_task_class(TaskClass.MUTATION_INFRA, "task-002")
     assert hc.requires_human_approval is True
     assert hc.context_scope == "full_domain"
+
+
+def test_derive_permission_mode_collapses_harness_scopes():
+    assert derive_permission_mode("read_only") == PermissionMode.READ_ONLY
+    assert derive_permission_mode("read_plus_idempotent") == PermissionMode.READ_ONLY
+    assert derive_permission_mode("repo_write") == PermissionMode.READ_WRITE
+    assert derive_permission_mode("repo_write_scoped") == PermissionMode.READ_WRITE
+    assert derive_permission_mode("config_write_declared") == PermissionMode.READ_WRITE
+    assert derive_permission_mode("infra_write_declared") == PermissionMode.FULL
+    assert derive_permission_mode("data_write_declared") == PermissionMode.FULL
+    assert derive_permission_mode("child_scope_union") == PermissionMode.FULL
+    assert derive_permission_mode("harness_engine_write") == PermissionMode.FULL
+    assert derive_permission_mode("ncp_store_write") == PermissionMode.FULL
 
 
 def test_to_json_roundtrip():

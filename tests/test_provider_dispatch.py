@@ -380,6 +380,76 @@ def test_configured_command_provider_dispatches_non_local_work_unit(tmp_path):
     assert data["evidence"]["metadata"]["response_evidence"]["command_provider"] is True
 
 
+def test_service_dispatch_for_executor_role_forwards_read_write_permission_mode(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, storage = app._storage()
+    workspace = storage.create_workspace(name="Sarathi App", root_path=str(tmp_path))
+    task = storage.create_task(
+        workspace_id=workspace["id"],
+        title="Implement scoped change",
+        status="in_progress",
+        metadata={
+            "source_prompt": "Implement a scoped code change.",
+            "task_class": "codegen/patch",
+            "acceptance_criteria": ["Provider receives write-capable mode."],
+        },
+    )
+    subtask = storage.create_subtask(
+        workspace_id=workspace["id"],
+        task_id=task["id"],
+        title="Implement scoped change",
+        status="in_progress",
+        metadata={
+            "role": "Pravaha",
+            "provider": "Codex",
+            "blocked_by": [],
+            "evidence_required": ["changed_files", "tests"],
+            "task_packet": {
+                "goal": "Implement scoped change",
+                "context": "Use the parent task scope.",
+                "review_criteria": ["Provider receives write-capable mode."],
+            },
+        },
+    )
+    provider_script = _write_provider_script(
+        tmp_path / "providers" / "codex-provider.py",
+        (
+            "import json,sys;"
+            "request=json.load(sys.stdin);"
+            "print(json.dumps({"
+            "'success': True,"
+            "'outputs': {'messages': ['ok'], 'work_unit_result': {'summary': 'ok'}},"
+            "'evidence': {'permission_mode': request['constraints'].get('permission_mode')},"
+            "'artifacts': {'permission_mode': request['constraints'].get('permission_mode')}"
+            "}))"
+        ),
+    )
+    storage.upsert_provider(
+        workspace_id=workspace["id"],
+        provider_id="codex",
+        name="Codex",
+        provider_type="cli",
+        config={
+            "path": str(provider_script),
+            "auth": "connected",
+            "health": "online",
+        },
+    )
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{subtask['id']}/dispatch",
+            {"provider": "codex"},
+        )
+    )
+
+    assert status == 201
+    assert data["dispatch"]["metadata"]["evidence"]["permission_mode"] == "read_write"
+    assert data["dispatch"]["metadata"]["artifacts"]["permission_mode"] == "read_write"
+
+
 def test_local_provider_dispatch_attaches_estimated_usage():
     adapter = LocalProviderAdapter()
     response = adapter.dispatch(

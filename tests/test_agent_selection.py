@@ -116,6 +116,26 @@ def test_harness_aware_dispatcher_injects_preferred_agent():
     assert cap.last_request.constraints.get("provider") == "claude"
 
 
+def test_harness_aware_dispatcher_injects_permission_mode():
+    from src.engine import _HarnessAwareDispatcher
+    cap = _CapturingDispatcher()
+    d = _HarnessAwareDispatcher(cap)
+    d.preferred_permission_mode = "read_write"
+
+    d.dispatch(_make_request())
+    assert cap.last_request.constraints.get("permission_mode") == "read_write"
+
+
+def test_harness_aware_dispatcher_does_not_override_explicit_permission_mode():
+    from src.engine import _HarnessAwareDispatcher
+    cap = _CapturingDispatcher()
+    d = _HarnessAwareDispatcher(cap)
+    d.preferred_permission_mode = "read_write"
+
+    d.dispatch(_make_request(constraints={"permission_mode": "read_only"}))
+    assert cap.last_request.constraints["permission_mode"] == "read_only"
+
+
 def test_harness_aware_dispatcher_does_not_override_explicit_provider():
     from src.engine import _HarnessAwareDispatcher
     cap = _CapturingDispatcher()
@@ -166,3 +186,8 @@ def test_engine_updates_dispatcher_preferred_agent_after_route():
     engine.run_task(task)
     # MUTATION_INFRA → highest_capability → claude
     assert engine.dispatcher.preferred_agent == "claude"
+    assert engine.dispatcher.preferred_permission_mode == "full"
+
+    route = next(result for result in task.phase_results if result.phase.value == "Route")
+    assert route.artifacts["permission_scope"] == "infra_write_declared"
+    assert route.artifacts["permission_mode"] == "full"

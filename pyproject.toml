@@ -53,6 +53,15 @@ include-package-data = true
     "skill/sarathi-implementer-prompt.md",
     "skill/sarathi-init.md",
 ]
+"share/sarathi/skill/hooks" = [
+    "skill/hooks/hooks.json",
+    "skill/hooks/hooks-cursor.json",
+    "skill/hooks/run-hook.cmd",
+    "skill/hooks/session-start",
+]
+"share/sarathi/skill/.opencode/plugins" = [
+    "skill/.opencode/plugins/sarathi.js",
+]
 "share/sarathi/skill/reference" = [
     "skill/reference/config.md",
     "skill/reference/required-list.md",

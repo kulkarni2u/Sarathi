@@ -22,6 +22,25 @@ A generic, tool-agnostic workflow orchestration framework for AI agents. Defines
    - **OpenAI Codex CLI**: `~/.codex/skills/sarathi/SKILL.md` or workspace `.codex/skills/sarathi/SKILL.md`.
    - **OpenCode**: `~/.opencode/skills/sarathi/SKILL.md` or workspace `.opencode/skills/sarathi/SKILL.md`.
 
+### Session-start auto-detection hook
+
+Sarathi ships an optional session-start hook, modeled after Superpowers, for
+agent hosts that support startup hooks or plugins.
+
+- Claude/Copilot/Codex-style hosts can use `hooks/hooks.json`, which invokes
+  `hooks/run-hook.cmd session-start`.
+- Cursor-style hosts can use `hooks/hooks-cursor.json`.
+- OpenCode can load `.opencode/plugins/sarathi.js`.
+
+The hook walks upward from the session workspace and activates only when it
+finds `policy-pack/`, `.sarathi/`, or `SARATHI.md`. When no Sarathi marker is
+found, it returns an empty JSON object and injects nothing. When a marker is
+found, it adds this Sarathi skill content to session context so the agent starts
+aware of the Sarathi lifecycle and workspace policy pack.
+
+The hook is context-only. It does not create files, start services, or mutate
+the repository just because an agent session opened.
+
 ## GitHub Copilot integration
 
 To add Sarathi to Copilot agent mode:

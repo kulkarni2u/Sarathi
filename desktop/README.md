@@ -28,7 +28,7 @@ No Node APIs are bridged into the renderer.
 
 ## Prerequisites
 
-- **Node.js 18+** (for Electron / electron-builder).
+- **Node.js 22.12+** (required by the Electron desktop packaging toolchain).
 - **Python 3.10+** with the `sarathi` package importable. By default the app
   runs `python3`; override with the `SARATHI_PYTHON` environment variable to
   point at a specific interpreter or virtualenv.

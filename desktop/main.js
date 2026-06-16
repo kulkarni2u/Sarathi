@@ -12,8 +12,9 @@
 // This mirrors src/service/desktop.py but for a packaged Electron app.
 
 const { app, BrowserWindow, dialog } = require("electron");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const crypto = require("crypto");
+const fs = require("fs");
 const http = require("http");
 const net = require("net");
 const path = require("path");
@@ -27,6 +28,18 @@ let mainWindow = null;
 let shuttingDown = false;
 let activePort = null;
 
+const REQUIRED_PYTHON_IMPORTS = ["yaml", "httpx"];
+const COMMON_MACOS_PYTHON_BINS = [
+  "/usr/local/bin/python3",
+  "/opt/homebrew/bin/python3",
+  "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+  "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3",
+  "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
+  "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+  "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
+  "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3",
+];
+
 // Resolve the directory that contains the Python `src` package.
 //   - Dev (running `electron .` from desktop/): two levels up from __dirname.
 //   - Packaged: electron-builder copies ../src and ../web/dist into the app's
@@ -38,8 +51,45 @@ function resolveRepoRoot() {
   return path.resolve(__dirname, "..");
 }
 
+function pythonHasRuntimeDeps(candidate) {
+  const importList = REQUIRED_PYTHON_IMPORTS.join(", ");
+  const result = spawnSync(candidate, ["-c", `import ${importList}`], {
+    encoding: "utf8",
+    stdio: "pipe",
+    timeout: 5000,
+  });
+  return result.status === 0;
+}
+
+function uniqueCandidates(candidates) {
+  return candidates.filter((candidate, index) => {
+    if (!candidate || candidates.indexOf(candidate) !== index) {
+      return false;
+    }
+    return !path.isAbsolute(candidate) || fs.existsSync(candidate);
+  });
+}
+
 function resolvePythonBin() {
-  return process.env.SARATHI_PYTHON || "python3";
+  const envPython = process.env.SARATHI_PYTHON;
+  const pathPython = "python3";
+  const candidates = uniqueCandidates([
+    envPython,
+    app.isPackaged ? null : pathPython,
+    ...COMMON_MACOS_PYTHON_BINS,
+    pathPython,
+  ]);
+
+  for (const candidate of candidates) {
+    if (pythonHasRuntimeDeps(candidate)) {
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    "No usable Python 3 interpreter found. Install Sarathi's Python dependencies " +
+      `(${REQUIRED_PYTHON_IMPORTS.join(", ")}) or set SARATHI_PYTHON to a compatible interpreter.`
+  );
 }
 
 // Find a free TCP port. Falls back to DEFAULT_PORT on any error.
@@ -75,6 +125,13 @@ function spawnService({ port, token, repoRoot, dbPath }) {
 
   child.stdout.on("data", (data) => process.stdout.write(`[service] ${data}`));
   child.stderr.on("data", (data) => process.stderr.write(`[service] ${data}`));
+
+  child.on("error", (err) => {
+    const detail = `Failed to start Sarathi service with ${pythonBin}: ${err.message}`;
+    console.error(`[sarathi] ${detail}`);
+    dialog.showErrorBox("Sarathi service failed to start", detail);
+    app.quit();
+  });
 
   child.on("exit", (code, signal) => {
     if (shuttingDown) {

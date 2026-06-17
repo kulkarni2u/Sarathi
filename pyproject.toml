@@ -1,5 +1,5 @@
 [project]
-name = "sarathi"
+name = "sarathi-ai"
 version = "0.3.0"
 description = "Policy-backed AI delivery cockpit with shared service, CLI, TUI, WebUI, desktop, and agent integrations."
 readme = "README.md"

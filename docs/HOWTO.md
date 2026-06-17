@@ -67,7 +67,7 @@ python3 -m pip install -e .
 ### Option B: From Wheel
 
 ```bash
-python3 -m pip install sarathi-*.whl
+python3 -m pip install sarathi_ai-*.whl
 ```
 
 ### Option C: Virtual Environment
@@ -78,6 +78,19 @@ python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -e .
 ```
+
+### Guided Setup
+
+After installing Sarathi, run the interactive setup assistant:
+
+```bash
+sarathi setup
+```
+
+It asks whether to enable the Terminal UI, MCP server, WebUI, NCP workspace
+bootstrap, and desktop launcher guidance. For automation, use `sarathi setup
+--yes --dry-run` to preview the recommended plan or pass explicit component
+flags such as `--tui`, `--no-webui`, `--mcp`, or `--no-ncp`.
 
 ---
 

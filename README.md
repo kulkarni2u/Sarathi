@@ -88,6 +88,12 @@ source .venv/bin/activate
 python3 -m pip install -e ".[tui,mcp,dev]"
 ```
 
+For a guided local setup after install:
+
+```bash
+sarathi setup
+```
+
 Useful extras:
 
 | Extra | Installs |
@@ -151,6 +157,7 @@ config through `/sarathi-runtime.js`, including the local bearer token.
 The CLI is the fastest way to bootstrap and inspect work.
 
 ```bash
+sarathi setup                          # guided TUI/WebUI/NCP/Desktop setup
 sarathi init .                         # create policy-pack and local repo wiki
 sarathi init . --no-wiki               # skip generated .sarathi/wiki output
 sarathi validate ./policy-pack         # validate required policy files

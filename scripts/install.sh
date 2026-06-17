@@ -110,7 +110,7 @@ if [ -n "${SARATHI_INSTALL_SPEC:-}" ]; then
     INSTALL_SPEC="$SARATHI_INSTALL_SPEC"
     INSTALL_SOURCE="SARATHI_INSTALL_SPEC override"
 elif [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/pyproject.toml" ] \
-        && grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*"sarathi"' "$REPO_ROOT/pyproject.toml"; then
+        && grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*"sarathi-ai"' "$REPO_ROOT/pyproject.toml"; then
     INSTALL_SPEC="$REPO_ROOT"
     INSTALL_SOURCE="local checkout"
 else

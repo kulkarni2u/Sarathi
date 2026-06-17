@@ -63,7 +63,7 @@ this as soft-success (warn + exit 0), matching the "exit 0 on success" contract.
 ## Reproduce
 
 ```bash
-pip install sarathi                          # includes neural-context-protocol 1.1+
+python3 -m pip install "git+https://github.com/kulkarni2u/Sarathi.git"  # includes NCP 1.1+
 sarathi init --ncp                            # creates .ncp/config.toml and executable .ncp/run.py
 
 # sanity: round-trip a memory through the bridge

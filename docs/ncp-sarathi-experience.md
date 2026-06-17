@@ -110,12 +110,13 @@ zero CI coverage** despite looking covered.
 ### 2.3 The working bridge used to be a "copy these example files" ritual
 Earlier `docs/ncp-integration.md` reproduction steps required:
 ```bash
-pip install sarathi
+python3 -m pip install "git+https://github.com/kulkarni2u/Sarathi.git"
 sarathi init --ncp
 ```
-That path is now replaced by `pip install sarathi` plus `sarathi init --ncp`.
-Sarathi depends on `neural-context-protocol>=1.1.0,<2.0.0`, and init scaffolds
-the project-local `.ncp/config.toml` and executable `.ncp/run.py` bridge.
+That path is now replaced by installing Sarathi from GitHub or a local checkout
+plus `sarathi init --ncp`. Sarathi depends on
+`neural-context-protocol>=1.1.0,<2.0.0`, and init scaffolds the project-local
+`.ncp/config.toml` and executable `.ncp/run.py` bridge.
 
 ### 2.4 NCP provenance is invisible in the web UI
 T5.4 (this session) built the Knowledge Center's **Context Inspector**, which

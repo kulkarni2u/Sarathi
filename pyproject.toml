@@ -1,6 +1,6 @@
 [project]
 name = "sarathi"
-version = "0.2.0"
+version = "0.3.0"
 description = "Policy-backed workflow orchestration for AI-assisted delivery (CLI + portable agent skill)."
 readme = "README.md"
 requires-python = ">=3.10"

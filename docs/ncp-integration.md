@@ -64,16 +64,14 @@ this as soft-success (warn + exit 0), matching the "exit 0 on success" contract.
 
 ```bash
 pip install neural-context-protocol httpx     # NCP 1.1.0; httpx is a declared Sarathi core dep
-mkdir -p .ncp
-cp docs/ncp/config.toml.example .ncp/config.toml      # SQLite store at .ncp/store.db
-cp docs/ncp/run.py.example .ncp/run.py && chmod +x .ncp/run.py
+sarathi init --ncp                            # creates .ncp/config.toml and executable .ncp/run.py
 
 # sanity: round-trip a memory through the bridge
 ./.ncp/run.py write_memory '{"content":"hello","layer":"semantic","src":"agent_inferred","written_by":"me"}'
 ./.ncp/run.py fetch '{"query":"hello","k":3}'         # -> chunk:... hello
 
-# run a real task with NCP enabled (local deterministic provider; no API key)
-python3 -m src.cli run --ncp --policy-pack policy-pack/EXAMPLE "Document the NCP integration"
+# run a real task with NCP auto-detected (local deterministic provider; no API key)
+python3 -m src.cli run --policy-pack policy-pack/EXAMPLE "Document the NCP integration"
 ncp explain                                            # inspect the SQLite store
 ```
 

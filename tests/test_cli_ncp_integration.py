@@ -2,7 +2,22 @@
 
 import subprocess
 import sys
+import os
 from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _repo_env() -> dict[str, str]:
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(PROJECT_ROOT)
+        if not existing_pythonpath
+        else str(PROJECT_ROOT) + os.pathsep + existing_pythonpath
+    )
+    return env
 
 
 def test_cli_run_ncp_dry_run(tmp_path):
@@ -25,6 +40,7 @@ def test_cli_run_ncp_dry_run(tmp_path):
         [sys.executable, "-m", "src.cli", "run", "--ncp", "--dry-run", "test task"],
         capture_output=True, text=True,
         cwd=str(tmp_path),
+        env=_repo_env(),
     )
     assert result.returncode == 0, f"stdout: {result.stdout}, stderr: {result.stderr}"
     assert "Route" in result.stdout
@@ -43,6 +59,7 @@ def test_cli_run_without_ncp_uses_native_adapters(tmp_path):
         [sys.executable, "-m", "src.cli", "run", "--dry-run", "test task"],
         capture_output=True, text=True,
         cwd=str(tmp_path),
+        env=_repo_env(),
     )
     assert result.returncode == 0, f"stdout: {result.stdout}, stderr: {result.stderr}"
     assert "Route" in result.stdout

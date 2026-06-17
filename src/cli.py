@@ -51,6 +51,47 @@ except ImportError:
 import time
 
 
+def _find_ncp_template(filename: str) -> Path | None:
+    """Return the source or installed NCP template path."""
+    candidates = [
+        Path(__file__).resolve().parents[1] / "docs" / "ncp" / filename,
+        Path(sys.prefix) / "share" / "sarathi" / "ncp" / filename,
+        Path(sys.base_prefix) / "share" / "sarathi" / "ncp" / filename,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _ensure_ncp_sidecar(init_target: Path) -> dict[str, bool]:
+    """Ensure Sarathi's direct-mode NCP files exist under ``init_target/.ncp``."""
+    import shutil
+
+    ncp_dir = init_target / ".ncp"
+    ncp_dir.mkdir(parents=True, exist_ok=True)
+
+    created = {"config": False, "run_py": False}
+    config_path = ncp_dir / "config.toml"
+    if not config_path.exists():
+        config_template = _find_ncp_template("config.toml.example")
+        if config_template is not None:
+            shutil.copyfile(config_template, config_path)
+            created["config"] = True
+
+    run_path = ncp_dir / "run.py"
+    if not run_path.exists():
+        run_template = _find_ncp_template("run.py.example")
+        if run_template is not None:
+            shutil.copyfile(run_template, run_path)
+            created["run_py"] = True
+
+    if run_path.exists():
+        run_path.chmod(run_path.stat().st_mode | 0o111)
+
+    return created
+
+
 def _resolve_workspace_ncp(args, cwd: str) -> bool | None:
     """Resolve ncp_enabled from CLI flags and workspace metadata.
     
@@ -796,6 +837,14 @@ def handle_init(args: argparse.Namespace) -> None:
         else:
             print(f"  ⚠ NCP init warning: {ncp_init_result.stderr.strip()}")
 
+        sidecar_created = _ensure_ncp_sidecar(init_target)
+        if sidecar_created["config"]:
+            print("  ✓ Wrote .ncp/config.toml from Sarathi template")
+        if sidecar_created["run_py"]:
+            print("  ✓ Wrote .ncp/run.py direct-mode bridge")
+        elif (init_target / ".ncp" / "run.py").exists():
+            print("  ✓ Verified .ncp/run.py direct-mode bridge")
+
         # 2. Write Sarathi-optimized config overrides
         ncp_config_path = init_target / ".ncp" / "config.toml"
         if ncp_config_path.exists():
@@ -815,7 +864,8 @@ default_ttl_hours = 168
         welcome_path.write_text(
             "# NCP + Sarathi\n\n"
             "NCP is configured as the context handler for this project.\n"
-            "Run `sarathi run --ncp \"task description\"` to use it.\n"
+            "Run `sarathi run \"task description\"` to use auto-detected NCP, "
+            "or pass `--no-ncp` to use native adapters.\n"
         )
         print("  ✓ Wrote .ncp/WELCOME.md")
 

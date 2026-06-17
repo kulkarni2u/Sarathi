@@ -750,14 +750,13 @@ class Engine:
         self.ncp_mode = ncp_mode
         self.ncp_router_enabled = ncp_router
         self.ncp_endpoint = ncp_endpoint
+        self.ncp_run_path = self._find_ncp_run_path() if ncp_mode == "direct" else None
 
         # Auto-detect NCP when not explicitly enabled/disabled
         _ncp_explicit = ncp_enabled is not None
         if ncp_enabled is None:
             ncp_enabled = self._probe_ncp()
-            if ncp_enabled:
-                print("[ncp] NCP detected — using NCP adapters for context, memory, and cost tracking")
-            else:
+            if not ncp_enabled:
                 print(
                     "[ncp] NCP not found — using native adapters. "
                     "To enable: `pip install neural-context-protocol` then `sarathi init --ncp`. "
@@ -777,10 +776,15 @@ class Engine:
         self.ncp_enabled = ncp_enabled
 
         if ncp_enabled:
-            self.context_adapter = NCPContextAdapter(mode=ncp_mode, endpoint=ncp_endpoint)
-            self.persistence = NCPPersistenceAdapter(mode=ncp_mode, endpoint=ncp_endpoint)
-            self.artifact_store = NCPArtifactAdapter(mode=ncp_mode, endpoint=ncp_endpoint)
-            self.whisper_router = NCPWhisperRouter(mode=ncp_mode, endpoint=ncp_endpoint) if ncp_router else None
+            if not _ncp_explicit:
+                print("[ncp] NCP detected — using NCP adapters for context, memory, and cost tracking")
+            adapter_kwargs = {"mode": ncp_mode, "endpoint": ncp_endpoint}
+            if self.ncp_run_path is not None:
+                adapter_kwargs["run_path"] = self.ncp_run_path
+            self.context_adapter = NCPContextAdapter(**adapter_kwargs)
+            self.persistence = NCPPersistenceAdapter(**adapter_kwargs)
+            self.artifact_store = NCPArtifactAdapter(**adapter_kwargs)
+            self.whisper_router = NCPWhisperRouter(**adapter_kwargs) if ncp_router else None
         else:
             self.context_adapter = ContextCompiler()
             self.persistence = PersistenceManager()
@@ -1649,34 +1653,35 @@ class Engine:
             return "EXECUTE"
 
     @staticmethod
-    def _probe_ncp() -> bool:
-        """Probe whether NCP is available on this system (local project only)."""
-        import shutil
-        import subprocess
-        from pathlib import Path
-
-        # Quick check: ncp CLI must be on PATH
-        if shutil.which("ncp") is None:
-            return False
-
-        # Check for .ncp/ in CWD or up to 3 parent levels
+    def _find_ncp_run_path() -> Path | None:
+        """Find an executable direct-mode NCP bridge in CWD or nearby parents."""
         cwd = Path.cwd().resolve()
-        found_local_ncp = False
         for i, parent in enumerate([cwd] + list(cwd.parents)):
             if i > 3:
                 break
             ncp_dir = parent / ".ncp"
-            if ncp_dir.is_dir() and (ncp_dir / "config.toml").exists():
-                found_local_ncp = True
-                break
+            run_path = ncp_dir / "run.py"
+            if (
+                ncp_dir.is_dir()
+                and (ncp_dir / "config.toml").exists()
+                and run_path.exists()
+                and os.access(run_path, os.X_OK)
+            ):
+                return run_path
+        return None
 
-        if not found_local_ncp:
+    @staticmethod
+    def _probe_ncp() -> bool:
+        """Probe whether direct-mode NCP is available for the local project."""
+        import subprocess
+
+        run_path = Engine._find_ncp_run_path()
+        if run_path is None:
             return False
 
-        # Verify NCP is actually functional
         try:
             result = subprocess.run(
-                ["ncp", "status"],
+                [str(run_path), "status"],
                 capture_output=True, text=True, timeout=5,
             )
             return result.returncode == 0
@@ -1686,9 +1691,13 @@ class Engine:
     def _validate_ncp_available(self) -> None:
         """Check NCP is reachable. Raises NCPNotAvailableError if not."""
         from .ncp_adapter import NCPContextAdapter
-        adapter = NCPContextAdapter(mode=self.ncp_mode, endpoint=getattr(self, 'ncp_endpoint', 'http://127.0.0.1:4242/mcp'))
+        adapter = NCPContextAdapter(
+            mode=self.ncp_mode,
+            endpoint=getattr(self, 'ncp_endpoint', 'http://127.0.0.1:4242/mcp'),
+            run_path=self.ncp_run_path or ".ncp/run.py",
+        )
         if not adapter.check_available():
-            mode_hint = "Run 'ncp init' first." if self.ncp_mode == "direct" else "Start 'ncp serve' first."
+            mode_hint = "Run 'sarathi init --ncp' first." if self.ncp_mode == "direct" else "Start 'ncp serve' first."
             raise NCPNotAvailableError(
                 f"NCP not reachable in {self.ncp_mode} mode. {mode_hint}"
             )

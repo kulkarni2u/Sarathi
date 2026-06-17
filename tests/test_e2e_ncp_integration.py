@@ -13,6 +13,9 @@ from pathlib import Path
 import pytest
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _ncp_available() -> bool:
     return shutil.which("ncp") is not None
 
@@ -26,10 +29,18 @@ def _ensure_policy_pack(path: Path) -> None:
 
 
 def _run_sarathi(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(PROJECT_ROOT)
+        if not existing_pythonpath
+        else str(PROJECT_ROOT) + os.pathsep + existing_pythonpath
+    )
     return subprocess.run(
         [sys.executable, "-m", "src.cli", *args],
         capture_output=True, text=True,
         cwd=str(cwd),
+        env=env,
     )
 
 
@@ -47,6 +58,9 @@ def test_e2e_ncp_init_creates_dot_ncp(tmp_path):
 
     assert result.returncode == 0, f"init failed: {result.stderr}"
     assert (tmp_path / ".ncp" / "config.toml").exists(), ".ncp/config.toml not created"
+    run_py = tmp_path / ".ncp" / "run.py"
+    assert run_py.exists(), ".ncp/run.py direct bridge not created"
+    assert os.access(run_py, os.X_OK), ".ncp/run.py is not executable"
     assert (tmp_path / ".ncp" / "WELCOME.md").exists(), ".ncp/WELCOME.md not created"
 
 
@@ -71,10 +85,10 @@ def test_e2e_ncp_auto_detect_uses_ncp_when_available(tmp_path):
         pytest.skip("ncp CLI not available")
 
     _ensure_policy_pack(tmp_path)
-    # Init NCP so auto-detect finds it
-    subprocess.run(["ncp", "init"], capture_output=True, cwd=str(tmp_path))
-    # Ensure .ncp/config.toml exists (the probe checks this)
+    result = _run_sarathi(tmp_path, "init", ".", "--ncp")
+    assert result.returncode == 0, f"init failed: {result.stderr}"
     assert (tmp_path / ".ncp" / "config.toml").exists()
+    assert os.access(tmp_path / ".ncp" / "run.py", os.X_OK)
 
     result = _run_sarathi(tmp_path, "run", "--dry-run", "e2e auto-detect test")
     assert result.returncode == 0, f"stdout: {result.stdout}, stderr: {result.stderr}"
@@ -224,7 +238,7 @@ def test_e2e_skill_doc_has_ncp_usage_note():
 # -------------------------------------------------------------------
 
 def test_e2e_engine_auto_detect_probe(tmp_path):
-    """Engine._probe_ncp returns True when .ncp/config.toml exists and ncp CLI is available."""
+    """Engine._probe_ncp requires a usable direct bridge, not config alone."""
     if not _ncp_available():
         pytest.skip("ncp CLI not available")
 
@@ -236,13 +250,27 @@ def test_e2e_engine_auto_detect_probe(tmp_path):
             "_probe_ncp returned True for dir without .ncp/"
         )
 
-    # With .ncp/config.toml in CWD — should return True
+    # With .ncp/config.toml only — should return False because direct mode
+    # validates through .ncp/run.py.
     ncp_dir = tmp_path / ".ncp"
     ncp_dir.mkdir(parents=True)
     (ncp_dir / "config.toml").write_text("[ncp]\nkey = \"test\"\n")
     with _override_cwd(tmp_path):
+        assert not Engine._probe_ncp(), (
+            "_probe_ncp returned True for config-only .ncp/"
+        )
+
+    run_py = ncp_dir / "run.py"
+    run_py.write_text("#!/usr/bin/env python3\nimport sys; sys.exit(0)\n")
+    with _override_cwd(tmp_path):
+        assert not Engine._probe_ncp(), (
+            "_probe_ncp returned True for non-executable .ncp/run.py"
+        )
+
+    run_py.chmod(0o755)
+    with _override_cwd(tmp_path):
         assert Engine._probe_ncp(), (
-            "_probe_ncp returned False when .ncp/config.toml exists"
+            "_probe_ncp returned False when config and executable run.py exist"
         )
 
 
@@ -252,11 +280,10 @@ def test_e2e_engine_auto_detect_creates_ncp_adapters(tmp_path):
         pytest.skip("ncp CLI not available")
 
     _ensure_policy_pack(tmp_path)
-    subprocess.run(["ncp", "init"], capture_output=True, cwd=str(tmp_path))
-    assert (tmp_path / ".ncp" / "config.toml").exists(), "ncp init did not create config.toml"
-    # Seed run.py so direct-mode validation passes (ncp init does not create it)
-    (tmp_path / ".ncp" / "run.py").write_text("#!/usr/bin/env python3\nimport sys; sys.exit(0)")
-    (tmp_path / ".ncp" / "run.py").chmod(0o755)
+    result = _run_sarathi(tmp_path, "init", ".", "--ncp")
+    assert result.returncode == 0, f"init failed: {result.stderr}"
+    assert (tmp_path / ".ncp" / "config.toml").exists(), "sarathi init --ncp did not create config.toml"
+    assert os.access(tmp_path / ".ncp" / "run.py", os.X_OK), "sarathi init --ncp did not create executable run.py"
 
     import io
     from contextlib import redirect_stdout
@@ -269,6 +296,26 @@ def test_e2e_engine_auto_detect_creates_ncp_adapters(tmp_path):
     assert engine.ncp_enabled, (
         f"Engine.ncp_enabled should be True when NCP available, got {engine.ncp_enabled}"
     )
+
+
+def test_e2e_engine_auto_detect_does_not_announce_config_only_ncp(tmp_path):
+    """Engine does not announce NCP when only .ncp/config.toml exists."""
+    from src.engine import Engine
+    import io
+    from contextlib import redirect_stdout
+
+    _ensure_policy_pack(tmp_path)
+    ncp_dir = tmp_path / ".ncp"
+    ncp_dir.mkdir(parents=True)
+    (ncp_dir / "config.toml").write_text("[ncp]\nkey = \"test\"\n")
+
+    buf = io.StringIO()
+    with _override_cwd(tmp_path), redirect_stdout(buf):
+        engine = Engine(policy_pack_path=str(tmp_path / "policy-pack"), enforce_preflight=False)
+
+    captured = buf.getvalue()
+    assert not engine.ncp_enabled
+    assert "NCP detected" not in captured
 
 
 def test_e2e_engine_auto_detect_falls_back(tmp_path):

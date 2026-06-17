@@ -504,16 +504,16 @@ sarathi run "Add OAuth2 authentication" --policy-pack ./policy-pack
 
 ## NCP Integration
 
-> **Sarathi works without NCP.** Native adapters handle context compilation, persistence, and artifact storage locally. NCP is an optional enhancement, not a requirement.
+Sarathi is moving to an **NCP-first context path**. Native adapters still work, but a workspace initialized with NCP becomes the preferred/default runtime for context assembly, memory, artifact storage, whispers, and token/cost tracking.
 
-NCP (Neural Context Protocol) is a **separate tool** that Sarathi integrates with as a sidecar. When present, it replaces Sarathi's native adapters with NCP-backed services that add:
+NCP (Neural Context Protocol) runs as a local sidecar. In direct mode, Sarathi talks to it through the project-local `.ncp/run.py` bridge created by `sarathi init --ncp`.
 
 - **Persistent cross-session memory** — agents recall findings from prior runs
 - **Cross-agent whispers** — fanout/classify branches receive context from their parent
 - **Pattern-aware context** — SYNTHESIZE and JUDGE nodes fetch sibling outputs automatically
 - **Pipeline cost tracking** — per-node token spend logged back to NCP
 
-### Getting NCP
+### Setup
 
 NCP is available on PyPI — **[kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)**
 
@@ -524,17 +524,23 @@ pip install sarathi[ncp]
 # Or install NCP separately
 pip install neural-context-protocol
 
-# Bootstrap NCP into your project (creates .ncp/ directory)
+# Bootstrap NCP into your project:
+# - .ncp/config.toml
+# - .ncp/run.py direct bridge
+# - .ncp/WELCOME.md
 sarathi init --ncp
 
-# Run with NCP enabled
+# Run normally; Sarathi auto-detects the NCP bridge
+sarathi run "task description"
+
+# Force NCP and fail if it is unavailable
 sarathi run --ncp "task description"
 
-# Run without NCP (explicit, uses native adapters)
+# Opt out for a run and use native adapters
 sarathi run --no-ncp "task description"
 ```
 
-Sarathi auto-detects NCP on startup by checking for `.ncp/run.py` in the project root. If found, NCP adapters are used automatically — no flag needed.
+Sarathi auto-detects NCP only when `.ncp/config.toml` and an executable `.ncp/run.py` are present and the bridge answers `status`. A config-only `.ncp/` directory is treated as not ready, so Sarathi uses native adapters instead of announcing a false NCP runtime.
 
 ### When you need NCP
 

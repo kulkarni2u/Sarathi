@@ -2,7 +2,7 @@
 
 All notable changes to Sarathi are documented here.
 
-## 0.2.0 - 2026-06-17
+## 0.3.0 - 2026-06-17
 
 ### Added
 

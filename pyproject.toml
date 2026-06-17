@@ -1,7 +1,7 @@
 [project]
 name = "sarathi"
-version = "0.2.0"
-description = "Policy-backed workflow orchestration for AI-assisted delivery (CLI + portable agent skill)."
+version = "0.3.0"
+description = "Policy-backed AI delivery cockpit with shared service, CLI, TUI, WebUI, desktop, and agent integrations."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

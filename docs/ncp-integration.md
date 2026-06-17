@@ -63,7 +63,7 @@ this as soft-success (warn + exit 0), matching the "exit 0 on success" contract.
 ## Reproduce
 
 ```bash
-pip install neural-context-protocol httpx     # NCP 1.1.0; httpx is a declared Sarathi core dep
+pip install sarathi                          # includes neural-context-protocol 1.1+
 sarathi init --ncp                            # creates .ncp/config.toml and executable .ncp/run.py
 
 # sanity: round-trip a memory through the bridge
@@ -102,7 +102,7 @@ The 9 "baseline" test failures we carried during the cockpit build were **not
 real failures**: 7 were `tests/test_ncp_adapter/*` failing only because `httpx`
 (a *declared core dependency* in `pyproject.toml`) wasn't installed in the
 container — installing it made them pass. A session-start step that runs
-`pip install -e .` (and `pip install neural-context-protocol` if NCP is desired)
+`pip install -e .`
 keeps the environment correctly provisioned. The remaining 2
 `test_cli_ncp_integration` failures are a separate policy-pack auto-discovery
 quirk in those tests.

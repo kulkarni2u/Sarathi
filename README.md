@@ -518,11 +518,8 @@ NCP (Neural Context Protocol) runs as a local sidecar. In direct mode, Sarathi t
 NCP is available on PyPI — **[kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)**
 
 ```bash
-# Install NCP alongside Sarathi (recommended)
-pip install sarathi[ncp]
-
-# Or install NCP separately
-pip install neural-context-protocol
+# Install Sarathi; NCP 1.1+ is included as a Python dependency
+pip install sarathi
 
 # Bootstrap NCP into your project:
 # - .ncp/config.toml

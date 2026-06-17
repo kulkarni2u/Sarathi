@@ -13,7 +13,7 @@
 4. [Using as a Python API](#4-using-as-a-python-api)
 5. [Using with AI Agents](#5-using-with-ai-agents)
 6. [Policy Pack Setup](#6-policy-pack-setup)
-7. [NCP Integration (optional)](#7-ncp-integration-optional)
+7. [NCP Integration](#7-ncp-integration)
 8. [Common Workflows](#8-common-workflows)
 9. [Task Management](#9-task-management)
 10. [Troubleshooting](#10-troubleshooting)
@@ -387,13 +387,13 @@ sarathi validate ./policy-pack --verbose
 
 ---
 
-## 7. NCP Integration (optional)
+## 7. NCP Integration
 
-Sarathi works fully without NCP. This section is for teams that want persistent cross-session memory, cross-agent context passing for dynamic workflow patterns, and pipeline cost tracking.
+Sarathi installs NCP as a Python dependency and can bootstrap a project-local NCP sidecar for persistent cross-session memory, cross-agent context passing for dynamic workflow patterns, and pipeline cost tracking.
 
 ### 7.1 What is NCP?
 
-NCP (Neural Context Protocol) is a **separate tool** — a sidecar process or server that Sarathi calls out to. It is not bundled with Sarathi. You must install it independently.
+NCP (Neural Context Protocol) is a sidecar runtime that Sarathi calls for context and memory. Sarathi depends on `neural-context-protocol>=1.1.0,<2.0.0`, so installing Sarathi also installs the Python package.
 
 **PyPI:** `neural-context-protocol` — **[kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)**
 
@@ -663,9 +663,8 @@ This message means Sarathi checked for `.ncp/run.py` and didn't find it. **This 
 
 If you want NCP:
 ```bash
-# 1. Install NCP
-pip install neural-context-protocol   # or: pip install sarathi[ncp]
-ncp --version                          # verify it's on your PATH
+# 1. Verify NCP installed with Sarathi
+ncp --version
 
 # 2. Bootstrap NCP into your project
 sarathi init --ncp

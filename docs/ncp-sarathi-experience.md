@@ -107,19 +107,15 @@ itself. It's been a stable "7 pre-existing failures" baseline for multiple
 sessions, which is fine for now, but it means **this corner of NCP CLI behavior has
 zero CI coverage** despite looking covered.
 
-### 2.3 The working bridge is a "copy these example files" ritual
-`docs/ncp-integration.md`'s "Reproduce" section requires:
+### 2.3 The working bridge used to be a "copy these example files" ritual
+Earlier `docs/ncp-integration.md` reproduction steps required:
 ```bash
-pip install neural-context-protocol httpx
-mkdir -p .ncp
-cp docs/ncp/config.toml.example .ncp/config.toml
-cp docs/ncp/run.py.example .ncp/run.py && chmod +x .ncp/run.py
+pip install sarathi
+sarathi init --ncp
 ```
-`.ncp/` is gitignored by design (it's per-workspace, regenerable), but there's no
-`sarathi` command that performs this scaffolding — a new workspace that wants NCP
-has to know these four manual steps exist and find them in a markdown doc. The
-auto-detect default (2.6 above) means a workspace silently runs *without* NCP
-until someone does this ritual, with no in-product nudge.
+That path is now replaced by `pip install sarathi` plus `sarathi init --ncp`.
+Sarathi depends on `neural-context-protocol>=1.1.0,<2.0.0`, and init scaffolds
+the project-local `.ncp/config.toml` and executable `.ncp/run.py` bridge.
 
 ### 2.4 NCP provenance is invisible in the web UI
 T5.4 (this session) built the Knowledge Center's **Context Inspector**, which
@@ -159,13 +155,12 @@ These are intentionally **not implemented now** — they're scoped for a follow-
    actually exercise the CLI's NCP flag handling. This would shrink the "known
    failures" baseline from 7 to 0 and give real coverage to `--ncp`/`--no-ncp`.
 
-2. **Add a `sarathi ncp init` (or `sarathi init --ncp`) scaffolding command** that
-   performs the four-step ritual in §2.3 programmatically: `pip`-check for
-   `neural-context-protocol`, create `.ncp/`, copy/render
-   `config.toml.example`/`run.py.example` from package data, `chmod +x`. Pair with
-   a one-line note in the Settings NCP toggle UI ("not yet configured — run
-   `sarathi ncp init`") so the auto-detect default (§2.3) is discoverable rather
-   than silent.
+2. **Done:** `sarathi init --ncp` now performs the §2.3 scaffolding
+   programmatically: create `.ncp/`, copy/render `config.toml.example` and
+   `run.py.example` from package data, and `chmod +x` the bridge. The remaining
+   product opportunity is a one-line note in the Settings NCP toggle UI
+   ("not yet configured — run `sarathi init --ncp`") so the auto-detect default is
+   discoverable rather than silent.
 
 3. **Surface NCP provenance + store health in the Knowledge Center / Context
    Inspector (T5.4 follow-up)**. Extend the context-bundle data the inspector
@@ -192,6 +187,6 @@ These are intentionally **not implemented now** — they're scoped for a follow-
 
 7. **Add a session-start provisioning check** (§2.1): a `scripts/` or `make`
    target (or a `pytest` collection-time check with a clear skip message) that
-   verifies `httpx` and, optionally, `neural-context-protocol` are installed before
+   verifies the Sarathi dependency set, including `neural-context-protocol`, before
    running the NCP test suites — turning "40 tests mysteriously fail" into a single
    actionable message.

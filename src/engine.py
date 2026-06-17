@@ -759,7 +759,7 @@ class Engine:
             if not ncp_enabled:
                 print(
                     "[ncp] NCP not found — using native adapters. "
-                    "To enable: `pip install neural-context-protocol` then `sarathi init --ncp`. "
+                    "To enable for this workspace: `sarathi init --ncp`. "
                     "Pass --no-ncp to silence this message."
                 )
 

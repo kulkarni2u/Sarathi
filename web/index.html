@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sarathi — Operator Cockpit</title>
+    <!--
+      Runtime config contract (see src/service/desktop.py):
+      The desktop launcher writes a script that sets
+      window.__SARATHI_RUNTIME_CONFIG__ = { baseUrl, token } before the app
+      boots. In dev (vite) this file may not exist; src/api/runtimeConfig.ts
+      falls back to import.meta.env / http://127.0.0.1:8765 in that case.
+    -->
+    <script src="/sarathi-runtime.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

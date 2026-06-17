@@ -1,0 +1,145 @@
+/* Usage Stats — HarnessOutcome quality signals, ported from
+   docs/mockups/sarathi-webui-mockup.html (#outcomes .stats/.stat/table). */
+
+.usage-stats {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+@media (max-width: 1200px) {
+  .usage-stats {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media (max-width: 720px) {
+  .usage-stats {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.usage-stat {
+  padding: 15px;
+}
+
+.usage-stat .l {
+  color: var(--faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.usage-stat .v {
+  font-size: 25px;
+  font-weight: 680;
+  margin: 7px 0 3px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.5px;
+}
+
+.usage-stat .dl {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.usage-stat .dl.up {
+  color: var(--green);
+}
+
+.usage-stat .dl.down {
+  color: var(--red);
+}
+
+.usage-stat .dl.muted {
+  color: var(--faint);
+  font-weight: 500;
+}
+
+/* ---------- recent outcomes table ---------- */
+.usage-card {
+  overflow: hidden;
+}
+
+.usage-card-head {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-soft);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.usage-card-head b {
+  font-size: 13px;
+}
+
+.usage-card-head .usage-note {
+  margin-left: auto;
+  margin-top: 0;
+}
+
+.usage-note {
+  color: var(--faint);
+  font-size: 11px;
+  margin-top: 8px;
+}
+
+.usage-card table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.usage-card thead th {
+  text-align: left;
+  color: var(--faint);
+  font-weight: 600;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.usage-card tbody td {
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.usage-card tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.usage-card tbody tr:hover {
+  background: var(--hover);
+}
+
+.usage-num {
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-fail {
+  color: var(--red);
+}
+
+.usage-placeholder-cell {
+  color: var(--faint);
+}
+
+/* ---------- states ---------- */
+.usage-empty,
+.usage-loading {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--muted);
+}
+
+/* ---------- status banner ---------- */
+.usage-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 10px;
+}

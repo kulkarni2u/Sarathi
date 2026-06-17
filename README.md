@@ -10,6 +10,38 @@ It gives teams a consistent, auditable lifecycle for planning, building, verifyi
 - A phase-based engine that can scale from simple tasks to complex work
 - A portable agent skill pack (in `skill/SKILL.md`) for Claude Code, Codex, Copilot, and OpenCode
 
+## Install
+
+Pick whichever fits your setup. Sarathi targets Python 3.10+.
+
+**One-line installer (recommended).** Creates an isolated venv and installs the CLI plus the `sarathi-desktop` cockpit:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kulkarni2u/Sarathi/main/scripts/install.sh | bash
+```
+
+The installer puts everything under `$SARATHI_HOME` (default `~/.sarathi`, override by exporting `SARATHI_HOME` first) and prints how to add `~/.sarathi/venv/bin` to your `PATH`. Pass `--dry-run` (or set `SARATHI_DRY_RUN=1`) to preview the plan without changing anything.
+
+**pip from GitHub.** Into any environment you manage yourself:
+
+```bash
+pip install "git+https://github.com/kulkarni2u/Sarathi.git"
+```
+
+**Homebrew.** Sarathi has no tagged release yet, so install from HEAD via a tap that carries `Formula/sarathi.rb`:
+
+```bash
+brew install --HEAD <your-tap>/sarathi
+```
+
+(The `--HEAD` flag is required until a versioned release is published.)
+
+**Launch the desktop cockpit** once installed:
+
+```bash
+sarathi-desktop
+```
+
 ## Quick Start
 
 ```bash
@@ -84,6 +116,21 @@ export SARATHI_EXEC_COMMANDS=1
 export SARATHI_WORKDIR=/path/to/repo   # optional; defaults to cwd
 export SARATHI_COMMAND_TIMEOUT=600     # optional; seconds
 sarathi run "…" --policy-pack ./policy-pack
+```
+
+To run those commands inside a local container sandbox, choose a Docker-compatible
+runtime. Docker is the default when sandboxing is enabled; Podman is also
+supported. If the executable is not on `PATH`, set `SARATHI_SANDBOX_RUNTIME` to
+the machine-local binary path instead of hardcoding it in policy or source.
+
+```bash
+export SARATHI_SANDBOX=docker
+
+# Or:
+export SARATHI_SANDBOX=podman
+
+# Optional, only when the runtime binary is not on PATH:
+export SARATHI_SANDBOX_RUNTIME=/path/to/docker-or-podman
 ```
 
 ### Optional: live provider smoke tests
@@ -211,7 +258,12 @@ Workspace provider settings feed service-side routing:
 - `opencode` — HTTP bridge via `opencode serve`; starts a local server, creates a session, and reads the SSE stream for the response
 - Any provider can also point at a custom executable that reads Sarathi JSON from stdin and returns a normalized JSON result on stdout
 
-Provider tool permissions are declared in `policy-pack/permissions.md` and written as native config files by `sarathi init` (`.claude/settings.json`, `~/.codex/config.yaml`, `opencode.json`). No runtime permission-bypass flags are used.
+Provider tool permissions are declared in `policy-pack/permissions.md` as
+mode-specific grants: `read_only`, `read_write`, and `full`. `sarathi init`
+writes the initial native config files (`.claude/settings.json`,
+`~/.codex/config.yaml`, `opencode.json`), and provider dispatch refreshes those
+configs from the current harness permission mode before invoking
+Claude/Codex/OpenCode. No runtime permission-bypass flags are used.
 
 To wire real CLI providers in a policy pack:
 

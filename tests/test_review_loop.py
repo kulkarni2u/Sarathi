@@ -57,6 +57,39 @@ def test_review_run_approves_evidenced_review_units_and_records_ac_coverage(tmp_
     assert "review.completed" in {event["event_type"] for event in studio_data["events"]}
 
 
+def test_review_run_approves_when_evidenced_units_already_completed(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_dispatched_unit(app, tmp_path)
+    _, studio_before = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    reviewed_node = next(node for node in studio_before["graph"]["nodes"] if node["status"] == "review")
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{reviewed_node['id']}/transition",
+            {"status": "complete", "actor": "Operator"},
+        )
+    )
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task['id']}/reviews/run",
+            {"review_type": "functional"},
+        )
+    )
+
+    assert status == 201
+    assert data["review"]["status"] == "approved"
+    assert data["review"]["summary"] == "Review approved with dispatch evidence."
+    assert data["review"]["metadata"]["reviewed_subtasks"] == [reviewed_node["id"]]
+    assert [subtask["id"] for subtask in data["completed_subtasks"]] == [reviewed_node["id"]]
+
+    _, studio_after = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    assert "review.completed" in {event["event_type"] for event in studio_after["events"]}
+
+
 def test_review_run_rejects_missing_evidence_and_requeues_review_units(tmp_path):
     app = create_app(tmp_path / "sarathi.db")
     task = create_task_with_review_unit_without_evidence(app, tmp_path)

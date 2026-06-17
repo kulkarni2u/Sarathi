@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 10
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -92,6 +93,27 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
             (7, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 8:
+        conn.executescript(_MIGRATION_008)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (8, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 9:
+        conn.executescript(_MIGRATION_009)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (9, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 10:
+        conn.executescript(_MIGRATION_010)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (10, _utc_now()),
         )
         conn.commit()
 
@@ -332,7 +354,7 @@ class Storage:
                 t.id,
                 MAX(t.updated_at) AS last_activity
             FROM tasks t
-            WHERE json_extract(t.metadata, '$.project_id') = ?
+            WHERE t.project_id = ?
             GROUP BY t.id
             """,
             (project_id,),
@@ -519,15 +541,16 @@ class Storage:
         status: str = "pending",
         description: str | None = None,
         metadata: dict[str, Any] | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         task_id = _new_id()
         now = _utc_now()
         self.conn.execute(
             """
             INSERT INTO tasks (
-                id, workspace_id, title, description, status, metadata, created_at, updated_at
+                id, workspace_id, title, description, status, metadata, created_at, updated_at, project_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -538,6 +561,7 @@ class Storage:
                 _dump_json(metadata),
                 now,
                 now,
+                project_id,
             ),
         )
         self.conn.commit()
@@ -548,7 +572,7 @@ class Storage:
     def get_task(self, task_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             """
-            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at
+            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at, project_id
             FROM tasks
             WHERE id = ?
             """,
@@ -585,7 +609,7 @@ class Storage:
     def list_tasks_for_workspace(self, workspace_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             """
-            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at
+            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at, project_id
             FROM tasks
             WHERE workspace_id = ?
             ORDER BY created_at, id
@@ -762,6 +786,7 @@ class Storage:
         role: str,
         content: str,
         task_id: str | None = None,
+        session_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         message_id = _new_id()
@@ -769,11 +794,20 @@ class Storage:
         self.conn.execute(
             """
             INSERT INTO messages (
-                id, workspace_id, task_id, role, content, metadata, created_at
+                id, workspace_id, task_id, session_id, role, content, metadata, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (message_id, workspace_id, task_id, role, content, _dump_json(metadata), now),
+            (
+                message_id,
+                workspace_id,
+                task_id,
+                session_id,
+                role,
+                content,
+                _dump_json(metadata),
+                now,
+            ),
         )
         self.conn.commit()
         message = self.get_message(message_id)
@@ -783,7 +817,7 @@ class Storage:
     def get_message(self, message_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
             """
-            SELECT id, workspace_id, task_id, role, content, metadata, created_at
+            SELECT id, workspace_id, task_id, session_id, role, content, metadata, created_at
             FROM messages
             WHERE id = ?
             """,
@@ -796,6 +830,7 @@ class Storage:
         *,
         workspace_id: str | None = None,
         task_id: str | None = None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         filters: list[str] = []
         params: list[str] = []
@@ -805,10 +840,13 @@ class Storage:
         if task_id is not None:
             filters.append("task_id = ?")
             params.append(task_id)
+        if session_id is not None:
+            filters.append("session_id = ?")
+            params.append(session_id)
         where = f"WHERE {' AND '.join(filters)}" if filters else ""
         rows = self.conn.execute(
             f"""
-            SELECT id, workspace_id, task_id, role, content, metadata, created_at
+            SELECT id, workspace_id, task_id, session_id, role, content, metadata, created_at
             FROM messages
             {where}
             ORDER BY created_at, id
@@ -864,6 +902,342 @@ class Storage:
             (task_id,),
         ).fetchall()
         return [_approval_gate_from_row(row) for row in rows]
+
+    def create_session(
+        self,
+        *,
+        workspace_id: str,
+        task_id: str,
+        owner: str = "local",
+        visibility: str = "private",
+        share_token: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        session_id = _new_id()
+        now = _utc_now()
+        if share_token is None:
+            share_token = secrets.token_urlsafe(18)
+        self.conn.execute(
+            """
+            INSERT INTO sessions (
+                id, workspace_id, task_id, owner, share_token, visibility,
+                status, metadata, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                workspace_id,
+                task_id,
+                owner,
+                share_token,
+                visibility,
+                "active",
+                _dump_json(metadata),
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        self.add_session_participant(session_id=session_id, user=owner, role="owner")
+        session = self.get_session(session_id)
+        assert session is not None
+        return session
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, workspace_id, task_id, owner, share_token, visibility,
+                   status, metadata, created_at, updated_at
+            FROM sessions
+            WHERE id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        return _session_from_row(row) if row is not None else None
+
+    def get_session_by_share_token(self, share_token: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, workspace_id, task_id, owner, share_token, visibility,
+                   status, metadata, created_at, updated_at
+            FROM sessions
+            WHERE share_token = ?
+            """,
+            (share_token,),
+        ).fetchone()
+        return _session_from_row(row) if row is not None else None
+
+    def list_sessions_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, task_id, owner, share_token, visibility,
+                   status, metadata, created_at, updated_at
+            FROM sessions
+            WHERE task_id = ?
+            ORDER BY created_at, id
+            """,
+            (task_id,),
+        ).fetchall()
+        return [_session_from_row(row) for row in rows]
+
+    def update_session(
+        self,
+        session_id: str,
+        *,
+        visibility: str | None = None,
+        status: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_session(session_id)
+        if existing is None:
+            raise KeyError(session_id)
+        now = _utc_now()
+        next_visibility = visibility if visibility is not None else existing["visibility"]
+        next_status = status if status is not None else existing["status"]
+        next_metadata = metadata if metadata is not None else existing["metadata"]
+        self.conn.execute(
+            """
+            UPDATE sessions
+            SET visibility = ?, status = ?, metadata = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (next_visibility, next_status, _dump_json(next_metadata), now, session_id),
+        )
+        self.conn.commit()
+        session = self.get_session(session_id)
+        assert session is not None
+        return session
+
+    def create_user(
+        self,
+        *,
+        username: str,
+        token: str | None = None,
+        display_name: str | None = None,
+        status: str = "active",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        user_id = _new_id()
+        now = _utc_now()
+        if token is None:
+            token = secrets.token_urlsafe(24)
+        self.conn.execute(
+            """
+            INSERT INTO users (
+                id, username, token, display_name, status,
+                metadata, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                username,
+                token,
+                display_name,
+                status,
+                _dump_json(metadata),
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        user = self.get_user(user_id)
+        assert user is not None
+        return user
+
+    def get_user(self, user_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, username, token, display_name, status,
+                   metadata, created_at, updated_at
+            FROM users
+            WHERE id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        return _user_from_row(row) if row is not None else None
+
+    def get_user_by_token(self, token: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, username, token, display_name, status,
+                   metadata, created_at, updated_at
+            FROM users
+            WHERE token = ?
+            """,
+            (token,),
+        ).fetchone()
+        return _user_from_row(row) if row is not None else None
+
+    def get_user_by_username(self, username: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, username, token, display_name, status,
+                   metadata, created_at, updated_at
+            FROM users
+            WHERE username = ?
+            """,
+            (username,),
+        ).fetchone()
+        return _user_from_row(row) if row is not None else None
+
+    def list_users(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, username, token, display_name, status,
+                   metadata, created_at, updated_at
+            FROM users
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+        return [_user_from_row(row) for row in rows]
+
+    def update_user(
+        self,
+        user_id: str,
+        *,
+        display_name: str | None = None,
+        status: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_user(user_id)
+        if existing is None:
+            raise KeyError(user_id)
+        now = _utc_now()
+        next_display_name = (
+            display_name if display_name is not None else existing["display_name"]
+        )
+        next_status = status if status is not None else existing["status"]
+        next_metadata = metadata if metadata is not None else existing["metadata"]
+        self.conn.execute(
+            """
+            UPDATE users
+            SET display_name = ?, status = ?, metadata = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (next_display_name, next_status, _dump_json(next_metadata), now, user_id),
+        )
+        self.conn.commit()
+        user = self.get_user(user_id)
+        assert user is not None
+        return user
+
+    def add_session_participant(
+        self,
+        *,
+        session_id: str,
+        user: str,
+        role: str = "observer",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = _utc_now()
+        existing = self.get_session_participant(session_id, user)
+        if existing is not None:
+            self.conn.execute(
+                """
+                UPDATE session_participants
+                SET role = ?, status = 'active', updated_at = ?
+                WHERE session_id = ? AND user = ?
+                """,
+                (role, now, session_id, user),
+            )
+        else:
+            participant_id = _new_id()
+            self.conn.execute(
+                """
+                INSERT INTO session_participants (
+                    id, session_id, user, role, status, metadata, joined_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    participant_id,
+                    session_id,
+                    user,
+                    role,
+                    "active",
+                    _dump_json(metadata),
+                    now,
+                    now,
+                ),
+            )
+        self.conn.commit()
+        participant = self.get_session_participant(session_id, user)
+        assert participant is not None
+        return participant
+
+    def get_session_participant(
+        self, session_id: str, user: str
+    ) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, session_id, user, role, status, metadata, joined_at, updated_at
+            FROM session_participants
+            WHERE session_id = ? AND user = ?
+            """,
+            (session_id, user),
+        ).fetchone()
+        return _session_participant_from_row(row) if row is not None else None
+
+    def list_session_participants(self, session_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, session_id, user, role, status, metadata, joined_at, updated_at
+            FROM session_participants
+            WHERE session_id = ?
+            ORDER BY joined_at, id
+            """,
+            (session_id,),
+        ).fetchall()
+        return [_session_participant_from_row(row) for row in rows]
+
+    def update_session_participant(
+        self,
+        session_id: str,
+        user: str,
+        *,
+        role: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_session_participant(session_id, user)
+        if existing is None:
+            raise KeyError((session_id, user))
+        now = _utc_now()
+        next_role = role if role is not None else existing["role"]
+        next_status = status if status is not None else existing["status"]
+        self.conn.execute(
+            """
+            UPDATE session_participants
+            SET role = ?, status = ?, updated_at = ?
+            WHERE session_id = ? AND user = ?
+            """,
+            (next_role, next_status, now, session_id, user),
+        )
+        self.conn.commit()
+        participant = self.get_session_participant(session_id, user)
+        assert participant is not None
+        return participant
+
+    def remove_session_participant(
+        self, session_id: str, user: str
+    ) -> dict[str, Any]:
+        existing = self.get_session_participant(session_id, user)
+        if existing is None:
+            raise KeyError((session_id, user))
+        now = _utc_now()
+        self.conn.execute(
+            """
+            UPDATE session_participants
+            SET status = 'left', updated_at = ?
+            WHERE session_id = ? AND user = ?
+            """,
+            (now, session_id, user),
+        )
+        self.conn.commit()
+        participant = self.get_session_participant(session_id, user)
+        assert participant is not None
+        return participant
 
     def create_lifecycle_event(
         self,
@@ -1475,6 +1849,7 @@ def _task_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "metadata": _load_json(row["metadata"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "project_id": row["project_id"] if "project_id" in row.keys() else None,
     }
 
 
@@ -1500,6 +1875,7 @@ def _message_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "id": row["id"],
         "workspace_id": row["workspace_id"],
         "task_id": row["task_id"],
+        "session_id": row["session_id"],
         "role": row["role"],
         "content": row["content"],
         "metadata": _load_json(row["metadata"]),
@@ -1516,6 +1892,47 @@ def _approval_gate_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "status": row["status"],
         "metadata": _load_json(row["metadata"]),
         "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _session_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "workspace_id": row["workspace_id"],
+        "task_id": row["task_id"],
+        "owner": row["owner"],
+        "share_token": row["share_token"],
+        "visibility": row["visibility"],
+        "status": row["status"],
+        "metadata": _load_json(row["metadata"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _user_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "token": row["token"],
+        "display_name": row["display_name"],
+        "status": row["status"],
+        "metadata": _load_json(row["metadata"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _session_participant_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "user": row["user"],
+        "role": row["role"],
+        "status": row["status"],
+        "metadata": _load_json(row["metadata"]),
+        "joined_at": row["joined_at"],
         "updated_at": row["updated_at"],
     }
 
@@ -2124,4 +2541,77 @@ ALTER TABLE subtasks ADD COLUMN heartbeat_at TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_subtasks_claim
     ON subtasks(status, claimed_by);
+"""
+
+
+_MIGRATION_008 = """
+ALTER TABLE tasks ADD COLUMN project_id TEXT;
+
+INSERT INTO projects (id, workspace_id, name, description, status, metadata, created_at, updated_at)
+SELECT
+    w.id || '-default' AS id,
+    w.id AS workspace_id,
+    'Default' AS name,
+    'Default project created during migration' AS description,
+    'active' AS status,
+    '{}' AS metadata,
+    datetime('now') AS created_at,
+    datetime('now') AS updated_at
+FROM workspaces w
+WHERE w.id NOT IN (SELECT DISTINCT workspace_id FROM projects);
+
+UPDATE tasks
+SET project_id = workspace_id || '-default'
+WHERE project_id IS NULL;
+"""
+
+
+_MIGRATION_009 = """
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    owner TEXT NOT NULL DEFAULT 'local',
+    share_token TEXT NOT NULL,
+    visibility TEXT NOT NULL DEFAULT 'private',   -- 'private' | 'link'
+    status TEXT NOT NULL DEFAULT 'active',         -- 'active' | 'closed'
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_share_token ON sessions(share_token);
+CREATE INDEX IF NOT EXISTS idx_sessions_task ON sessions(task_id);
+
+CREATE TABLE IF NOT EXISTS session_participants (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    user TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'observer',        -- 'owner' | 'driver' | 'observer'
+    status TEXT NOT NULL DEFAULT 'active',         -- 'active' | 'left'
+    metadata TEXT NOT NULL DEFAULT '{}',
+    joined_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_participants_unique ON session_participants(session_id, user);
+
+ALTER TABLE messages ADD COLUMN session_id TEXT;
+"""
+
+
+_MIGRATION_010 = """
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    token TEXT NOT NULL,
+    display_name TEXT,
+    status TEXT NOT NULL DEFAULT 'active',   -- 'active' | 'disabled'
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_token ON users(token);
 """

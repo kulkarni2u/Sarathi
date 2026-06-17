@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
+import logging
 from pathlib import Path
 import subprocess
 from typing import Any
@@ -20,8 +21,11 @@ from .cli_bridge import (
     _parse_json_dict,
     _provider_prompt,
     dispatch_via_cli_bridge,
+    ensure_provider_permissions,
 )
 from ..workspace_evidence import attach_workspace_evidence, snapshot_workspace
+
+logger = logging.getLogger("sarathi.opencode_sdk")
 
 
 class OpenCodeSdkProviderAdapter(ProviderAdapter):
@@ -72,6 +76,13 @@ class OpenCodeSdkProviderAdapter(ProviderAdapter):
 
     def dispatch(self, request: DispatchRequest) -> DispatchResponse:
         before = snapshot_workspace(self.workspace_root)
+        try:
+            ensure_provider_permissions(
+                self.workspace_root,
+                permission_mode=request.constraints.get("permission_mode", "read_only"),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to apply OpenCode SDK provider permissions")
         if request.constraints.get("ncp_handoff_enabled") and self.provider_path:
             response = dispatch_via_cli_bridge(
                 provider="opencode",

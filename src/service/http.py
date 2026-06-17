@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .app import create_app
+from .app import RawResponse, create_app
 from .errors import (
     MAX_BODY_BYTES,
     ServiceError,
@@ -32,9 +32,10 @@ def create_http_server(
     token: str,
     host: str = "127.0.0.1",
     port: int = 0,
+    dist_root: str | Path | None = None,
 ) -> ThreadingHTTPServer:
     resolved_db_path = Path(db_path).expanduser().resolve()
-    app = create_app(resolved_db_path, token=token)
+    app = create_app(resolved_db_path, token=token, dist_root=dist_root)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -77,12 +78,16 @@ def create_http_server(
                 self._write_json(error.status, _error(error, correlation_id))
                 return
 
-            status, payload = app.handle(
+            result = app.handle(
                 self.command,
                 self.path,
                 body=body,
                 headers=dict(self.headers.items()),
             )
+            if isinstance(result, RawResponse):
+                self._write_raw(result)
+                return
+            status, payload = result
             self._write_json(status, payload)
 
         def _handle_sse(self) -> None:
@@ -151,6 +156,18 @@ def create_http_server(
             self._write_cors_headers()
             self.end_headers()
             self.wfile.write(encoded)
+            self.close_connection = True
+
+        def _write_raw(self, response: RawResponse) -> None:
+            self.send_response(response.status, HTTPStatus(response.status).phrase)
+            self.send_header("content-type", response.content_type)
+            self.send_header("content-length", str(len(response.body)))
+            self.send_header("connection", "close")
+            for header, value in response.headers.items():
+                self.send_header(header, value)
+            self._write_cors_headers()
+            self.end_headers()
+            self.wfile.write(response.body)
             self.close_connection = True
 
         def _write_cors_headers(self) -> None:

@@ -1,0 +1,34 @@
+# NCP store configuration for Sarathi (direct mode, SQLite backend).
+# Place at <repo_root>/.ncp/config.toml. NCP finds it by walking up to the
+# project root (the dir containing .git).
+
+[store]
+type = "sqlite"           # local, zero-infra. Use "pgvector" only with `ncp infra` (Docker Postgres+Redis).
+path = ".ncp/store.db"    # SQLite DB file (gitignored — regenerable per workspace)
+
+[budget]
+context_token_budget = 840
+warn_at_ratio = 0.70
+critical_at_ratio = 0.85
+
+[chunking]
+max_chunk_tokens = 200
+default_type = "auto"
+
+[whispers]
+default_ttl_seconds = 1800
+max_per_drain = 3
+min_confidence = 0.60
+
+[observability]
+log_level = "info"
+cost_tracking = true
+
+# --- Optional backends (NOT used in the SQLite setup) ---
+# [redis]    # only needed for cross-process whispers
+# url = "redis://127.0.0.1:6379/0"
+# [pgvector] # only with `ncp infra` (Docker Postgres); requires `ncp migrate`
+# dsn = "postgresql://USER:PASSWORD@127.0.0.1:5432/ncp"
+
+# [server]
+# auth_token = "<generate-your-own; do NOT commit a real token>"

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
+from src.repo_wiki import GENERATED_MARKER
 from src.evolve import Evolver
 from src.policy import compile_policy_pack
 from src.storage import Storage
@@ -220,7 +221,7 @@ def _workspace_wiki(workspace: dict[str, Any]) -> dict[str, Any]:
 
 def _workspace_wiki_page(workspace: dict[str, Any], page: str) -> dict[str, Any]:
     workspace_root = Path(workspace["root_path"]).expanduser()
-    wiki_dir = workspace_root / "wiki"
+    wiki_dir = _workspace_wiki_dir(workspace_root)
     page_path = _resolve_workspace_wiki_page_path(wiki_dir, page)
     if not wiki_dir.exists():
         raise ServiceError("not_found", "Wiki directory not found.", 404)
@@ -237,7 +238,7 @@ def _workspace_wiki_page(workspace: dict[str, Any], page: str) -> dict[str, Any]
 
 def _save_workspace_wiki_page(workspace: dict[str, Any], body: Mapping[str, Any] | None) -> dict[str, Any]:
     workspace_root = Path(workspace["root_path"]).expanduser()
-    wiki_dir = workspace_root / "wiki"
+    wiki_dir = _workspace_wiki_dir(workspace_root, for_write=True)
     wiki_dir.mkdir(parents=True, exist_ok=True)
     page = _required_text(body, "page")
     content = _required_text(body, "content")
@@ -382,19 +383,40 @@ def _repository_guide_status(workspace_root: Path) -> dict[str, Any]:
 
 
 def _list_wiki_pages(workspace_root: Path) -> list[dict[str, Any]]:
-    wiki_dir = workspace_root / "wiki"
+    wiki_dir = _workspace_wiki_dir(workspace_root)
     if not wiki_dir.exists():
         return []
     pages = []
     for md_file in sorted(wiki_dir.rglob("*.md")):
         relative = md_file.relative_to(wiki_dir)
         page_name = str(relative.with_suffix("")).replace("/", " / ")
+        content = md_file.read_text(encoding="utf-8", errors="ignore")
         pages.append({
             "name": page_name,
             "path": str(relative),
             "exists": True,
+            "source": _wiki_source_label(workspace_root, wiki_dir),
+            "generated": content.lstrip().startswith(GENERATED_MARKER),
+            "human_authored": not content.lstrip().startswith(GENERATED_MARKER),
         })
     return pages
+
+
+def _workspace_wiki_dir(workspace_root: Path, *, for_write: bool = False) -> Path:
+    generated = workspace_root / ".sarathi" / "wiki"
+    legacy = workspace_root / "wiki"
+    if generated.exists():
+        return generated
+    if legacy.exists() and not for_write:
+        return legacy
+    return generated
+
+
+def _wiki_source_label(workspace_root: Path, wiki_dir: Path) -> str:
+    try:
+        return str(wiki_dir.relative_to(workspace_root))
+    except ValueError:
+        return str(wiki_dir)
 
 
 def _resolve_workspace_wiki_page_path(wiki_dir: Path, page: str) -> Path:
@@ -750,4 +772,3 @@ def _recent_context_bundles_detail(
                 },
             })
     return sorted(bundles, key=lambda b: b.get("created_at", ""), reverse=True)[:20]
-

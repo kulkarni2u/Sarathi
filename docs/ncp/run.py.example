@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Direct-mode bridge: Sarathi <-> NCP (neural-context-protocol) Python API.
+
+Invoked by Sarathi's NCPTransportMixin as:
+
+    .ncp/run.py <command> <json-args>
+
+Supported commands:
+    status        -- exit 0 if the NCP store is reachable (used by check_available)
+    write_memory  -- persist a SubconsciousChunk; exit 0 on success
+    get_context   -- assemble pidgin context for a ConsciousBlock; print to stdout
+    fetch         -- query the store for relevant chunks; print pidgin "chunk:" blocks
+    log_cost      -- record a cost/turn entry; exit 0 on success
+
+All errors are reported on stderr with a non-zero exit code.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+# Repo root is the parent of this .ncp/ directory. NCP's config loader walks
+# up from cwd looking for a .git directory to find the project root, and then
+# reads <project_root>/.ncp/config.toml (sqlite store at .ncp/store.db).
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _fail(message: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        _fail("usage: run.py <command> [<json-args>]", 2)
+
+    command = argv[1]
+    raw_args = argv[2] if len(argv) > 2 else "{}"
+
+    try:
+        args = json.loads(raw_args) if raw_args else {}
+    except json.JSONDecodeError as exc:
+        _fail(f"invalid JSON args: {exc}", 2)
+
+    try:
+        import ncp
+        from ncp.types import ConsciousBlock, SubconsciousChunk, BudgetContext
+        from ncp import configure
+        from ncp.stores import create_store
+    except Exception as exc:  # pragma: no cover - import failure
+        _fail(f"failed to import ncp: {exc}", 1)
+
+    try:
+        config = configure(cwd=REPO_ROOT)
+        store = create_store(config)
+    except Exception as exc:
+        _fail(f"failed to load NCP config/store: {exc}", 1)
+
+    try:
+        if command == "status":
+            # Touch the store to confirm it is reachable.
+            store.status()
+            return 0
+
+        if command == "write_memory":
+            chunk = SubconsciousChunk(
+                content=str(args["content"]),
+                layer=args.get("layer", "episodic"),
+                src=args.get("src", "tool_result"),
+                written_by=args.get("written_by", "sarathi"),
+            )
+            ok = ncp.write_memory(chunk, store=store, config=config)
+            if not ok:
+                # SQLiteStore.write() returns False only when the chunk is a
+                # near-duplicate (>0.92 similarity) of an existing chunk in
+                # the same zone/layer/pipeline -- a no-op dedup, not an
+                # error. Treat as success per the direct-protocol contract
+                # ("write_memory ... exit 0 on success").
+                print("write_memory: skipped (near-duplicate of existing chunk)", file=sys.stderr)
+            return 0
+
+        if command == "get_context":
+            agent_kwargs = {
+                "agent_id": args.get("agent_id", "sarathi"),
+                "role": args.get("role", "Pravaha"),
+                "owns": args.get("owns", []),
+                "must_not": args.get("must_not", []),
+                "task": args.get("task", ""),
+                "slot": args.get("slot", "Build"),
+                "intent": args.get("intent", ""),
+            }
+            agent = ConsciousBlock(**agent_kwargs)
+            max_tokens = args.get("token_budget")
+            ctx = ncp.get_context(
+                agent=agent,
+                budget=BudgetContext(),
+                query_text=args.get("query_text"),
+                store=store,
+                config=config,
+                max_tokens=max_tokens,
+            )
+            sys.stdout.write(ctx)
+            return 0
+
+        if command == "fetch":
+            query = str(args.get("query", ""))
+            k = int(args.get("k", 3))
+            chunks = store.query(query, k=k, fallback_to_trust_recency=True)
+            for chunk in chunks:
+                print(f"chunk:{chunk.chunk_id}")
+                print(f"  {chunk.content}")
+            return 0
+
+        if command == "log_cost":
+            store.log_cost_raw(
+                turn_id=str(args.get("turn_id", "")),
+                agent_id=str(args.get("agent_id", "sarathi")),
+                model=str(args.get("model", "unknown")),
+                input_tokens=int(args.get("input_tokens", 0)),
+                output_tokens=int(args.get("output_tokens", 0)),
+                cost_usd=float(args.get("cost_usd", 0.0)),
+                pipeline_id=args.get("pipeline_id"),
+                latency_ms=int(args.get("latency_ms", 0)),
+            )
+            return 0
+
+        _fail(f"unknown command: {command!r}", 2)
+    except SystemExit:
+        raise
+    except KeyError as exc:
+        _fail(f"missing required arg: {exc}", 2)
+    except Exception as exc:
+        _fail(f"{command} failed: {exc}", 1)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

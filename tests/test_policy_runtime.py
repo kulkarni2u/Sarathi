@@ -6,7 +6,7 @@ except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib
 
 from src.dispatch import LocalDispatcher
-from src.engine import Complexity, Engine, Phase, TaskContext
+from src.engine import Complexity, Engine, PersistenceManager, Phase, TaskContext
 from src.policy import CompiledPolicyData, compile_policy_pack
 from src.runtime import ArtifactStore, DispatchRequest, DispatchResponse, GateResult
 
@@ -54,6 +54,17 @@ def test_packaged_skill_policy_files_include_current_templates():
     assert "skill/policy-pack/EXAMPLE/workflow-patterns.md" in example_files
     assert "skill/policy-pack/TEMPLATE/permissions.md" in template_files
     assert "skill/policy-pack/TEMPLATE/workflow-patterns.md" in template_files
+
+
+def test_permissions_template_uses_explicit_modes_not_global_full_auto():
+    template = Path("skill/policy-pack/TEMPLATE/permissions.md").read_text(encoding="utf-8")
+
+    assert "read_only:" in template
+    assert "read_write:" in template
+    assert "full:" in template
+    assert "autoapprove" not in template
+    assert "auto_approve" not in template
+    assert "full_auto: true" not in template.split("read_write:", 1)[0]
 
 
 def test_compile_policy_pack_loads_accepted_proposal_feedback(tmp_path: Path):
@@ -142,7 +153,7 @@ test:
         complexity=Complexity.HIGH,
     )
     engine = Engine(policy_pack_path=str(policy_dir), dispatcher=LocalDispatcher())
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
     engine.artifact_store = ArtifactStore(str(tmp_path / "artifacts"))
 
     result = engine.run_task(task)

@@ -8,6 +8,9 @@ from urllib.parse import urlparse
 import pytest
 
 from src.service import create_app, create_http_server
+from src.service.app import RawResponse
+from src.service.openapi import build_openapi_spec
+from src.service import providers as service_providers
 from src.storage import Storage, connect, run_migrations
 
 
@@ -40,6 +43,29 @@ def assert_error(response, *, status, code, correlation_id="corr-test"):
     assert "data" not in payload
 
 
+class FakeChatSession:
+    PROVIDERS = ("claude", "opencode", "codex")
+    sent: list[str] = []
+
+    def __init__(self, workspace_root=None):
+        self.workspace_root = workspace_root
+        self.provider = None
+
+    def set_provider(self, name):
+        self.provider = (name, f"/fake/{name}")
+        return True
+
+    def resolve_provider(self):
+        if self.provider is None:
+            self.provider = ("claude", "/fake/claude")
+        return self.provider
+
+    def send(self, message):
+        self.resolve_provider()
+        self.sent.append(message)
+        return f"provider reply: {message}"
+
+
 def test_health_returns_ok_with_correlation_id(tmp_path):
     app = create_app(tmp_path / "sarathi.db")
 
@@ -49,9 +75,9 @@ def test_health_returns_ok_with_correlation_id(tmp_path):
     assert data == {"status": "ok"}
 
 
-def test_workspace_lifecycle_is_persisted_without_touching_repo_paths(tmp_path):
+def test_workspace_creation_bootstraps_policy_pack_and_generated_wiki(tmp_path):
     db_path = tmp_path / "state" / "sarathi.db"
-    root_path = tmp_path / "repo-that-service-must-not-create"
+    root_path = tmp_path / "repo-to-bootstrap"
     app = create_app(db_path)
 
     status, data = assert_ok(
@@ -66,12 +92,45 @@ def test_workspace_lifecycle_is_persisted_without_touching_repo_paths(tmp_path):
     assert data["workspace"]["id"]
     assert data["workspace"]["name"] == "Pravaha UI"
     assert data["workspace"]["root_path"] == str(root_path)
-    assert not root_path.exists()
+    assert (root_path / "policy-pack" / "commands.md").exists()
+    assert (root_path / ".sarathi" / "wiki" / "README.md").exists()
+    bootstrap = data["workspace"]["metadata"]["bootstrap"]
+    assert bootstrap["policy_pack"]["status"] == "created"
+    assert bootstrap["wiki"]["status"] == "created"
 
     status, data = assert_ok(request(create_app(db_path), "GET", "/api/workspaces"))
     assert status == 200
     assert len(data["workspaces"]) == 1
     assert data["workspaces"][0]["name"] == "Pravaha UI"
+
+
+def test_workspace_creation_reuses_existing_init_and_human_wiki(tmp_path):
+    db_path = tmp_path / "state" / "sarathi.db"
+    root_path = tmp_path / "existing-repo"
+    policy_dir = root_path / "policy-pack"
+    wiki_dir = root_path / ".sarathi" / "wiki"
+    policy_dir.mkdir(parents=True)
+    wiki_dir.mkdir(parents=True)
+    existing_commands = "# Commands\n\ncustom: true\n"
+    human_notes = "# Human Notes\n\nDo not overwrite this.\n"
+    (policy_dir / "commands.md").write_text(existing_commands, encoding="utf-8")
+    (wiki_dir / "notes.md").write_text(human_notes, encoding="utf-8")
+    app = create_app(db_path)
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Existing", "root_path": str(root_path)},
+        )
+    )
+
+    assert status == 201
+    assert (policy_dir / "commands.md").read_text(encoding="utf-8") == existing_commands
+    assert (wiki_dir / "notes.md").read_text(encoding="utf-8") == human_notes
+    assert data["workspace"]["metadata"]["bootstrap"]["policy_pack"]["status"] == "reused"
+    assert data["workspace"]["metadata"]["bootstrap"]["wiki"]["status"] == "refreshed"
 
 
 def test_workspace_repository_action_preference_can_be_saved(tmp_path):
@@ -516,7 +575,9 @@ def test_approval_endpoint_persists_gate_and_event(tmp_path):
     assert events_data["events"][-1]["object_id"] == approval["id"]
 
 
-def test_chat_and_task_draft_persist_project_context(tmp_path):
+def test_chat_and_task_draft_persist_project_context(tmp_path, monkeypatch):
+    FakeChatSession.sent = []
+    monkeypatch.setattr(service_providers, "ChatSession", FakeChatSession)
     app = create_app(tmp_path / "sarathi.db")
     _, workspace_data = assert_ok(
         request(
@@ -559,6 +620,127 @@ def test_chat_and_task_draft_persist_project_context(tmp_path):
     assert status == 201
     _, task_data = assert_ok(request(app, "GET", f"/api/tasks/{chat_data['taskId']}"))
     assert task_data["task"]["metadata"]["project_id"] == project_id
+
+
+def test_service_chat_invokes_provider_and_persists_reply(tmp_path, monkeypatch):
+    FakeChatSession.sent = []
+    monkeypatch.setattr(service_providers, "ChatSession", FakeChatSession)
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/chat",
+            {
+                "message": "Talk to the model from the service.",
+                "context": {"workspaceId": workspace_id},
+            },
+        )
+    )
+
+    assert status == 201
+    assert data["agent"] == "claude"
+    assert data["status"] == "completed"
+    assert FakeChatSession.sent == ["Talk to the model from the service."]
+    assert data["reply"]["content"] == "provider reply: Talk to the model from the service."
+    _, messages = assert_ok(request(app, "GET", f"/api/tasks/{data['taskId']}/messages"))
+    assert [message["role"] for message in messages["messages"]] == ["user", "claude"]
+
+
+def test_task_message_can_invoke_provider_and_return_reply(tmp_path, monkeypatch):
+    FakeChatSession.sent = []
+    monkeypatch.setattr(service_providers, "ChatSession", FakeChatSession)
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+    _, task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/tasks",
+            {"title": "Provider-backed task chat"},
+        )
+    )
+    task_id = task_data["task"]["id"]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/tasks/{task_id}/messages",
+            {
+                "content": "Continue this task with an agent.",
+                "target": "Current task agents",
+                "invoke_provider": True,
+            },
+        )
+    )
+
+    assert status == 201
+    assert data["agent"] == "claude"
+    assert FakeChatSession.sent == ["Continue this task with an agent."]
+    assert data["reply"]["content"] == "provider reply: Continue this task with an agent."
+    _, messages = assert_ok(request(app, "GET", f"/api/tasks/{task_id}/messages"))
+    assert [message["role"] for message in messages["messages"]] == ["user", "claude"]
+    _, events = assert_ok(request(app, "GET", f"/api/events?task_id={task_id}"))
+    event_types = {event["event_type"] for event in events["events"]}
+    assert "message.created" in event_types
+    assert "message.provider_replied" in event_types
+
+
+def test_task_draft_accepts_snake_case_project_context(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+    _, project_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/projects",
+            {"name": "UI Enhancements"},
+        )
+    )
+    project_id = project_data["project"]["id"]
+
+    status, draft_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/task-drafts",
+            {
+                "prompt": "Start a project chat from the cockpit.",
+                "context": {"project_id": project_id},
+            },
+        )
+    )
+
+    assert status == 201
+    assert draft_data["task"]["project_id"] == project_id
+    assert draft_data["task"]["metadata"]["project_id"] == project_id
 
 
 def test_workspace_projects_can_be_created_and_listed(tmp_path):
@@ -1019,8 +1201,10 @@ def test_http_server_rejects_oversized_body(tmp_path):
 
 
 class running_server:
-    def __init__(self, db_path, token):
-        self.server = create_http_server(db_path=db_path, token=token, host="127.0.0.1", port=0)
+    def __init__(self, db_path, token, dist_root=None):
+        self.server = create_http_server(
+            db_path=db_path, token=token, host="127.0.0.1", port=0, dist_root=dist_root
+        )
         self.thread = threading.Thread(
             target=lambda: self.server.serve_forever(poll_interval=0.01),
             daemon=True,
@@ -1872,3 +2056,322 @@ test:
     )
     (policy_dir / "model-routing.md").write_text("# Model routing\n", encoding="utf-8")
     (policy_dir / "escalation.md").write_text("# Escalation\n", encoding="utf-8")
+
+
+# ── Usage stats, SSE replay, /docs, and static serving ─────────────────────
+
+
+def test_usage_stats_route_returns_projection(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    _, task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/tasks",
+            {"title": "Usage task"},
+        )
+    )
+    task_id = task_data["task"]["id"]
+
+    status, data = assert_ok(
+        request(app, "GET", f"/api/workspaces/{workspace_id}/usage-stats")
+    )
+
+    assert status == 200
+    assert data["workspace_id"] == workspace_id
+    assert data["task_count"] == 1
+    assert data["tasks"][0]["task_id"] == task_id
+    # Defensive defaults for a fresh task with no reviews/dispatches.
+    assert data["test_pass_rate"] is None
+    assert data["avg_blast_radius"] is None
+    assert data["total_tokens"] == 0
+
+
+def test_usage_stats_route_404s_for_unknown_workspace(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+
+    assert_error(
+        request(app, "GET", "/api/workspaces/nonexistent/usage-stats"),
+        status=404,
+        code="not_found",
+    )
+
+
+def test_events_stream_route_replays_lifecycle_events_as_sse(tmp_path):
+    db_path = tmp_path / "sarathi.db"
+    app = create_app(db_path)
+
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    _, task_data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/tasks",
+            {"title": "Streamed task"},
+        )
+    )
+    task_id = task_data["task"]["id"]
+
+    conn, storage = app._storage()
+    storage.create_lifecycle_event(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type="task.started",
+        payload={"object_id": task_id},
+    )
+    storage.create_lifecycle_event(
+        workspace_id=workspace_id,
+        task_id=task_id,
+        event_type="task.completed",
+        payload={"object_id": task_id},
+    )
+
+    result = app.handle(
+        "GET", f"/api/workspaces/{workspace_id}/tasks/{task_id}/events/stream"
+    )
+
+    assert result.status == 200
+    assert result.content_type == "text/event-stream"
+    body = result.body.decode("utf-8")
+    assert "event: task.created" in body
+    assert "event: task.started" in body
+    assert "event: task.completed" in body
+    # Each SSE frame is terminated by a blank line.
+    assert body.count("\n\n") >= 3
+
+    # Honor Last-Event-ID: replay only events strictly after the given id.
+    events = storage.list_events(workspace_id=workspace_id, task_id=task_id)
+    created_event_id = next(e["id"] for e in events if e["event_type"] == "task.created")
+
+    result_after = app.handle(
+        "GET",
+        f"/api/workspaces/{workspace_id}/tasks/{task_id}/events/stream",
+        headers={"Last-Event-ID": created_event_id},
+    )
+    body_after = result_after.body.decode("utf-8")
+    assert "event: task.created" not in body_after
+    assert "event: task.started" in body_after
+    assert "event: task.completed" in body_after
+
+
+def test_events_stream_route_404s_for_unknown_task(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": "/tmp/sutra"},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+
+    result = app.handle(
+        "GET", f"/api/workspaces/{workspace_id}/tasks/missing/events/stream"
+    )
+
+    # 404s are still returned through the normal {ok, error} envelope since
+    # the route did not match the raw-SSE special case (task lookup failed
+    # before any SSE bytes were written).
+    status, payload = result
+    assert status == 404
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_found"
+
+
+def test_docs_route_returns_html_referencing_openapi(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+
+    result = app.handle("GET", "/api/docs")
+
+    assert result.status == 200
+    assert result.content_type.startswith("text/html")
+    body = result.body.decode("utf-8")
+    assert "/openapi.json" in body
+    assert "<html" in body.lower()
+
+
+def test_http_docs_route_serves_html_over_the_wire(tmp_path):
+    with running_server(tmp_path / "sarathi.db", token="secret") as base_url:
+        status, headers, body = http_raw("GET", f"{base_url}/api/docs", token="secret")
+
+        assert status == 200
+        assert headers["content-type"].startswith("text/html")
+        assert "/openapi.json" in body
+
+
+def test_static_serving_returns_seeded_file_from_temp_dist_root(tmp_path):
+    dist_root = tmp_path / "dist"
+    dist_root.mkdir()
+    (dist_root / "index.html").write_text("<html><body>SPA shell</body></html>", encoding="utf-8")
+    assets_dir = dist_root / "assets"
+    assets_dir.mkdir()
+    (assets_dir / "app.js").write_text("console.log('hi');", encoding="utf-8")
+
+    app = create_app(tmp_path / "sarathi.db", dist_root=dist_root)
+
+    # A direct asset request returns the seeded file with the right content type.
+    result = app.handle("GET", "/assets/app.js")
+    assert result.status == 200
+    assert result.content_type.startswith("text/javascript")
+    assert result.body == b"console.log('hi');"
+
+    # A client-side route with no extension falls back to index.html.
+    result = app.handle("GET", "/some/spa/route")
+    assert result.status == 200
+    assert result.content_type.startswith("text/html")
+    assert b"SPA shell" in result.body
+
+    # A missing asset (has an extension, no file on disk) 404s.
+    result = app.handle("GET", "/assets/missing.js")
+    assert result.status == 404
+
+
+def test_static_serving_does_not_shadow_api_routes(tmp_path):
+    dist_root = tmp_path / "dist"
+    dist_root.mkdir()
+    (dist_root / "index.html").write_text("<html><body>SPA shell</body></html>", encoding="utf-8")
+
+    app = create_app(tmp_path / "sarathi.db", dist_root=dist_root)
+
+    # /api/health must still hit the JSON API, not the static fallback.
+    status, data = assert_ok(request(app, "GET", "/api/health"))
+    assert status == 200
+    assert data == {"status": "ok"}
+
+    # An unknown workspace under /api/workspaces/... still 404s through the
+    # normal error envelope rather than falling back to the SPA shell.
+    assert_error(
+        request(app, "GET", "/api/workspaces/nonexistent"),
+        status=404,
+        code="not_found",
+    )
+
+
+def test_http_static_serving_over_the_wire(tmp_path):
+    dist_root = tmp_path / "dist"
+    dist_root.mkdir()
+    (dist_root / "index.html").write_text("<html><body>SPA shell</body></html>", encoding="utf-8")
+    assets_dir = dist_root / "assets"
+    assets_dir.mkdir()
+    (assets_dir / "app.js").write_text("console.log('hi');", encoding="utf-8")
+
+    with running_server(tmp_path / "sarathi.db", token="secret", dist_root=dist_root) as base_url:
+        status, headers, body = http_raw("GET", f"{base_url}/assets/app.js", token="secret")
+        assert status == 200
+        assert headers["content-type"].startswith("text/javascript")
+        assert body == "console.log('hi');"
+
+        status, headers, body = http_raw("GET", f"{base_url}/assets/missing.js", token="secret")
+        assert status == 404
+
+
+def test_root_spa_shell_is_public_even_with_token_configured(tmp_path):
+    # The single-origin "installable app" path: a browser navigating to
+    # http://127.0.0.1:8765/ has no Authorization header. The SPA shell must
+    # be served (200), not rejected with 401.
+    dist_root = tmp_path / "dist"
+    dist_root.mkdir()
+    (dist_root / "index.html").write_text("<html><body>SPA shell</body></html>", encoding="utf-8")
+
+    app = create_app(tmp_path / "sarathi.db", token="secret", dist_root=dist_root)
+
+    result = app.handle("GET", "/")
+
+    assert isinstance(result, RawResponse)
+    assert result.status == 200
+    assert result.content_type.startswith("text/html")
+    assert b"SPA shell" in result.body
+
+
+def test_api_routes_still_require_auth_when_token_configured(tmp_path):
+    dist_root = tmp_path / "dist"
+    dist_root.mkdir()
+    (dist_root / "index.html").write_text("<html><body>SPA shell</body></html>", encoding="utf-8")
+
+    app = create_app(tmp_path / "sarathi.db", token="secret", dist_root=dist_root)
+
+    # No Authorization header -> the JSON API is still locked down.
+    assert_error(
+        app.handle("GET", "/api/workspaces", headers={"x-correlation-id": "corr-test"}),
+        status=401,
+        code="unauthorized",
+    )
+
+    # With the correct bearer token, the API still works as before.
+    status, data = assert_ok(
+        app.handle(
+            "GET",
+            "/api/workspaces",
+            headers={"authorization": "Bearer secret", "x-correlation-id": "corr-test"},
+        )
+    )
+    assert status == 200
+    assert data == {"workspaces": []}
+
+
+def test_sarathi_runtime_js_is_public_and_contains_token(tmp_path):
+    app = create_app(tmp_path / "sarathi.db", token="secret")
+
+    result = app.handle("GET", "/sarathi-runtime.js")
+
+    assert isinstance(result, RawResponse)
+    assert result.status == 200
+    assert result.content_type.startswith("application/javascript")
+    body = result.body.decode("utf-8")
+    assert "__SARATHI_RUNTIME_CONFIG__" in body
+    assert "secret" in body
+    assert '"baseUrl": ""' in body or '"baseUrl":""' in body
+
+
+def test_health_route_is_public_without_token(tmp_path):
+    app = create_app(tmp_path / "sarathi.db", token="secret")
+
+    status, data = assert_ok(app.handle("GET", "/health", headers={"x-correlation-id": "corr-test"}))
+
+    assert status == 200
+    assert data == {"status": "ok"}
+
+
+def test_docs_and_openapi_routes_are_public_without_token(tmp_path):
+    app = create_app(tmp_path / "sarathi.db", token="secret")
+
+    docs_result = app.handle("GET", "/docs")
+    assert isinstance(docs_result, RawResponse)
+    assert docs_result.status == 200
+    assert docs_result.content_type.startswith("text/html")
+
+    status, spec = app.handle("GET", "/openapi.json")
+    assert status == 200
+    assert spec["openapi"].startswith("3.")
+
+
+def test_openapi_spec_includes_usage_stats_and_event_stream_routes():
+    spec = build_openapi_spec()
+    paths = spec["paths"]
+
+    assert "/workspaces/{id}/usage-stats" in paths
+    assert "get" in paths["/workspaces/{id}/usage-stats"]
+
+    assert "/workspaces/{id}/tasks/{taskId}/events/stream" in paths
+    stream_op = paths["/workspaces/{id}/tasks/{taskId}/events/stream"]["get"]
+    assert "text/event-stream" in stream_op["responses"]["200"]["content"]

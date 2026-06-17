@@ -24,6 +24,12 @@ class EscalationAction(Enum):
     ABORT               = "abort"
 
 
+class PermissionMode(Enum):
+    READ_ONLY = "read_only"
+    READ_WRITE = "read_write"
+    FULL = "full"
+
+
 @dataclass
 class ExpansionRule:
     condition: str        # DSL predicate, e.g. "side_effect == READ_ONLY and cost < 0.01"

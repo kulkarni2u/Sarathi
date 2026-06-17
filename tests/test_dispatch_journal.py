@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from src.engine import Complexity, Engine, TaskContext
+from src.engine import Complexity, Engine, PersistenceManager, TaskContext
 from src.runtime.contracts import DispatchRequest, DispatchResponse
 from src.runtime.dispatch_journal import DispatchJournal
 
@@ -234,7 +234,7 @@ def test_resume_task_reconciles_inflight_dispatch(tmp_path: Path, monkeypatch):
     )
 
     engine = Engine()
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
     engine.dispatch_journal = DispatchJournal(tmp_path / "journal")
     engine.workspace_root = str(repo)
     engine.dispatcher.journal = engine.dispatch_journal

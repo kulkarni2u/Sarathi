@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from src.dispatch import LocalDispatcher
+from src.harness import derive_permission_mode
+from src.permissions import PermissionMode
 from src.runtime import (
     ContextCompiler,
     DispatchRequest,
@@ -17,6 +19,8 @@ from src.runtime import (
     normalize_agent_output,
 )
 from src.storage import Storage
+from src.task_class import TASK_CLASS_DEFAULTS, TaskClass, classify_task_class, from_legacy_type
+from src.tui_data import ChatSession, is_error_reply
 
 from .errors import ServiceError
 from .intake import _task_context_project_id, _task_context_workspace_id, _task_draft_metadata
@@ -88,6 +92,44 @@ def _dispatch_subtask(
         and workspace_root is not None
         and (workspace_root / ".ncp" / "config.toml").exists()
     )
+
+    ncp_run_path = workspace_root / ".ncp" / "run.py" if workspace_root is not None else None
+    ncp_config_present = bool(
+        workspace_root is not None
+        and (workspace_root / ".ncp" / "config.toml").exists()
+        and ncp_run_path is not None
+        and ncp_run_path.exists()
+    )
+
+    ncp_adapter = None
+    ncp_available = False
+    ncp_prior_findings_fetched = 0
+    if ncp_config_present:
+        from src.ncp_adapter.persistence_adapter import NCPPersistenceAdapter
+
+        ncp_adapter = NCPPersistenceAdapter(run_path=ncp_run_path)
+        try:
+            fetch_chunks = ncp_adapter._call_fetch(
+                f"{task['title']} {subtask['title']}", k=3
+            )
+            ncp_available = True
+            for chunk in fetch_chunks:
+                text = ncp_adapter._reconstruct_chunk_text(chunk).strip()
+                if not text:
+                    continue
+                ncp_prior_findings_fetched += 1
+                agent_input = context_pack_artifact.setdefault("agent_input", {})
+                prior_findings = list(agent_input.get("prior_findings", []))
+                prior_findings = [text[:200]] + prior_findings
+                agent_input["prior_findings"] = prior_findings[:8]
+            context_pack_artifact.setdefault("compilation", {})["ncp_prior_findings"] = (
+                ncp_prior_findings_fetched
+            )
+        except Exception:
+            ncp_available = False
+            ncp_prior_findings_fetched = 0
+            context_pack_artifact.setdefault("compilation", {})["ncp_prior_findings"] = 0
+
     storage.create_lifecycle_event(
         workspace_id=subtask["workspace_id"],
         task_id=subtask["task_id"],
@@ -116,6 +158,7 @@ def _dispatch_subtask(
             constraints={
                 "purpose": "child_task_execution",
                 "provider": provider,
+                "permission_mode": _permission_mode_for_service_dispatch(task, subtask),
                 **(
                     {
                         "ncp_handoff_enabled": True,
@@ -137,6 +180,27 @@ def _dispatch_subtask(
         purpose="child_task_execution",
     ).to_artifact()
     status = "completed" if response.success else "failed"
+
+    phase_log_written = False
+    cost_logged = False
+    if ncp_config_present and ncp_available and ncp_adapter is not None:
+        try:
+            ncp_adapter.save_phase_log(
+                task={"task_id": task["id"]}, phase="TaskTracking", status=status,
+            )
+            phase_log_written = True
+        except Exception:
+            pass
+        if response.usage:
+            try:
+                ncp_adapter.log_cost(
+                    usage_record=response.usage.to_artifact(),
+                    pipeline_id=f"sarathi_{subtask['id']}",
+                )
+                cost_logged = True
+            except Exception:
+                pass
+
     dispatch = storage.create_dispatch(
         workspace_id=subtask["workspace_id"],
         task_id=subtask["task_id"],
@@ -152,6 +216,19 @@ def _dispatch_subtask(
             "artifact_index": artifact_index,
             **({"usage": response.usage.to_artifact()} if response.usage else {}),
             **({"error": response.error} if response.error else {}),
+            **(
+                {
+                    "ncp": {
+                        "config_present": True,
+                        "available": ncp_available,
+                        "prior_findings_fetched": ncp_prior_findings_fetched,
+                        "phase_log_written": phase_log_written,
+                        "cost_logged": cost_logged,
+                    }
+                }
+                if ncp_config_present
+                else {}
+            ),
         },
     )
     next_status = "review" if response.success else "failed"
@@ -167,6 +244,20 @@ def _dispatch_subtask(
             "status": status,
         },
     )
+
+    if ncp_config_present:
+        storage.create_lifecycle_event(
+            workspace_id=subtask["workspace_id"],
+            task_id=subtask["task_id"],
+            event_type="ncp.memory_written",
+            payload={
+                "object_id": subtask["id"],
+                "dispatch_id": dispatch["id"],
+                "phase_log_written": phase_log_written,
+                "cost_logged": cost_logged,
+                "prior_findings_fetched": ncp_prior_findings_fetched,
+            },
+        )
 
     evidence = None
     if response.success:
@@ -200,6 +291,156 @@ def _dispatch_subtask(
         "dispatch": dispatch,
         "evidence": evidence,
     }
+
+
+def _invoke_task_chat_provider(
+    storage: Storage,
+    task: Mapping[str, Any],
+    user_message: Mapping[str, Any],
+    *,
+    target: str = "Current task agents",
+) -> dict[str, Any]:
+    """Invoke the same free-form provider chat path used by the TUI.
+
+    This is intentionally separate from TaskTracking dispatch: chat messages
+    should get conversational provider replies, while graph nodes still use the
+    governed subtask dispatch contract.
+    """
+    workspace = storage.get_workspace(str(task["workspace_id"]))
+    workspace_root = workspace["root_path"] if workspace is not None else None
+    session = ChatSession(workspace_root=workspace_root)
+    preferred_provider = _prefer_chat_session_provider(storage, str(task["workspace_id"]), session)
+    reply_text = session.send(str(user_message["content"]))
+    provider = (session.provider[0] if session.provider else preferred_provider) or "unavailable"
+    error = is_error_reply(reply_text) or provider == "unavailable"
+    reply = storage.create_message(
+        workspace_id=str(task["workspace_id"]),
+        task_id=str(task["id"]),
+        role=provider if provider != "unavailable" else "sarathi",
+        content=reply_text,
+        metadata={
+            "source": "provider_chat",
+            "provider": provider,
+            "target": target,
+            "reply_to": user_message["id"],
+            **({"error": True} if error else {}),
+        },
+    )
+    storage.create_lifecycle_event(
+        workspace_id=str(task["workspace_id"]),
+        task_id=str(task["id"]),
+        event_type="message.provider_replied",
+        payload={
+            "object_id": reply["id"],
+            "reply_to": user_message["id"],
+            "provider": provider,
+            "status": "error" if error else "completed",
+        },
+    )
+    return {
+        "message": reply,
+        "agent": provider,
+        "status": "error" if error else "completed",
+    }
+
+
+def _prefer_chat_session_provider(
+    storage: Storage,
+    workspace_id: str,
+    session: ChatSession,
+) -> str | None:
+    priority = [provider for provider in _get_provider_priority(storage, workspace_id) if provider in ChatSession.PROVIDERS]
+    for provider in priority:
+        if session.set_provider(provider):
+            return provider
+    resolved = session.resolve_provider()
+    return resolved[0] if resolved else None
+
+
+_READ_ONLY_ROLES = {"disha", "vichara", "prajna", "nirnaya", "marga", "sahayaka"}
+_EXECUTOR_ROLES = {"pravaha", "samanvaya"}
+
+
+def _permission_mode_for_service_dispatch(
+    task: Mapping[str, Any],
+    subtask: Mapping[str, Any],
+) -> str:
+    """Derive provider permissions for service-triggered child-agent dispatch."""
+    subtask_metadata = _mapping(subtask.get("metadata"))
+    task_metadata = _mapping(task.get("metadata"))
+
+    explicit = _explicit_permission_mode(subtask_metadata)
+    if explicit is not None:
+        return explicit.value
+
+    role = str(subtask_metadata.get("role") or "").strip().lower()
+    if role in _READ_ONLY_ROLES:
+        return PermissionMode.READ_ONLY.value
+    if role in _EXECUTOR_ROLES:
+        return _task_permission_mode(task, task_metadata, default=PermissionMode.READ_WRITE).value
+
+    explicit = _explicit_permission_mode(task_metadata)
+    if explicit is not None:
+        return explicit.value
+    return _task_permission_mode(task, task_metadata, default=PermissionMode.READ_ONLY).value
+
+
+def _task_permission_mode(
+    task: Mapping[str, Any],
+    task_metadata: Mapping[str, Any],
+    *,
+    default: PermissionMode,
+) -> PermissionMode:
+    harness_config = _mapping(task_metadata.get("harness_config"))
+    mode = _explicit_permission_mode(harness_config)
+    if mode is not None:
+        return mode
+
+    task_class = _task_class_from_metadata(task_metadata)
+    if task_class is None:
+        task_class = classify_task_class(
+            " ".join(
+                str(part)
+                for part in [
+                    task_metadata.get("source_prompt"),
+                    task.get("description"),
+                    task.get("title"),
+                ]
+                if part
+            )
+        )
+    defaults = TASK_CLASS_DEFAULTS.get(task_class)
+    if defaults is None:
+        return default
+    return derive_permission_mode(defaults.permission_scope)
+
+
+def _explicit_permission_mode(metadata: Mapping[str, Any]) -> PermissionMode | None:
+    raw_mode = metadata.get("permission_mode")
+    if isinstance(raw_mode, str):
+        normalized = raw_mode.strip().lower()
+        for mode in PermissionMode:
+            if normalized == mode.value:
+                return mode
+    raw_scope = metadata.get("permission_scope")
+    if isinstance(raw_scope, str) and raw_scope.strip():
+        return derive_permission_mode(raw_scope)
+    return None
+
+
+def _task_class_from_metadata(metadata: Mapping[str, Any]) -> TaskClass | None:
+    raw_task_class = metadata.get("task_class")
+    if not isinstance(raw_task_class, str) or not raw_task_class.strip():
+        return None
+    value = raw_task_class.strip()
+    try:
+        return TaskClass(value)
+    except ValueError:
+        return from_legacy_type(value)
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
 
 
 def _provider_dispatch_adapter_config(
@@ -445,15 +686,24 @@ def _handle_chat(storage: Storage, body: Mapping[str, Any]) -> dict[str, Any]:
     provider = _select_available_provider(storage, workspace_id, priority)
     if provider is None:
         provider = priority[0] if priority else "local"
+    metadata = _task_draft_metadata(
+        message,
+        project_id=_task_context_project_id(context),
+    )
     task = storage.create_task(
         workspace_id=workspace_id,
         title=message[:100],
         status="prd_pending",
         description=message,
-        metadata=_task_draft_metadata(
-            message,
-            project_id=_task_context_project_id(context),
-        ),
+        metadata=metadata,
+        project_id=metadata.get("project_id"),
+    )
+    user_message = storage.create_message(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        role="user",
+        content=message,
+        metadata={"target": "Current task agents", "source": "service_chat"},
     )
     storage.create_lifecycle_event(
         workspace_id=workspace_id,
@@ -461,7 +711,14 @@ def _handle_chat(storage: Storage, body: Mapping[str, Any]) -> dict[str, Any]:
         event_type="task.chat_created",
         payload={"object_id": task["id"], "agent": provider},
     )
-    return {"taskId": task["id"], "agent": provider, "status": "started"}
+    provider_reply = _invoke_task_chat_provider(storage, task, user_message)
+    return {
+        "taskId": task["id"],
+        "agent": provider_reply["agent"],
+        "status": provider_reply["status"],
+        "message": user_message,
+        "reply": provider_reply["message"],
+    }
 
 
 def _get_provider_priority(storage: Storage, workspace_id: str) -> list[str]:
@@ -663,4 +920,3 @@ def _provider_view(
         "last_checked_at": override.get("last_checked_at"),
         "last_error": override.get("last_error"),
     }
-

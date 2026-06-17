@@ -24,6 +24,8 @@ data/
 
 # Build artifacts
 sarathi.egg-info/
+/build/
+/dist/
 desktop/tsconfig.tsbuildinfo
 desktop/dist/
 
@@ -39,3 +41,6 @@ desktop/public/sarathi-runtime.js
 
 # Claude Code session worktrees (agent sandboxes)
 .claude/worktrees/
+build/
+dist/
+*.egg-info/

@@ -7,6 +7,7 @@ from .configured import (
     validate_provider_routing_config,
 )
 from .anthropic_sdk import AnthropicSdkProviderAdapter
+from .gateway import GatewayProviderAdapter
 from .local import LocalProviderAdapter
 from .openai_sdk import OpenAISdkProviderAdapter
 from .opencode_sdk import OpenCodeSdkProviderAdapter
@@ -16,6 +17,7 @@ __all__ = [
     "ConfiguredProviderAdapter",
     "CommandProviderAdapter",
     "ExternalProviderAdapter",
+    "GatewayProviderAdapter",
     "OpenAISdkProviderAdapter",
     "OpenCodeSdkProviderAdapter",
     "ProviderCapabilities",

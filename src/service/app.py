@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hmac
+import json
 import shutil
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import unquote
 
+from src.init import bootstrap_workspace
 from src.storage import Storage, connect, run_migrations
 
 from .errors import (
@@ -20,6 +23,9 @@ from .errors import (
     _path_parts,
     _query,
 )
+from .events import format_sse_event, replay_events
+from .static_files import resolve_static_file
+from .usage_stats import build_usage_stats
 from .intake import (
     _build_github_issue_reference,
     _derive_task_title,
@@ -32,6 +38,13 @@ from .intake import (
     _task_context_project_id,
     _task_draft_metadata,
     _write_brainstorm_spec,
+)
+from .openapi import build_openapi_spec
+from .policy_layers import (
+    get_session_policy,
+    get_workspace_policy,
+    set_session_policy_overrides,
+    set_workspace_policy_overrides,
 )
 from .preferences import (
     _effective_auto_approve_preference,
@@ -51,6 +64,7 @@ from .providers import (
     _claim_is_fresh,
     _dispatch_subtask,
     _handle_chat,
+    _invoke_task_chat_provider,
     _provider_health,
     _test_and_store_provider,
 )
@@ -76,6 +90,21 @@ from .review import (
     _record_repository_action,
     _run_task_review,
 )
+from .auth import (
+    auth_enabled as _auth_enabled,
+    Principal,
+    require_admin,
+    resolve_principal,
+)
+from .sessions import (
+    attach_via_share_token,
+    create_task_session,
+    fork_session,
+    join_session,
+    leave_session,
+    post_session_message,
+    update_task_session,
+)
 from .scheduling import (
     _create_graph_draft,
     _graph_for_task,
@@ -94,12 +123,81 @@ from .views import (
 )
 
 
+# Repository root: src/service/app.py -> src/service -> src -> <repo root>
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Default location of the built web bundle (Vite/SPA `dist` output).
+DEFAULT_DIST_ROOT = _REPO_ROOT / "web" / "dist"
+
+
+@dataclass(frozen=True)
+class RawResponse:
+    """A non-enveloped HTTP response (bypasses the ``{ok, data}`` JSON envelope).
+
+    Used for responses that must be a specific content type at the top
+    level — e.g. the OpenAPI document, the `/docs` HTML page, SSE streams,
+    and static assets from the built web bundle.
+    """
+
+    status: int
+    content_type: str
+    body: bytes
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+def _html_response(status: int, html: str) -> RawResponse:
+    return RawResponse(status, "text/html; charset=utf-8", html.encode("utf-8"))
+
+
+def _sse_response(status: int, body: str) -> RawResponse:
+    return RawResponse(
+        status,
+        "text/event-stream",
+        body.encode("utf-8"),
+        headers={"cache-control": "no-cache"},
+    )
+
+
+def _optional_bool(body: Mapping[str, Any], key: str, *, default: bool = False) -> bool:
+    value = body.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ServiceError("invalid_request", f"Field '{key}' must be a boolean.", 400)
+
+
+_DOCS_HTML = """<!DOCTYPE html>
+<html>
+  <head>
+    <title>Sarathi API Docs</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>body { margin: 0; padding: 0; }</style>
+  </head>
+  <body>
+    <redoc spec-url="/openapi.json"></redoc>
+    <script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+  </body>
+</html>
+"""
+
+
 class ServiceApp:
     """Callable local request handler that does not require a socket server."""
 
-    def __init__(self, db_path: str | Path, token: str | None = None):
+    def __init__(
+        self,
+        db_path: str | Path,
+        token: str | None = None,
+        *,
+        dist_root: str | Path | None = None,
+        auth_enabled: bool | None = None,
+    ):
         self.db_path = Path(db_path)
         self.token = token
+        self.dist_root = Path(dist_root) if dist_root is not None else DEFAULT_DIST_ROOT
+        self.auth_enabled = _auth_enabled() if auth_enabled is None else auth_enabled
         self._local = threading.local()
         # Run migrations once at startup on the main thread
         with connect(self.db_path) as _conn:
@@ -120,8 +218,23 @@ class ServiceApp:
         *,
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
-    ) -> tuple[int, dict[str, Any]]:
+    ) -> tuple[int, dict[str, Any]] | RawResponse:
         return self.handle(method, path, body=body, headers=headers)
+
+    # First path segments that are served by the JSON API router (`_route`).
+    # A GET to any other top-level path falls back to the static web bundle.
+    _API_PREFIXES = {
+        "health",
+        "workspaces",
+        "tasks",
+        "subtasks",
+        "providers",
+        "chat",
+        "events",
+        "brainstorm",
+        "sessions",
+        "users",
+    }
 
     def handle(
         self,
@@ -131,20 +244,159 @@ class ServiceApp:
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
         skip_auth: bool = False,
-    ) -> tuple[int, dict[str, Any]]:
+    ) -> tuple[int, dict[str, Any]] | RawResponse:
         correlation_id = _correlation_id(headers)
         try:
-            if not skip_auth:
-                self._authorize(headers)
+            method = method.upper()
+            raw_parts = _path_parts(path)
+            is_api_request = bool(raw_parts) and raw_parts[0] == "api"
+
+            # Public, unauthenticated routes for the same-origin "installable
+            # app" path: a browser navigating directly to this service (e.g.
+            # http://127.0.0.1:8765/) has no `Authorization` header yet, so
+            # the SPA shell, its static assets, `/docs`, `/openapi.json`,
+            # `/health`, and the runtime-config script must be reachable
+            # without a bearer token. Anything under `/api/...` (the JSON
+            # API) is never treated as public here and always requires
+            # `_authorize` below — this check runs only for non-`/api`
+            # GET requests.
+            if method == "GET" and not is_api_request:
+                public_response = self._public_get_response(raw_parts, correlation_id)
+                if public_response is not None:
+                    return public_response
+
+            principal = None if skip_auth else self._authorize(headers)
+            parts = raw_parts[1:] if is_api_request else raw_parts
+            # The OpenAPI document (and its docs page) are returned as-is,
+            # without the success envelope, since they must be valid
+            # top-level OpenAPI/HTML documents for tooling that fetches them
+            # directly (e.g. Redoc, openapi-spec-validator).
+            if method == "GET" and parts == ["openapi.json"]:
+                return 200, build_openapi_spec()
+            if method == "GET" and parts == ["docs"]:
+                return _html_response(200, _DOCS_HTML)
+            # SSE replay stream for a task's lifecycle events. Like
+            # /openapi.json and /docs, this is a raw (non-enveloped)
+            # response because its top-level content type must be
+            # text/event-stream.
+            if (
+                method == "GET"
+                and len(parts) == 6
+                and parts[0] == "workspaces"
+                and parts[2] == "tasks"
+                and parts[4] == "events"
+                and parts[5] == "stream"
+            ):
+                return self._handle_event_stream(parts[1], parts[3], headers)
+            if method == "GET" and (not parts or parts[0] not in self._API_PREFIXES):
+                # No matching API route for this GET — fall back to serving
+                # the built web bundle (the SPA), if present.
+                static_response = self._serve_static(parts)
+                if static_response is not None:
+                    return static_response
             status, data = self._route(
-                method.upper(),
-                _path_parts(path),
+                method,
+                parts,
                 _query(path),
                 body or {},
+                principal=principal,
             )
             return status, _ok(data, correlation_id)
         except ServiceError as error:
             return error.status, _error(error, correlation_id)
+
+    def _public_get_response(
+        self, raw_parts: list[str], correlation_id: str
+    ) -> tuple[int, dict[str, Any]] | RawResponse | None:
+        """Handle public (no bearer token required) GET requests.
+
+        Only called for GET requests whose path does not start with
+        `/api/`. Covers the same-origin SPA shell and its static assets, the
+        SPA history-mode fallback, `/docs`, `/openapi.json`, `/health`, and
+        `/sarathi-runtime.js`. Returns ``None`` if `raw_parts` is an
+        unauthenticated request for an API-shaped path (e.g. a bare
+        `/workspaces` without the `/api` prefix), which falls through to the
+        normal authorized routing below.
+        """
+        if raw_parts == ["health"]:
+            return 200, _ok({"status": "ok"}, correlation_id)
+        if raw_parts == ["openapi.json"]:
+            return 200, build_openapi_spec()
+        if raw_parts == ["docs"]:
+            return _html_response(200, _DOCS_HTML)
+        if raw_parts == ["sarathi-runtime.js"]:
+            return self._serve_runtime_config()
+        if not raw_parts or raw_parts[0] not in self._API_PREFIXES:
+            # The SPA shell (`/`), its static assets, and extensionless SPA
+            # fallback routes (e.g. `/tasks/123`) all live here.
+            return self._serve_static(raw_parts)
+        return None
+
+    def _serve_runtime_config(self) -> RawResponse:
+        """Serve `/sarathi-runtime.js`: the same-origin SPA's bearer token.
+
+        Trust model: like the discovery file written by `desktop.py`
+        (`~/.sarathi/service.json`, mode 0600) and the runtime-config script
+        it generates for the split-origin desktop UI, this endpoint is only
+        safe because the service binds to 127.0.0.1/localhost — any local
+        process that can reach this port can already read those files or
+        connect directly. This route is the single-origin analogue: it hands
+        the same bearer token to the SPA when it is served from this same
+        origin (so `baseUrl` is `""`, i.e. same-origin requests).
+        """
+        payload = {"baseUrl": "", "token": self.token or ""}
+        body = (
+            "window.__SARATHI_RUNTIME_CONFIG__ = "
+            f"{json.dumps(payload, sort_keys=True)};\n"
+        )
+        return RawResponse(200, "application/javascript", body.encode("utf-8"))
+
+    def _handle_event_stream(
+        self,
+        workspace_id: str,
+        task_id: str,
+        headers: Mapping[str, str] | None,
+    ) -> RawResponse:
+        """Replay a task's lifecycle events as a Server-Sent Events stream.
+
+        MVP behaviour: this writes the full (or `Last-Event-ID`-bounded)
+        backlog of events as SSE frames and then closes the stream with a
+        200. Continuous tailing of newly-created events is a follow-up (the
+        `/api/events/stream` websocket-style polling endpoint in
+        `http.py` already provides a live snapshot stream in the meantime).
+        """
+        conn, storage = self._storage()
+        if storage.get_workspace(workspace_id) is None:
+            raise ServiceError("not_found", "Workspace not found.", 404)
+        if storage.get_task(task_id) is None:
+            raise ServiceError("not_found", "Task not found.", 404)
+
+        after_id = None
+        if headers:
+            for key, value in headers.items():
+                if key.lower() == "last-event-id" and value:
+                    after_id = value
+                    break
+
+        events = replay_events(conn, workspace_id, task_id, after_id=after_id)
+        body = "".join(
+            format_sse_event(event["id"], event["event_type"], event["payload"])
+            for event in events
+        )
+        return _sse_response(200, body)
+
+    def _serve_static(self, parts: list[str]) -> RawResponse | None:
+        """Serve a file from the built web bundle (`self.dist_root`).
+
+        Returns ``None`` when there is no asset to serve (caller should fall
+        through to the normal API routing/404 behaviour) or a `RawResponse`
+        (200 for a resolved asset/SPA fallback, 404 for a missing asset).
+        """
+        url_path = "/" + "/".join(parts)
+        result = resolve_static_file(self.dist_root, url_path)
+        if result is None:
+            return RawResponse(404, "text/plain; charset=utf-8", b"Not Found")
+        return RawResponse(result.status, result.content_type, result.body)
 
     def _route(
         self,
@@ -152,6 +404,8 @@ class ServiceApp:
         parts: list[str],
         query: Mapping[str, list[str]],
         body: Mapping[str, Any],
+        *,
+        principal: Principal | None = None,
     ) -> tuple[int, dict[str, Any]]:
         if parts and parts[0] == "api":
             parts = parts[1:]
@@ -171,15 +425,28 @@ class ServiceApp:
             return 200, {"workspaces": workspaces}
 
         if method == "POST" and parts == ["workspaces"]:
+            root_path = _required_text(body, "root_path")
+            metadata = _optional_dict(body, "metadata") or {}
+            bootstrap = bootstrap_workspace(root_path)
+            metadata = {
+                **metadata,
+                "bootstrap": bootstrap,
+            }
             workspace = storage.create_workspace(
                 name=_required_text(body, "name"),
-                root_path=_required_text(body, "root_path"),
-                metadata=_optional_dict(body, "metadata"),
+                root_path=bootstrap["root_path"],
+                metadata=metadata,
             )
             storage.create_lifecycle_event(
                 workspace_id=workspace["id"],
                 event_type="workspace.created",
-                payload={"object_id": workspace["id"]},
+                payload={
+                    "object_id": workspace["id"],
+                    "bootstrap": {
+                        "policy_pack": bootstrap["policy_pack"]["status"],
+                        "wiki": bootstrap["wiki"]["status"],
+                    },
+                },
             )
             return 201, {"workspace": workspace}
 
@@ -490,6 +757,17 @@ class ServiceApp:
             method == "GET"
             and len(parts) == 3
             and parts[0] == "workspaces"
+            and parts[2] == "usage-stats"
+        ):
+            workspace_id = parts[1]
+            if storage.get_workspace(workspace_id) is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, build_usage_stats(storage, workspace_id)
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "workspaces"
             and parts[2] == "reuse-kit"
         ):
             workspace_id = parts[1]
@@ -671,11 +949,13 @@ class ServiceApp:
             workspace_id = parts[1]
             if storage.get_workspace(workspace_id) is None:
                 raise ServiceError("not_found", "Workspace not found.", 404)
+            task_metadata = _merge_task_defaults(_optional_dict(body, "metadata"))
             task = storage.create_task(
                 workspace_id=workspace_id,
                 title=_required_text(body, "title"),
                 description=_optional_text(body, "description"),
-                metadata=_merge_task_defaults(_optional_dict(body, "metadata")),
+                metadata=task_metadata,
+                project_id=task_metadata.get("project_id"),
             )
             storage.create_lifecycle_event(
                 workspace_id=workspace_id,
@@ -707,6 +987,7 @@ class ServiceApp:
                 status="prd_pending",
                 description=metadata["prd"]["problem"],
                 metadata=metadata,
+                project_id=metadata.get("project_id"),
             )
             user_message = storage.create_message(
                 workspace_id=workspace_id,
@@ -714,16 +995,6 @@ class ServiceApp:
                 role="user",
                 content=prompt,
                 metadata={"target": "Sarathi", "source": "orchestrator_chat"},
-            )
-            sarathi_message = storage.create_message(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                role="sarathi",
-                content=(
-                    "I drafted the PRD/AC shell and opened the PRD/AC approval gate "
-                    "before graph generation."
-                ),
-                metadata={"draft_task_id": task["id"], "gate": "PRD/AC"},
             )
             gate = storage.create_approval_gate(
                 workspace_id=workspace_id,
@@ -748,10 +1019,27 @@ class ServiceApp:
                 event_type="approval.requested",
                 payload={"object_id": gate["id"], "name": gate["name"]},
             )
+            if _optional_bool(body, "invoke_provider", default=False):
+                reply_result = _invoke_task_chat_provider(
+                    storage, task, user_message, target="Sarathi"
+                )
+                messages = [user_message, reply_result["message"]]
+            else:
+                sarathi_message = storage.create_message(
+                    workspace_id=workspace_id,
+                    task_id=task["id"],
+                    role="sarathi",
+                    content=(
+                        "I drafted the PRD/AC shell and opened the PRD/AC approval gate "
+                        "before graph generation."
+                    ),
+                    metadata={"draft_task_id": task["id"], "gate": "PRD/AC"},
+                )
+                messages = [user_message, sarathi_message]
             return 201, {
                 "task": task,
                 "approval_gate": gate,
-                "messages": [user_message, sarathi_message],
+                "messages": messages,
             }
 
         if (
@@ -797,6 +1085,7 @@ class ServiceApp:
                 status="prd_pending",
                 description=issue["url"] or f"Imported GitHub issue #{issue['number']}.",
                 metadata=task_metadata,
+                project_id=task_metadata.get("project_id"),
             )
             user_message = storage.create_message(
                 workspace_id=workspace_id,
@@ -933,7 +1222,18 @@ class ServiceApp:
                 event_type="message.created",
                 payload={"object_id": message["id"], "target": message["metadata"]["target"]},
             )
-            return 201, {"message": message}
+            reply_result = None
+            if _optional_bool(body, "invoke_provider", default=False):
+                reply_result = _invoke_task_chat_provider(
+                    storage,
+                    task,
+                    message,
+                    target=str(message["metadata"]["target"]),
+                )
+            return 201, {
+                "message": message,
+                **({"reply": reply_result["message"], "agent": reply_result["agent"]} if reply_result else {}),
+            }
 
         if (
             method == "POST"
@@ -1155,6 +1455,7 @@ class ServiceApp:
                     "project_id": checkpoint["project_id"],
                     "repository_action_preference": checkpoint["repository_action_preference"],
                 },
+                project_id=checkpoint["project_id"],
             )
             storage.create_lifecycle_event(
                 workspace_id=checkpoint["workspace_id"],
@@ -1212,6 +1513,175 @@ class ServiceApp:
                 )
             return 201, _dispatch_subtask(storage, subtask, body)
 
+        # ── Sessions (sharing & co-drive) ────────────────────────────────────
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "tasks"
+            and parts[2] == "sessions"
+        ):
+            task = storage.get_task(parts[1])
+            if task is None:
+                raise ServiceError("not_found", "Task not found.", 404)
+            session = create_task_session(
+                storage,
+                task,
+                owner=_optional_text(body, "owner") or "local",
+                visibility=_optional_text(body, "visibility") or "private",
+            )
+            return 201, {"session": session}
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "tasks"
+            and parts[2] == "sessions"
+        ):
+            task = storage.get_task(parts[1])
+            if task is None:
+                raise ServiceError("not_found", "Task not found.", 404)
+            return 200, {"sessions": storage.list_sessions_for_task(parts[1])}
+
+        if method == "POST" and parts == ["sessions", "attach"]:
+            result = attach_via_share_token(
+                storage,
+                share_token=_required_text(body, "share_token"),
+                user=_required_text(body, "user"),
+                role=_optional_text(body, "role") or "observer",
+            )
+            return 201, result
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "participants"
+        ):
+            session = storage.get_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Session not found.", 404)
+            return 200, {"participants": storage.list_session_participants(parts[1])}
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "participants"
+        ):
+            session = storage.get_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Session not found.", 404)
+            participant = join_session(
+                storage,
+                parts[1],
+                user=_required_text(body, "user"),
+                role=_optional_text(body, "role") or "observer",
+            )
+            return 201, {"participant": participant}
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "leave"
+        ):
+            participant = leave_session(
+                storage,
+                parts[1],
+                user=_required_text(body, "user"),
+            )
+            return 200, {"participant": participant}
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "fork"
+        ):
+            return 201, fork_session(
+                storage,
+                parts[1],
+                owner=_optional_text(body, "owner"),
+            )
+
+        if (
+            method == "GET"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "messages"
+        ):
+            session = storage.get_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Session not found.", 404)
+            return 200, {"messages": storage.list_messages(session_id=parts[1])}
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "sessions"
+            and parts[2] == "messages"
+        ):
+            session = storage.get_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Session not found.", 404)
+            # With auth on, the actor is the authenticated principal, not a
+            # client-supplied field — so observers cannot post by spoofing a
+            # driver's user id in the body.
+            actor = (
+                principal.username
+                if principal is not None and not principal.is_admin
+                else _required_text(body, "user")
+            )
+            message = post_session_message(
+                storage,
+                session,
+                user=actor,
+                content=_required_text(body, "content"),
+                role=_optional_text(body, "role"),
+            )
+            return 201, {"message": message}
+
+        if method == "GET" and len(parts) == 2 and parts[0] == "sessions":
+            session = storage.get_session(parts[1])
+            if session is None:
+                raise ServiceError("not_found", "Session not found.", 404)
+            return 200, {
+                "session": session,
+                "participants": storage.list_session_participants(parts[1]),
+            }
+
+        if method == "PATCH" and len(parts) == 2 and parts[0] == "sessions":
+            session = update_task_session(
+                storage,
+                parts[1],
+                visibility=_optional_text(body, "visibility"),
+                status=_optional_text(body, "status"),
+            )
+            return 200, {"session": session}
+
+        if method == "GET" and len(parts) == 3 and parts[0] == "sessions" and parts[2] == "policy":
+            return 200, get_session_policy(storage, parts[1])
+
+        if method == "PATCH" and len(parts) == 3 and parts[0] == "sessions" and parts[2] == "policy":
+            return 200, set_session_policy_overrides(storage, parts[1], body.get("overrides"))
+
+        # ── Users (opt-in multi-user auth: admin-only provisioning) ──────────
+        if method == "POST" and parts == ["users"]:
+            require_admin(principal)
+            username = _required_text(body, "username")
+            if storage.get_user_by_username(username) is not None:
+                raise ServiceError("conflict", "Username already exists.", 409)
+            user = storage.create_user(
+                username=username,
+                display_name=_optional_text(body, "display_name"),
+                metadata=_optional_dict(body, "metadata"),
+            )
+            return 201, {"user": user}
+
+        if method == "GET" and parts == ["users"]:
+            require_admin(principal)
+            return 200, {"users": storage.list_users()}
+
         if method == "GET" and parts == ["providers"]:
             workspace_id = _first_query(query, "workspace_id")
             if workspace_id and storage.get_workspace(workspace_id) is None:
@@ -1252,6 +1722,12 @@ class ServiceApp:
                 raise ServiceError("not_found", "Workspace not found.", 404)
             filename = parts[3]
             return 200, _put_policy_pack_file(storage, workspace_id, filename, body)
+
+        if method == "GET" and len(parts) == 3 and parts[0] == "workspaces" and parts[2] == "policy":
+            return 200, get_workspace_policy(storage, parts[1])
+
+        if method == "PATCH" and len(parts) == 3 and parts[0] == "workspaces" and parts[2] == "policy":
+            return 200, set_workspace_policy_overrides(storage, parts[1], body.get("overrides"))
 
         # ── Brainstorm sessions ──────────────────────────────────────────────
         if method == "POST" and len(parts) == 2 and parts[0] == "brainstorm" and parts[1] == "sessions":
@@ -1342,6 +1818,7 @@ class ServiceApp:
                 title=session["title"],
                 description=spec_content,
                 metadata=task_metadata,
+                project_id=task_metadata.get("project_id"),
             )
             approved = storage.approve_brainstorm_session(session["id"], task_id=task["id"])
             spec_path = _write_brainstorm_spec(approved)
@@ -1354,15 +1831,23 @@ class ServiceApp:
 
         raise ServiceError("not_found", "Endpoint not found.", 404)
 
-    def _authorize(self, headers: Mapping[str, str] | None) -> None:
+    def _authorize(self, headers: Mapping[str, str] | None) -> Principal | None:
+        # Opt-in multi-user mode: the bearer must be the admin token or an
+        # active user token; the resolved principal is returned for routing.
+        if self.auth_enabled:
+            _conn, storage = self._storage()
+            return resolve_principal(
+                storage, headers, admin_token=self.token, enabled=True
+            )
+        # Default single-user local mode: shared-token check, no principal.
         if self.token is None:
-            return
+            return None
         expected = f"Bearer {self.token}"
         for key, value in (headers or {}).items():
             if key.lower() == "authorization" and hmac.compare_digest(
                 str(value).encode(), expected.encode()
             ):
-                return
+                return None
         raise ServiceError("unauthorized", "Missing or invalid authorization token.", 401)
 
     def _authorize_stream(
@@ -1385,6 +1870,13 @@ class ServiceApp:
         raise ServiceError("unauthorized", "Missing or invalid authorization token.", 401)
 
 
-def create_app(db_path: str | Path, token: str | None = None) -> ServiceApp:
-    return ServiceApp(db_path, token=token)
-
+def create_app(
+    db_path: str | Path,
+    token: str | None = None,
+    *,
+    dist_root: str | Path | None = None,
+    auth_enabled: bool | None = None,
+) -> ServiceApp:
+    return ServiceApp(
+        db_path, token=token, dist_root=dist_root, auth_enabled=auth_enabled
+    )

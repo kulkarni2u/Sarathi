@@ -4,6 +4,11 @@ from pathlib import Path
 from typing import Any
 import os
 
+try:
+    from .repo_wiki import generate_repo_wiki
+except ImportError:  # pragma: no cover - direct execution fallback
+    from repo_wiki import generate_repo_wiki
+
 
 @dataclass
 class InitWorkflow:
@@ -465,37 +470,66 @@ background_unblock:
         # Generate permissions.md
         permissions_md = """# Permissions
 
-Declares the tool allowlist for each provider Sarathi invokes as a subprocess.
-`sarathi init` writes these as provider-native config files so no runtime
-permission-bypass flags are needed.
+Declares mode-specific tool permissions for each provider Sarathi invokes as a
+subprocess. `sarathi init` writes these as provider-native config files, and
+provider dispatch refreshes them from the current Sarathi permission mode.
+
+Sarathi derives the mode from the harness permission scope:
+
+- `read_only` — inspect/search/read only.
+- `read_write` — repo file edits plus build/test commands.
+- `full` — broad tool use for approved mutation/evolution work.
 
 ## Provider tool grants
 
 ```yaml
 permissions:
-  # Claude Code: written to .claude/settings.json (permissions.allow)
   claude:
-    allowed_tools:
-      - Bash
-      - Read
-      - Write
-      - Edit
-      - Glob
-      - Grep
-      - LS
-      - WebFetch
-      - WebSearch
-      - TodoRead
-      - TodoWrite
+    modes:
+      read_only:
+        allowed_tools: [Read, Glob, Grep, LS, WebFetch, WebSearch, TodoRead]
+      read_write:
+        allowed_tools: [Read, Write, Edit, Glob, Grep, LS, WebFetch, WebSearch, TodoRead, TodoWrite]
+      full:
+        allowed_tools: [Bash, Read, Write, Edit, Glob, Grep, LS, WebFetch, WebSearch, TodoRead, TodoWrite]
 
-  # Codex: written to ~/.codex/config.yaml
   codex:
-    full_auto: true
-    disable_sandbox: false
+    modes:
+      read_only:
+        full_auto: false
+        disable_sandbox: false
+      read_write:
+        full_auto: true
+        disable_sandbox: false
+      full:
+        full_auto: true
+        disable_sandbox: true
 
-  # OpenCode: written to opencode.json at workspace root
   opencode:
-    auto_approve: true
+    modes:
+      read_only:
+        permission:
+          read: allow
+          grep: allow
+          glob: allow
+          list: allow
+      read_write:
+        permission:
+          read: allow
+          grep: allow
+          glob: allow
+          list: allow
+          edit: allow
+          write: allow
+      full:
+        permission:
+          read: allow
+          grep: allow
+          glob: allow
+          list: allow
+          edit: allow
+          write: allow
+          bash: allow
 ```
 """
         (policy_path / "permissions.md").write_text(permissions_md)
@@ -522,3 +556,43 @@ permissions:
     def evolve(self) -> dict[str, Any]:
         """Run learning loop + skill-evolve."""
         return {"status": "completed", "message": "Evolution completed"}
+
+
+def bootstrap_workspace(
+    target_path: str,
+    *,
+    engine_path: str = "markdown",
+    with_wiki: bool = True,
+    overwrite_policy_pack: bool = False,
+) -> dict[str, Any]:
+    """Initialize or reuse Sarathi workspace artifacts for a root path."""
+
+    target = Path(target_path).expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    workflow = InitWorkflow(target_path=str(target), engine_path=engine_path)
+    inspection = workflow.inspect()
+    policy_path = target / "policy-pack"
+    policy_status = "reused"
+    if overwrite_policy_pack or not policy_path.exists():
+        interview = workflow.interview(inspection)
+        policy_path = workflow.generate(inspection, interview)
+        policy_status = "created"
+    wiki_result = (
+        generate_repo_wiki(target)
+        if with_wiki
+        else {"status": "skipped", "path": str(target / ".sarathi" / "wiki")}
+    )
+    return {
+        "root_path": str(target),
+        "policy_pack": {
+            "status": policy_status,
+            "path": str(policy_path),
+        },
+        "wiki": wiki_result,
+        "inspection": {
+            "languages": inspection.get("languages", []),
+            "frameworks": inspection.get("frameworks", []),
+            "build_tools": inspection.get("build_tools", []),
+            "test_patterns": inspection.get("test_patterns", []),
+        },
+    }

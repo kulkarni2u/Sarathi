@@ -1,0 +1,315 @@
+/* Dashboard — Kanban board + list view, ported from
+   docs/mockups/sarathi-webui-mockup.html (.board/.lane/.kc/.tag/.chip/.bar). */
+
+.dash-chips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.dash-chip {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 6px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  display: inline-flex;
+  gap: 7px;
+  align-items: center;
+  cursor: pointer;
+}
+
+.dash-chip:hover {
+  color: var(--text);
+}
+
+.dash-chip.on {
+  background: var(--blueb);
+  border-color: transparent;
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.dash-chat-modal {
+  max-width: 520px;
+}
+
+.dash-chat-select {
+  min-height: 38px;
+}
+
+.dash-chat-textarea {
+  min-height: 132px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
+/* ---------- board ---------- */
+.board {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(218px, 1fr));
+  gap: 14px;
+  align-items: start;
+  overflow-x: auto;
+}
+
+.lane {
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--r-md);
+  min-width: 0;
+}
+
+[data-theme="light"] .lane {
+  background: var(--elev);
+}
+
+.lh {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 13px;
+}
+
+.lh .ic {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  flex: none;
+}
+
+.lh b {
+  font-size: 12.5px;
+  font-weight: 620;
+}
+
+.lh .ct {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 11px;
+  background: var(--elev2);
+  border-radius: 20px;
+  padding: 1px 8px;
+}
+
+.lb {
+  padding: 0 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 40px;
+}
+
+.lb-empty {
+  padding: 14px 4px;
+  color: var(--faint);
+  font-size: 11.5px;
+  text-align: center;
+}
+
+/* ---------- cards ---------- */
+.kc {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 12px;
+  cursor: pointer;
+  transition: transform 0.05s, box-shadow 0.12s, border-color 0.12s;
+  text-align: left;
+  width: 100%;
+  display: block;
+  color: inherit;
+  font: inherit;
+}
+
+.kc:hover {
+  box-shadow: var(--shadow);
+  border-color: var(--field-br);
+}
+
+.kc:active {
+  transform: translateY(1px);
+}
+
+.kc .pj {
+  font-size: 10.5px;
+  color: var(--faint);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.kc .tt {
+  font-weight: 620;
+  margin: 4px 0 10px;
+  font-size: 12.8px;
+}
+
+.kc .r {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.tag {
+  font-size: 10.5px;
+  border-radius: 6px;
+  padding: 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.tag .d {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.t-run {
+  background: var(--blueb);
+  color: var(--blue);
+}
+.t-run .d {
+  background: var(--blue);
+}
+
+.t-plan {
+  background: var(--slateb);
+  color: var(--slate);
+}
+.t-plan .d {
+  background: var(--slate);
+}
+
+.t-need {
+  background: var(--amberb);
+  color: var(--amber);
+}
+.t-need .d {
+  background: var(--amber);
+}
+
+.t-block {
+  background: var(--redb);
+  color: var(--red);
+}
+.t-block .d {
+  background: var(--red);
+}
+
+.t-review {
+  background: var(--purpleb);
+  color: var(--purple);
+}
+.t-review .d {
+  background: var(--purple);
+}
+
+.t-done {
+  background: var(--greenb);
+  color: var(--green);
+}
+.t-done .d {
+  background: var(--green);
+}
+
+.tag.ph {
+  background: var(--elev2);
+  color: var(--muted);
+}
+
+.kc .mt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--faint);
+  font-size: 10.8px;
+}
+
+.ac {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.bar {
+  width: 44px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--elev2);
+  overflow: hidden;
+  flex: none;
+}
+
+.bar i {
+  display: block;
+  height: 100%;
+  background: var(--green);
+}
+
+/* ---------- list view ---------- */
+.dash-list {
+  overflow: hidden;
+}
+
+.dash-list table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.dash-list thead th {
+  text-align: left;
+  color: var(--faint);
+  font-weight: 600;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.dash-list tbody td {
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.dash-list tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.dash-list tbody tr {
+  cursor: pointer;
+}
+
+.dash-list tbody tr:hover {
+  background: var(--hover);
+}
+
+.dash-list .ac-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ---------- misc ---------- */
+.vr {
+  width: 1px;
+  height: 20px;
+  background: var(--border);
+  margin: 0 3px;
+}
+
+.dash-empty {
+  padding: 18px;
+  color: var(--muted);
+}

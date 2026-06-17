@@ -380,6 +380,76 @@ def test_configured_command_provider_dispatches_non_local_work_unit(tmp_path):
     assert data["evidence"]["metadata"]["response_evidence"]["command_provider"] is True
 
 
+def test_service_dispatch_for_executor_role_forwards_read_write_permission_mode(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    _, storage = app._storage()
+    workspace = storage.create_workspace(name="Sarathi App", root_path=str(tmp_path))
+    task = storage.create_task(
+        workspace_id=workspace["id"],
+        title="Implement scoped change",
+        status="in_progress",
+        metadata={
+            "source_prompt": "Implement a scoped code change.",
+            "task_class": "codegen/patch",
+            "acceptance_criteria": ["Provider receives write-capable mode."],
+        },
+    )
+    subtask = storage.create_subtask(
+        workspace_id=workspace["id"],
+        task_id=task["id"],
+        title="Implement scoped change",
+        status="in_progress",
+        metadata={
+            "role": "Pravaha",
+            "provider": "Codex",
+            "blocked_by": [],
+            "evidence_required": ["changed_files", "tests"],
+            "task_packet": {
+                "goal": "Implement scoped change",
+                "context": "Use the parent task scope.",
+                "review_criteria": ["Provider receives write-capable mode."],
+            },
+        },
+    )
+    provider_script = _write_provider_script(
+        tmp_path / "providers" / "codex-provider.py",
+        (
+            "import json,sys;"
+            "request=json.load(sys.stdin);"
+            "print(json.dumps({"
+            "'success': True,"
+            "'outputs': {'messages': ['ok'], 'work_unit_result': {'summary': 'ok'}},"
+            "'evidence': {'permission_mode': request['constraints'].get('permission_mode')},"
+            "'artifacts': {'permission_mode': request['constraints'].get('permission_mode')}"
+            "}))"
+        ),
+    )
+    storage.upsert_provider(
+        workspace_id=workspace["id"],
+        provider_id="codex",
+        name="Codex",
+        provider_type="cli",
+        config={
+            "path": str(provider_script),
+            "auth": "connected",
+            "health": "online",
+        },
+    )
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{subtask['id']}/dispatch",
+            {"provider": "codex"},
+        )
+    )
+
+    assert status == 201
+    assert data["dispatch"]["metadata"]["evidence"]["permission_mode"] == "read_write"
+    assert data["dispatch"]["metadata"]["artifacts"]["permission_mode"] == "read_write"
+
+
 def test_local_provider_dispatch_attaches_estimated_usage():
     adapter = LocalProviderAdapter()
     response = adapter.dispatch(
@@ -1223,3 +1293,281 @@ def _write_provider_script(path: Path, inline_python: str) -> Path:
     path.write_text("#!/usr/bin/env python3\n" + inline_python + "\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
+
+
+def _write_ncp_run_stub(workspace_root: Path) -> Path:
+    """Write a minimal `.ncp/run.py` stub that doesn't depend on the real ncp package.
+
+    Supports the subset of subcommands exercised by ``NCPTransportMixin`` and
+    ``NCPContextAdapter.check_available``: ``status``, ``fetch``, ``write_memory``,
+    and ``log_cost``.
+    """
+    ncp_dir = workspace_root / ".ncp"
+    ncp_dir.mkdir(parents=True, exist_ok=True)
+    (ncp_dir / "config.toml").write_text("[store]\ntype = 'sqlite'\n", encoding="utf-8")
+    script = ncp_dir / "run.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "\n"
+        "command = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+        "\n"
+        "if command == 'status':\n"
+        "    sys.exit(0)\n"
+        "elif command == 'fetch':\n"
+        "    print('chunk:prior-1')\n"
+        "    print('  {\"note\": \"previous run found X\"}')\n"
+        "    sys.exit(0)\n"
+        "elif command == 'write_memory':\n"
+        "    sys.exit(0)\n"
+        "elif command == 'log_cost':\n"
+        "    sys.exit(0)\n"
+        "else:\n"
+        "    sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script
+
+
+def test_dispatch_writes_to_ncp_memory_when_workspace_is_ncp_enabled(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+    _write_ncp_run_stub(tmp_path)
+
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, scheduled_snapshot = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    running_node = scheduled_snapshot["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{running_node['id']}/dispatch",
+            {"provider": "local"},
+        )
+    )
+
+    assert status == 201
+    ncp_meta = data["dispatch"]["metadata"]["ncp"]
+    assert ncp_meta["config_present"] is True
+    assert ncp_meta["available"] is True
+    assert ncp_meta["prior_findings_fetched"] >= 1
+    assert ncp_meta["cost_logged"] is True
+
+    compilation = data["dispatch"]["metadata"]["context_pack"]["compilation"]
+    assert compilation["ncp_prior_findings"] >= 1
+
+    prior_findings = data["dispatch"]["metadata"]["context_pack"]["agent_input"]["prior_findings"]
+    assert any("previous run found X" in finding for finding in prior_findings)
+
+    _, studio_data = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    event_types = [event["event_type"] for event in studio_data["events"]]
+    assert "ncp.memory_written" in event_types
+
+
+def test_dispatch_omits_ncp_metadata_when_workspace_has_no_ncp_config(tmp_path):
+    app = create_app(tmp_path / "sarathi.db")
+    task = create_task_with_ready_graph(app, tmp_path)
+
+    assert_ok(request(app, "POST", f"/api/tasks/{task['id']}/schedule"))
+    _, scheduled_snapshot = assert_ok(request(app, "GET", f"/api/tasks/{task['id']}/studio"))
+    running_node = scheduled_snapshot["graph"]["nodes"][0]
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/subtasks/{running_node['id']}/dispatch",
+            {"provider": "local"},
+        )
+    )
+
+    assert status == 201
+    assert "ncp" not in data["dispatch"]["metadata"]
+    assert "ncp_prior_findings" not in data["dispatch"]["metadata"]["context_pack"]["compilation"]
+
+
+import json as _json
+import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from src.runtime.providers import GatewayProviderAdapter, ConfiguredProviderAdapter
+from src.runtime.contracts import DispatchRequest as _GatewayDispatchRequest
+from src.runtime.providers.configured import validate_provider_routing_config
+
+
+@contextmanager
+def _stub_openai_server():
+    """Start a threaded OpenAI-compatible stub server on a free 127.0.0.1 port.
+
+    Records the Authorization header observed on the most recent POST in
+    ``recorder`` and always responds 200 with a fixed chat-completions payload.
+    """
+    recorder = {"auth_present": False, "auth_value": None}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence stderr noise
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            self.rfile.read(length)
+            auth = self.headers.get("Authorization")
+            recorder["auth_present"] = auth is not None
+            recorder["auth_value"] = auth
+            body = _json.dumps(
+                {
+                    "choices": [
+                        {"message": {"role": "assistant", "content": "gateway says hello"}}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 11,
+                        "completion_tokens": 7,
+                        "total_tokens": 18,
+                    },
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    host, port = server.server_address
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://{host}:{port}/v1"
+    try:
+        yield base_url, recorder, server
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_gateway_provider_completes_dispatch_and_records_reported_usage():
+    with _stub_openai_server() as (base_url, _recorder, _server):
+        adapter = GatewayProviderAdapter(name="gateway", base_url=base_url, model="llama3")
+        response = adapter.dispatch(
+            _GatewayDispatchRequest(
+                mode="execute",
+                task_id="t-gateway",
+                phase="Build",
+                prompt="hello gateway",
+            )
+        )
+
+    assert response.success is True
+    assert response.outputs["messages"] == ["gateway says hello"]
+    assert response.usage is not None
+    assert response.usage.input_tokens == 11
+    assert response.usage.output_tokens == 7
+    assert response.usage.usage_source == "reported"
+    assert response.usage.estimated is False
+    assert response.artifacts["transport_kind"] == "api"
+
+
+def test_gateway_provider_sends_bearer_when_api_key_env_set(monkeypatch):
+    monkeypatch.setenv("SARATHI_GATEWAY_KEY", "secret-token-123")
+    with _stub_openai_server() as (base_url, recorder, _server):
+        adapter = GatewayProviderAdapter(
+            name="gateway",
+            base_url=base_url,
+            model="gpt-4o-mini",
+            api_key_env="SARATHI_GATEWAY_KEY",
+        )
+        response = adapter.dispatch(
+            _GatewayDispatchRequest(
+                mode="execute",
+                task_id="t-gateway-auth",
+                phase="Build",
+                prompt="hello with key",
+            )
+        )
+
+    assert response.success is True
+    assert recorder["auth_present"] is True
+    assert recorder["auth_value"] == "Bearer secret-token-123"
+
+
+def test_gateway_provider_omits_auth_when_no_api_key_env():
+    with _stub_openai_server() as (base_url, recorder, _server):
+        adapter = GatewayProviderAdapter(name="gateway", base_url=base_url, model="llama3")
+        response = adapter.dispatch(
+            _GatewayDispatchRequest(
+                mode="execute",
+                task_id="t-gateway-keyless",
+                phase="Build",
+                prompt="hello ollama",
+            )
+        )
+
+    assert response.success is True
+    assert recorder["auth_present"] is False
+    assert recorder["auth_value"] is None
+
+
+def test_gateway_provider_dispatch_failure_returns_error():
+    # Start then immediately shut down the server to free the port.
+    with _stub_openai_server() as (base_url, _recorder, server):
+        server.shutdown()
+        server.server_close()
+        adapter = GatewayProviderAdapter(
+            name="gateway",
+            base_url=base_url,
+            model="llama3",
+            timeout_seconds=2,
+        )
+        response = adapter.dispatch(
+            _GatewayDispatchRequest(
+                mode="execute",
+                task_id="t-gateway-fail",
+                phase="Build",
+                prompt="this should fail",
+            )
+        )
+
+    assert response.success is False
+    assert isinstance(response.error, str) and response.error
+    assert response.artifacts["transport_kind"] == "api"
+
+
+def test_configured_provider_routes_to_gateway():
+    with _stub_openai_server() as (base_url, _recorder, _server):
+        adapter = ConfiguredProviderAdapter(
+            config={
+                "provider": "gw",
+                "providers": {
+                    "gw": {"type": "gateway", "base_url": base_url, "model": "llama3"}
+                },
+            }
+        )
+        response = adapter.dispatch(
+            _GatewayDispatchRequest(
+                mode="execute",
+                task_id="t-gw",
+                phase="Build",
+                prompt="hello",
+            )
+        )
+
+    assert response.success is True
+    assert response.outputs["messages"] == ["gateway says hello"]
+    assert response.usage is not None
+    assert response.usage.input_tokens == 11
+    assert response.usage.output_tokens == 7
+    assert response.usage.usage_source == "reported"
+
+
+def test_validate_provider_routing_flags_gateway_missing_fields():
+    issues = validate_provider_routing_config(
+        {
+            "provider": "gw",
+            "providers": {"gw": {"type": "gateway"}},
+        }
+    )
+
+    assert any("gw.base_url" in issue for issue in issues)
+    assert any("gw.model" in issue for issue in issues)

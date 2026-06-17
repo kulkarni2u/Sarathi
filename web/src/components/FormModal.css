@@ -1,0 +1,80 @@
+.fm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 20px;
+}
+
+.fm-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  width: 100%;
+  max-width: 420px;
+  padding: 20px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+}
+
+.fm-head {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--text);
+  margin-bottom: 16px;
+}
+
+.fm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 14px;
+}
+
+.fm-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.fm-req {
+  color: var(--amber);
+}
+
+.fm-input {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 8px 11px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font);
+}
+
+.fm-input:focus {
+  outline: none;
+  border-color: var(--brand1);
+}
+
+.fm-hint {
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.fm-error {
+  background: var(--redb);
+  color: var(--red);
+  border-radius: 9px;
+  padding: 8px 11px;
+  font-size: 12px;
+  margin-bottom: 14px;
+}
+
+.fm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-top: 18px;
+}

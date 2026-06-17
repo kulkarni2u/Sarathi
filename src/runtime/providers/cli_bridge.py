@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import http.client
 import logging
@@ -30,10 +31,12 @@ except ImportError:
 try:
     from ..contracts import DispatchRequest, DispatchResponse, build_usage_record
     from ..agent_roles import PHASE_AGENT_ROLE_KEYS
+    from ...permissions import PermissionMode
     from ..workspace_evidence import attach_workspace_evidence, snapshot_workspace
 except ImportError:
     from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
     from runtime.agent_roles import PHASE_AGENT_ROLE_KEYS
+    from permissions import PermissionMode
     from runtime.workspace_evidence import attach_workspace_evidence, snapshot_workspace
 
 logger = logging.getLogger("sarathi.cli_bridge")
@@ -115,6 +118,16 @@ def dispatch_via_cli_bridge(
     request: DispatchRequest,
 ) -> DispatchResponse:
     provider_name = provider.strip().lower()
+    permission_mode = _coerce_permission_mode(request.constraints.get("permission_mode"))
+    if provider_name in {"claude", "codex", "opencode"}:
+        try:
+            ensure_provider_permissions(workspace_root, permission_mode=permission_mode)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Failed to apply %s provider permissions for %s",
+                permission_mode.value,
+                provider_name,
+            )
     before = snapshot_workspace(workspace_root)
     if provider_name == "codex":
         response = _run_codex(path=path, workspace_root=workspace_root, request=request)
@@ -1095,6 +1108,68 @@ _DEFAULT_CLAUDE_TOOLS = [
     "WebFetch", "WebSearch", "TodoRead", "TodoWrite",
 ]
 
+_DEFAULT_PROVIDER_PERMISSION_MODES: dict[str, dict[str, dict[str, Any]]] = {
+    "claude": {
+        "read_only": {
+            "allowed_tools": ["Read", "Glob", "Grep", "LS", "WebFetch", "WebSearch", "TodoRead"],
+        },
+        "read_write": {
+            "allowed_tools": [
+                "Read", "Write", "Edit", "Glob", "Grep", "LS",
+                "WebFetch", "WebSearch", "TodoRead", "TodoWrite",
+            ],
+        },
+        "full": {"allowed_tools": _DEFAULT_CLAUDE_TOOLS},
+    },
+    "codex": {
+        "read_only": {"full_auto": False, "disable_sandbox": False},
+        "read_write": {"full_auto": True, "disable_sandbox": False},
+        "full": {"full_auto": True, "disable_sandbox": True},
+    },
+    "opencode": {
+        "read_only": {
+            "permission": {
+                "read": "allow",
+                "grep": "allow",
+                "glob": "allow",
+                "list": "allow",
+            },
+        },
+        "read_write": {
+            "permission": {
+                "read": "allow",
+                "grep": "allow",
+                "glob": "allow",
+                "list": "allow",
+                "edit": "allow",
+                "write": "allow",
+            },
+        },
+        "full": {
+            "permission": {
+                "read": "allow",
+                "grep": "allow",
+                "glob": "allow",
+                "list": "allow",
+                "edit": "allow",
+                "write": "allow",
+                "bash": "allow",
+            },
+        },
+    },
+}
+
+
+def _coerce_permission_mode(value: Any) -> PermissionMode:
+    if isinstance(value, PermissionMode):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        for mode in PermissionMode:
+            if normalized == mode.value:
+                return mode
+    return PermissionMode.READ_ONLY
+
 
 def _load_permissions_policy(workspace_root: str) -> dict[str, Any]:
     """Parse permissions.yaml from policy-pack/permissions.md, if present."""
@@ -1113,9 +1188,43 @@ def _load_permissions_policy(workspace_root: str) -> dict[str, Any]:
     return {}
 
 
-def _write_claude_settings(workspace_root: str, policy: dict[str, Any]) -> None:
+def _policy_for_mode(
+    provider: str,
+    policy: dict[str, Any],
+    permission_mode: PermissionMode,
+) -> dict[str, Any]:
+    mode_value = permission_mode.value
+    selected = deepcopy(_DEFAULT_PROVIDER_PERMISSION_MODES[provider][mode_value])
+    modes = policy.get("modes")
+    if isinstance(modes, dict):
+        mode_policy = modes.get(mode_value)
+        if isinstance(mode_policy, dict):
+            selected.update(mode_policy)
+        return selected
+
+    # Backward-compatible flat policies are treated as full-mode overrides only.
+    # This prevents old `full_auto: true` / `auto_approve: true` templates from
+    # silently broadening read-only dispatches.
+    if permission_mode == PermissionMode.FULL:
+        legacy_keys = {
+            "claude": {"allowed_tools"},
+            "codex": {"full_auto", "disable_sandbox"},
+            "opencode": {"permission", "permissions"},
+        }.get(provider, set())
+        for key in legacy_keys:
+            if key in policy:
+                selected[key] = policy[key]
+    return selected
+
+
+def _write_claude_settings(
+    workspace_root: str,
+    policy: dict[str, Any],
+    permission_mode: PermissionMode,
+) -> None:
     """Merge allowed_tools into .claude/settings.json (permissions.allow)."""
-    tools = policy.get("allowed_tools") or _DEFAULT_CLAUDE_TOOLS
+    mode_policy = _policy_for_mode("claude", policy, permission_mode)
+    tools = mode_policy.get("allowed_tools") or _DEFAULT_PROVIDER_PERMISSION_MODES["claude"][permission_mode.value]["allowed_tools"]
     # A bare tool name allows all uses of that tool; "Tool(pattern)" scopes it.
     # ("Bash(*)" is NOT a match-everything rule in Claude Code's rule syntax.)
     allow = list(tools)
@@ -1137,14 +1246,18 @@ def _write_claude_settings(workspace_root: str, policy: dict[str, Any]) -> None:
 _CODEX_CONFIG_MARKER = "# Sarathi-managed Codex permission config"
 
 
-def _write_codex_config(workspace_root: str, policy: dict[str, Any]) -> None:
+def _write_codex_config(
+    workspace_root: str,
+    policy: dict[str, Any],
+    permission_mode: PermissionMode,
+) -> None:
     """Write ~/.codex/config.yaml from policy, creating parent dirs if needed.
 
     Refuses to overwrite a config file Sarathi did not create — clobbering the
     user's global Codex settings is worse than skipping the policy write.
     """
     codex_dir = Path.home() / ".codex"
-    codex_dir.mkdir(exist_ok=True)
+    codex_dir.mkdir(parents=True, exist_ok=True)
     config_path = codex_dir / "config.yaml"
     if config_path.exists():
         try:
@@ -1158,16 +1271,21 @@ def _write_codex_config(workspace_root: str, policy: dict[str, Any]) -> None:
                 config_path,
             )
             return
+    mode_policy = _policy_for_mode("codex", policy, permission_mode)
     lines: list[str] = [_CODEX_CONFIG_MARKER + "\n"]
-    if policy.get("full_auto", True):
+    if mode_policy.get("full_auto", False):
         lines.append("full-auto: true\n")
-    if policy.get("disable_sandbox", False):
+    if mode_policy.get("disable_sandbox", False):
         lines.append("disable-sandbox: true\n")
     config_path.write_text("".join(lines), encoding="utf-8")
 
 
-def _write_opencode_config(workspace_root: str, policy: dict[str, Any]) -> None:
-    """Merge auto_approve into opencode.json at workspace root."""
+def _write_opencode_config(
+    workspace_root: str,
+    policy: dict[str, Any],
+    permission_mode: PermissionMode,
+) -> None:
+    """Merge mode-specific tool permissions into opencode.json at workspace root."""
     config_path = Path(workspace_root) / "opencode.json"
     existing: dict[str, Any] = {}
     if config_path.exists():
@@ -1175,12 +1293,18 @@ def _write_opencode_config(workspace_root: str, policy: dict[str, Any]) -> None:
             existing = json.loads(config_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
-    if policy.get("auto_approve", True):
-        existing["autoapprove"] = True
+    existing.pop("autoapprove", None)
+    mode_policy = _policy_for_mode("opencode", policy, permission_mode)
+    permissions = mode_policy.get("permission") or mode_policy.get("permissions") or {}
+    if isinstance(permissions, dict):
+        existing["permission"] = dict(permissions)
     config_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
 
 
-def ensure_provider_permissions(workspace_root: str) -> dict[str, str]:
+def ensure_provider_permissions(
+    workspace_root: str,
+    permission_mode: PermissionMode | str = PermissionMode.READ_ONLY,
+) -> dict[str, str]:
     """
     Read policy-pack/permissions.md and write provider-native config files.
 
@@ -1188,15 +1312,16 @@ def ensure_provider_permissions(workspace_root: str) -> dict[str, str]:
     Silently skips any provider whose section is absent from the policy.
     """
     policy = _load_permissions_policy(workspace_root)
+    mode = _coerce_permission_mode(permission_mode)
     written: dict[str, str] = {}
     if "claude" in policy:
-        _write_claude_settings(workspace_root, policy["claude"])
+        _write_claude_settings(workspace_root, policy["claude"], mode)
         written["claude"] = str(Path(workspace_root) / ".claude" / "settings.json")
     if "codex" in policy:
-        _write_codex_config(workspace_root, policy["codex"])
+        _write_codex_config(workspace_root, policy["codex"], mode)
         written["codex"] = str(Path.home() / ".codex" / "config.yaml")
     if "opencode" in policy:
-        _write_opencode_config(workspace_root, policy["opencode"])
+        _write_opencode_config(workspace_root, policy["opencode"], mode)
         written["opencode"] = str(Path(workspace_root) / "opencode.json")
     return written
 

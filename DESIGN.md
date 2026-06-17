@@ -482,4 +482,4 @@ If not found, native adapters are used with no change to behaviour. The
 | NCP integration | Sidecar, not embedded | Any NCP implementation works; zero import coupling |
 | Pattern context | NCP fetch on typed nodes only | Avoids NCP roundtrips for plain execute nodes |
 | Pattern policy gate | WorkflowPatternsPolicy at runtime | Disable patterns in production without touching graph declarations |
-| Provider permissions | Policy-declared, written at init | No runtime bypass flags; explicit allowlist per provider, auditable in policy-pack |
+| Provider permissions | Policy-declared by `read_only` / `read_write` / `full` mode, written at init and refreshed before provider dispatch | No runtime bypass flags; explicit mode allowlist per provider, auditable in policy-pack |

@@ -1,1 +1,3 @@
 recursive-include skill *.md
+recursive-include skill/hooks *
+recursive-include skill/.opencode *

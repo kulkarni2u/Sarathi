@@ -840,9 +840,11 @@ def _task_dashboard(
     *,
     project_id: str | None = None,
 ) -> list[dict[str, Any]]:
+    project_names = {project["id"]: project["name"] for project in storage.list_projects(workspace_id)}
     summaries = []
     for task in storage.list_tasks_for_workspace(workspace_id):
-        if project_id is not None and task["metadata"].get("project_id") != project_id:
+        task_project_id = task.get("project_id") or task["metadata"].get("project_id")
+        if project_id is not None and task_project_id != project_id:
             continue
         approvals = storage.list_approval_gates_for_task(task["id"])
         graph = _graph_for_task(storage, task)
@@ -851,19 +853,25 @@ def _task_dashboard(
         handoffs = storage.list_handoffs_for_task(task["id"])
         latest_checkpoint = _latest_or_none(checkpoints)
         latest_handoff = _latest_or_none(handoffs)
+        reviews = storage.list_review_runs_for_task(task["id"])
+        handoff_state = _handoff_state(latest_handoff)
+        queue_state = _task_studio_queue_state(task, graph, approvals, reviews, handoff_state)
         summaries.append(
             {
                 "id": task["id"],
                 "workspace_id": task["workspace_id"],
+                "project_id": task_project_id,
+                "project_name": project_names.get(task_project_id),
                 "title": task["title"],
                 "status": task["status"],
+                "queue_state": queue_state,
                 "phase": task["metadata"].get("phase", task["status"]),
                 "approval_state": _approval_state(approvals),
                 "graph_state": _graph_state(graph, approvals),
                 "next_gate": next_gate["name"] if next_gate else None,
                 "node_count": len(graph["nodes"]),
                 "blocked_count": len(graph.get("blocked_nodes", [])) + len(graph.get("waiting_human_nodes", [])),
-                "review_needed_count": _review_needed_count(approvals, storage.list_review_runs_for_task(task["id"])),
+                "review_needed_count": _review_needed_count(approvals, reviews),
                 "coordination_state": graph.get("coordination_state"),
                 "fan_out_ready_count": len(graph.get("fan_out_ready_nodes", [])),
                 "fan_in_count": len(graph.get("fan_in_nodes", [])),
@@ -875,7 +883,7 @@ def _task_dashboard(
                 ),
                 "updated_at": task["updated_at"],
                 "checkpoint_state": _checkpoint_state(latest_checkpoint),
-                "handoff_state": _handoff_state(latest_handoff),
+                "handoff_state": handoff_state,
             }
         )
     return summaries
@@ -1039,12 +1047,23 @@ def _task_studio_header(
     workspace: dict[str, Any] | None,
 ) -> dict[str, Any]:
     handoff_state = _handoff_state(handoff)
-    queue_state = _task_studio_queue_state(task, graph, approvals, reviews, handoff_state)
+    current_approvals = _current_approval_gates(approvals)
+    queue_state = _task_studio_queue_state(
+        task,
+        graph,
+        current_approvals,
+        reviews,
+        handoff_state,
+    )
     repository_action_preference = _effective_repository_action_preference(task, workspace)
     return {
         "queue_state": queue_state,
-        "approval_state": _approval_state(approvals),
-        "next_safe_action": _task_studio_next_safe_action(queue_state, approvals, checkpoint),
+        "approval_state": _approval_state(current_approvals),
+        "next_safe_action": _task_studio_next_safe_action(
+            queue_state,
+            current_approvals,
+            checkpoint,
+        ),
         "repository_action_mode": repository_action_preference["mode"],
         "checkpoint_ready": checkpoint is not None,
         "handoff_state": handoff_state,
@@ -1065,13 +1084,17 @@ def _task_studio_queue_state(
     if any(gate["status"] == "pending" for gate in approvals):
         return "awaiting_approval"
     coordination_state = graph.get("coordination_state")
+    # _coordination_state() (src/service/scheduling.py) returns one of: waiting_human,
+    # fan_out_ready, active, fan_in_blocked, blocked, ready, fan_out_complete, idle.
+    # Map every "stuck" variant to its corresponding queue state so blocked/waiting
+    # tasks surface in the dashboard's "Needs You" lane instead of "planning".
     if coordination_state == "waiting_human":
         return "waiting_human"
-    if coordination_state == "blocked":
+    if coordination_state in {"blocked", "fan_in_blocked"}:
         return "blocked"
     if coordination_state == "active":
         return "running"
-    if coordination_state == "ready":
+    if coordination_state in {"ready", "fan_out_ready"}:
         return "ready"
     if task["status"] in {"done", "complete"}:
         return "done"
@@ -1099,4 +1122,3 @@ def _task_studio_next_safe_action(
     if queue_state == "ready":
         return "Dispatch ready work"
     return "Open task"
-

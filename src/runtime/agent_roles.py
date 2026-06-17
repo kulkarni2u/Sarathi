@@ -134,6 +134,8 @@ def get_agent_role(
     normalized = _normalize(role)
     if normalized in lookup:
         return lookup[normalized]
+    if normalized in _REGISTERED_AGENT_ROLES:
+        return _REGISTERED_AGENT_ROLES[normalized]
     if default is not None:
         return default
     raise KeyError(f"Unknown Sarathi agent role: {role}")
@@ -185,3 +187,37 @@ def _role_lookup(roles: Iterable[AgentRole]) -> dict[str, AgentRole]:
 
 def _normalize(value: str) -> str:
     return value.strip().lower().replace("_", " ").replace("-", " ")
+
+
+# ---------------------------------------------------------------------------
+# Registry of user-declared (non-default) agent roles.
+#
+# Declarative agent specs (see runtime.agent_spec) register their AgentRole
+# here so get_agent_role(...) can find them by key/name/alias alongside the
+# fixed DEFAULT_AGENT_ROLES. This registry is intentionally mutable — callers
+# (e.g. the CLI, or tests) register/clear roles at runtime.
+# ---------------------------------------------------------------------------
+
+_REGISTERED_AGENT_ROLES: dict[str, AgentRole] = {}
+
+
+def register_agent_role(role: AgentRole) -> None:
+    """Register a user-declared AgentRole for lookup via get_agent_role()."""
+
+    for value in (role.key, role.name, role.purpose, *role.aliases):
+        _REGISTERED_AGENT_ROLES[_normalize(value)] = role
+
+
+def registered_agent_roles() -> tuple[AgentRole, ...]:
+    """Return distinct registered AgentRole objects, in insertion order."""
+
+    seen: dict[str, AgentRole] = {}
+    for agent_role in _REGISTERED_AGENT_ROLES.values():
+        seen.setdefault(agent_role.key, agent_role)
+    return tuple(seen.values())
+
+
+def clear_registered_agent_roles() -> None:
+    """Remove all user-declared agent roles (used for test isolation)."""
+
+    _REGISTERED_AGENT_ROLES.clear()

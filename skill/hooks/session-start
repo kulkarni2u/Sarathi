@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# SessionStart hook for Sarathi-aware agent sessions.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${CLAUDE_PLUGIN_ROOT:-${SCRIPT_DIR}/..}" && pwd)"
+
+candidate_start_dir() {
+  if [ -n "${SARATHI_PROJECT_DIR:-}" ]; then
+    printf '%s\n' "$SARATHI_PROJECT_DIR"
+  elif [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+    printf '%s\n' "$CLAUDE_PROJECT_DIR"
+  else
+    pwd
+  fi
+}
+
+is_sarathi_workspace() {
+  local dir="$1"
+  [ -d "${dir}/policy-pack" ] || [ -d "${dir}/.sarathi" ] || [ -f "${dir}/SARATHI.md" ]
+}
+
+find_sarathi_workspace() {
+  local current
+  current="$(cd "$(candidate_start_dir)" 2>/dev/null && pwd || pwd)"
+
+  while [ "$current" != "/" ]; do
+    if is_sarathi_workspace "$current"; then
+      printf '%s\n' "$current"
+      return 0
+    fi
+    current="$(dirname "$current")"
+  done
+
+  return 1
+}
+
+workspace_root="$(find_sarathi_workspace || true)"
+if [ -z "$workspace_root" ]; then
+  printf '{}\n'
+  exit 0
+fi
+
+skill_path="${PLUGIN_ROOT}/SKILL.md"
+if [ ! -f "$skill_path" ]; then
+  printf '{}\n'
+  exit 0
+fi
+
+skill_content="$(cat "$skill_path")"
+context="<SARATHI_SESSION_START>
+Sarathi workspace detected at: ${workspace_root}
+
+You are starting inside a Sarathi-ready workspace. Use Sarathi's policy-backed lifecycle when the work benefits from structured route, brainstorm, plan, build, verify, review, task tracking, and learn phases.
+
+Use the workspace policy pack as the source of truth when it exists:
+- ${workspace_root}/policy-pack
+
+Do not mutate files or start services only because this hook fired. Treat this as operating context for the session.
+
+Below is the full content of your 'sarathi' skill:
+
+${skill_content}
+</SARATHI_SESSION_START>"
+
+if [ -n "${CURSOR_PLUGIN_ROOT:-}" ]; then
+  output_format="cursor"
+elif [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -z "${COPILOT_CLI:-}" ]; then
+  output_format="claude"
+else
+  output_format="standard"
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+  SARATHI_HOOK_CONTEXT="$context" SARATHI_HOOK_FORMAT="$output_format" python3 - <<'PY'
+import json
+import os
+
+context = os.environ["SARATHI_HOOK_CONTEXT"]
+output_format = os.environ["SARATHI_HOOK_FORMAT"]
+
+if output_format == "cursor":
+    payload = {"additional_context": context}
+elif output_format == "claude":
+    payload = {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": context,
+        }
+    }
+else:
+    payload = {"additionalContext": context}
+
+print(json.dumps(payload))
+PY
+  exit 0
+fi
+
+escape_for_json() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+context_escaped="$(escape_for_json "$context")"
+case "$output_format" in
+  cursor)
+    printf '{\n  "additional_context": "%s"\n}\n' "$context_escaped"
+    ;;
+  claude)
+    printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$context_escaped"
+    ;;
+  *)
+    printf '{\n  "additionalContext": "%s"\n}\n' "$context_escaped"
+    ;;
+esac

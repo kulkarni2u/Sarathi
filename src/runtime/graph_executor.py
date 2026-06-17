@@ -550,16 +550,22 @@ class TaskGraphExecutor:
         branch_ids = [f"{parent_id}-branch-{i}" for i in range(1, count + 1)]
         synthesize_id = f"{parent_id}-synthesize"
 
-        children = [
-            {
-                "id": bid,
-                "title": title_template.replace("{i}", str(i)),
-                "node_type": NodeType.EXECUTE,
-                "depends_on": [parent_id],
-                "pattern_config": {},
-            }
-            for i, bid in enumerate(branch_ids, start=1)
-        ]
+        providers = cfg.get("providers") or []
+
+        children = []
+        for i, bid in enumerate(branch_ids, start=1):
+            branch_cfg: dict = {}
+            if providers:
+                branch_cfg["provider"] = providers[(i - 1) % len(providers)]
+            children.append(
+                {
+                    "id": bid,
+                    "title": title_template.replace("{i}", str(i)),
+                    "node_type": NodeType.EXECUTE,
+                    "depends_on": [parent_id],
+                    "pattern_config": branch_cfg,
+                }
+            )
         children.append(
             {
                 "id": synthesize_id,
@@ -677,6 +683,11 @@ class TaskGraphExecutor:
         else:
             context_pack_artifact, token_budget = self._local_context(node, graph)
 
+        constraints = {"purpose": "child_task_execution"}
+        node_provider = node.get("pattern_config", {}).get("provider")
+        if node_provider:
+            constraints["provider"] = node_provider
+
         request = DispatchRequest(
             mode="execute",
             task_id=str(node.get("id", "unknown")),
@@ -688,7 +699,7 @@ class TaskGraphExecutor:
                 "context_pack": context_pack_artifact,
             },
             expected_outputs=["implementation_plan", "work_unit_result", "evidence"],
-            constraints={"purpose": "child_task_execution"},
+            constraints=constraints,
             context_pack=context_pack_artifact,
             token_budget=token_budget,
             retry_budget=0,

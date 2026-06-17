@@ -20,12 +20,12 @@ logger = logging.getLogger("sarathi.engine")
 # Harness Engine imports
 try:
     from .task_class import TaskClass, classify_task_class, from_legacy_type
-    from .harness import HarnessConfig, HarnessOutcome
+    from .harness import HarnessConfig, HarnessOutcome, derive_permission_mode
     from .permissions import PermissionScope, build_permission_scope
     from .trust_gate import TrustGate, TrustGateResult, arbitrate
 except ImportError:
     from task_class import TaskClass, classify_task_class, from_legacy_type
-    from harness import HarnessConfig, HarnessOutcome
+    from harness import HarnessConfig, HarnessOutcome, derive_permission_mode
     from permissions import PermissionScope, build_permission_scope
     from trust_gate import TrustGate, TrustGateResult, arbitrate
 
@@ -46,14 +46,18 @@ try:
     )
     from .policy import compile_policy_pack
     from .runtime import (
+        AgentSpec,
         ArtifactStore,
         apply_learning_feedback_to_provider_routing,
+        build_sandbox_executor,
+        CommandRunner,
         DispatchJournal,
         DispatchRequest,
         GateResult,
         PreflightPolicy,
         ProviderHealthStore,
         RecoveryRunner,
+        register_agent_role,
         TaskBudget,
         phase_agent_role_artifact,
         ContextCompiler,
@@ -76,14 +80,18 @@ except ImportError:
     )
     from policy import compile_policy_pack
     from runtime import (
+        AgentSpec,
         ArtifactStore,
         apply_learning_feedback_to_provider_routing,
+        build_sandbox_executor,
+        CommandRunner,
         DispatchJournal,
         DispatchRequest,
         GateResult,
         PreflightPolicy,
         ProviderHealthStore,
         RecoveryRunner,
+        register_agent_role,
         TaskBudget,
         phase_agent_role_artifact,
         ContextCompiler,
@@ -225,36 +233,46 @@ class RouteHandler(PhaseHandler):
 
     def execute(self, task: TaskContext, phase: Phase) -> PhaseResult:
         """Route the task — classify TaskClass, select assembly mode, emit HarnessConfig."""
-        task_class = classify_task_class(task.description)
+        agent_spec = getattr(task, "agent_spec", None)
         legacy_type = self._classify_task_type(task.description)
         workflow_path = self._select_workflow_path(task, legacy_type)
 
-        # Assembly mode: DEEP for mutation/evolution, FAST for cache hit, STANDARD otherwise
-        is_deep = task_class.value.startswith(("mutation/", "evolution/"))
-        cache_hit = None if is_deep else self._harness_cache.get(task_class.value)
-
-        if is_deep:
-            assembly_mode = "DEEP"
-        elif cache_hit is not None:
-            assembly_mode = "FAST"
-        else:
+        if agent_spec is not None:
+            task_class = agent_spec.task_class
             assembly_mode = "STANDARD"
-
-        if assembly_mode == "FAST":
-            # Reuse cached config skeleton — freshen identity fields only
-            harness = HarnessConfig.from_json(cache_hit.to_json())
-            harness.harness_id = str(uuid.uuid4())[:8]
-            harness.task_id = task.task_id
-            harness.assembled_at = datetime.utcnow().isoformat()
-            harness.trace_id = str(uuid.uuid4())
-            harness.assembly_mode = "FAST"
-        else:
-            harness = HarnessConfig.from_task_class(task_class, task.task_id, ncp_enabled=self.ncp_enabled)
+            harness = HarnessConfig.from_agent_spec(agent_spec, task.task_id, ncp_enabled=self.ncp_enabled)
             harness.assembly_mode = assembly_mode
             perm_scope = build_permission_scope(task_class)
             harness.requires_human_approval = perm_scope.requires_human_approval
-            if assembly_mode == "STANDARD":
-                self._harness_cache[task_class.value] = harness
+        else:
+            task_class = classify_task_class(task.description)
+
+            # Assembly mode: DEEP for mutation/evolution, FAST for cache hit, STANDARD otherwise
+            is_deep = task_class.value.startswith(("mutation/", "evolution/"))
+            cache_hit = None if is_deep else self._harness_cache.get(task_class.value)
+
+            if is_deep:
+                assembly_mode = "DEEP"
+            elif cache_hit is not None:
+                assembly_mode = "FAST"
+            else:
+                assembly_mode = "STANDARD"
+
+            if assembly_mode == "FAST":
+                # Reuse cached config skeleton — freshen identity fields only
+                harness = HarnessConfig.from_json(cache_hit.to_json())
+                harness.harness_id = str(uuid.uuid4())[:8]
+                harness.task_id = task.task_id
+                harness.assembled_at = datetime.utcnow().isoformat()
+                harness.trace_id = str(uuid.uuid4())
+                harness.assembly_mode = "FAST"
+            else:
+                harness = HarnessConfig.from_task_class(task_class, task.task_id, ncp_enabled=self.ncp_enabled)
+                harness.assembly_mode = assembly_mode
+                perm_scope = build_permission_scope(task_class)
+                harness.requires_human_approval = perm_scope.requires_human_approval
+                if assembly_mode == "STANDARD":
+                    self._harness_cache[task_class.value] = harness
 
         harness_dict = json.loads(harness.to_json())
 
@@ -269,17 +287,24 @@ class RouteHandler(PhaseHandler):
             "cache_hit": assembly_mode == "FAST",
         }
 
+        artifacts = {
+            "routing_decision": workflow_path,
+            "task_class": task_class.value,
+            "harness_config": harness_dict,
+            "permission_scope": harness.permission_scope,
+            "permission_mode": derive_permission_mode(harness.permission_scope).value,
+            "assembly_mode": assembly_mode,
+        }
+
+        if agent_spec is not None:
+            evidence["agent_spec_key"] = agent_spec.key
+            artifacts["agent_spec_key"] = agent_spec.key
+
         return PhaseResult(
             phase=phase,
             outcome="pass",
             evidence=evidence,
-            artifacts={
-                "routing_decision": workflow_path,
-                "task_class": task_class.value,
-                "harness_config": harness_dict,
-                "permission_scope": task_class.value,
-                "assembly_mode": assembly_mode,
-            },
+            artifacts=artifacts,
         )
 
     def _classify_task_type(self, description: str) -> str:
@@ -459,6 +484,9 @@ class TaskContext:
     gate_retry_hint: dict | None = field(default=None)
     budget_snapshot: dict[str, Any] | None = None
     crash_reconciliation: list[dict[str, Any]] | None = None
+    # Declarative user agent (set by the CLI for `--agent <name>` runs).
+    # Transient: not persisted by PersistenceManager.save_task/load_task.
+    agent_spec: AgentSpec | None = None
 
     def get_completed_phases(self) -> set[Phase]:
         """Get set of phases that have been completed."""
@@ -498,6 +526,7 @@ class _HarnessAwareDispatcher:
     def __init__(self, base: Any) -> None:
         self._base = base
         self.preferred_agent: str | None = None
+        self.preferred_permission_mode: str | None = None
         self.claude_session_id: str | None = None
         self.fallback_agents: list[str] = []
         self.journal: Any | None = None
@@ -506,6 +535,7 @@ class _HarnessAwareDispatcher:
     def reset_task_state(self) -> None:
         """Clear per-task routing/session state before a new task starts."""
         self.preferred_agent = None
+        self.preferred_permission_mode = None
         self.claude_session_id = None
         self.fallback_agents = []
 
@@ -521,6 +551,14 @@ class _HarnessAwareDispatcher:
             request = _dc_replace(
                 request,
                 constraints={**request.constraints, "claude_session_id": self.claude_session_id},
+            )
+        if self.preferred_permission_mode and not request.constraints.get("permission_mode"):
+            request = _dc_replace(
+                request,
+                constraints={
+                    **request.constraints,
+                    "permission_mode": self.preferred_permission_mode,
+                },
             )
         # CLI-backed providers flake more than the deterministic local one —
         # give a non-local provider one retry inside LocalDispatcher when the
@@ -829,7 +867,7 @@ class Engine:
                 ncp_whisper_router=ncp_whi,
                 ncp_persistence_adapter=ncp_per,
             ),
-            Phase.VERIFY: VerifyHandler(self.policy_pack, self.dispatcher),
+            Phase.VERIFY: VerifyHandler(self.policy_pack, self.dispatcher, command_runner=CommandRunner(sandbox=build_sandbox_executor(self.compiled_policy.get("execution") if isinstance(self.compiled_policy, dict) else None))),
             Phase.REVIEW: ReviewHandler(self.policy_pack, self.dispatcher),
             Phase.TASK_TRACKING: TaskTrackingHandler(self.policy_pack, self.dispatcher),
             Phase.RISK_CHECK: RiskCheckHandler(self.policy_pack, self.dispatcher),
@@ -1403,6 +1441,10 @@ class Engine:
                     if hasattr(self.dispatcher, "preferred_agent"):
                         agent_id = task.harness_config.primary_agent.agent_id
                         self.dispatcher.preferred_agent = agent_id if agent_id != "local" else None
+                    if hasattr(self.dispatcher, "preferred_permission_mode"):
+                        self.dispatcher.preferred_permission_mode = derive_permission_mode(
+                            task.harness_config.permission_scope
+                        ).value
                     if hasattr(self.dispatcher, "fallback_agents"):
                         self.dispatcher.fallback_agents = [
                             b.agent_id for b in task.harness_config.fallback_agents

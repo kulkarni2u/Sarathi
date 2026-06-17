@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.engine import Complexity, Engine, Phase, TaskContext
+from src.engine import Complexity, Engine, PersistenceManager, Phase, TaskContext
 from src.runtime.budget import TaskBudget
 
 
@@ -34,7 +34,7 @@ def _minimal_policy_dir(tmp_path: Path, escalation_extra: str = "") -> Path:
 
 def _engine(tmp_path: Path, escalation_extra: str = "") -> Engine:
     engine = Engine(policy_pack_path=str(_minimal_policy_dir(tmp_path, escalation_extra)), ncp_enabled=False)
-    engine.persistence = engine.persistence.__class__(str(tmp_path / "tasks"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
     return engine
 
 

@@ -28,7 +28,7 @@ def default_db_path(root: Path | None = None) -> Path:
 
 def default_runtime_script_path(root: Path | None = None) -> Path:
     base = root or repo_root()
-    return base / "desktop" / "public" / "sarathi-runtime.js"
+    return base / "web" / "public" / "sarathi-runtime.js"
 
 
 def render_runtime_script(*, base_url: str, token: str) -> str:
@@ -75,7 +75,7 @@ def build_launch_config(args: argparse.Namespace) -> dict[str, Any]:
     runtime_script = Path(args.runtime_script) if args.runtime_script else default_runtime_script_path(root)
     return {
         "repo_root": str(root),
-        "desktop_dir": str(root / "desktop"),
+        "desktop_dir": str(root / "web"),
         "db_path": str(db_path),
         "runtime_script": str(runtime_script),
         "service_host": args.service_host,

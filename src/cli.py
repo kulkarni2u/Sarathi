@@ -4,14 +4,19 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 try:
     from .evolve import Evolver, ProposalReviewStore
-    from .init import InitWorkflow
-    from .runtime import UsageRecord, list_agent_roles, list_phase_agent_roles
+    from .init import InitWorkflow, bootstrap_workspace
+    from .policy import compile_policy_pack
+    from .policy.layering import extract_server_caps
+    from .runtime import UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
+    from .runtime import TaskGraphExecutor, load_recipe, load_recipes
+    from .runtime.agent_spec import load_agent_specs
     from .task_graph import (
         graph_summary,
         latest_completed_node,
@@ -26,8 +31,12 @@ try:
 except ImportError:
     # Support direct execution via sarathi.py, which prepends src/ to sys.path.
     from evolve import Evolver, ProposalReviewStore
-    from init import InitWorkflow
-    from runtime import UsageRecord, list_agent_roles, list_phase_agent_roles
+    from init import InitWorkflow, bootstrap_workspace
+    from policy import compile_policy_pack
+    from policy.layering import extract_server_caps
+    from runtime import UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
+    from runtime import TaskGraphExecutor, load_recipe, load_recipes
+    from runtime.agent_spec import load_agent_specs
     from task_graph import (
         graph_summary,
         latest_completed_node,
@@ -479,6 +488,11 @@ def main() -> None:
         action="store_true",
         help="Initialize with NCP context protocol (bootstraps .ncp/ directory required for auto-detect)",
     )
+    init_parser.add_argument(
+        "--no-wiki",
+        action="store_true",
+        help="Skip generated .sarathi/wiki creation.",
+    )
 
     # Validate command
     validate_parser = subparsers.add_parser("validate", help="Validate a policy pack")
@@ -534,7 +548,22 @@ def main() -> None:
         action="store_true",
         help="Show phase sequence without executing",
     )
-    
+    run_parser.add_argument(
+        "--agent",
+        default=None,
+        help="Name (key) of a declarative user agent to dispatch this run through (see agents/<name>.md in the policy pack)",
+    )
+    run_parser.add_argument(
+        "--agents-dir",
+        default=None,
+        help="Directory containing agent spec files (default: <policy-pack>/agents)",
+    )
+    run_parser.add_argument(
+        "--recipe",
+        default=None,
+        help="Path to a recipe dir/file to execute as a FANOUT/JUDGE workflow graph (instead of the standard lifecycle)",
+    )
+
     # NCP Integration
     run_parser.add_argument(
         "--ncp",
@@ -630,6 +659,37 @@ def main() -> None:
     )
     subparsers.add_parser("agents", help="Show Sarathi agent role names and phase mapping")
 
+    recipes_parser = subparsers.add_parser("recipes", help="List reference recipes (FANOUT/JUDGE workflow packs)")
+    recipes_parser.add_argument(
+        "--recipes-dir",
+        default="policy-pack/RECIPES",
+        help="Directory containing recipe sub-packs (default: policy-pack/RECIPES)",
+    )
+
+    # Attach command (join a shared session)
+    attach_parser = subparsers.add_parser(
+        "attach", help="Attach to a shared Sarathi session via its share token"
+    )
+    attach_parser.add_argument("share_token", help="The session share token (from a share link)")
+    attach_parser.add_argument(
+        "--user", default=None, help="Your participant identifier (default: $USER or 'local')"
+    )
+    attach_parser.add_argument(
+        "--role",
+        default="observer",
+        choices=["observer", "driver"],
+        help="Join as observer (read-only) or driver",
+    )
+
+    # Fork command (fork a session into a new independent task)
+    fork_parser = subparsers.add_parser(
+        "fork", help="Fork a session into a new independent task"
+    )
+    fork_parser.add_argument("session_id", help="The session id to fork")
+    fork_parser.add_argument(
+        "--owner", default=None, help="Owner for the forked session (default: source owner)"
+    )
+
     if len(sys.argv) > 1 and sys.argv[1] == "desktop":
         args, _desktop_passthrough = parser.parse_known_args()
         setattr(args, "desktop_args", sys.argv[2:])
@@ -665,8 +725,14 @@ def main() -> None:
         handle_proposals(args)
     elif args.command == "reuse":
         handle_reuse(args)
+    elif args.command == "attach":
+        handle_attach(args)
+    elif args.command == "fork":
+        handle_fork(args)
     elif args.command == "agents":
         handle_agents()
+    elif args.command == "recipes":
+        handle_recipes(args)
 
 
 def handle_init(args: argparse.Namespace) -> None:
@@ -674,28 +740,24 @@ def handle_init(args: argparse.Namespace) -> None:
     print(f"Initializing Sarathi policy pack at: {args.target_path}")
     print(f"Using engine: {args.engine}")
 
-    workflow = InitWorkflow(
-        target_path=args.target_path,
-        engine_path=args.engine
-    )
-
     # Phase 1: Inspect
     print("\n[1/5] Inspect: Scanning repository...")
+    workflow = InitWorkflow(target_path=args.target_path, engine_path=args.engine)
     inspection = workflow.inspect()
     print(f"  Detected: {inspection.get('languages', [])}")
     print(f"  Build tools: {inspection.get('build_tools', [])}")
     print(f"  Test patterns: {inspection.get('test_patterns', [])}")
 
-    # Phase 2: Interview
-    print("\n[2/5] Interview: Gathering policy preferences...")
-    interview = workflow.interview(inspection)
-    print("  Policy keys: configured")
-    print("  Task tracking: configured")
-
-    # Phase 3: Generate
-    print("\n[3/5] Generate: Creating policy pack...")
-    policy_path = workflow.generate(inspection, interview)
-    print(f"  Created: {policy_path}")
+    # Phases 2-3: bootstrap policy pack and wiki.
+    print("\n[2/5] Bootstrap: Creating or reusing workspace artifacts...")
+    bootstrap = bootstrap_workspace(
+        args.target_path,
+        engine_path=args.engine,
+        with_wiki=not getattr(args, "no_wiki", False),
+    )
+    policy_path = Path(bootstrap["policy_pack"]["path"])
+    print(f"  Policy pack: {bootstrap['policy_pack']['status']} → {policy_path}")
+    print(f"  Wiki: {bootstrap['wiki']['status']} → {bootstrap['wiki']['path']}")
     # Write provider-native permission config files from the generated permissions.md
     try:
         from .runtime.providers.cli_bridge import ensure_provider_permissions
@@ -706,13 +768,13 @@ def handle_init(args: argparse.Namespace) -> None:
         print(f"  Wrote {provider} permissions → {config_path}")
 
     # Phase 4: Validate
-    print("\n[4/5] Validate: Checking policy pack...")
+    print("\n[3/5] Validate: Checking policy pack...")
     validation_results = workflow.validate(policy_path)
     passed = sum(1 for r in validation_results if r.status.value == "PASS")
     print(f"  Passed: {passed}/{len(validation_results)}")
 
     # Phase 5: Evolve
-    print("\n[5/5] Evolve: Learning from setup...")
+    print("\n[4/5] Evolve: Learning from setup...")
     workflow.evolve()
 
     # NCP Integration
@@ -720,7 +782,6 @@ def handle_init(args: argparse.Namespace) -> None:
         print("\n[6/6] NCP: Initializing Neural Context Protocol...")
         import subprocess
         import sys
-        from pathlib import Path
 
         # Determine init target — use explicit target_path or CWD
         init_target = Path(args.target_path)
@@ -800,6 +861,21 @@ def handle_validate(args: argparse.Namespace) -> None:
 
     print(f"\nSummary: {passed} PASS, {drifted} DRIFT, {todo} TODO")
 
+    try:
+        compiled = compile_policy_pack(str(path))
+        caps = extract_server_caps(compiled)
+    except Exception:
+        caps = None
+
+    if caps is not None:
+        print("\nPolicy caps (server tier):")
+        budget = caps["cost_budget_tokens"]
+        print(f"  cost_budget_tokens: {budget if budget is not None else 'uncapped'}")
+        max_calls = caps["max_tool_calls"]
+        print(f"  max_tool_calls: {max_calls if max_calls is not None else 'uncapped'}")
+        gates = caps["required_approval_gates"]
+        print(f"  required_approval_gates: {gates if gates else 'none'}")
+
     if args.verbose:
         print("\nDetailed Results:")
         print("-" * 60)
@@ -810,6 +886,59 @@ def handle_validate(args: argparse.Namespace) -> None:
                 print(f"      → {r.policy_file}")
             if r.issue:
                 print(f"      → {r.issue}")
+
+
+def handle_recipes(args: argparse.Namespace) -> None:
+    """List reference recipes discovered under the recipes directory."""
+    recipes_dir = Path(args.recipes_dir)
+    recipes = load_recipes(recipes_dir)
+    if not recipes:
+        print(f"No recipes found under {recipes_dir}")
+        return
+    print(f"Recipes in {recipes_dir}:\n")
+    for key, recipe in recipes.items():
+        node_count = len(recipe.workflow.get("nodes", []))
+        providers = ", ".join(recipe.providers) or "(default)"
+        print(f"  {key:<16} {recipe.name}")
+        print(f"      {recipe.description}")
+        print(f"      providers: {providers}  |  nodes: {node_count}")
+        print()
+
+
+def _run_recipe(args: argparse.Namespace, policy_pack: str) -> None:
+    """Execute a recipe's FANOUT/JUDGE workflow graph and print a measured summary."""
+    recipe = load_recipe(args.recipe)
+    print(f"\nRunning recipe: {recipe.name} ({recipe.key})")
+    print(f"  {recipe.description}")
+    print(f"  Declared providers: {', '.join(recipe.providers) or '(policy default)'}")
+
+    engine = Engine(
+        policy_pack_path=policy_pack,
+        enforce_preflight=False,
+        ncp_enabled=_resolve_workspace_ncp(args, os.getcwd()),
+        ncp_mode=args.ncp_mode,
+        ncp_router=args.ncp_router,
+    )
+    graph = recipe.build_graph().to_artifact()
+    executor = TaskGraphExecutor(dispatcher=engine.dispatcher)
+    result = executor.execute_all(graph).to_artifact()
+
+    state = result["graph_state"]
+    providers_used = set()
+    total_tokens = 0
+    for event in result["events"]:
+        pr = event.get("provider_result") or {}
+        usage = pr.get("usage") or {}
+        total_tokens += int(usage.get("total_tokens", 0) or 0)
+    # Derive providers used from the executed branch nodes' pattern_config
+    for node in state.get("nodes", []):
+        prov = (node.get("pattern_config") or {}).get("provider")
+        if prov:
+            providers_used.add(prov)
+
+    print(f"\n✓ Recipe complete: {len(state.get('completed_nodes', []))} nodes")
+    print(f"  Providers used (fan-out): {', '.join(sorted(providers_used)) or '(single/default)'}")
+    print(f"  Measured token cost: {total_tokens}")
 
 
 def handle_run(args: argparse.Namespace) -> None:
@@ -825,6 +954,26 @@ def handle_run(args: argparse.Namespace) -> None:
             sys.exit(1)
     else:
         policy_pack = str(Path.cwd() / policy_pack)
+
+    if getattr(args, "recipe", None):
+        _run_recipe(args, policy_pack)
+        return
+
+    # Resolve declarative user agent (--agent), if requested
+    agent_spec = None
+    if getattr(args, "agent", None):
+        agents_dir_arg = getattr(args, "agents_dir", None)
+        agents_dir = Path(agents_dir_arg) if agents_dir_arg else Path(policy_pack) / "agents"
+        specs = load_agent_specs(agents_dir)
+        if args.agent not in specs:
+            available = ", ".join(sorted(specs)) or "(none found)"
+            print(f"Error: Unknown agent '{args.agent}'. Available agents in {agents_dir}: {available}")
+            sys.exit(1)
+        agent_spec = specs[args.agent]
+        register_agent_role(agent_spec.to_role())
+        print(f"Using declarative agent: {agent_spec.name} ({agent_spec.key})")
+        if agent_spec.tools:
+            print(f"  Tools: {', '.join(tool.name for tool in agent_spec.tools)}")
 
     # Auto-calculate or use provided complexity
     if args.complexity == "auto":
@@ -852,6 +1001,8 @@ def handle_run(args: argparse.Namespace) -> None:
         description=args.task_description,
         complexity=complexity,
     )
+    if agent_spec is not None:
+        task.agent_spec = agent_spec
 
     if args.dry_run:
         phase = Phase.ROUTE
@@ -990,6 +1141,46 @@ def _service_get_json(service_url: str, path: str, *, token: str | None = None) 
     return data
 
 
+def _service_post_json(
+    service_url: str,
+    path: str,
+    body: dict[str, Any],
+    *,
+    token: str | None = None,
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{service_url.rstrip('/')}{path}",
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+    )
+    request.add_header("Content-Type", "application/json")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        message = None
+        try:
+            error_payload = json.loads(error.read().decode("utf-8"))
+            if isinstance(error_payload, dict):
+                err = error_payload.get("error") or {}
+                if isinstance(err, dict):
+                    message = err.get("message")
+        except Exception:
+            message = None
+        raise RuntimeError(str(message or f"Service request failed (HTTP {error.code})."))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected service response.")
+    if not payload.get("ok"):
+        error = payload.get("error") or {}
+        raise RuntimeError(str(error.get("message") or "Service request failed."))
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("Service response did not contain a data object.")
+    return data
+
+
 def _desktop_launcher_main():
     try:
         from .service.desktop import main as desktop_main
@@ -1108,6 +1299,116 @@ def handle_reuse(args: argparse.Namespace) -> None:
             print(line)
     else:
         print("  No learned playbooks recorded yet.")
+
+
+def handle_attach(args: argparse.Namespace) -> None:
+    """Attach to a shared Sarathi session via its share token."""
+    info = _read_service_discovery()
+    service_url = info.get("url") if isinstance(info, dict) else None
+    token = _service_auth_token(info)
+    if not service_url:
+        print(
+            "No running Sarathi service found. Start it with: "
+            "python3 -m src.service --db ~/.sarathi/sarathi.db --port 8765"
+        )
+        return
+
+    user = args.user or os.environ.get("USER") or "local"
+
+    try:
+        data = _service_post_json(
+            service_url,
+            "/api/sessions/attach",
+            {"share_token": args.share_token, "user": user, "role": args.role},
+            token=token,
+        )
+    except RuntimeError as exc:
+        print(f"Could not attach: {exc}")
+        return
+
+    session = data["session"]
+    participant = data["participant"]
+    role = participant.get("role", args.role)
+
+    print(f"Attached to session {session['id']}")
+    print(f"  task: {session['task_id']}")
+    print(f"  role: {role}")
+    print(f"  visibility: {session.get('visibility', 'unknown')}")
+
+    try:
+        detail = _service_get_json(service_url, f"/api/sessions/{session['id']}", token=token)
+        participants = detail.get("participants", [])
+        print("\nParticipants:")
+        if participants:
+            for member in participants:
+                print(
+                    f"  - {member.get('user')} ({member.get('role')}) "
+                    f"[{member.get('status')}]"
+                )
+        else:
+            print("  (none)")
+
+        msgs = _service_get_json(
+            service_url, f"/api/sessions/{session['id']}/messages", token=token
+        ).get("messages", [])
+        print("\nRecent messages:")
+        if msgs:
+            for message in msgs[-10:]:
+                print(f"  {message.get('role')}: {message.get('content')}")
+        else:
+            print("  (no messages yet)")
+    except RuntimeError as exc:
+        print(f"\n(Could not load session details: {exc})")
+
+    if role == "observer":
+        print("\nNote: observers are read-only and cannot drive the session.")
+
+
+def handle_fork(args: argparse.Namespace) -> None:
+    """Fork a session into a new independent task via the running service."""
+    info = _read_service_discovery()
+    service_url = info.get("url") if isinstance(info, dict) else None
+    token = _service_auth_token(info)
+    if not service_url:
+        print(
+            "No running Sarathi service found. Start it with: "
+            "python3 -m src.service --db ~/.sarathi/sarathi.db --port 8765"
+        )
+        return
+
+    body: dict[str, Any] = {}
+    if args.owner:
+        body["owner"] = args.owner
+
+    try:
+        data = _service_post_json(
+            service_url,
+            f"/api/sessions/{args.session_id}/fork",
+            body,
+            token=token,
+        )
+    except RuntimeError as exc:
+        print(f"Could not fork: {exc}")
+        return
+
+    task = data["task"]
+    session = data["session"]
+    checkpoint = data.get("checkpoint") or {}
+
+    print(f"Forked session {args.session_id}")
+    print(f"  new task:    {task['id']}")
+    print(f"  new session: {session['id']}")
+    if checkpoint.get("id"):
+        print(f"  checkpoint:  {checkpoint['id']}")
+    print(f"  messages copied: {data.get('messages_copied', 0)}")
+
+    ncp = data.get("ncp")
+    if isinstance(ncp, dict):
+        print(
+            "  NCP seed: "
+            f"{ncp.get('parent_findings_carried', 0)} parent finding(s) carried, "
+            f"seed_written={ncp.get('seed_written')}"
+        )
 
 
 def handle_proposals(args: argparse.Namespace | None = None) -> None:

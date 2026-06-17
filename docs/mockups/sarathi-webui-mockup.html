@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sarathi — Operator Cockpit (v1 mockup)</title>
+<style>
+  /* ---------- theme tokens ---------- */
+  [data-theme="dark"]{
+    --bg:#0a0a0b; --panel:#141416; --elev:#19191c; --elev2:#212126;
+    --border:rgba(255,255,255,.08); --border-soft:rgba(255,255,255,.05);
+    --text:#f3f3f4; --muted:#9a9aa2; --faint:#6a6a72;
+    --field:#161618; --field-br:rgba(255,255,255,.10);
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.35);
+    --hover:rgba(255,255,255,.04);
+  }
+  [data-theme="light"]{
+    --bg:#f1f1f3; --panel:#ffffff; --elev:#f7f7f9; --elev2:#eeeef1;
+    --border:rgba(0,0,0,.09); --border-soft:rgba(0,0,0,.055);
+    --text:#17171a; --muted:#65656e; --faint:#9b9ba4;
+    --field:#ffffff; --field-br:rgba(0,0,0,.13);
+    --shadow:0 1px 2px rgba(0,0,0,.04),0 12px 30px rgba(0,0,0,.08);
+    --hover:rgba(0,0,0,.035);
+  }
+  :root{
+    --brand1:#f0a93b; --brand2:#e0742a;
+    --blue:#5b8def; --blueb:rgba(91,141,239,.16);
+    --green:#3fb27f; --greenb:rgba(63,178,127,.16);
+    --amber:#e0902f; --amberb:rgba(224,144,47,.16);
+    --red:#e05c5c; --redb:rgba(224,92,92,.15);
+    --purple:#9b7ff0; --purpleb:rgba(155,127,240,.16);
+    --slate:#8a8a93; --slateb:rgba(138,138,147,.14);
+    --r-lg:16px; --r-md:12px; --r-sm:9px;
+    --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+    --mono:"SF Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  button{font-family:inherit;font-size:inherit;color:inherit;cursor:pointer}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:var(--elev2);border-radius:8px;border:3px solid transparent;background-clip:padding-box}
+
+  /* ---------- shell ---------- */
+  .app{display:grid;grid-template-columns:248px 1fr;height:100vh;padding:10px;gap:10px}
+  .sidebar{background:var(--panel);border:1px solid var(--border);border-radius:var(--r-lg);display:flex;flex-direction:column;min-height:0;box-shadow:var(--shadow)}
+  .main{min-width:0;display:flex;flex-direction:column;min-height:0;background:var(--panel);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;box-shadow:var(--shadow)}
+
+  /* org / workspace switcher */
+  .org{display:flex;align-items:center;gap:10px;padding:14px 14px 10px}
+  .org .ava{width:26px;height:26px;border-radius:9px;background:conic-gradient(from 200deg,var(--brand1),#e0742a,#c44ad0,#5b8def,var(--brand1));flex:none;box-shadow:inset 0 0 0 1px rgba(255,255,255,.15)}
+  .org .nm{font-weight:650;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .org .ic{color:var(--faint);display:grid;place-items:center;width:24px;height:24px;border-radius:7px}
+  .org .ic:hover{background:var(--hover);color:var(--muted)}
+  .org-wrap{position:relative}
+  .org-menu{position:absolute;left:14px;right:14px;top:48px;background:var(--panel);border:1px solid var(--border);border-radius:var(--r-md);box-shadow:var(--shadow);padding:6px;z-index:60;display:none}
+  .org-menu.open{display:block}
+  .om{display:flex;align-items:center;gap:10px;padding:8px 9px;border-radius:9px}
+  .om:hover{background:var(--hover)}
+  .om .d{width:7px;height:7px;border-radius:50%}
+  .om small{margin-left:auto;color:var(--faint);font-size:10.5px}
+  .om.new{color:var(--blue);border-top:1px solid var(--border-soft);margin-top:4px;padding-top:9px}
+
+  /* search */
+  .search{margin:4px 12px 8px;display:flex;align-items:center;gap:8px;background:var(--field);border:1px solid var(--border);border-radius:10px;padding:7px 10px;color:var(--faint)}
+  .search input{flex:1;background:none;border:none;outline:none;color:var(--text);font-size:12.5px}
+  .search kbd{font-family:var(--mono);font-size:11px;color:var(--faint);border:1px solid var(--border);border-radius:5px;padding:0 5px}
+
+  nav{padding:4px 10px;display:flex;flex-direction:column;gap:2px;overflow:auto}
+  .nl{color:var(--faint);font-size:10.5px;letter-spacing:.6px;text-transform:uppercase;padding:14px 10px 6px;display:flex;align-items:center;gap:6px}
+  .ni{display:flex;align-items:center;gap:11px;padding:8px 10px;border-radius:10px;color:var(--muted)}
+  .ni:hover{background:var(--hover);color:var(--text)}
+  .ni.active{background:var(--elev2);color:var(--text)}
+  .ni svg{width:17px;height:17px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7}
+  .ni .ct{margin-left:auto;font-size:10.5px;color:var(--faint);background:var(--elev2);border-radius:20px;padding:1px 8px;min-width:20px;text-align:center}
+  .ni.active .ct{background:var(--bg)}
+  .ni .ct.amber{background:var(--amber);color:#241a05;font-weight:700}
+  .pin{display:flex;align-items:center;gap:11px;padding:7px 10px;border-radius:10px;color:var(--muted)}
+  .pin:hover{background:var(--hover);color:var(--text)}
+  .pin .dot{width:16px;height:16px;border-radius:6px;flex:none}
+
+  .sfoot{margin-top:auto;border-top:1px solid var(--border-soft);padding:10px 12px;display:flex;align-items:center;gap:10px}
+  .sfoot .ava{width:28px;height:28px;border-radius:50%;background:conic-gradient(from 130deg,#5b8def,#9b7ff0,#e0742a,#5b8def);flex:none}
+  .sfoot .who{flex:1;min-width:0}
+  .sfoot .who b{font-size:12.5px;display:block;line-height:1.2}
+  .sfoot .who span{font-size:10.5px;color:var(--faint)}
+  .pill{font-size:9.5px;font-weight:700;letter-spacing:.4px;color:var(--green);border:1px solid var(--green);border-radius:5px;padding:1px 5px}
+  .sfoot .more{color:var(--faint);margin-left:auto;padding:4px}
+
+  /* ---------- topbar ---------- */
+  .top{height:54px;border-bottom:1px solid var(--border-soft);display:flex;align-items:center;gap:12px;padding:0 18px;flex:none}
+  .top .ttl{display:flex;align-items:center;gap:9px;font-weight:650;font-size:14px}
+  .top .ttl svg{width:17px;height:17px;stroke:var(--muted);fill:none;stroke-width:1.8}
+  .top .crumb{color:var(--faint)}
+  .grow{flex:1}
+  .iconbtn{width:32px;height:32px;border-radius:9px;border:1px solid var(--border);background:var(--field);display:grid;place-items:center;color:var(--muted)}
+  .iconbtn:hover{color:var(--text)}
+  .needs{display:flex;align-items:center;gap:7px;background:var(--amberb);border:1px solid transparent;color:var(--amber);border-radius:10px;padding:7px 11px;font-weight:600}
+  .needs .n{background:var(--amber);color:#241a05;border-radius:20px;font-size:11px;padding:0 7px;font-weight:700}
+
+  .content{flex:1;min-height:0;overflow:auto;padding:22px 26px}
+  .view{display:none} .view.active{display:block}
+
+  /* page header + tabs */
+  .ph{margin-bottom:18px}
+  .ph h1{font-size:21px;margin:0;font-weight:680;letter-spacing:-.2px}
+  .ph p{margin:5px 0 0;color:var(--muted)}
+  .ph .row{display:flex;align-items:center;gap:12px}
+  .tabs{display:flex;gap:4px;border-bottom:1px solid var(--border-soft);margin:18px 0 18px}
+  .tab{display:flex;align-items:center;gap:7px;padding:9px 13px;border-radius:9px;color:var(--muted);font-weight:550}
+  .tab svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7}
+  .tab:hover{background:var(--hover);color:var(--text)}
+  .tab.on{background:var(--elev2);color:var(--text)}
+
+  .btn{background:var(--field);border:1px solid var(--border);border-radius:10px;padding:8px 13px;color:var(--text);font-weight:600;display:inline-flex;align-items:center;gap:7px}
+  .btn:hover{background:var(--hover)}
+  .btn.primary{background:linear-gradient(180deg,var(--brand1),var(--brand2));border-color:transparent;color:#1c1305}
+  .btn.primary:hover{filter:brightness(1.04)}
+  .btn.ghost{background:transparent;border-color:transparent;color:var(--muted)}
+  .btn.ghost:hover{background:var(--hover);color:var(--text)}
+
+  .seg{display:flex;background:var(--field);border:1px solid var(--border);border-radius:10px;padding:3px}
+  .seg button{padding:5px 11px;border-radius:7px;color:var(--muted);background:none;border:none;font-weight:550}
+  .seg button.on{background:var(--elev2);color:var(--text)}
+
+  .chips{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+  .chip{background:var(--field);border:1px solid var(--border);border-radius:20px;padding:6px 12px;color:var(--muted);font-size:12px;display:inline-flex;gap:7px;align-items:center}
+  .chip.on{background:var(--blueb);border-color:transparent;color:var(--blue);font-weight:600}
+  .vr{width:1px;height:20px;background:var(--border);margin:0 3px}
+
+  .card2{background:var(--panel);border:1px solid var(--border);border-radius:var(--r-md)}
+
+  /* ---------- kanban ---------- */
+  .board{display:grid;grid-template-columns:repeat(5,minmax(218px,1fr));gap:14px;align-items:start}
+  .lane{background:var(--bg);border:1px solid var(--border-soft);border-radius:var(--r-md)}
+  [data-theme="light"] .lane{background:var(--elev)}
+  .lh{display:flex;align-items:center;gap:9px;padding:12px 13px}
+  .lh .ic{width:9px;height:9px;border-radius:3px}
+  .lh b{font-size:12.5px;font-weight:620}
+  .lh .ct{margin-left:auto;color:var(--faint);font-size:11px;background:var(--elev2);border-radius:20px;padding:1px 8px}
+  .lb{padding:0 10px 12px;display:flex;flex-direction:column;gap:10px}
+  .kc{background:var(--panel);border:1px solid var(--border);border-radius:var(--r-md);padding:12px;cursor:pointer;transition:transform .05s,box-shadow .12s,border-color .12s}
+  .kc:hover{box-shadow:var(--shadow);border-color:var(--field-br)}
+  .kc:active{transform:translateY(1px)}
+  .kc .pj{font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.4px}
+  .kc .tt{font-weight:620;margin:4px 0 10px;font-size:12.8px}
+  .kc .r{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .tag{font-size:10.5px;border-radius:6px;padding:2px 8px;display:inline-flex;align-items:center;gap:5px;font-weight:600}
+  .tag .d{width:6px;height:6px;border-radius:50%}
+  .t-run{background:var(--blueb);color:var(--blue)} .t-run .d{background:var(--blue)}
+  .t-plan{background:var(--slateb);color:var(--slate)} .t-plan .d{background:var(--slate)}
+  .t-need{background:var(--amberb);color:var(--amber)} .t-need .d{background:var(--amber)}
+  .t-block{background:var(--redb);color:var(--red)} .t-block .d{background:var(--red)}
+  .t-review{background:var(--purpleb);color:var(--purple)} .t-review .d{background:var(--purple)}
+  .t-done{background:var(--greenb);color:var(--green)} .t-done .d{background:var(--green)}
+  .tag.ph{background:var(--elev2);color:var(--muted)}
+  .kc .mt{display:flex;align-items:center;gap:8px;margin-top:10px;color:var(--faint);font-size:10.8px}
+  .ac{margin-left:auto;display:flex;align-items:center;gap:6px}
+  .bar{width:44px;height:5px;border-radius:3px;background:var(--elev2);overflow:hidden}
+  .bar i{display:block;height:100%;background:var(--green)}
+
+  /* ---------- task studio ---------- */
+  .studio{display:grid;grid-template-columns:1fr 384px;gap:14px;height:calc(100vh - 54px - 44px - 56px)}
+  .sleft{display:flex;flex-direction:column;gap:14px;min-height:0}
+  .tshead{padding:15px 17px;display:flex;flex-wrap:wrap;gap:12px 22px;align-items:center}
+  .tshead h2{margin:0;width:100%;font-size:16.5px;font-weight:670}
+  .kv span{color:var(--faint);font-size:10px;text-transform:uppercase;letter-spacing:.5px;display:block}
+  .kv b{font-size:12.5px;font-weight:620}
+  .nextsafe{margin-left:auto;background:var(--amberb);color:var(--amber);border-radius:10px;padding:8px 12px;font-weight:600;display:flex;gap:8px;align-items:center}
+  .gwrap{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+  .gtool{display:flex;align-items:center;gap:12px;padding:11px 15px;border-bottom:1px solid var(--border-soft)}
+  .legend{display:flex;gap:13px;color:var(--faint);font-size:11px;flex-wrap:wrap;margin-left:auto}
+  .legend span{display:inline-flex;align-items:center;gap:5px}
+  .legend i{width:9px;height:9px;border-radius:3px}
+  .canvas{flex:1;min-height:0;overflow:auto}
+
+  .chat{display:flex;flex-direction:column;min-height:0;overflow:hidden}
+  .chh{padding:13px 15px;border-bottom:1px solid var(--border-soft);display:flex;align-items:center;gap:9px}
+  .chh b{font-size:12.5px} .chh .who{margin-left:auto;color:var(--faint);font-size:11px}
+  .chb{flex:1;overflow:auto;padding:15px;display:flex;flex-direction:column;gap:15px}
+  .msg{display:flex;gap:10px}
+  .msg .a{width:27px;height:27px;border-radius:9px;flex:none;display:grid;place-items:center;font-size:11px;font-weight:700}
+  .msg.user .a{background:var(--elev2);color:var(--muted)}
+  .msg.sarathi .a{background:linear-gradient(135deg,var(--brand1),var(--brand2));color:#1c1305}
+  .msg.agent .a{background:var(--blueb);color:var(--blue)}
+  .msg .bd{flex:1;min-width:0}
+  .msg .nm{font-size:11px;color:var(--faint);margin-bottom:4px}
+  .msg .nm b{color:var(--muted)}
+  .bub{background:var(--elev);border:1px solid var(--border-soft);border-radius:12px;border-top-left-radius:4px;padding:10px 12px;font-size:12.5px}
+  .msg.user .bub{background:var(--elev2)}
+  .mini{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+  .mini button{font-size:11px;padding:4px 9px;border-radius:7px;border:1px solid var(--border);background:var(--field);color:var(--muted)}
+  .mini button:hover{color:var(--text)}
+  .appr{background:var(--amberb);border:1px solid transparent;border-radius:12px;padding:13px;margin-top:5px}
+  .appr h4{margin:0 0 6px;font-size:12.5px;color:var(--amber);display:flex;gap:7px;align-items:center}
+  .appr p{margin:0 0 11px;color:var(--text);opacity:.85;font-size:12px}
+  .appr .acts{display:flex;gap:8px;flex-wrap:wrap}
+  .appr .ok{background:var(--green);border-color:transparent;color:#062417}
+  .appr .no{background:transparent;border-color:var(--amber);color:var(--amber)}
+  .comp{border-top:1px solid var(--border-soft);padding:11px;display:flex;gap:9px;align-items:flex-end}
+  .comp textarea{flex:1;resize:none;background:var(--field);border:1px solid var(--border);border-radius:11px;color:var(--text);padding:10px 12px;font-family:inherit;font-size:12.5px;height:40px;outline:none}
+  .comp .snd{width:40px;height:40px;border-radius:11px;border:none;background:linear-gradient(180deg,var(--brand1),var(--brand2));color:#1c1305;font-weight:800;display:grid;place-items:center}
+
+  /* ---------- outcomes ---------- */
+  .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:16px}
+  .stat{padding:15px}
+  .stat .l{color:var(--faint);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  .stat .v{font-size:25px;font-weight:680;margin:7px 0 3px;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+  .stat .dl{font-size:11px;font-weight:600}
+  .up{color:var(--green)} .down{color:var(--red)}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  thead th{text-align:left;color:var(--faint);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;padding:11px 13px;border-bottom:1px solid var(--border-soft)}
+  tbody td{padding:11px 13px;border-bottom:1px solid var(--border-soft)}
+  tbody tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:var(--hover)}
+  .num{font-variant-numeric:tabular-nums}
+  .spark{display:inline-flex;align-items:flex-end;gap:2px;height:18px}
+  .spark i{width:4px;background:var(--blue);border-radius:1px;display:block}
+
+  /* ---------- wiki ---------- */
+  .wiki{display:grid;grid-template-columns:236px 1fr;gap:0;height:calc(100vh - 54px - 44px - 56px);border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden}
+  .wnav{padding:9px;border-right:1px solid var(--border-soft);overflow:auto}
+  .wi{padding:9px 11px;border-radius:9px;color:var(--muted);display:flex;align-items:center;gap:9px;font-size:12.5px}
+  .wi:hover{background:var(--hover)} .wi.on{background:var(--elev2);color:var(--text)}
+  .wi .g{margin-left:auto;font-size:9px;color:var(--brand1);border:1px solid var(--brand1);border-radius:5px;padding:0 5px;text-transform:uppercase;letter-spacing:.4px}
+  .wi .g.h{color:var(--green);border-color:var(--green)}
+  .doc{padding:24px 28px;overflow:auto}
+  .doc h2{margin:0 0 4px;font-size:19px}
+  .doc .pv{color:var(--faint);font-size:11.5px;margin-bottom:18px}
+  .doc p{color:var(--text);opacity:.82;max-width:680px}
+  .doc h3{font-size:14px;margin:22px 0 6px}
+  code{font-family:var(--mono);background:var(--elev2);border-radius:5px;padding:1px 5px;font-size:11.5px}
+  .banner{background:var(--blueb);color:var(--blue);border-radius:11px;padding:11px 13px;font-size:12px;display:flex;gap:10px;align-items:center;max-width:680px;margin:0 0 20px;font-weight:550}
+  .banner b{margin-left:auto;cursor:pointer;text-decoration:underline}
+
+  /* ---------- settings ---------- */
+  .sgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
+  .sect{padding:17px}
+  .sect h3{margin:0 0 13px;font-size:13.5px;display:flex;align-items:center;gap:8px;font-weight:650}
+  .prov{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--border-soft)}
+  .prov:first-of-type{border-top:none;padding-top:0}
+  .prov .pic{width:32px;height:32px;border-radius:9px;background:var(--elev2);display:grid;place-items:center;font-weight:700;font-size:11px;color:var(--muted)}
+  .prov .pi{flex:1} .prov .pi b{font-size:12.5px} .prov .pi span{display:block;color:var(--faint);font-size:11px}
+  .st{font-size:11px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+  .st .d{width:7px;height:7px;border-radius:50%}
+  .st.ok{color:var(--green)} .st.ok .d{background:var(--green)}
+  .st.wn{color:var(--amber)} .st.wn .d{background:var(--amber)}
+  .st.of{color:var(--faint)} .st.of .d{background:var(--faint)}
+  .kvl{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-top:1px solid var(--border-soft);font-size:12.5px}
+  .kvl:first-of-type{border-top:none}
+  .kvl span{color:var(--muted)}
+  .note{color:var(--faint);font-size:11px;margin-top:8px}
+  .tog{width:38px;height:22px;border-radius:20px;background:var(--elev2);border:1px solid var(--border);position:relative;cursor:pointer}
+  .tog.on{background:var(--green);border-color:transparent}
+  .tog i{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:left .14s}
+  .tog.on i{left:18px}
+  .saved{margin-top:14px;background:var(--field);border:1px solid var(--border);border-radius:11px;padding:11px 14px;color:var(--muted);font-size:12px;display:flex;align-items:center;gap:9px}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ================= SIDEBAR ================= -->
+  <aside class="sidebar">
+    <div class="org-wrap">
+      <div class="org">
+        <div class="ava"></div>
+        <div class="nm">payments-platform</div>
+        <div class="ic" onclick="document.getElementById('orgmenu').classList.toggle('open')">▾</div>
+        <div class="ic" title="Collapse">⬚</div>
+      </div>
+      <div class="org-menu" id="orgmenu">
+        <div class="om"><span class="d" style="background:var(--green)"></span> payments-platform <small>healthy</small></div>
+        <div class="om"><span class="d" style="background:var(--amber)"></span> data-lakehouse <small>degraded</small></div>
+        <div class="om"><span class="d" style="background:var(--faint)"></span> internal-tools <small>setup</small></div>
+        <div class="om new">＋ New workspace</div>
+        <div class="om" style="color:var(--muted)">⚙ Manage workspace…</div>
+      </div>
+    </div>
+
+    <div class="search">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+      <input placeholder="Search anything…" />
+      <kbd>/</kbd>
+    </div>
+
+    <nav>
+      <div class="nl">Workspace</div>
+      <div class="ni active" data-view="dashboard" onclick="go(this)">
+        <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="2"/><rect x="14" y="3" width="7" height="5" rx="2"/><rect x="14" y="12" width="7" height="9" rx="2"/><rect x="3" y="16" width="7" height="5" rx="2"/></svg>
+        Dashboard <span class="ct">9</span>
+      </div>
+      <div class="ni" data-view="dashboard" onclick="go(this)">
+        <svg viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 8 3 8H3s3-1 3-8"/><path d="M10 21a2 2 0 0 0 4 0"/></svg>
+        Needs you <span class="ct amber">3</span>
+      </div>
+      <div class="ni" data-view="history" onclick="go(this)">
+        <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 5v4h4"/><path d="M12 8v4l3 2"/></svg>
+        History <span class="ct">6</span>
+      </div>
+      <div class="ni" data-view="agents" onclick="go(this)">
+        <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="4"/><circle cx="9.5" cy="10" r="1.3"/><circle cx="14.5" cy="10" r="1.3"/><path d="M9 15c1 1 5 1 6 0"/></svg>
+        Agents <span class="ct">5</span>
+      </div>
+
+      <div class="nl">Knowledge</div>
+      <div class="ni" data-view="wiki" onclick="go(this)">
+        <svg viewBox="0 0 24 24"><path d="M4 5a2 2 0 0 1 2-2h9l5 5v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M14 3v5h5"/></svg>
+        Wiki
+      </div>
+      <div class="ni" data-view="outcomes" onclick="go(this)">
+        <svg viewBox="0 0 24 24"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 16l3-4 3 2 5-7"/></svg>
+        Usage Stats
+      </div>
+
+      <div class="nl">System</div>
+      <div class="ni" data-view="settings" onclick="go(this)">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 13a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 0 1-4 0v-.2A1.7 1.7 0 0 0 6 19.4l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0-1.2-2.9H2a2 2 0 0 1 0-4h.2A1.7 1.7 0 0 0 4 6l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 3V2.8a2 2 0 0 1 4 0V3a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1A1.7 1.7 0 0 0 21 10h.2a2 2 0 0 1 0 4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
+        Settings
+      </div>
+
+      <div class="nl">Pinned projects</div>
+      <div class="pin"><span class="dot" style="background:linear-gradient(135deg,#5b8def,#9b7ff0)"></span> checkout-revamp</div>
+      <div class="pin"><span class="dot" style="background:linear-gradient(135deg,#e0742a,#f0a93b)"></span> fraud-engine</div>
+      <div class="pin"><span class="dot" style="background:linear-gradient(135deg,#3fb27f,#5b8def)"></span> platform-infra</div>
+    </nav>
+
+    <div style="display:flex;align-items:center;gap:8px;padding:9px 16px;color:var(--faint);font-size:11px;border-top:1px solid var(--border-soft)">
+      <span style="width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px var(--greenb)"></span>
+      Connected · Live · 3 sessions active
+    </div>
+
+    <div class="sfoot">
+      <div class="ava"></div>
+      <div class="who"><b>sweethome</b><span>operator</span></div>
+      <span class="pill">LOCAL</span>
+      <span class="more">⋯</span>
+    </div>
+  </aside>
+
+  <!-- ================= MAIN ================= -->
+  <div class="main">
+    <div class="top">
+      <div class="ttl"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span id="crumb">Dashboard</span></div>
+      <div class="grow"></div>
+      <button class="needs"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 8 3 8H3s3-1 3-8"/></svg> Needs you <span class="n">3</span></button>
+      <button class="iconbtn" id="themebtn" title="Toggle theme" onclick="toggleTheme()">☾</button>
+    </div>
+
+    <div class="content">
+      <!-- ===== DASHBOARD ===== -->
+      <section class="view active" id="dashboard">
+        <div class="ph">
+          <div class="row">
+            <div>
+              <h1>Dashboard</h1>
+              <p>payments-platform · all projects · live service projection</p>
+            </div>
+            <div class="grow"></div>
+            <div class="seg"><button class="on">Board</button><button>List</button></div>
+            <button class="btn primary">＋ New project</button>
+          </div>
+        </div>
+
+        <div class="chips">
+          <span class="chip on">All projects</span>
+          <span class="chip">checkout-revamp</span>
+          <span class="chip">fraud-engine</span>
+          <span class="chip">platform-infra</span>
+          <span class="vr"></span>
+          <span class="chip">Provider: any ▾</span>
+          <span class="chip">Saved view ▾</span>
+        </div>
+
+        <div class="board">
+          <div class="lane">
+            <div class="lh"><span class="ic" style="background:var(--slate)"></span><b>Intake / Planning</b><span class="ct">2</span></div>
+            <div class="lb">
+              <div class="kc" onclick="openTask()"><div class="pj">checkout-revamp</div><div class="tt">Add Apple Pay to guest checkout</div><div class="r"><span class="tag t-plan"><span class="d"></span>planning</span><span class="tag ph">PLAN</span></div><div class="mt">Disha · planner<span class="ac">AC 0/4<span class="bar"><i style="width:0"></i></span></span></div></div>
+              <div class="kc" onclick="openTask()"><div class="pj">fraud-engine</div><div class="tt">Draft PRD: velocity-based risk scoring</div><div class="r"><span class="tag t-plan"><span class="d"></span>intake</span></div><div class="mt">from brainstorm<span class="ac">AC —</span></div></div>
+            </div>
+          </div>
+
+          <div class="lane">
+            <div class="lh"><span class="ic" style="background:var(--blue)"></span><b>Active</b><span class="ct">3</span></div>
+            <div class="lb">
+              <div class="kc" onclick="openTask()"><div class="pj">checkout-revamp</div><div class="tt">Refactor PaymentIntent state machine</div><div class="r"><span class="tag t-run"><span class="d"></span>running</span><span class="tag ph">BUILD</span></div><div class="mt">claude · 2 units<span class="ac">AC 3/6<span class="bar"><i style="width:50%"></i></span></span></div></div>
+              <div class="kc" onclick="openTask()"><div class="pj">platform-infra</div><div class="tt">Migrate webhook queue to SQS FIFO</div><div class="r"><span class="tag t-run"><span class="d"></span>running</span></div><div class="mt">codex · fanout ×3<span class="ac">AC 2/5<span class="bar"><i style="width:40%"></i></span></span></div></div>
+              <div class="kc" onclick="openTask()"><div class="pj">fraud-engine</div><div class="tt">Add idempotency keys to scoring API</div><div class="r"><span class="tag t-run"><span class="d"></span>ready</span></div><div class="mt">local · queued<span class="ac">AC 0/3<span class="bar"><i style="width:0"></i></span></span></div></div>
+            </div>
+          </div>
+
+          <div class="lane">
+            <div class="lh"><span class="ic" style="background:var(--amber)"></span><b>Needs You</b><span class="ct">3</span></div>
+            <div class="lb">
+              <div class="kc" onclick="openTask()"><div class="pj">checkout-revamp</div><div class="tt">Apply DB migration: payment_method col</div><div class="r"><span class="tag t-need"><span class="d"></span>awaiting approval</span></div><div class="mt">mutation/data · irreversible<span class="ac">gate</span></div></div>
+              <div class="kc" onclick="openTask()"><div class="pj">platform-infra</div><div class="tt">Provision staging Redis cluster</div><div class="r"><span class="tag t-block"><span class="d"></span>blocked</span></div><div class="mt">missing terraform creds</div></div>
+              <div class="kc" onclick="openTask()"><div class="pj">fraud-engine</div><div class="tt">Backfill historical risk scores</div><div class="r"><span class="tag t-block"><span class="d"></span>failed</span></div><div class="mt">verify 2/7 · retry?</div></div>
+            </div>
+          </div>
+
+          <div class="lane">
+            <div class="lh"><span class="ic" style="background:var(--purple)"></span><b>Review</b><span class="ct">2</span></div>
+            <div class="lb">
+              <div class="kc" onclick="openTask()"><div class="pj">checkout-revamp</div><div class="tt">Tokenize stored cards (PCI scope)</div><div class="r"><span class="tag t-review"><span class="d"></span>under review</span></div><div class="mt">judge ×2 · conf 0.81<span class="ac">AC 6/6<span class="bar"><i style="width:100%"></i></span></span></div></div>
+              <div class="kc" onclick="openTask()"><div class="pj">fraud-engine</div><div class="tt">Rule DSL parser hardening</div><div class="r"><span class="tag t-review"><span class="d"></span>under review</span></div><div class="mt">1 blocker finding<span class="ac">AC 4/4<span class="bar"><i style="width:100%"></i></span></span></div></div>
+            </div>
+          </div>
+
+          <div class="lane">
+            <div class="lh"><span class="ic" style="background:var(--green)"></span><b>Done / Handoff</b><span class="ct">2</span></div>
+            <div class="lb">
+              <div class="kc" onclick="openTask()"><div class="pj">platform-infra</div><div class="tt">Upgrade Python runtime to 3.12</div><div class="r"><span class="tag t-need"><span class="d"></span>handoff ready</span></div><div class="mt">dossier ready · PR?<span class="ac">AC 5/5<span class="bar"><i style="width:100%"></i></span></span></div></div>
+              <div class="kc" onclick="openTask()"><div class="pj">checkout-revamp</div><div class="tt">Fix null pointer in refund flow</div><div class="r"><span class="tag t-done"><span class="d"></span>done</span></div><div class="mt">merged · 2d ago<span class="ac">AC 3/3<span class="bar"><i style="width:100%"></i></span></span></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== TASK STUDIO ===== -->
+      <section class="view" id="task">
+        <div class="ph"><div class="row"><button class="btn ghost" onclick="go(document.querySelector('[data-view=dashboard]'))">← Back to Dashboard</button></div></div>
+        <div class="studio">
+          <div class="sleft">
+            <div class="card2 tshead">
+              <h2>Refactor PaymentIntent state machine</h2>
+              <div class="kv"><span>Queue</span><b style="color:var(--blue)">running</b></div>
+              <div class="kv"><span>Phase</span><b>BUILD</b></div>
+              <div class="kv"><span>Class</span><b>codegen/refactor</b></div>
+              <div class="kv"><span>Provider</span><b>claude</b></div>
+              <div class="kv"><span>AC coverage</span><b>3 / 6</b></div>
+              <div class="nextsafe">▶ approve unit “migrate transitions”</div>
+            </div>
+            <div class="card2 gwrap">
+              <div class="gtool">
+                <div class="seg"><button class="on">Graph</button><button>List</button></div>
+                <div class="legend">
+                  <span><i style="background:var(--green)"></i>done</span>
+                  <span><i style="background:var(--blue)"></i>in progress</span>
+                  <span><i style="background:transparent;border:1.5px solid var(--slate)"></i>waiting</span>
+                  <span style="opacity:.4">|</span>
+                  <span><b style="font-family:var(--mono);font-weight:700;background:var(--elev2);border-radius:5px;padding:1px 5px;color:var(--muted)">CL</b> → claude</span>
+                  <span><b style="font-family:var(--mono);font-weight:700;background:var(--elev2);border-radius:5px;padding:1px 5px;color:var(--muted)">CO</b> → copilot</span>
+                </div>
+              </div>
+              <div class="canvas">
+                <svg viewBox="0 0 560 600" width="100%" height="100%" preserveAspectRatio="xMidYMid meet">
+                  <!-- edges: parent bottom-center -> child top-center -->
+                  <!-- row1 -> row2 (transitions) -->
+                  <path d="M160 96 C160 130 280 130 280 164" stroke="var(--slate)" stroke-width="1.6" fill="none" opacity=".5"/>
+                  <path d="M400 96 C400 130 280 130 280 164" stroke="var(--slate)" stroke-width="1.6" fill="none" opacity=".5"/>
+                  <!-- row2 (transitions) -> row3 (tests, callsites) -->
+                  <path d="M280 218 C280 252 160 252 160 286" stroke="var(--slate)" stroke-width="1.6" fill="none" opacity=".5"/>
+                  <path d="M280 218 C280 252 400 252 400 286" stroke="var(--slate)" stroke-width="1.6" fill="none" opacity=".5"/>
+                  <!-- row3 -> row4 (VERIFY · gate) : dashed -->
+                  <path d="M160 340 C160 374 280 374 280 408" stroke="var(--slate)" stroke-width="1.6" fill="none" opacity=".4" stroke-dasharray="6 5"/>
+                  <path d="M400 340 C400 374 280 374 280 408" stroke="var(--slate)" stroke-width="1.6" fill="none" opacity=".4" stroke-dasharray="6 5"/>
+
+                  <!-- row1: unit: model (done, CL) -->
+                  <g transform="translate(60,42)">
+                    <rect width="200" height="54" rx="13" stroke-width="1.7" fill="var(--greenb)" stroke="var(--green)"/>
+                    <rect x="16" y="22" width="10" height="10" rx="2.5" fill="var(--green)"/>
+                    <text x="100" y="31" text-anchor="middle" font-size="13" font-weight="600" fill="var(--text)" font-family="var(--font)">unit: model</text>
+                    <rect x="155" y="17" width="30" height="20" rx="6" fill="var(--elev2)"/>
+                    <text x="170" y="31" text-anchor="middle" font-size="10" font-weight="700" fill="var(--muted)" font-family="var(--mono)">CL</text>
+                  </g>
+                  <!-- row1: unit: schema (done, CO) -->
+                  <g transform="translate(300,42)">
+                    <rect width="200" height="54" rx="13" stroke-width="1.7" fill="var(--greenb)" stroke="var(--green)"/>
+                    <rect x="16" y="22" width="10" height="10" rx="2.5" fill="var(--green)"/>
+                    <text x="100" y="31" text-anchor="middle" font-size="13" font-weight="600" fill="var(--text)" font-family="var(--font)">unit: schema</text>
+                    <rect x="155" y="17" width="30" height="20" rx="6" fill="var(--elev2)"/>
+                    <text x="170" y="31" text-anchor="middle" font-size="10" font-weight="700" fill="var(--muted)" font-family="var(--mono)">CO</text>
+                  </g>
+                  <!-- row2: unit: transitions (running, CL) -->
+                  <g transform="translate(180,164)">
+                    <rect width="200" height="54" rx="13" stroke-width="1.7" fill="var(--blueb)" stroke="var(--blue)"/>
+                    <circle cx="21" cy="27" r="5" fill="var(--blue)"/>
+                    <text x="100" y="31" text-anchor="middle" font-size="13" font-weight="600" fill="var(--text)" font-family="var(--font)">unit: transitions</text>
+                    <rect x="155" y="17" width="30" height="20" rx="6" fill="var(--elev2)"/>
+                    <text x="170" y="31" text-anchor="middle" font-size="10" font-weight="700" fill="var(--muted)" font-family="var(--mono)">CL</text>
+                  </g>
+                  <!-- row3: unit: tests (running, CO) -->
+                  <g transform="translate(60,286)">
+                    <rect width="200" height="54" rx="13" stroke-width="1.7" fill="var(--blueb)" stroke="var(--blue)"/>
+                    <circle cx="21" cy="27" r="5" fill="var(--blue)"/>
+                    <text x="100" y="31" text-anchor="middle" font-size="13" font-weight="600" fill="var(--text)" font-family="var(--font)">unit: tests</text>
+                    <rect x="155" y="17" width="30" height="20" rx="6" fill="var(--elev2)"/>
+                    <text x="170" y="31" text-anchor="middle" font-size="10" font-weight="700" fill="var(--muted)" font-family="var(--mono)">CO</text>
+                  </g>
+                  <!-- row3: unit: callsites (running, CL) -->
+                  <g transform="translate(300,286)">
+                    <rect width="200" height="54" rx="13" stroke-width="1.7" fill="var(--blueb)" stroke="var(--blue)"/>
+                    <circle cx="21" cy="27" r="5" fill="var(--blue)"/>
+                    <text x="100" y="31" text-anchor="middle" font-size="13" font-weight="600" fill="var(--text)" font-family="var(--font)">unit: callsites</text>
+                    <rect x="155" y="17" width="30" height="20" rx="6" fill="var(--elev2)"/>
+                    <text x="170" y="31" text-anchor="middle" font-size="10" font-weight="700" fill="var(--muted)" font-family="var(--mono)">CL</text>
+                  </g>
+                  <!-- row4: VERIFY · gate (waiting, judge) -->
+                  <g transform="translate(180,408)">
+                    <rect width="200" height="54" rx="13" stroke-width="1.7" fill="var(--slateb)" stroke="var(--slate)" stroke-dasharray="5 4"/>
+                    <circle cx="21" cy="27" r="5" fill="none" stroke="var(--slate)" stroke-width="1.7"/>
+                    <text x="100" y="31" text-anchor="middle" font-size="13" font-weight="600" fill="var(--text)" font-family="var(--font)">VERIFY · gate</text>
+                    <rect x="142" y="17" width="44" height="20" rx="6" fill="var(--elev2)"/>
+                    <text x="164" y="31" text-anchor="middle" font-size="10" font-weight="700" fill="var(--muted)" font-family="var(--mono)">judge</text>
+                  </g>
+                </svg>
+              </div>
+            </div>
+          </div>
+
+          <div class="card2 chat">
+            <div class="chh"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><b>Conversation</b><span class="who">5 messages</span></div>
+            <div style="padding:10px 13px 0"><div class="search" style="margin:0"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input placeholder="Search messages…" /></div></div>
+            <div class="chb">
+              <div class="msg user"><div class="a">SK</div><div class="bd"><div class="nm"><b>You</b> · 09:14</div><div class="bub">Refactor the PaymentIntent transitions to a typed state machine. Keep behavior identical, add tests.</div></div></div>
+              <div class="msg sarathi"><div class="a">स</div><div class="bd"><div class="nm"><b>Sarathi</b> · planner (Disha) · 09:14</div><div class="bub">Classified as <b>codegen/refactor</b> → agent <b>claude</b>. Planned 3 units behind VERIFY + REVIEW. 6 acceptance criteria derived from the PRD brief.<div class="mini"><button>View plan</button><button>View AC (6)</button></div></div></div></div>
+              <div class="msg agent"><div class="a">CL</div><div class="bd"><div class="nm"><b>claude</b> · unit: model · 09:21</div><div class="bub">Extracted <code>PaymentState</code> enum and <code>Transition</code> table. 2 files changed, 38 lines. Self-check passed.<div class="mini"><button>View diff</button><button>Evidence</button></div></div></div></div>
+              <div class="msg sarathi"><div class="a">स</div><div class="bd"><div class="nm"><b>Sarathi</b> · approval gate · 09:22</div>
+                <div class="appr"><h4>⚠ Approval required — unit “migrate transitions”</h4><p>Rewrites 4 call-sites in <code>refunds.py</code>. Permission scope <b>repo_write_scoped</b> · blast radius est. 0.18.</p><div class="acts"><button class="btn ok">Approve &amp; dispatch</button><button class="btn no">Reject</button><button class="btn ghost">Change provider</button></div></div>
+              </div></div>
+              <div class="msg agent"><div class="a">CX</div><div class="bd"><div class="nm"><b>codex</b> · verify · 09:23</div><div class="bub">Test gate queued behind the approval above.</div></div></div>
+            </div>
+            <div class="comp"><div style="align-self:stretch;display:flex;align-items:center;gap:5px;padding:0 11px;border:1px solid var(--border);border-radius:11px;background:var(--field);color:var(--muted);font-size:12px;white-space:nowrap">You ▾</div><textarea placeholder="Send a message to agents…"></textarea><button class="snd">↑</button></div>
+            <div style="padding:6px 13px 11px;color:var(--faint);font-size:11px">Enter to send · visible to all agents on this ticket</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== OUTCOMES ===== -->
+      <section class="view" id="outcomes">
+        <div class="ph"><div class="row"><div><h1>Usage Stats</h1><p>Measured quality signals from HarnessOutcome — not just cost. Last 30 days.</p></div><div class="grow"></div><div class="seg"><button>7d</button><button class="on">30d</button><button>All</button></div></div></div>
+        <div class="stats">
+          <div class="card2 stat"><div class="l">Test pass rate</div><div class="v">94.2%</div><div class="dl up">▲ 3.1% vs baseline</div></div>
+          <div class="card2 stat"><div class="l">Avg blast radius</div><div class="v">0.11</div><div class="dl up">▼ 0.04 lower risk</div></div>
+          <div class="card2 stat"><div class="l">Median latency</div><div class="v">3.2s</div><div class="dl down">▲ 0.4s slower</div></div>
+          <div class="card2 stat"><div class="l">Tokens (actual)</div><div class="v">1.84M</div><div class="dl up">▼ 9% per task</div></div>
+          <div class="card2 stat"><div class="l">Policy proposals</div><div class="v">7</div><div class="dl up">3 accepted</div></div>
+        </div>
+        <div class="card2" style="overflow:hidden">
+          <div style="padding:14px 16px;border-bottom:1px solid var(--border-soft);display:flex;align-items:center"><b style="font-size:13px">Recent task outcomes</b><span class="note" style="margin-left:auto;margin-top:0">measured at LEARN phase · from dispatch evidence</span></div>
+          <table>
+            <thead><tr><th>Task</th><th>Class</th><th>Agent</th><th>Pass</th><th>Blast</th><th>Tokens</th><th>Latency</th><th>Trend</th></tr></thead>
+            <tbody>
+              <tr><td>Tokenize stored cards</td><td>codegen/refactor</td><td>claude</td><td class="num">6/6</td><td class="num">0.06</td><td class="num">214k</td><td class="num">4.1s</td><td><span class="spark"><i style="height:6px"></i><i style="height:9px"></i><i style="height:7px"></i><i style="height:13px"></i><i style="height:16px"></i></span></td></tr>
+              <tr><td>Upgrade Python to 3.12</td><td>mutation/config</td><td>claude</td><td class="num">5/5</td><td class="num">0.09</td><td class="num">141k</td><td class="num">2.7s</td><td><span class="spark"><i style="height:8px"></i><i style="height:7px"></i><i style="height:11px"></i><i style="height:10px"></i><i style="height:15px"></i></span></td></tr>
+              <tr><td>Fix null pointer in refund flow</td><td>codegen/patch</td><td>local</td><td class="num">3/3</td><td class="num">0.04</td><td class="num">38k</td><td class="num">1.2s</td><td><span class="spark"><i style="height:5px"></i><i style="height:8px"></i><i style="height:6px"></i><i style="height:12px"></i><i style="height:14px"></i></span></td></tr>
+              <tr><td>Backfill historical risk scores</td><td>mutation/data</td><td>claude</td><td class="num" style="color:var(--red)">2/7</td><td class="num">0.41</td><td class="num">96k</td><td class="num">6.8s</td><td><span class="spark"><i style="height:12px;background:var(--red)"></i><i style="height:9px;background:var(--red)"></i><i style="height:6px;background:var(--red)"></i><i style="height:7px;background:var(--red)"></i><i style="height:5px;background:var(--red)"></i></span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===== WIKI ===== -->
+      <section class="view" id="wiki">
+        <div class="ph"><div class="row"><div><h1>Wiki</h1><p>Workspace knowledge · approved &amp; proposal-backed edits</p></div><div class="grow"></div><button class="btn">Propose edit</button></div></div>
+        <div class="wiki">
+          <div class="wnav">
+            <div class="wi on">📐 Architecture <span class="g h">human</span></div>
+            <div class="wi">🚀 Development setup</div>
+            <div class="wi">🧭 Coding standards</div>
+            <div class="wi">🔌 Payment providers <span class="g">gen</span></div>
+            <div class="wi">🗄 Data model <span class="g">gen</span></div>
+            <div class="wi">📋 Runbooks</div>
+          </div>
+          <div class="doc">
+            <div class="banner">📝 A pending proposal updates this page with the new PaymentIntent state machine. <b>Review diff →</b></div>
+            <h2>Architecture</h2>
+            <div class="pv">Last edited by sweethome · 4 days ago · human-authored · linked to 3 tasks</div>
+            <p>The payments platform splits into a synchronous <code>checkout</code> service and an asynchronous <code>settlement</code> pipeline. All money-moving operations flow through the <code>PaymentIntent</code> aggregate — the single source of truth for a transaction's lifecycle.</p>
+            <h3>PaymentIntent lifecycle</h3>
+            <p>States: <code>created → authorized → captured → settled</code>, with <code>refunded</code> and <code>failed</code> as terminal branches. Transitions are being migrated to a typed state machine (see pending proposal above).</p>
+            <h3>Webhook delivery</h3>
+            <p>Provider webhooks ingest via an SQS FIFO queue keyed by <code>payment_intent_id</code> to guarantee per-transaction ordering. Idempotency is enforced at the handler boundary.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== SETTINGS ===== -->
+      <section class="view" id="settings">
+        <div class="ph"><div class="row"><div><h1>Settings</h1><p>Providers, policy, and governance for payments-platform</p></div></div></div>
+        <div class="tabs">
+          <div class="tab on"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M3 9h18"/></svg> Providers</div>
+          <div class="tab"><svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 8-8 10-4.5-2-8-5-8-10V6z"/></svg> Policy</div>
+          <div class="tab"><svg viewBox="0 0 24 24"><path d="M4 4h16v6H4z"/><path d="M4 14h16v6H4z"/></svg> Governance</div>
+          <div class="tab"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg> Preferences</div>
+        </div>
+        <div class="sgrid">
+          <div class="card2 sect">
+            <h3>🔌 Providers &amp; routing</h3>
+            <div class="prov"><div class="pic">CL</div><div class="pi"><b>claude</b><span>SDK · highest_capability lane</span></div><span class="st ok"><span class="d"></span>ready</span></div>
+            <div class="prov"><div class="pic">CX</div><div class="pi"><b>codex</b><span>CLI fallback · auth ok</span></div><span class="st wn"><span class="d"></span>fallback</span></div>
+            <div class="prov"><div class="pic">GW</div><div class="pi"><b>gateway</b><span>OpenAI-compatible · ollama:11434</span></div><span class="st ok"><span class="d"></span>ready</span></div>
+            <div class="prov"><div class="pic">LO</div><div class="pi"><b>local</b><span>deterministic · dry-run + tests</span></div><span class="st ok"><span class="d"></span>ready</span></div>
+            <div class="prov"><div class="pic">OC</div><div class="pi"><b>opencode</b><span>not configured</span></div><span class="st of"><span class="d"></span>off</span></div>
+            <p class="note">Secrets are stored via the local keychain and never rendered here.</p>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:14px">
+            <div class="card2 sect">
+              <h3>🛡 Policy pack</h3>
+              <div class="kvl"><span>Validation</span><b style="color:var(--green)">PASS · 0 drift</b></div>
+              <div class="kvl"><span>Patterns enabled</span><b>classify, fanout, judge, loop</b></div>
+              <div class="kvl"><span>Approval-gated classes</span><b>mutation/*, evolution/*</b></div>
+              <div class="kvl"><span>Cost budget (session)</span><b>$5.00 hard · $3.50 warn</b></div>
+            </div>
+            <div class="card2 sect">
+              <h3>⚙ Preferences</h3>
+              <div class="kvl"><span>Auto-schedule ready nodes</span><div class="tog on" onclick="this.classList.toggle('on')"><i></i></div></div>
+              <div class="kvl"><span>Require approval for irreversible ops</span><div class="tog on" onclick="this.classList.toggle('on')"><i></i></div></div>
+              <div class="kvl"><span>Show mock data when offline</span><div class="tog" onclick="this.classList.toggle('on')"><i></i></div></div>
+              <div class="saved">ⓘ Your changes haven't been saved</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== HISTORY ===== -->
+      <section class="view" id="history">
+        <div class="ph"><div class="row"><div><h1>History</h1><p>Phase transitions and governance events · payments-platform</p></div><div class="grow"></div><div class="seg"><button class="on">All</button><button>Approvals</button><button>Failures</button></div></div></div>
+        <div class="card2" style="overflow:hidden">
+          <table>
+            <thead><tr><th>Time</th><th>Task</th><th>Transition</th><th>Outcome</th><th>Iter</th><th>Key decisions</th></tr></thead>
+            <tbody>
+              <tr><td class="num">09:24</td><td>Refactor PaymentIntent state machine</td><td>BUILD → VERIFY</td><td><span class="tag t-run"><span class="d"></span>running</span></td><td class="num">2</td><td>Approved unit “migrate transitions”; scope repo_write_scoped</td></tr>
+              <tr><td class="num">08:51</td><td>Tokenize stored cards</td><td>VERIFY → REVIEW</td><td><span class="tag t-need"><span class="d"></span>gate</span></td><td class="num">1</td><td>Judge ×2 conf 0.81 · routed to human review (PCI scope)</td></tr>
+              <tr><td class="num">08:12</td><td>Backfill risk scores</td><td>BUILD → VERIFY</td><td><span class="tag t-block"><span class="d"></span>fail</span></td><td class="num">3</td><td>Verify 2/7 · blast radius 0.41 exceeded warn · halted</td></tr>
+              <tr><td class="num">Yesterday</td><td>Apply DB migration</td><td>PLAN → BUILD</td><td><span class="tag t-need"><span class="d"></span>gate</span></td><td class="num">1</td><td>Irreversible mutation/data · awaiting operator approval</td></tr>
+              <tr><td class="num">2d ago</td><td>Tokenize stored cards</td><td>PLAN → BUILD</td><td><span class="tag t-done"><span class="d"></span>pass</span></td><td class="num">1</td><td>Classified codegen/refactor → claude · 6 AC derived</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ===== AGENTS ===== -->
+      <section class="view" id="agents">
+        <div class="ph"><div class="row"><div><h1>Agents</h1><p>Provider runtime, transport posture, and Sarathi roles</p></div></div></div>
+        <div class="stats" style="grid-template-columns:repeat(3,1fr)">
+          <div class="card2" style="padding:15px">
+            <div style="display:flex;align-items:center;gap:11px;margin-bottom:13px">
+              <div style="width:34px;height:34px;border-radius:9px;background:var(--elev2);display:grid;place-items:center;font-family:var(--mono);font-weight:700;font-size:11px;color:var(--muted)">CL</div>
+              <div style="flex:1"><b style="font-size:12.5px">claude</b><span style="display:block;color:var(--faint);font-size:11px">SDK · highest_capability</span></div>
+              <span class="st ok"><span class="d"></span>ready</span>
+            </div>
+            <div class="kvl"><span>Transport</span><b>SDK · in-process</b></div>
+            <div class="kvl"><span>Active dispatches</span><b>2</b></div>
+            <div class="kvl"><span>Last checked</span><b>12s ago</b></div>
+          </div>
+          <div class="card2" style="padding:15px">
+            <div style="display:flex;align-items:center;gap:11px;margin-bottom:13px">
+              <div style="width:34px;height:34px;border-radius:9px;background:var(--elev2);display:grid;place-items:center;font-family:var(--mono);font-weight:700;font-size:11px;color:var(--muted)">CX</div>
+              <div style="flex:1"><b style="font-size:12.5px">codex</b><span style="display:block;color:var(--faint);font-size:11px">CLI fallback · auth ok</span></div>
+              <span class="st wn"><span class="d"></span>fallback</span>
+            </div>
+            <div class="kvl"><span>Transport</span><b>CLI · subprocess</b></div>
+            <div class="kvl"><span>Active dispatches</span><b>1</b></div>
+            <div class="kvl"><span>Last checked</span><b>48s ago</b></div>
+          </div>
+          <div class="card2" style="padding:15px">
+            <div style="display:flex;align-items:center;gap:11px;margin-bottom:13px">
+              <div style="width:34px;height:34px;border-radius:9px;background:var(--elev2);display:grid;place-items:center;font-family:var(--mono);font-weight:700;font-size:11px;color:var(--muted)">GW</div>
+              <div style="flex:1"><b style="font-size:12.5px">gateway</b><span style="display:block;color:var(--faint);font-size:11px">OpenAI-compatible · ollama</span></div>
+              <span class="st ok"><span class="d"></span>ready</span>
+            </div>
+            <div class="kvl"><span>Transport</span><b>HTTP · localhost:11434</b></div>
+            <div class="kvl"><span>Active dispatches</span><b>0</b></div>
+            <div class="kvl"><span>Last checked</span><b>5s ago</b></div>
+          </div>
+        </div>
+        <div class="card2 sect">
+          <h3>Sarathi roles</h3>
+          <div class="kvl"><span>Disha · planner</span><b>PLAN / PLANNING_ADVISOR</b></div>
+          <div class="kvl"><span>Nirman · builder</span><b>BUILD</b></div>
+          <div class="kvl"><span>Pariksha · verifier</span><b>VERIFY / REVIEW</b></div>
+          <div class="kvl"><span>Smriti · learner</span><b>LEARN</b></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script>
+  function go(el){
+    var v=el.getAttribute('data-view');
+    document.querySelectorAll('.ni').forEach(n=>n.classList.remove('active'));
+    document.querySelectorAll('.ni[data-view="'+v+'"]').forEach(n=>n.classList.add('active'));
+    document.querySelectorAll('.view').forEach(s=>s.classList.remove('active'));
+    document.getElementById(v).classList.add('active');
+    var L={dashboard:'Dashboard',wiki:'Wiki',outcomes:'Usage Stats',settings:'Settings',history:'History',agents:'Agents'};
+    document.getElementById('crumb').textContent=L[v];
+    document.querySelector('.content').scrollTop=0;
+  }
+  function openTask(){
+    document.querySelectorAll('.view').forEach(s=>s.classList.remove('active'));
+    document.getElementById('task').classList.add('active');
+    document.getElementById('crumb').textContent='Refactor PaymentIntent state machine';
+    document.querySelectorAll('.ni').forEach(n=>n.classList.remove('active'));
+  }
+  function toggleTheme(){
+    var h=document.documentElement, d=h.getAttribute('data-theme')==='dark';
+    h.setAttribute('data-theme', d?'light':'dark');
+    document.getElementById('themebtn').textContent = d?'☀':'☾';
+  }
+  document.querySelectorAll('.tab').forEach(t=>t.onclick=function(){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));this.classList.add('on')});
+  document.addEventListener('click',function(e){var m=document.getElementById('orgmenu');if(!e.target.closest('.org-wrap'))m.classList.remove('open')});
+</script>
+</body>
+</html>

@@ -7,10 +7,19 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 try:
     from datetime import UTC
 except ImportError:
     UTC = timezone.utc
+
+try:
+    from .sandbox import build_sandbox_executor
+except ImportError:  # pragma: no cover - direct module import fallback
+    from sandbox import build_sandbox_executor
+
+if TYPE_CHECKING:
+    from .sandbox import SandboxExecutor
 
 
 @dataclass
@@ -28,6 +37,7 @@ class CommandResult:
     workdir: str | None = None
     timeout_seconds: int | None = None
     argv: list[str] | None = None
+    executor: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -54,6 +64,7 @@ class CommandResult:
             "timeout_seconds": self.timeout_seconds,
             "argv": self.argv or [],
             "command_name": self.command_name,
+            "executor": self.executor,
         }
 
 
@@ -65,6 +76,7 @@ class CommandRunner:
         execute_enabled: bool | None = None,
         workdir: str | None = None,
         timeout_seconds: int | None = None,
+        sandbox: "SandboxExecutor | None" = None,
     ):
         self.execute_enabled = (
             os.environ.get("SARATHI_EXEC_COMMANDS") == "1"
@@ -73,6 +85,13 @@ class CommandRunner:
         )
         self.workdir = workdir or os.environ.get("SARATHI_WORKDIR", os.getcwd())
         self.timeout_seconds = timeout_seconds or int(os.environ.get("SARATHI_COMMAND_TIMEOUT", "600"))
+        if sandbox is None:
+            sandbox_spec: object = os.environ.get("SARATHI_SANDBOX")
+            sandbox_runtime = os.environ.get("SARATHI_SANDBOX_RUNTIME")
+            if sandbox_spec and sandbox_runtime:
+                sandbox_spec = {"sandbox": sandbox_spec, "runtime": sandbox_runtime}
+            sandbox = build_sandbox_executor(sandbox_spec)
+        self.sandbox = sandbox
 
     @staticmethod
     def _timestamp() -> str:
@@ -126,6 +145,50 @@ class CommandRunner:
                 argv=argv,
             )
 
+        if self.sandbox is not None:
+            started_monotonic = time.monotonic()
+            sandbox_result = self.sandbox.run(
+                argv,
+                workdir=self.workdir,
+                timeout_seconds=self.timeout_seconds,
+            )
+            finished_at = self._timestamp()
+            duration = round(time.monotonic() - started_monotonic, 6)
+            executor_kind = self.sandbox.kind
+
+            # Infra failure (could not run the command at all): error set and
+            # no exit code. Surface as shell_error so VERIFY does not treat it
+            # as a real pass/fail signal.
+            if sandbox_result.error is not None and sandbox_result.exit_code is None:
+                return CommandResult(
+                    command=command,
+                    source="shell_error",
+                    error=sandbox_result.error,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_seconds=duration,
+                    workdir=self.workdir,
+                    timeout_seconds=self.timeout_seconds,
+                    argv=argv,
+                    executor=executor_kind,
+                )
+
+            out = (sandbox_result.stdout or "") + (sandbox_result.stderr or "")
+            return CommandResult(
+                command=command,
+                source="shell",
+                exit_code=sandbox_result.exit_code,
+                output_tail=out[-2000:],
+                error=sandbox_result.error,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_seconds=duration,
+                workdir=self.workdir,
+                timeout_seconds=self.timeout_seconds,
+                argv=argv,
+                executor=executor_kind,
+            )
+
         started_monotonic = time.monotonic()
         try:
             proc = subprocess.run(
@@ -163,4 +226,5 @@ class CommandRunner:
             workdir=self.workdir,
             timeout_seconds=self.timeout_seconds,
             argv=argv,
+            executor="host",
         )

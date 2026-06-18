@@ -240,6 +240,14 @@ Top-level routes today:
 - Manage Workspace
 - Task Studio (`/task/:id`)
 
+Screenshots from the local WebUI:
+
+![Sarathi WebUI dashboard](docs/assets/screenshots/webui-dashboard.png)
+
+![Sarathi WebUI task studio](docs/assets/screenshots/webui-task-studio.png)
+
+![Sarathi WebUI knowledge center](docs/assets/screenshots/webui-knowledge.png)
+
 For WebUI development:
 
 ```bash

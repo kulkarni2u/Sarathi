@@ -66,6 +66,13 @@ def test_distribution_name_is_sarathi_ai_with_sarathi_console_scripts():
     assert scripts["sarathi-mcp"] == "src.mcp_server:main"
 
 
+def test_python_requires_matches_core_ncp_dependency_floor():
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert pyproject["project"]["requires-python"] == ">=3.11"
+    assert "neural-context-protocol>=1.1.0,<2.0.0" in pyproject["project"]["dependencies"]
+
+
 def test_runtime_install_hints_use_sarathi_ai_distribution_name():
     for path in [Path("src/cli.py"), Path("src/mcp_server.py")]:
         content = path.read_text(encoding="utf-8")

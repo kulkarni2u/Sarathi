@@ -54,7 +54,7 @@ path, and optional MCP clients layer on top of the local runtime.
 
 ## Install
 
-Sarathi targets Python 3.10+.
+Sarathi targets Python 3.11+.
 
 ### One-line installer
 
@@ -305,7 +305,7 @@ npm run dist:mac
 ```
 
 The Electron packaging path currently expects Node.js 22.12+ and a host Python
-3.10+ runtime with Sarathi importable. It does not bundle a standalone Python
+3.11+ runtime with Sarathi importable. It does not bundle a standalone Python
 runtime yet.
 
 ## Local Service

@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev,tui,mcp]"       # dev + optional extras
-pip install -e ".[ncp]"               # optional: cross-session memory
+                                      # NCP (cross-session memory) ships as a core dependency — no extra needed
 ```
 
 ## Commands
@@ -86,7 +86,7 @@ HTTP service for workspace management, multi-worker scheduling, and policy propo
 
 ### NCP Adapter (`src/ncp_adapter/`)
 
-Optional integration with Neural Context Protocol for cross-session context and memory. Gated behind the `[ncp]` extra. The `trust_gate.py` arbitrates which context sources are trusted when NCP is active.
+Integration with Neural Context Protocol for cross-session context and memory. `neural-context-protocol` is a core dependency (installed with the base package); NCP adapters activate only when a workspace is bootstrapped via `sarathi init --ncp` and auto-detected at runtime. The `trust_gate.py` arbitrates which context sources are trusted when NCP is active.
 
 ## Key Invariants
 

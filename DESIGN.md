@@ -410,7 +410,7 @@ NCP (Neural Context Protocol) is an optional sidecar that replaces Sarathi's
 native context compilation, persistence, and artifact storage with persistent,
 cross-session NCP-backed services.
 
-**Package:** `pip install neural-context-protocol` (or `pip install sarathi[ncp]`)
+**Package:** `neural-context-protocol` ships as a core dependency of `sarathi-ai` (installed automatically; no extra required)
 **Repo:** https://github.com/kulkarni2u/neural-context-protocol
 
 ### Transport

@@ -63,17 +63,15 @@ this as soft-success (warn + exit 0), matching the "exit 0 on success" contract.
 ## Reproduce
 
 ```bash
-pip install neural-context-protocol httpx     # NCP 1.1.0; httpx is a declared Sarathi core dep
-mkdir -p .ncp
-cp docs/ncp/config.toml.example .ncp/config.toml      # SQLite store at .ncp/store.db
-cp docs/ncp/run.py.example .ncp/run.py && chmod +x .ncp/run.py
+python3 -m pip install "git+https://github.com/kulkarni2u/Sarathi.git"  # includes NCP 1.1+
+sarathi init --ncp                            # creates .ncp/config.toml and executable .ncp/run.py
 
 # sanity: round-trip a memory through the bridge
 ./.ncp/run.py write_memory '{"content":"hello","layer":"semantic","src":"agent_inferred","written_by":"me"}'
 ./.ncp/run.py fetch '{"query":"hello","k":3}'         # -> chunk:... hello
 
-# run a real task with NCP enabled (local deterministic provider; no API key)
-python3 -m src.cli run --ncp --policy-pack policy-pack/EXAMPLE "Document the NCP integration"
+# run a real task with NCP auto-detected (local deterministic provider; no API key)
+python3 -m src.cli run --policy-pack policy-pack/EXAMPLE "Document the NCP integration"
 ncp explain                                            # inspect the SQLite store
 ```
 
@@ -104,7 +102,7 @@ The 9 "baseline" test failures we carried during the cockpit build were **not
 real failures**: 7 were `tests/test_ncp_adapter/*` failing only because `httpx`
 (a *declared core dependency* in `pyproject.toml`) wasn't installed in the
 container — installing it made them pass. A session-start step that runs
-`pip install -e .` (and `pip install neural-context-protocol` if NCP is desired)
+`pip install -e .`
 keeps the environment correctly provisioned. The remaining 2
 `test_cli_ncp_integration` failures are a separate policy-pack auto-discovery
 quirk in those tests.

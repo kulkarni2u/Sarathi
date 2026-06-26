@@ -25,7 +25,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 GIT_SPEC_DEFAULT="git+https://github.com/kulkarni2u/Sarathi.git"
 MIN_PY_MAJOR=3
-MIN_PY_MINOR=10
+MIN_PY_MINOR=11
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -68,7 +68,7 @@ resolve_repo_root() {
 }
 
 # ---------------------------------------------------------------------------
-# Detect a Python >= 3.10 interpreter
+# Detect a Python >= 3.11 interpreter
 # ---------------------------------------------------------------------------
 py_is_recent_enough() {
     # $1 = interpreter path/name. Returns 0 if version >= MIN.
@@ -110,7 +110,7 @@ if [ -n "${SARATHI_INSTALL_SPEC:-}" ]; then
     INSTALL_SPEC="$SARATHI_INSTALL_SPEC"
     INSTALL_SOURCE="SARATHI_INSTALL_SPEC override"
 elif [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/pyproject.toml" ] \
-        && grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*"sarathi"' "$REPO_ROOT/pyproject.toml"; then
+        && grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*"sarathi-ai"' "$REPO_ROOT/pyproject.toml"; then
     INSTALL_SPEC="$REPO_ROOT"
     INSTALL_SOURCE="local checkout"
 else

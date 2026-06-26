@@ -14,8 +14,8 @@ Pass `--ncp` to bootstrap NCP (Neural Context Protocol) alongside the policy pac
 This creates a `.ncp/` directory in the target project so Sarathi can auto-detect
 NCP on subsequent runs.
 
-**Requires:** `pip install neural-context-protocol` (or `pip install sarathi[ncp]`)
-before running `sarathi init --ncp`. See [HOWTO.md §7](HOWTO.md#7-ncp-integration-optional)
+**Requires:** Sarathi installed from a package version that includes
+`neural-context-protocol>=1.1.0`. See [HOWTO.md §7](HOWTO.md#7-ncp-integration)
 for the full NCP setup guide.
 
 When `--ncp` is passed, `sarathi init` also generates a `workflow-patterns.md`

@@ -8,7 +8,7 @@ The plain functions in this module are MCP-independent: they return
 JSON-serializable dicts and never raise. ``create_server()`` wraps them as
 MCP tools using the optional ``mcp`` package (FastMCP). The ``mcp`` package
 is an OPTIONAL dependency -- core Sarathi imports and tests cleanly without
-it. Install it with ``pip install 'sarathi[mcp]'``.
+it. Install it with ``pip install 'sarathi-ai[mcp]'``.
 """
 from __future__ import annotations
 
@@ -547,7 +547,7 @@ def create_server():
     except ImportError as exc:  # pragma: no cover - exercised when mcp absent
         raise ImportError(
             "The 'mcp' package is required to run the Sarathi MCP server. "
-            "Install it with: pip install 'sarathi[mcp]'"
+            "Install it with: pip install 'sarathi-ai[mcp]'"
         ) from exc
 
     server = FastMCP("sarathi")

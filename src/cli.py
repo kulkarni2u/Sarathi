@@ -51,6 +51,88 @@ except ImportError:
 import time
 
 
+def _find_ncp_template(filename: str) -> Path | None:
+    """Return the source or installed NCP template path."""
+    candidates = [
+        Path(__file__).resolve().parents[1] / "docs" / "ncp" / filename,
+        Path(sys.prefix) / "share" / "sarathi" / "ncp" / filename,
+        Path(sys.base_prefix) / "share" / "sarathi" / "ncp" / filename,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _ensure_ncp_sidecar(init_target: Path) -> dict[str, bool]:
+    """Ensure Sarathi's direct-mode NCP files exist under ``init_target/.ncp``."""
+    import shutil
+
+    ncp_dir = init_target / ".ncp"
+    ncp_dir.mkdir(parents=True, exist_ok=True)
+
+    created = {"config": False, "run_py": False}
+    config_path = ncp_dir / "config.toml"
+    if not config_path.exists():
+        config_template = _find_ncp_template("config.toml.example")
+        if config_template is not None:
+            shutil.copyfile(config_template, config_path)
+            created["config"] = True
+
+    run_path = ncp_dir / "run.py"
+    if not run_path.exists():
+        run_template = _find_ncp_template("run.py.example")
+        if run_template is not None:
+            shutil.copyfile(run_template, run_path)
+            created["run_py"] = True
+
+    if run_path.exists():
+        run_path.chmod(run_path.stat().st_mode | 0o111)
+
+    return created
+
+
+def _prompt_yes_no(label: str, default: bool) -> bool:
+    """Prompt for a yes/no setup choice."""
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        answer = input(f"{label} {suffix} ").strip().lower()
+        if not answer:
+            return default
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Please answer yes or no.")
+
+
+def _setup_choice(args: argparse.Namespace, attr: str, label: str, default: bool) -> bool:
+    """Resolve a setup component from explicit flags, --yes, or prompt."""
+    explicit = getattr(args, attr)
+    if explicit is not None:
+        return bool(explicit)
+    if getattr(args, "yes", False):
+        return default
+    return _prompt_yes_no(label, default)
+
+
+def _setup_extras_install_plan(extras: list[str], repo_root: Path) -> tuple[str, list[str], str | None]:
+    """Return display text, command, and cwd for installing selected extras."""
+    extras_spec = ",".join(extras)
+    source_checkout = (repo_root / "pyproject.toml").exists()
+    if source_checkout:
+        return (
+            f'python3 -m pip install -e ".[{extras_spec}]"',
+            [sys.executable, "-m", "pip", "install", "-e", f".[{extras_spec}]"],
+            str(repo_root),
+        )
+    return (
+        f'python3 -m pip install "sarathi-ai[{extras_spec}]"',
+        [sys.executable, "-m", "pip", "install", f"sarathi-ai[{extras_spec}]"],
+        None,
+    )
+
+
 def _resolve_workspace_ncp(args, cwd: str) -> bool | None:
     """Resolve ncp_enabled from CLI flags and workspace metadata.
     
@@ -470,6 +552,53 @@ def main() -> None:
     )
     subparsers = parser.add_subparsers(dest="command")
 
+    # Setup command
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="Interactively configure Sarathi components for this machine/workspace",
+    )
+    setup_parser.add_argument(
+        "--workspace",
+        default=".",
+        help="Workspace to initialize when NCP is enabled (default: .)",
+    )
+    setup_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Accept recommended defaults without prompting",
+    )
+    setup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the setup plan without changing files or installing dependencies",
+    )
+    setup_parser.add_argument(
+        "--install-extras",
+        action="store_true",
+        help="Install selected optional Python extras with pip",
+    )
+    for flag, help_text in [
+        ("tui", "Terminal UI support"),
+        ("mcp", "MCP server support"),
+        ("webui", "Web cockpit assets/build guidance"),
+        ("ncp", "NCP workspace bootstrap"),
+        ("desktop", "Desktop launcher guidance"),
+    ]:
+        group = setup_parser.add_mutually_exclusive_group()
+        group.add_argument(
+            f"--{flag}",
+            dest=f"setup_{flag}",
+            action="store_true",
+            default=None,
+            help=f"Enable {help_text}",
+        )
+        group.add_argument(
+            f"--no-{flag}",
+            dest=f"setup_{flag}",
+            action="store_false",
+            help=f"Skip {help_text}",
+        )
+
     # Init command
     init_parser = subparsers.add_parser("init", help="Initialize a new Sarathi policy pack")
     init_parser.add_argument(
@@ -699,6 +828,9 @@ def main() -> None:
     if args.command is None:
         _show_home()
         return
+    if args.command == "setup":
+        handle_setup(args)
+        return
     if args.command in ("tui", "dashboard", "chat"):
         handle_tui(args)
         return
@@ -796,6 +928,14 @@ def handle_init(args: argparse.Namespace) -> None:
         else:
             print(f"  ⚠ NCP init warning: {ncp_init_result.stderr.strip()}")
 
+        sidecar_created = _ensure_ncp_sidecar(init_target)
+        if sidecar_created["config"]:
+            print("  ✓ Wrote .ncp/config.toml from Sarathi template")
+        if sidecar_created["run_py"]:
+            print("  ✓ Wrote .ncp/run.py direct-mode bridge")
+        elif (init_target / ".ncp" / "run.py").exists():
+            print("  ✓ Verified .ncp/run.py direct-mode bridge")
+
         # 2. Write Sarathi-optimized config overrides
         ncp_config_path = init_target / ".ncp" / "config.toml"
         if ncp_config_path.exists():
@@ -815,7 +955,8 @@ default_ttl_hours = 168
         welcome_path.write_text(
             "# NCP + Sarathi\n\n"
             "NCP is configured as the context handler for this project.\n"
-            "Run `sarathi run --ncp \"task description\"` to use it.\n"
+            "Run `sarathi run \"task description\"` to use auto-detected NCP, "
+            "or pass `--no-ncp` to use native adapters.\n"
         )
         print("  ✓ Wrote .ncp/WELCOME.md")
 
@@ -824,6 +965,91 @@ default_ttl_hours = 168
     print(f"  1. Review generated files in {policy_path}/")
     print(f"  2. Customize policy-pack/*.md to your team's needs")
     print(f"  3. Run: sarathi validate {policy_path}")
+
+
+def handle_setup(args: argparse.Namespace) -> None:
+    """Handle the setup command."""
+    workspace = Path(args.workspace).expanduser().resolve()
+    choices = {
+        "tui": _setup_choice(args, "setup_tui", "Enable Terminal UI?", True),
+        "mcp": _setup_choice(args, "setup_mcp", "Enable MCP server?", False),
+        "webui": _setup_choice(args, "setup_webui", "Enable WebUI?", True),
+        "ncp": _setup_choice(args, "setup_ncp", "Initialize NCP for this workspace?", True),
+        "desktop": _setup_choice(args, "setup_desktop", "Configure desktop launcher?", False),
+    }
+
+    labels = {
+        "tui": "Terminal UI",
+        "mcp": "MCP server",
+        "webui": "WebUI",
+        "ncp": "NCP workspace",
+        "desktop": "Desktop launcher",
+    }
+    extras = [name for name in ("tui", "mcp") if choices[name]]
+    repo_root = Path(__file__).resolve().parents[1]
+    web_dir = repo_root / "web"
+
+    print("Sarathi setup plan")
+    print(f"Workspace: {workspace}")
+    for name in ("tui", "mcp", "webui", "ncp", "desktop"):
+        state = "enabled" if choices[name] else "skipped"
+        print(f"{labels[name]}: {state}")
+
+    planned_commands: list[tuple[str, list[str] | None]] = []
+    if extras:
+        display, command, _cwd = _setup_extras_install_plan(extras, repo_root)
+        planned_commands.append((
+            display,
+            command,
+        ))
+    if choices["webui"]:
+        planned_commands.append((
+            f"cd {web_dir} && npm install && npm run build",
+            None,
+        ))
+    if choices["ncp"]:
+        planned_commands.append((
+            f"sarathi init {workspace} --ncp",
+            None,
+        ))
+    if choices["desktop"]:
+        planned_commands.append((
+            "sarathi desktop",
+            None,
+        ))
+
+    if planned_commands:
+        print("\nPlanned actions:")
+        for display, _cmd in planned_commands:
+            prefix = "Would run" if args.dry_run else "Run"
+            print(f"{prefix}: {display}")
+    else:
+        print("\nNo components selected.")
+
+    if args.dry_run:
+        print("\nDry run: no changes made.")
+        return
+
+    import subprocess
+
+    if extras:
+        if args.install_extras:
+            _display, command, cwd = _setup_extras_install_plan(extras, repo_root)
+            subprocess.run(
+                command,
+                cwd=cwd,
+                check=True,
+            )
+        else:
+            print("\nOptional Python extras were not installed. Re-run with --install-extras to apply them.")
+
+    if choices["ncp"]:
+        handle_init(argparse.Namespace(target_path=str(workspace), engine="markdown", ncp=True, no_wiki=False))
+
+    if choices["webui"]:
+        print(f"\nWebUI selected. Build assets when needed with: cd {web_dir} && npm install && npm run build")
+    if choices["desktop"]:
+        print("Desktop launcher selected. Start it with: sarathi desktop")
 
 
 def handle_validate(args: argparse.Namespace) -> None:
@@ -1054,7 +1280,7 @@ def handle_tui(args: argparse.Namespace) -> None:
         import textual  # noqa: F401
     except ModuleNotFoundError:
         print("The Sarathi dashboard requires the optional TUI dependencies.")
-        print('Install them with: python3 -m pip install "sarathi[tui]"')
+        print('Install them with: python3 -m pip install "sarathi-ai[tui]"')
         raise SystemExit(1)
     try:
         from .tui import launch_sarathi_tui

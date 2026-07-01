@@ -20,6 +20,13 @@ from .agent_spec import (
     parse_agent_spec_dict,
     resolve_tool_callable,
 )
+from .autoresearch import (
+    AutoresearchEvidence,
+    AutoresearchExperiment,
+    AutoresearchStore,
+    AutoresearchVerdict,
+    EvidenceTier,
+)
 from .artifacts import ArtifactStore
 from .budget import TaskBudget
 from .commands import CommandResult, CommandRunner
@@ -73,6 +80,11 @@ __all__ = [
     "register_agent_role",
     "registered_agent_roles",
     "clear_registered_agent_roles",
+    "AutoresearchEvidence",
+    "AutoresearchExperiment",
+    "AutoresearchStore",
+    "AutoresearchVerdict",
+    "EvidenceTier",
     "ArtifactStore",
     "TaskBudget",
     "CommandResult",

@@ -203,6 +203,60 @@ def test_handle_run_executes_when_preflight_passes(tmp_path, capsys):
     assert "Pravaha" in output
 
 
+def test_handle_autoresearch_register_evidence_and_verdict(tmp_path, capsys):
+    register_args = Namespace(
+        action="register",
+        store=str(tmp_path),
+        hypothesis="Review packets reduce reviewer tool calls",
+        prediction="Reviewer tool calls drop below 2 per review",
+        tier="MINE",
+        method="Mine existing review runs",
+        quality_gate="Manual inspection confirms no missing spec verdicts",
+        created_by="vichara",
+    )
+
+    cli.handle_autoresearch(register_args)
+    register_output = capsys.readouterr().out
+
+    assert "Registered experiment" in register_output
+    experiment_id = register_output.split("Registered experiment ", 1)[1].split()[0]
+
+    evidence_args = Namespace(
+        action="evidence",
+        store=str(tmp_path),
+        experiment_id=experiment_id,
+        summary="Reviewer tool calls fell from 6.4 to 1.0",
+        uri="sarathi://runs/review-package",
+        metric=["tool_calls=1.0", "baseline=6.4"],
+        recorded_by="nirnaya",
+    )
+    cli.handle_autoresearch(evidence_args)
+    evidence_output = capsys.readouterr().out
+    assert "Recorded evidence" in evidence_output
+    evidence_id = evidence_output.split("Recorded evidence ", 1)[1].split()[0]
+
+    verdict_args = Namespace(
+        action="verdict",
+        store=str(tmp_path),
+        experiment_id=experiment_id,
+        verdict="confirmed",
+        summary="Keep review-package handoff",
+        evidence_ref=[evidence_id],
+        cost_usd=0.0,
+        recorded_by="sarathi",
+    )
+    cli.handle_autoresearch(verdict_args)
+    verdict_output = capsys.readouterr().out
+    assert "Recorded verdict confirmed" in verdict_output
+
+    list_args = Namespace(action="list", store=str(tmp_path), status=None)
+    cli.handle_autoresearch(list_args)
+    list_output = capsys.readouterr().out
+    assert "Autoresearch Experiments: 1" in list_output
+    assert "Review packets reduce reviewer tool calls" in list_output
+    assert "confirmed" in list_output
+
+
 def test_handle_run_reports_paused_graph_execution(tmp_path, capsys, monkeypatch):
     policy_dir = tmp_path / "policy-pack"
     _write_policy_pack(policy_dir)

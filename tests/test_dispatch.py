@@ -1,7 +1,9 @@
 import json
 import sys
 
-from src.dispatch import LocalDispatcher, NullDispatcher, TaskSpec
+import pytest
+
+from src.dispatch import LocalDispatcher, MissingHarnessError, NullDispatcher, TaskSpec, require_harness_id
 from src.runtime import DispatchRequest, DispatchResponse
 from src.runtime.providers import (
     AnthropicSdkProviderAdapter,
@@ -11,6 +13,43 @@ from src.runtime.providers import (
     OpenAISdkProviderAdapter,
     OpenCodeSdkProviderAdapter,
 )
+
+
+def test_require_harness_id_raises_for_child_task_dispatch_without_harness():
+    request = DispatchRequest(
+        mode="execute",
+        task_id="node-1",
+        phase="Build",
+        prompt="do work",
+        constraints={"purpose": "child_task_execution"},
+    )
+    with pytest.raises(MissingHarnessError):
+        require_harness_id(request)
+
+
+def test_require_harness_id_passes_for_child_task_dispatch_with_harness():
+    request = DispatchRequest(
+        mode="execute",
+        task_id="node-1",
+        phase="Build",
+        prompt="do work",
+        constraints={"purpose": "child_task_execution"},
+        harness_id="h-1",
+    )
+    require_harness_id(request)  # should not raise
+
+
+def test_require_harness_id_is_a_noop_for_non_child_task_dispatch():
+    """Single-task phase dispatch (brainstorm/plan/build/review) doesn't tag
+    purpose == 'child_task_execution' and isn't required to carry harness_id
+    yet — this check is scoped to graph-node dispatch only."""
+    request = DispatchRequest(
+        mode="execute",
+        task_id="task-1",
+        phase="Brainstorm",
+        prompt="think",
+    )
+    require_harness_id(request)  # should not raise despite harness_id being None
 
 
 def test_null_dispatcher_execute():

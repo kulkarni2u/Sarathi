@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 try:
     from datetime import UTC
 except ImportError:
@@ -111,6 +112,7 @@ class TaskGraphExecutor:
         ncp_persistence_adapter=None,
         workflow_patterns_policy: "WorkflowPatternsPolicy | None" = None,
         max_parallel: int | None = None,
+        harness_config: Any = None,
     ):
         self.dispatcher = dispatcher
         self.dispatch_phase = dispatch_phase
@@ -120,12 +122,29 @@ class TaskGraphExecutor:
         self.ncp_whisper_router = ncp_whisper_router
         self.ncp_persistence_adapter = ncp_persistence_adapter
         self.workflow_patterns_policy = workflow_patterns_policy
+        # The HarnessConfig (src/harness.py) compiled for the parent task,
+        # if any. Every node this executor dispatches carries the harness_id
+        # of this config on its DispatchRequest — the "declare before
+        # dispatch" invariant (see CLAUDE.md) applied to graph nodes, not
+        # just the single top-level routed task. Callers that drive many
+        # tasks through one long-lived executor (e.g. BuildHandler) should
+        # pass a fresher ``harness_config`` into execute_*() per call instead
+        # of relying on this constructor default.
+        self.harness_config = harness_config
         if max_parallel is None:
             try:
                 max_parallel = int(os.environ.get("SARATHI_GRAPH_MAX_PARALLEL", "4"))
             except ValueError:
                 max_parallel = 4
         self.max_parallel = max(1, max_parallel)
+
+    def _resolve_harness(self, harness_config: Any) -> Any:
+        """Return the effective harness for a dispatch call.
+
+        Falls back to the executor's own ``self.harness_config`` when the
+        caller doesn't override it for this specific call.
+        """
+        return harness_config if harness_config is not None else self.harness_config
 
     @staticmethod
     def _timestamp() -> str:
@@ -154,14 +173,20 @@ class TaskGraphExecutor:
             break
         return graph
 
-    def execute_next(self, graph: dict, fail_node_id: str | None = None, fail_error: str | None = None) -> GraphExecutionResult:
+    def execute_next(
+        self,
+        graph: dict,
+        fail_node_id: str | None = None,
+        fail_error: str | None = None,
+        harness_config: Any = None,
+    ) -> GraphExecutionResult:
         """Execute the next ready node only."""
         current = _copy_graph_state(graph)
         ready = next_ready_node(current)
         if ready is None:
             return GraphExecutionResult(graph_state=current, events=[])
 
-        provider_result = self._dispatch_node(ready, graph=current)
+        provider_result = self._dispatch_node(ready, graph=current, harness_config=harness_config)
         updated, event, _failed = self._apply_node_result(
             current, ready, provider_result, fail_node_id=fail_node_id, fail_error=fail_error
         )
@@ -173,22 +198,38 @@ class TaskGraphExecutor:
         max_nodes: int | None = None,
         fail_node_id: str | None = None,
         fail_error: str | None = None,
+        harness_config: Any = None,
     ) -> GraphExecutionResult:
         """Execute up to `max_nodes` ready nodes in dependency order."""
         if max_nodes is None:
-            return self.execute_all(graph, fail_node_id=fail_node_id, fail_error=fail_error)
+            return self.execute_all(
+                graph, fail_node_id=fail_node_id, fail_error=fail_error, harness_config=harness_config
+            )
         if max_nodes <= 0:
             current = _copy_graph_state(graph)
             return GraphExecutionResult(graph_state=current, events=[])
-        return self._execute_loop(graph, max_nodes=max_nodes, fail_node_id=fail_node_id, fail_error=fail_error)
+        return self._execute_loop(
+            graph,
+            max_nodes=max_nodes,
+            fail_node_id=fail_node_id,
+            fail_error=fail_error,
+            harness_config=harness_config,
+        )
 
     def execute_all(
         self,
         graph: dict,
         fail_node_id: str | None = None,
         fail_error: str | None = None,
+        harness_config: Any = None,
     ) -> GraphExecutionResult:
-        return self._execute_loop(graph, max_nodes=None, fail_node_id=fail_node_id, fail_error=fail_error)
+        return self._execute_loop(
+            graph,
+            max_nodes=None,
+            fail_node_id=fail_node_id,
+            fail_error=fail_error,
+            harness_config=harness_config,
+        )
 
     def _execute_loop(
         self,
@@ -197,6 +238,7 @@ class TaskGraphExecutor:
         max_nodes: int | None,
         fail_node_id: str | None,
         fail_error: str | None,
+        harness_config: Any = None,
     ) -> GraphExecutionResult:
         """Drive the graph to completion in batches of independent ready nodes.
 
@@ -219,7 +261,7 @@ class TaskGraphExecutor:
             batch = self._ready_batch(current, limit=remaining)
             if not batch:
                 break
-            for ready, provider_result in self._dispatch_batch(batch, current):
+            for ready, provider_result in self._dispatch_batch(batch, current, harness_config=harness_config):
                 current, event, failed = self._apply_node_result(
                     current, ready, provider_result, fail_node_id=fail_node_id, fail_error=fail_error
                 )
@@ -245,7 +287,7 @@ class TaskGraphExecutor:
         return batch
 
     def _dispatch_batch(
-        self, batch: list[dict], graph: dict
+        self, batch: list[dict], graph: dict, *, harness_config: Any = None
     ) -> list[tuple[dict, dict | None]]:
         """Dispatch a batch of independent ready nodes, concurrently when possible.
 
@@ -254,9 +296,15 @@ class TaskGraphExecutor:
         parallelize them effectively. Results are returned in batch order.
         """
         if len(batch) == 1 or self.max_parallel <= 1 or self.dispatcher is None:
-            return [(node, self._dispatch_node(node, graph=graph)) for node in batch]
+            return [
+                (node, self._dispatch_node(node, graph=graph, harness_config=harness_config))
+                for node in batch
+            ]
         with ThreadPoolExecutor(max_workers=min(self.max_parallel, len(batch))) as pool:
-            futures = [pool.submit(self._dispatch_node, node, graph=graph) for node in batch]
+            futures = [
+                pool.submit(self._dispatch_node, node, graph=graph, harness_config=harness_config)
+                for node in batch
+            ]
             return [(node, future.result()) for node, future in zip(batch, futures)]
 
     def _apply_node_result(
@@ -657,7 +705,9 @@ class TaskGraphExecutor:
         )
         return cp.to_artifact(), cp.agent_input.token_budget
 
-    def _dispatch_node(self, node: dict, *, graph: dict | None = None) -> dict | None:
+    def _dispatch_node(
+        self, node: dict, *, graph: dict | None = None, harness_config: Any = None
+    ) -> dict | None:
         """Dispatch a ready node as a child work unit when a dispatcher is configured."""
         if self.dispatcher is None:
             return None
@@ -688,6 +738,14 @@ class TaskGraphExecutor:
         if node_provider:
             constraints["provider"] = node_provider
 
+        # "Declare before dispatch": stamp the harness_id of the HarnessConfig
+        # already compiled for the parent task (in ROUTE) onto this node's
+        # DispatchRequest. Every graph node — including FANOUT branches and
+        # JUDGE candidates — dispatches under the same declared permission /
+        # budget contract as the task it belongs to. See src/harness.py.
+        effective_harness = self._resolve_harness(harness_config)
+        harness_id = getattr(effective_harness, "harness_id", None)
+
         request = DispatchRequest(
             mode="execute",
             task_id=str(node.get("id", "unknown")),
@@ -703,6 +761,7 @@ class TaskGraphExecutor:
             context_pack=context_pack_artifact,
             token_budget=token_budget,
             retry_budget=0,
+            harness_id=harness_id,
         )
         try:
             response = self.dispatcher.dispatch(request)

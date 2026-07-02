@@ -35,7 +35,8 @@ class TaskScheduler:
         *,
         phase: str = "Build",
         max_nodes: int | None = None,
+        harness_config: Any = None,
     ) -> SchedulerRun:
         executor = TaskGraphExecutor(dispatcher=self.dispatcher, dispatch_phase=phase)
-        result = executor.execute_some(graph, max_nodes=max_nodes)
+        result = executor.execute_some(graph, max_nodes=max_nodes, harness_config=harness_config)
         return SchedulerRun(phase=phase, graph_state=result.graph_state, events=result.events)

@@ -9,12 +9,14 @@ try:
         validate_graph_execution_config,
         validate_provider_routing_config,
         validate_quality_loop_config,
+        validate_recovery_classification_config,
     )
 except ImportError:
     from runtime import (
         validate_graph_execution_config,
         validate_provider_routing_config,
         validate_quality_loop_config,
+        validate_recovery_classification_config,
     )
 
 
@@ -114,6 +116,12 @@ def semantic_issues(policy_pack_path: str) -> dict[str, str]:
         quality_issues = validate_quality_loop_config(section.typed_data.get("quality_loop"))
         if quality_issues:
             issues[Path(section.path).name] = "; ".join(quality_issues)
+            continue
+        recovery_issues = validate_recovery_classification_config(
+            section.typed_data.get("recovery_classification")
+        )
+        if recovery_issues:
+            issues[Path(section.path).name] = "; ".join(recovery_issues)
             continue
         if section_name == "model_routing":
             provider_issues = validate_provider_routing_config(section.typed_data)

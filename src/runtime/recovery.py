@@ -7,12 +7,238 @@ try:
     from datetime import UTC
 except ImportError:
     UTC = timezone.utc
-from typing import Any
+from typing import Any, NamedTuple
 
 try:
     from .contracts import DispatchRequest
 except ImportError:
     from runtime.contracts import DispatchRequest
+
+
+class ReasonRule(NamedTuple):
+    """One ordered rule used to derive a human-readable recovery reason."""
+
+    artifact: str
+    field: str
+    check: str  # "equals" or "truthy"
+    expected: Any
+    reason: str
+
+
+@dataclass(frozen=True)
+class RecoveryClassificationPolicy:
+    """Runtime policy for classifying phase failures into recovery classes.
+
+    Mirrors the ``QualityLoopPolicy`` pattern: defaults reproduce today's
+    hardcoded substring-matching behavior byte-for-byte, and policy packs can
+    override or extend the rules via ``escalation.md``'s
+    ``recovery_classification`` block.
+    """
+
+    reason_rules: tuple[ReasonRule, ...] = (
+        ReasonRule("verification_summary", "command_succeeded", "equals", False, "verification command failed"),
+        ReasonRule("verification_summary", "lint_errors", "truthy", None, "lint errors detected"),
+        ReasonRule("review_summary", "failed", "truthy", None, "review findings require retry"),
+    )
+    default_reason: str = "phase requested recovery"
+
+    error_text_rules: tuple[tuple[tuple[str, ...], str], ...] = (
+        (("authorization token", "auth"), "auth"),
+        (("provider unavailable", "cli path not found"), "provider_offline"),
+    )
+    native_cli_invocation_kind: str = "native_cli"
+    native_cli_class: str | None = "native_cli_failure"
+    reason_keyword_rules: tuple[tuple[str, str], ...] = (("review", "review_content"),)
+    default_class: str = "generic_retry"
+
+    @classmethod
+    def from_escalation(cls, escalation: dict[str, Any] | None = None) -> "RecoveryClassificationPolicy":
+        if not isinstance(escalation, dict):
+            return cls()
+        config = escalation.get("recovery_classification")
+        if not isinstance(config, dict):
+            return cls()
+        defaults = cls()
+        return cls(
+            reason_rules=_parse_reason_rules(config.get("reason_rules"), defaults.reason_rules),
+            default_reason=_string_or_default(config, "default_reason", defaults.default_reason),
+            error_text_rules=_parse_error_text_rules(config.get("error_text_rules"), defaults.error_text_rules),
+            native_cli_invocation_kind=_string_or_default(
+                config, "native_cli_invocation_kind", defaults.native_cli_invocation_kind
+            ),
+            native_cli_class=_optional_string_or_default(config, "native_cli_class", defaults.native_cli_class),
+            reason_keyword_rules=_parse_keyword_rules(
+                config.get("reason_keyword_rules"), defaults.reason_keyword_rules
+            ),
+            default_class=_string_or_default(config, "default_class", defaults.default_class),
+        )
+
+    def classify_reason(self, result: Any) -> str:
+        """Derive a human-readable reason from a phase result's artifacts."""
+        artifacts = getattr(result, "artifacts", {}) or {}
+        for rule in self.reason_rules:
+            section = artifacts.get(rule.artifact)
+            if not isinstance(section, dict):
+                continue
+            value = section.get(rule.field)
+            if rule.check == "equals" and value == rule.expected:
+                return rule.reason
+            if rule.check == "truthy" and bool(value):
+                return rule.reason
+        return self.default_reason
+
+    def classify(
+        self,
+        *,
+        error_text: str,
+        provider_context: dict[str, Any] | None,
+        reason: str,
+    ) -> str:
+        """Classify a failure into a recovery class using policy-defined rules."""
+        text = (error_text or "").lower()
+        for matches, recovery_class in self.error_text_rules:
+            if any(match in text for match in matches):
+                return recovery_class
+        if (
+            self.native_cli_class
+            and provider_context
+            and provider_context.get("invocation_kind") == self.native_cli_invocation_kind
+        ):
+            return self.native_cli_class
+        reason_lower = (reason or "").lower()
+        for keyword, recovery_class in self.reason_keyword_rules:
+            if keyword in reason_lower:
+                return recovery_class
+        return self.default_class
+
+    def to_artifact(self) -> dict[str, Any]:
+        return {
+            "reason_rules": [
+                {
+                    "artifact": rule.artifact,
+                    "field": rule.field,
+                    "check": rule.check,
+                    "expected": rule.expected,
+                    "reason": rule.reason,
+                }
+                for rule in self.reason_rules
+            ],
+            "default_reason": self.default_reason,
+            "error_text_rules": [
+                {"matches": list(matches), "class": recovery_class}
+                for matches, recovery_class in self.error_text_rules
+            ],
+            "native_cli_invocation_kind": self.native_cli_invocation_kind,
+            "native_cli_class": self.native_cli_class,
+            "reason_keyword_rules": [
+                {"keyword": keyword, "class": recovery_class}
+                for keyword, recovery_class in self.reason_keyword_rules
+            ],
+            "default_class": self.default_class,
+        }
+
+
+def validate_recovery_classification_config(config: Any) -> list[str]:
+    """Return validation issues for a recovery_classification policy block."""
+    if config is None:
+        return []
+    if not isinstance(config, dict):
+        return ["recovery_classification must be a mapping"]
+
+    issues: list[str] = []
+    for key in ("error_text_rules", "reason_rules", "reason_keyword_rules"):
+        value = config.get(key)
+        if key in config and not isinstance(value, list):
+            issues.append(f"recovery_classification.{key} must be a list")
+    for key in ("default_class", "default_reason", "native_cli_invocation_kind"):
+        value = config.get(key)
+        if key in config and not (isinstance(value, str) and value):
+            issues.append(f"recovery_classification.{key} must be a non-empty string")
+    if "native_cli_class" in config:
+        value = config["native_cli_class"]
+        if value is not None and not (isinstance(value, str) and value):
+            issues.append("recovery_classification.native_cli_class must be a non-empty string or null")
+    return issues
+
+
+def _string_or_default(config: dict[str, Any], key: str, default: str) -> str:
+    value = config.get(key)
+    return value if isinstance(value, str) and value else default
+
+
+def _optional_string_or_default(config: dict[str, Any], key: str, default: str | None) -> str | None:
+    if key not in config:
+        return default
+    value = config[key]
+    if value is None:
+        return None
+    return value if isinstance(value, str) and value else default
+
+
+def _parse_error_text_rules(
+    value: Any, default: tuple[tuple[tuple[str, ...], str], ...]
+) -> tuple[tuple[tuple[str, ...], str], ...]:
+    if not isinstance(value, list):
+        return default
+    rules: list[tuple[tuple[str, ...], str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        matches = item.get("matches")
+        recovery_class = item.get("class")
+        if not isinstance(matches, list) or not isinstance(recovery_class, str) or not recovery_class:
+            continue
+        normalized_matches = tuple(
+            match.lower() for match in matches if isinstance(match, str) and match
+        )
+        if not normalized_matches:
+            continue
+        rules.append((normalized_matches, recovery_class))
+    return tuple(rules) if rules else default
+
+
+def _parse_keyword_rules(
+    value: Any, default: tuple[tuple[str, str], ...]
+) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, list):
+        return default
+    rules: list[tuple[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        keyword = item.get("keyword")
+        recovery_class = item.get("class")
+        if isinstance(keyword, str) and keyword and isinstance(recovery_class, str) and recovery_class:
+            rules.append((keyword.lower(), recovery_class))
+    return tuple(rules) if rules else default
+
+
+def _parse_reason_rules(value: Any, default: tuple[ReasonRule, ...]) -> tuple[ReasonRule, ...]:
+    if not isinstance(value, list):
+        return default
+    rules: list[ReasonRule] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        artifact = item.get("artifact")
+        field_name = item.get("field")
+        reason = item.get("reason")
+        if not (
+            isinstance(artifact, str)
+            and artifact
+            and isinstance(field_name, str)
+            and field_name
+            and isinstance(reason, str)
+            and reason
+        ):
+            continue
+        if "equals" in item:
+            rules.append(ReasonRule(artifact, field_name, "equals", item["equals"], reason))
+        elif item.get("truthy") is True:
+            rules.append(ReasonRule(artifact, field_name, "truthy", None, reason))
+        else:
+            continue
+    return tuple(rules) if rules else default
 
 
 @dataclass
@@ -42,8 +268,16 @@ class RecoveryAction:
 class RecoveryRunner:
     """Executes deterministic recovery actions for retryable quality failures."""
 
-    def __init__(self, dispatcher: Any | None = None):
+    def __init__(
+        self,
+        dispatcher: Any | None = None,
+        escalation: dict[str, Any] | None = None,
+        classification_policy: RecoveryClassificationPolicy | None = None,
+    ):
         self.dispatcher = dispatcher
+        self.classification_policy = classification_policy or RecoveryClassificationPolicy.from_escalation(
+            escalation
+        )
 
     def execute(self, *, task_id: str, phase: str, attempt: int, result: Any) -> RecoveryAction:
         reason = self._reason(result)
@@ -76,18 +310,7 @@ class RecoveryRunner:
         )
 
     def _reason(self, result: Any) -> str:
-        artifacts = getattr(result, "artifacts", {}) or {}
-        if isinstance(artifacts.get("verification_summary"), dict):
-            summary = artifacts["verification_summary"]
-            if summary.get("command_succeeded") is False:
-                return "verification command failed"
-            if summary.get("lint_errors", 0):
-                return "lint errors detected"
-        if isinstance(artifacts.get("review_summary"), dict):
-            summary = artifacts["review_summary"]
-            if summary.get("failed", 0):
-                return "review findings require retry"
-        return "phase requested recovery"
+        return self.classification_policy.classify_reason(result)
 
     def _dispatch_provider_recovery(
         self,
@@ -186,13 +409,9 @@ class RecoveryRunner:
         result: Any,
         provider_context: dict[str, Any] | None,
     ) -> str:
-        error_text = str(getattr(result, "error", "") or "").lower()
-        if "authorization token" in error_text or "auth" in error_text:
-            return "auth"
-        if "provider unavailable" in error_text or "cli path not found" in error_text:
-            return "provider_offline"
-        if provider_context and provider_context.get("invocation_kind") == "native_cli":
-            return "native_cli_failure"
-        if "review" in self._reason(result).lower():
-            return "review_content"
-        return "generic_retry"
+        error_text = str(getattr(result, "error", "") or "")
+        return self.classification_policy.classify(
+            error_text=error_text,
+            provider_context=provider_context,
+            reason=self._reason(result),
+        )

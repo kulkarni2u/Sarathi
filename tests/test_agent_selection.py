@@ -188,6 +188,85 @@ def test_engine_updates_dispatcher_preferred_agent_after_route():
     assert engine.dispatcher.preferred_agent == "claude"
     assert engine.dispatcher.preferred_permission_mode == "full"
 
+
+# ── _HarnessAwareDispatcher: harness_id propagation ("declare before dispatch") ──
+
+def test_harness_aware_dispatcher_backfills_harness_id():
+    from src.engine import _HarnessAwareDispatcher
+    cap = _CapturingDispatcher()
+    d = _HarnessAwareDispatcher(cap)
+    d.harness_id = "h-123"
+
+    d.dispatch(_make_request())
+    assert cap.last_request.harness_id == "h-123"
+
+
+def test_harness_aware_dispatcher_does_not_override_explicit_harness_id():
+    from src.engine import _HarnessAwareDispatcher
+    cap = _CapturingDispatcher()
+    d = _HarnessAwareDispatcher(cap)
+    d.harness_id = "h-parent"
+
+    d.dispatch(_make_request(harness_id="h-explicit"))
+    assert cap.last_request.harness_id == "h-explicit"
+
+
+def test_harness_aware_dispatcher_raises_for_child_task_dispatch_without_harness():
+    """Structural enforcement: graph-node ('child_task_execution') dispatch with
+    no harness_id declared anywhere must be rejected, not silently allowed."""
+    from src.engine import _HarnessAwareDispatcher
+    from src.dispatch import MissingHarnessError
+    cap = _CapturingDispatcher()
+    d = _HarnessAwareDispatcher(cap)
+    # No harness_id ever assigned to the wrapper or the request.
+
+    with pytest.raises(MissingHarnessError):
+        d.dispatch(_make_request(constraints={"purpose": "child_task_execution"}))
+    assert cap.last_request is None  # never reached the base dispatcher
+
+
+def test_harness_aware_dispatcher_allows_child_task_dispatch_with_harness():
+    from src.engine import _HarnessAwareDispatcher
+    cap = _CapturingDispatcher()
+    d = _HarnessAwareDispatcher(cap)
+    d.harness_id = "h-graph"
+
+    d.dispatch(_make_request(constraints={"purpose": "child_task_execution"}))
+    assert cap.last_request.harness_id == "h-graph"
+
+
+def test_harness_aware_dispatcher_leaves_non_child_task_dispatch_unaffected():
+    """Single-task phase dispatch (no child_task_execution purpose) is never
+    rejected for a missing harness_id — only graph-node dispatch is."""
+    from src.engine import _HarnessAwareDispatcher
+    cap = _CapturingDispatcher()
+    d = _HarnessAwareDispatcher(cap)
+
+    d.dispatch(_make_request())  # no harness_id anywhere, no purpose tag
+    assert cap.last_request is not None
+    assert cap.last_request.harness_id is None
+
+
+def test_engine_updates_dispatcher_harness_id_after_route():
+    """After ROUTE, engine.dispatcher.harness_id matches the compiled HarnessConfig,
+    so every later dispatch for this task (including graph-node dispatch in BUILD)
+    can be traced back to a declared harness."""
+    from src.engine import Engine, TaskContext, Complexity, _HarnessAwareDispatcher
+
+    engine = Engine(ncp_enabled=False)
+    assert isinstance(engine.dispatcher, _HarnessAwareDispatcher)
+    assert engine.dispatcher.harness_id is None
+
+    task = TaskContext(
+        task_id="test-harness-id",
+        description="deploy infrastructure to production",
+        complexity=Complexity.MEDIUM,
+    )
+    engine.run_task(task)
+
+    assert task.harness_config is not None
+    assert engine.dispatcher.harness_id == task.harness_config.harness_id
+
     route = next(result for result in task.phase_results if result.phase.value == "Route")
     assert route.artifacts["permission_scope"] == "infra_write_declared"
     assert route.artifacts["permission_mode"] == "full"

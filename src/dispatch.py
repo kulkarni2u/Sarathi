@@ -32,6 +32,39 @@ class DispatchTimeoutError(Exception):
     """Raised when a provider dispatch call exceeds the configured timeout."""
 
 
+class MissingHarnessError(ValueError):
+    """Raised when a child-task/graph-node dispatch has no harness_id.
+
+    Per the "declare before dispatch" invariant (see src/harness.py and
+    CLAUDE.md), every graph node dispatched during BUILD-phase graph
+    execution (FANOUT branches, JUDGE candidates, SYNTHESIZE, etc.) must
+    carry the harness_id of a HarnessConfig compiled before it ran. This is
+    scoped to dispatches tagged ``constraints["purpose"] ==
+    "child_task_execution"`` — the marker TaskGraphExecutor already applies
+    to every node it dispatches — so it does not reach ahead into unrelated
+    dispatch paths (e.g. the single top-level phase dispatches in
+    src/phases/*.py, or the service layer's worker dispatch) that don't yet
+    thread a harness_id through.
+    """
+
+
+def require_harness_id(request: "DispatchRequest") -> None:
+    """Reject a child-task dispatch request that has no harness_id.
+
+    No-op for any request that isn't tagged as child-task/graph-node work
+    (``constraints["purpose"] == "child_task_execution"``); callers decide
+    where in the dispatch chain this scoped check applies.
+    """
+    if request.constraints.get("purpose") != "child_task_execution":
+        return
+    if not request.harness_id:
+        raise MissingHarnessError(
+            f"DispatchRequest for task {request.task_id!r} (phase={request.phase!r}) "
+            "is a child-task/graph-node dispatch with no harness_id — a HarnessConfig "
+            "must be compiled (src/harness.py) and propagated before dispatch."
+        )
+
+
 def _is_transient_failure(
     response_or_none: "DispatchResponse | None",
     exc_or_none: Exception | None,

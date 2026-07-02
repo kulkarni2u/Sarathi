@@ -30,7 +30,7 @@ except ImportError:
     from trust_gate import TrustGate, TrustGateResult, arbitrate
 
 try:
-    from .dispatch import Dispatcher, LocalDispatcher
+    from .dispatch import Dispatcher, LocalDispatcher, require_harness_id
     from .phases import (
         BrainstormHandler,
         BuildHandler,
@@ -64,7 +64,7 @@ try:
     )
     from .task_graph import annotate_graph_for_supervision
 except ImportError:
-    from dispatch import Dispatcher, LocalDispatcher
+    from dispatch import Dispatcher, LocalDispatcher, require_harness_id
     from phases import (
         BrainstormHandler,
         BuildHandler,
@@ -531,6 +531,12 @@ class _HarnessAwareDispatcher:
         self.fallback_agents: list[str] = []
         self.journal: Any | None = None
         self.workspace_root: str | None = None
+        # The harness_id of the HarnessConfig compiled for the current task
+        # (set by _sync_task_state after ROUTE runs). Backfilled onto every
+        # dispatch that doesn't already carry its own harness_id, so
+        # phase-level dispatch stays traceable to the declared harness even
+        # though phase modules don't set it themselves.
+        self.harness_id: str | None = None
 
     def reset_task_state(self) -> None:
         """Clear per-task routing/session state before a new task starts."""
@@ -538,6 +544,7 @@ class _HarnessAwareDispatcher:
         self.preferred_permission_mode = None
         self.claude_session_id = None
         self.fallback_agents = []
+        self.harness_id = None
 
     def dispatch(self, request: DispatchRequest) -> Any:
         injected_provider = False
@@ -560,6 +567,14 @@ class _HarnessAwareDispatcher:
                     "permission_mode": self.preferred_permission_mode,
                 },
             )
+        if self.harness_id and not request.harness_id:
+            request = _dc_replace(request, harness_id=self.harness_id)
+        # "Declare before dispatch": graph-node/child-task dispatches must
+        # carry a harness_id proving a HarnessConfig was compiled before this
+        # call. Scoped to purpose == "child_task_execution" (see
+        # TaskGraphExecutor) so single-task phase dispatch, which doesn't yet
+        # thread a harness_id through, is unaffected.
+        require_harness_id(request)
         # CLI-backed providers flake more than the deterministic local one —
         # give a non-local provider one retry inside LocalDispatcher when the
         # caller didn't already set a retry budget.
@@ -1453,6 +1468,13 @@ class Engine:
                         self.dispatcher.fallback_agents = [
                             b.agent_id for b in task.harness_config.fallback_agents
                         ]
+                    # Declare-before-dispatch: make this task's harness_id
+                    # available for the dispatcher to backfill onto every
+                    # dispatch it makes for this task (see
+                    # _HarnessAwareDispatcher.dispatch), including graph-node
+                    # dispatch during BUILD.
+                    if hasattr(self.dispatcher, "harness_id"):
+                        self.dispatcher.harness_id = task.harness_config.harness_id
                 except Exception:
                     logger.exception(
                         "Failed to restore harness_config for task %s; "

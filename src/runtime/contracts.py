@@ -25,6 +25,13 @@ class DispatchRequest:
     token_budget: int | None = None
     timeout_seconds: int = 300
     retry_budget: int = 0
+    # Traceability/enforcement for the "declare before dispatch" invariant:
+    # the harness_id of the HarnessConfig (see src/harness.py) that was
+    # compiled before this dispatch was issued. Populated directly by
+    # TaskGraphExecutor for graph-node dispatch (when given a harness_config)
+    # and backfilled by the engine's harness-aware dispatcher wrapper for
+    # phase-level dispatch.
+    harness_id: str | None = None
 
 
 @dataclass

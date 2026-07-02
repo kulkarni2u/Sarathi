@@ -96,3 +96,56 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.mypy]
+# Many modules under src/ use a dual-import fallback pattern
+# (`try: from .foo import X` / `except ImportError: from foo import X`) to
+# support running as scripts / from within a `src/` cwd without the package
+# installed (see e.g. src/harness.py, src/runtime/recovery.py,
+# src/phases/learn.py). Because a stray root-level `__init__.py` also
+# exists, mypy's default module-path inference sees the same file reachable
+# both as "src.<module>" and as "<repo-dir-name>.src.<module>", which it
+# reports as "Source file found twice under different module names".
+# Anchoring module resolution at the repo root (mypy_path) and using
+# explicit_package_bases resolves that ambiguity without touching the
+# dual-import pattern itself, and without renaming the (intentionally
+# named) "src" package that project.scripts entry points depend on.
+mypy_path = "."
+explicit_package_bases = true
+
+# The bare `except ImportError: import <name>` fallback branches above are
+# never resolvable as real top-level packages once "src" is correctly
+# anchored as the package root above (they only work at runtime via the
+# sys.path tricks those modules perform when executed directly). Without
+# these overrides, mypy cascades into a "Cannot find implementation or
+# library stub for module named ..." error for every one of those fallback
+# imports. This is the same root-cause ambiguity as above, just surfacing
+# per-file instead of as a single structural error, so it is suppressed
+# here rather than by editing ~30 files to drop the fallback pattern.
+[[tool.mypy.overrides]]
+module = [
+    "agent_roles",
+    "base",
+    "cli",
+    "dispatch",
+    "evolve",
+    "harness",
+    "init",
+    "permissions",
+    "phases",
+    "policy",
+    "repo_wiki",
+    "sandbox",
+    "task_class",
+    "task_graph",
+    "trust_gate",
+    "tui",
+    "tui_data",
+    "validate",
+    "workspace_evidence",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["runtime.*", "ncp_adapter.*", "policy.*", "service.*"]
+ignore_missing_imports = true

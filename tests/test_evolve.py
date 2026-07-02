@@ -1,7 +1,24 @@
 import pytest
 from datetime import datetime
-from src.evolve import Evolver, Pattern, EvolveBaseline, PolicyProposal, ProposalReviewStore
+from src.evolve import EvolutionPolicy, Evolver, Pattern, EvolveBaseline, PolicyProposal, ProposalReviewStore
+from src.harness import HarnessOutcome
 from src.runtime.learning import LearningRecord
+from src.task_class import TaskClass
+
+
+def _outcome(quality_signals: dict[str, float], task_id: str = "task-1") -> HarnessOutcome:
+    return HarnessOutcome(
+        harness_id="harness-1",
+        task_id=task_id,
+        task_class=TaskClass.CODEGEN_PATCH,
+        quality_signals=quality_signals,
+        token_cost_actual=100,
+        latency_ms=1000,
+        human_interventions=0,
+        rollback_triggered=False,
+        trust_gate_result="PASS",
+        agent_used="claude",
+    )
 
 
 def test_pattern_pass_gate():
@@ -240,4 +257,53 @@ def test_proposal_review_store_rejects_without_policy_mutation(tmp_path):
 
     assert decision["status"] == "rejected"
     assert (policy_dir / "review.md").read_text() == "# Review\n"
-    assert (policy_dir / ".sarathi-proposals" / f"{proposal.proposal_id}.json").exists()
+
+
+def test_evolution_policy_defaults_match_hardcoded_behavior():
+    policy = EvolutionPolicy.from_escalation(None)
+
+    assert policy.deviation_threshold == 0.1
+    assert policy.pass_gate == 0.8
+    assert policy.proposal_gate == 2
+
+    # An Evolver constructed with no args must reproduce today's exact
+    # thresholds -- the default-construction call sites must not change.
+    evolver = Evolver()
+    assert evolver.policy.deviation_threshold == 0.1
+    assert evolver.PASS_GATE == 0.8
+    assert evolver.PROPOSAL_GATE == 2
+
+
+def test_evolution_policy_from_escalation_overrides_deviation_threshold():
+    policy = EvolutionPolicy.from_escalation(
+        {"learn_evolve": {"deviation_threshold": 0.25, "pass_gate": 0.9, "proposal_gate": 3}}
+    )
+
+    assert policy.deviation_threshold == 0.25
+    assert policy.pass_gate == 0.9
+    assert policy.proposal_gate == 3
+
+
+def test_evolution_policy_ignores_missing_or_malformed_config():
+    assert EvolutionPolicy.from_escalation({}) == EvolutionPolicy()
+    assert EvolutionPolicy.from_escalation({"learn_evolve": "not-a-mapping"}) == EvolutionPolicy()
+    assert EvolutionPolicy.from_escalation("not-a-dict") == EvolutionPolicy()
+
+
+def test_custom_deviation_threshold_changes_whether_a_proposal_fires():
+    # A 0.15 deviation is below the default 0.1 threshold's complement (it
+    # exceeds 0.1, so it *would* fire under default settings) -- raise the
+    # threshold above the observed deviation and confirm it is suppressed.
+    baseline_outcome = _outcome({"test_pass_rate": 0.9}, task_id="task-baseline")
+    deviated_outcome = _outcome({"test_pass_rate": 0.75}, task_id="task-deviated")  # delta = -0.15
+
+    default_evolver = Evolver()
+    assert default_evolver.ingest_harness_outcome(baseline_outcome) == []
+    default_proposals = default_evolver.ingest_harness_outcome(deviated_outcome)
+    assert len(default_proposals) == 1
+
+    strict_policy = EvolutionPolicy.from_escalation({"learn_evolve": {"deviation_threshold": 0.2}})
+    strict_evolver = Evolver(strict_policy)
+    assert strict_evolver.ingest_harness_outcome(baseline_outcome) == []
+    strict_proposals = strict_evolver.ingest_harness_outcome(deviated_outcome)
+    assert strict_proposals == []

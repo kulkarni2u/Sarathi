@@ -47,7 +47,7 @@ from .providers import (
     ProviderSession,
     validate_provider_routing_config,
 )
-from .quality_policy import QualityLoopPolicy, validate_quality_loop_config
+from .quality_policy import GateEvidencePolicy, QualityLoopPolicy, validate_quality_loop_config
 from .recipes import Recipe, load_recipe, load_recipes, parse_recipe_dict
 from .recovery import RecoveryAction, RecoveryRunner
 from .review import ReviewFinding, ReviewRunner, ReviewVerdict
@@ -113,6 +113,7 @@ __all__ = [
     "ProviderSession",
     "apply_learning_feedback_to_provider_routing",
     "validate_provider_routing_config",
+    "GateEvidencePolicy",
     "QualityLoopPolicy",
     "Recipe",
     "load_recipe",

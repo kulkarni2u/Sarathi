@@ -257,6 +257,23 @@ def test_handle_autoresearch_register_evidence_and_verdict(tmp_path, capsys):
     assert "confirmed" in list_output
 
 
+def test_handle_autoresearch_unknown_experiment_error_has_no_stray_quotes(tmp_path):
+    evidence_args = Namespace(
+        action="evidence",
+        store=str(tmp_path),
+        experiment_id="does-not-exist",
+        summary="n/a",
+        uri=None,
+        metric=[],
+        recorded_by="sarathi",
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.handle_autoresearch(evidence_args)
+
+    assert str(exc_info.value) == "Unknown autoresearch experiment: does-not-exist"
+
+
 def test_handle_run_reports_paused_graph_execution(tmp_path, capsys, monkeypatch):
     policy_dir = tmp_path / "policy-pack"
     _write_policy_pack(policy_dir)

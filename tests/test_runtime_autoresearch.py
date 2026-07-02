@@ -92,3 +92,25 @@ def test_autoresearch_verdict_defaults_to_attached_evidence_refs(tmp_path):
 
     assert loaded is not None
     assert loaded.evidence_refs == [evidence.evidence_id]
+
+
+def test_autoresearch_skips_malformed_lines_instead_of_crashing(tmp_path):
+    store = AutoresearchStore(tmp_path)
+    good = store.register(
+        hypothesis="Good record survives a corrupted neighbor",
+        prediction="Store still loads",
+        tier="MINE",
+        method="n/a",
+        quality_gate="n/a",
+    )
+
+    log_path = tmp_path / "autoresearch.jsonl"
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": "registered", "payload": {"id": "exp_missing_fields"}}) + "\n")
+        handle.write("{not valid json\n")
+
+    reloaded = AutoresearchStore(tmp_path)
+
+    assert reloaded.get(good.experiment_id) is not None
+    assert reloaded.get("exp_missing_fields") is None
+    assert len(reloaded.list()) == 1

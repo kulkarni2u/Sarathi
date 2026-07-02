@@ -9,6 +9,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - fcntl is POSIX-only
+    fcntl = None
+
 
 class EvidenceTier(str, Enum):
     """Evidence tiers for an autoresearch experiment."""
@@ -212,7 +217,14 @@ class AutoresearchStore:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         record = {"event": event, "payload": payload, "recorded_at": _utcnow()}
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+                handle.flush()
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _load(self) -> dict[str, AutoresearchExperiment]:
         experiments: dict[str, AutoresearchExperiment] = {}
@@ -223,9 +235,9 @@ class AutoresearchStore:
                 continue
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
+                _apply_event(experiments, event.get("event"), event.get("payload") or {})
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError):
                 continue
-            _apply_event(experiments, event.get("event"), event.get("payload") or {})
         return experiments
 
 

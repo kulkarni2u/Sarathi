@@ -1582,10 +1582,10 @@ def handle_reuse(args: argparse.Namespace) -> None:
 
 def handle_autoresearch(args: argparse.Namespace) -> None:
     """Manage append-only autoresearch experiment records."""
-    store = AutoresearchStore(getattr(args, "store", ".sarathi"))
     action = getattr(args, "action", None)
 
     try:
+        store = AutoresearchStore(getattr(args, "store", ".sarathi"))
         if action == "register":
             experiment = store.register(
                 hypothesis=args.hypothesis,
@@ -1637,7 +1637,8 @@ def handle_autoresearch(args: argparse.Namespace) -> None:
         else:
             raise SystemExit(f"Unknown autoresearch action: {action}")
     except KeyError as exc:
-        raise SystemExit(str(exc)) from exc
+        message = exc.args[0] if exc.args else str(exc)
+        raise SystemExit(message) from exc
     except ValueError as exc:
         raise SystemExit(f"Invalid autoresearch input: {exc}") from exc
 

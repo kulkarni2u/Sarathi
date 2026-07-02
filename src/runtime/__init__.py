@@ -49,7 +49,12 @@ from .providers import (
 )
 from .quality_policy import QualityLoopPolicy, validate_quality_loop_config
 from .recipes import Recipe, load_recipe, load_recipes, parse_recipe_dict
-from .recovery import RecoveryAction, RecoveryRunner
+from .recovery import (
+    RecoveryAction,
+    RecoveryClassificationPolicy,
+    RecoveryRunner,
+    validate_recovery_classification_config,
+)
 from .review import ReviewFinding, ReviewRunner, ReviewVerdict
 from .sandbox import (
     build_sandbox_executor,
@@ -119,7 +124,9 @@ __all__ = [
     "load_recipes",
     "parse_recipe_dict",
     "RecoveryAction",
+    "RecoveryClassificationPolicy",
     "RecoveryRunner",
+    "validate_recovery_classification_config",
     "ReviewFinding",
     "ReviewRunner",
     "ReviewVerdict",

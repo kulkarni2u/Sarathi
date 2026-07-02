@@ -806,7 +806,10 @@ class Engine:
             self.dispatcher.workspace_root = self.workspace_root
 
         self.phase_handlers = self._create_phase_handlers()
-        self.recovery_runner = RecoveryRunner(dispatcher=self.dispatcher)
+        self.recovery_runner = RecoveryRunner(
+            dispatcher=self.dispatcher,
+            escalation=getattr(self.policy_pack, "escalation", {}) or {},
+        )
         self.phases = list(Phase)
 
     def _load_policy_section(self, policy_name: str) -> dict[str, Any]:

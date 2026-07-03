@@ -14,7 +14,7 @@ try:
     from .init import InitWorkflow, bootstrap_workspace
     from .policy import compile_policy_pack
     from .policy.layering import extract_server_caps
-    from .runtime import UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
+    from .runtime import AutoresearchStore, UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
     from .runtime import TaskGraphExecutor, load_recipe, load_recipes
     from .runtime.agent_spec import load_agent_specs
     from .task_graph import (
@@ -34,7 +34,7 @@ except ImportError:
     from init import InitWorkflow, bootstrap_workspace
     from policy import compile_policy_pack
     from policy.layering import extract_server_caps
-    from runtime import UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
+    from runtime import AutoresearchStore, UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
     from runtime import TaskGraphExecutor, load_recipe, load_recipes
     from runtime.agent_spec import load_agent_specs
     from task_graph import (
@@ -788,6 +788,57 @@ def main() -> None:
     )
     subparsers.add_parser("agents", help="Show Sarathi agent role names and phase mapping")
 
+    autoresearch_parser = subparsers.add_parser(
+        "autoresearch",
+        help="Manage pre-registered autoresearch experiments",
+    )
+    autoresearch_parser.add_argument(
+        "--store",
+        default=".sarathi",
+        help="Directory containing autoresearch.jsonl (default: .sarathi)",
+    )
+    autoresearch_subparsers = autoresearch_parser.add_subparsers(dest="action", required=True)
+    ar_register = autoresearch_subparsers.add_parser("register", help="Pre-register a hypothesis")
+    ar_register.add_argument("--hypothesis", required=True, help="Hypothesis to test")
+    ar_register.add_argument("--prediction", required=True, help="Pre-registered prediction")
+    ar_register.add_argument("--tier", choices=["MINE", "MICRO", "FULL"], required=True, help="Evidence tier")
+    ar_register.add_argument("--method", required=True, help="Experiment method")
+    ar_register.add_argument("--quality-gate", required=True, help="Quality gate that must hold")
+    ar_register.add_argument("--created-by", default="sarathi", help="Role or agent registering the hypothesis")
+
+    ar_evidence = autoresearch_subparsers.add_parser("evidence", help="Append evidence to an experiment")
+    ar_evidence.add_argument("experiment_id", help="Experiment id")
+    ar_evidence.add_argument("--summary", required=True, help="Evidence summary")
+    ar_evidence.add_argument("--uri", default=None, help="Artifact URI or path")
+    ar_evidence.add_argument(
+        "--metric",
+        action="append",
+        default=[],
+        help="Metric as key=value; repeat for multiple metrics",
+    )
+    ar_evidence.add_argument("--recorded-by", default="sarathi", help="Role or agent recording evidence")
+
+    ar_verdict = autoresearch_subparsers.add_parser("verdict", help="Record a verdict")
+    ar_verdict.add_argument("experiment_id", help="Experiment id")
+    ar_verdict.add_argument(
+        "--verdict",
+        choices=["confirmed", "refuted", "inconclusive", "backlog", "superseded"],
+        required=True,
+        help="Experiment verdict",
+    )
+    ar_verdict.add_argument("--summary", required=True, help="Verdict summary")
+    ar_verdict.add_argument(
+        "--evidence-ref",
+        action="append",
+        default=None,
+        help="Evidence id or external ref; repeat for multiple refs",
+    )
+    ar_verdict.add_argument("--cost-usd", type=float, default=0.0, help="Observed experiment cost")
+    ar_verdict.add_argument("--recorded-by", default="sarathi", help="Role or agent recording verdict")
+
+    ar_list = autoresearch_subparsers.add_parser("list", help="List experiments")
+    ar_list.add_argument("--status", default=None, help="Filter by status/verdict")
+
     recipes_parser = subparsers.add_parser("recipes", help="List reference recipes (FANOUT/JUDGE workflow packs)")
     recipes_parser.add_argument(
         "--recipes-dir",
@@ -857,6 +908,8 @@ def main() -> None:
         handle_proposals(args)
     elif args.command == "reuse":
         handle_reuse(args)
+    elif args.command == "autoresearch":
+        handle_autoresearch(args)
     elif args.command == "attach":
         handle_attach(args)
     elif args.command == "fork":
@@ -1525,6 +1578,94 @@ def handle_reuse(args: argparse.Namespace) -> None:
             print(line)
     else:
         print("  No learned playbooks recorded yet.")
+
+
+def handle_autoresearch(args: argparse.Namespace) -> None:
+    """Manage append-only autoresearch experiment records."""
+    action = getattr(args, "action", None)
+
+    try:
+        store = AutoresearchStore(getattr(args, "store", ".sarathi"))
+        if action == "register":
+            experiment = store.register(
+                hypothesis=args.hypothesis,
+                prediction=args.prediction,
+                tier=args.tier,
+                method=args.method,
+                quality_gate=args.quality_gate,
+                created_by=getattr(args, "created_by", "sarathi"),
+            )
+            print(f"Registered experiment {experiment.experiment_id} [{experiment.tier.value}]")
+            print(f"  Hypothesis: {experiment.hypothesis}")
+            print(f"  Prediction: {experiment.prediction}")
+            print(f"  Gate: {experiment.quality_gate}")
+        elif action == "evidence":
+            evidence = store.append_evidence(
+                args.experiment_id,
+                summary=args.summary,
+                uri=getattr(args, "uri", None),
+                metrics=_parse_autoresearch_metrics(getattr(args, "metric", [])),
+                recorded_by=getattr(args, "recorded_by", "sarathi"),
+            )
+            print(f"Recorded evidence {evidence.evidence_id} for {evidence.experiment_id}")
+            if evidence.uri:
+                print(f"  URI: {evidence.uri}")
+        elif action == "verdict":
+            evidence_refs = getattr(args, "evidence_ref", None)
+            verdict = store.record_verdict(
+                args.experiment_id,
+                verdict=args.verdict,
+                summary=args.summary,
+                evidence_refs=list(evidence_refs) if evidence_refs is not None else None,
+                cost_usd=float(getattr(args, "cost_usd", 0.0) or 0.0),
+                recorded_by=getattr(args, "recorded_by", "sarathi"),
+            )
+            print(f"Recorded verdict {verdict.verdict} for {args.experiment_id}")
+            print(f"  Summary: {verdict.summary}")
+        elif action == "list":
+            experiments = store.list(status=getattr(args, "status", None))
+            print(f"Autoresearch Experiments: {len(experiments)}")
+            for experiment in experiments:
+                print(
+                    f"- {experiment.experiment_id}"
+                    f" [{experiment.tier.value}]"
+                    f" {experiment.status}: {experiment.hypothesis}"
+                )
+                print(f"  Prediction: {experiment.prediction}")
+                if experiment.verdict is not None:
+                    print(f"  Verdict: {experiment.verdict.summary}")
+        else:
+            raise SystemExit(f"Unknown autoresearch action: {action}")
+    except KeyError as exc:
+        message = exc.args[0] if exc.args else str(exc)
+        raise SystemExit(message) from exc
+    except ValueError as exc:
+        raise SystemExit(f"Invalid autoresearch input: {exc}") from exc
+
+
+def _parse_autoresearch_metrics(metric_args: list[str] | None) -> dict[str, Any]:
+    """Parse repeated key=value metric flags into JSON-friendly values."""
+    metrics: dict[str, Any] = {}
+    for item in metric_args or []:
+        key, separator, value = item.partition("=")
+        key = key.strip()
+        if not separator or not key:
+            raise ValueError(f"metric must be key=value: {item}")
+        metrics[key] = _parse_metric_value(value.strip())
+    return metrics
+
+
+def _parse_metric_value(value: str) -> Any:
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
+    try:
+        if "." in value:
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value
 
 
 def handle_attach(args: argparse.Namespace) -> None:

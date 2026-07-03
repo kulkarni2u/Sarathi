@@ -320,6 +320,85 @@ def test_executor_judge_node_injects_winner_node():
 
 
 # ---------------------------------------------------------------------------
+# "Declare before dispatch": FANOUT/JUDGE child dispatch carries harness_id
+# ---------------------------------------------------------------------------
+
+def test_fanout_branch_and_synthesize_dispatch_carry_harness_id():
+    """Every node FANOUT spawns — parallel branches and the synthesize
+    fan-in — must dispatch under the same harness as the parent task, not
+    with no declared context/permission/budget contract at all."""
+    from src.harness import HarnessConfig
+    from src.runtime.contracts import DispatchResponse
+
+    class RecordingDispatcher:
+        def __init__(self):
+            self.requests = []
+
+        def dispatch(self, request):
+            self.requests.append(request)
+            return DispatchResponse(success=True, outputs={})
+
+    workflow = {
+        "nodes": [
+            {
+                "id": "fanout",
+                "title": "Explore options",
+                "node_type": "fanout",
+                "pattern_config": {"count": 2},
+            }
+        ]
+    }
+    graph = graph_from_workflow(workflow).to_artifact()
+    dispatcher = RecordingDispatcher()
+    harness = HarnessConfig(harness_id="h-fanout-parent")
+    executor = TaskGraphExecutor(dispatcher=dispatcher, harness_config=harness)
+
+    result = executor.execute_all(graph)
+
+    dispatched_ids = {req.task_id for req in dispatcher.requests}
+    assert {"fanout", "fanout-branch-1", "fanout-branch-2", "fanout-synthesize"} <= dispatched_ids
+    assert dispatcher.requests, "expected fanout to dispatch nodes"
+    assert all(req.harness_id == "h-fanout-parent" for req in dispatcher.requests)
+    assert result.graph_state["completed_nodes"]
+
+
+def test_judge_and_winner_dispatch_carry_harness_id():
+    """The JUDGE node and the winner-propagation node it injects must both
+    dispatch with the parent harness_id."""
+    from src.harness import HarnessConfig
+    from src.runtime.contracts import DispatchResponse
+
+    class RecordingDispatcher:
+        def __init__(self):
+            self.requests = []
+
+        def dispatch(self, request):
+            self.requests.append(request)
+            return DispatchResponse(success=True, outputs={})
+
+    workflow = {
+        "nodes": [
+            {
+                "id": "judge",
+                "title": "Compare",
+                "node_type": "judge",
+                "pattern_config": {"winner_title": "Apply best result"},
+            }
+        ]
+    }
+    graph = graph_from_workflow(workflow).to_artifact()
+    dispatcher = RecordingDispatcher()
+    harness = HarnessConfig(harness_id="h-judge-parent")
+    executor = TaskGraphExecutor(dispatcher=dispatcher, harness_config=harness)
+
+    executor.execute_all(graph)
+
+    dispatched_ids = {req.task_id for req in dispatcher.requests}
+    assert {"judge", "judge-winner"} <= dispatched_ids
+    assert all(req.harness_id == "h-judge-parent" for req in dispatcher.requests)
+
+
+# ---------------------------------------------------------------------------
 # WorkflowPatternsPolicy
 # ---------------------------------------------------------------------------
 

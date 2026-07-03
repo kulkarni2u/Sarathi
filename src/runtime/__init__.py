@@ -20,6 +20,13 @@ from .agent_spec import (
     parse_agent_spec_dict,
     resolve_tool_callable,
 )
+from .autoresearch import (
+    AutoresearchEvidence,
+    AutoresearchExperiment,
+    AutoresearchStore,
+    AutoresearchVerdict,
+    EvidenceTier,
+)
 from .artifacts import ArtifactStore
 from .budget import TaskBudget
 from .commands import CommandResult, CommandRunner
@@ -47,9 +54,14 @@ from .providers import (
     ProviderSession,
     validate_provider_routing_config,
 )
-from .quality_policy import QualityLoopPolicy, validate_quality_loop_config
+from .quality_policy import GateEvidencePolicy, QualityLoopPolicy, validate_quality_loop_config
 from .recipes import Recipe, load_recipe, load_recipes, parse_recipe_dict
-from .recovery import RecoveryAction, RecoveryRunner
+from .recovery import (
+    RecoveryAction,
+    RecoveryClassificationPolicy,
+    RecoveryRunner,
+    validate_recovery_classification_config,
+)
 from .review import ReviewFinding, ReviewRunner, ReviewVerdict
 from .sandbox import (
     build_sandbox_executor,
@@ -73,6 +85,11 @@ __all__ = [
     "register_agent_role",
     "registered_agent_roles",
     "clear_registered_agent_roles",
+    "AutoresearchEvidence",
+    "AutoresearchExperiment",
+    "AutoresearchStore",
+    "AutoresearchVerdict",
+    "EvidenceTier",
     "ArtifactStore",
     "TaskBudget",
     "CommandResult",
@@ -113,13 +130,16 @@ __all__ = [
     "ProviderSession",
     "apply_learning_feedback_to_provider_routing",
     "validate_provider_routing_config",
+    "GateEvidencePolicy",
     "QualityLoopPolicy",
     "Recipe",
     "load_recipe",
     "load_recipes",
     "parse_recipe_dict",
     "RecoveryAction",
+    "RecoveryClassificationPolicy",
     "RecoveryRunner",
+    "validate_recovery_classification_config",
     "ReviewFinding",
     "ReviewRunner",
     "ReviewVerdict",

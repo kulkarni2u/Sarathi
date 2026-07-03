@@ -2,6 +2,34 @@
 
 All notable changes to Sarathi are documented here.
 
+## Unreleased
+
+### Added
+
+- Added `sarathi autoresearch` (`register`/`evidence`/`verdict`/`list`) for
+  pre-registering hypotheses and recording evidence and verdicts as an
+  append-only `.sarathi/autoresearch.jsonl` log.
+
+### Changed
+
+- Made recovery failure classification, engine gate thresholds and
+  remediation text, and the learn-evolve deviation threshold
+  policy-configurable via `escalation.md`/`review.md` instead of hardcoded in
+  the engine and runtime.
+- Propagated `HarnessConfig` into graph-node dispatch (FANOUT/JUDGE/
+  SYNTHESIZE) so child-task dispatch declares a harness before running,
+  matching the single-task ROUTE path.
+
+### Fixed
+
+- Fixed `sarathi autoresearch` crashing on a corrupted store file; malformed
+  JSONL lines are now skipped instead of crashing every future invocation,
+  and `KeyError` messages no longer print with stray quotes.
+- Fixed a `mypy` duplicate-module error caused by the dual `src`/relative
+  import pattern, via `[tool.mypy]` config rather than a package rename.
+- Fixed stale CLAUDE.md documentation (service-layer file-size claims) and
+  added the missing `policy-pack/EXAMPLE/workflow-patterns.md`.
+
 ## 0.3.0 - 2026-06-17
 
 ### Added

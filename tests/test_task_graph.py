@@ -104,6 +104,74 @@ def test_graph_executor_marks_provider_failed_node_failed():
     assert result["graph_state"]["failed_nodes"] == ["step-1"]
 
 
+# ---------------------------------------------------------------------------
+# "Declare before dispatch": harness_id propagation onto graph-node dispatch
+# ---------------------------------------------------------------------------
+
+def test_graph_executor_node_dispatch_has_no_harness_id_by_default():
+    """Baseline: without a harness_config, dispatched nodes carry harness_id=None
+    (current/legacy behavior — callers that don't opt in aren't affected)."""
+    graph = graph_from_plan({"steps": ["A"]}).to_artifact()
+    dispatcher = RecordingDispatcher(DispatchResponse(success=True, outputs={}))
+
+    TaskGraphExecutor(dispatcher=dispatcher).execute_next(graph)
+
+    assert dispatcher.requests[0].harness_id is None
+
+
+def test_graph_executor_stamps_harness_id_from_per_call_harness_config():
+    from src.harness import HarnessConfig
+
+    graph = graph_from_plan({"steps": ["A"]}).to_artifact()
+    dispatcher = RecordingDispatcher(DispatchResponse(success=True, outputs={}))
+    harness = HarnessConfig(harness_id="h-call-scoped")
+
+    TaskGraphExecutor(dispatcher=dispatcher).execute_next(graph, harness_config=harness)
+
+    assert dispatcher.requests[0].harness_id == "h-call-scoped"
+
+
+def test_graph_executor_stamps_harness_id_from_constructor_default():
+    from src.harness import HarnessConfig
+
+    graph = graph_from_plan({"steps": ["A"]}).to_artifact()
+    dispatcher = RecordingDispatcher(DispatchResponse(success=True, outputs={}))
+    harness = HarnessConfig(harness_id="h-ctor-default")
+
+    TaskGraphExecutor(dispatcher=dispatcher, harness_config=harness).execute_next(graph)
+
+    assert dispatcher.requests[0].harness_id == "h-ctor-default"
+
+
+def test_graph_executor_per_call_harness_config_overrides_constructor_default():
+    from src.harness import HarnessConfig
+
+    graph = graph_from_plan({"steps": ["A"]}).to_artifact()
+    dispatcher = RecordingDispatcher(DispatchResponse(success=True, outputs={}))
+    ctor_harness = HarnessConfig(harness_id="h-ctor")
+    call_harness = HarnessConfig(harness_id="h-call")
+
+    executor = TaskGraphExecutor(dispatcher=dispatcher, harness_config=ctor_harness)
+    executor.execute_next(graph, harness_config=call_harness)
+
+    assert dispatcher.requests[0].harness_id == "h-call"
+
+
+def test_graph_executor_execute_all_stamps_harness_id_on_every_node():
+    """execute_all drives multiple sequential nodes — every dispatched node,
+    not just the first, must carry the harness_id."""
+    from src.harness import HarnessConfig
+
+    graph = graph_from_plan({"steps": ["A", "B", "C"]}).to_artifact()
+    dispatcher = RecordingDispatcher(DispatchResponse(success=True, outputs={}))
+    harness = HarnessConfig(harness_id="h-all-nodes")
+
+    TaskGraphExecutor(dispatcher=dispatcher, harness_config=harness).execute_all(graph)
+
+    assert len(dispatcher.requests) == 3
+    assert all(req.harness_id == "h-all-nodes" for req in dispatcher.requests)
+
+
 def test_task_scheduler_runs_graph_outside_build_phase():
     graph = graph_from_plan({"steps": ["Coordinate sibling work"]}).to_artifact()
     dispatcher = RecordingDispatcher(

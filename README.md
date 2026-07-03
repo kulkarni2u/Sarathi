@@ -183,6 +183,12 @@ sarathi agents
 sarathi recipes
 sarathi attach <share_token> --role observer
 sarathi fork <session_id>
+
+sarathi autoresearch register --hypothesis "..." --prediction "..." --tier MICRO \
+  --method "..." --quality-gate "..."
+sarathi autoresearch evidence <experiment_id> --summary "..." --metric key=value
+sarathi autoresearch verdict <experiment_id> --verdict confirmed --summary "..."
+sarathi autoresearch list
 ```
 
 Running `sarathi` with no subcommand prints the local home screen, including

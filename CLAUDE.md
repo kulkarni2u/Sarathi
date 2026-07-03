@@ -82,7 +82,7 @@ Built with Textual. Chat-first layout with a toggleable task panel. Entry point:
 
 ### Service Layer (`src/service/`)
 
-HTTP service for workspace management, multi-worker scheduling, and policy proposal handling. Entry point: `sarathi-desktop`. The `app.py` is the largest file (~55K lines); most new workspace features land here.
+HTTP service for workspace management, multi-worker scheduling, and policy proposal handling. Entry point: `sarathi-desktop`. `app.py` (~1.9K lines) is the ServiceApp router and is where most new workspace HTTP/service features land; `src/storage/__init__.py` (~2.6K lines) is actually the largest file in the repo, holding SQLite storage primitives and schema migrations.
 
 ### NCP Adapter (`src/ncp_adapter/`)
 

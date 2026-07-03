@@ -383,3 +383,152 @@ def test_engine_attaches_agent_roles_to_executed_and_skipped_phases(tmp_path: Pa
     assert route_result.evidence["agent_role_assigned"] is True
     assert skipped_advisor.artifacts["agent_role"]["name"] == "Disha"
     assert build_result.artifacts["agent_role"]["name"] == "Pravaha"
+
+
+# ---------------------------------------------------------------------------
+# GateEvidencePolicy: gate thresholds/remediation/retry-phases now come from
+# the `review` policy-pack section (src/runtime/quality_policy.py) instead of
+# module-level constants in src/engine.py. Defaults must reproduce the old
+# hardcoded values exactly; a policy pack may override them.
+# ---------------------------------------------------------------------------
+
+from src.runtime import GateEvidencePolicy  # noqa: E402
+
+
+def _policy_dir_with_review(tmp_path: Path, review_content: str) -> Path:
+    policy_dir = tmp_path / "policy-pack"
+    policy_dir.mkdir()
+    for filename, content in {
+        "complexity.md": "classification_thresholds: present\nskip_rules: present\n",
+        "conventions.md": "conventions: present\nbrainstorming_protocol: present\n",
+        "commands.md": "# Commands\n",
+        "review.md": review_content,
+        "escalation.md": "auto_fix: configured\nreview: configured\n",
+        "skills.md": "pattern_detection: enabled\nevolution_threshold: 0.8\n",
+        "task-tracking.md": "task: configured\noptions: configured\n",
+    }.items():
+        (policy_dir / filename).write_text(content)
+    return policy_dir
+
+
+def test_gate_evidence_policy_defaults_match_former_hardcoded_values():
+    """Pure-refactor guarantee: no review.md gate_* block => identical behavior."""
+    policy = GateEvidencePolicy.from_review(None)
+    assert policy.threshold_for("Brainstorm") == 0.80
+    assert policy.threshold_for("Plan") == 0.90
+    assert policy.is_retry_phase("Brainstorm")
+    assert policy.is_retry_phase("Plan")
+    assert not policy.is_retry_phase("Route")
+    assert policy.remediation_for("risks_identified") == (
+        "Brainstorm did not identify risks; ask the provider to set evidence.risks_identified "
+        "after enumerating potential failure modes or concerns."
+    )
+    assert policy.remediation_for("rollback_plan") == (
+        "Plan has no rollback plan; the provider should document a recovery procedure and set "
+        "evidence.rollback_plan."
+    )
+    assert policy.remediation_for("not_a_real_key") is None
+
+
+def test_engine_check_gate_default_thresholds_unchanged(tmp_path: Path):
+    """Engine wired from a policy pack with no gate_* overrides behaves as before."""
+    policy_dir = _policy_dir_with_review(tmp_path, "max_rounds: 5\nmin_coverage: 80\n")
+    engine = Engine(policy_pack_path=str(policy_dir))
+
+    # 0.6 < 0.80 default Brainstorm threshold => fails
+    passed, score = engine.check_gate(
+        Phase.BRAINSTORM,
+        {
+            "alternative_approaches_considered": True,
+            "risks_identified": True,
+            "success_criteria_defined": False,
+            "reversibility_assessed": False,
+        },
+    )
+    assert not passed
+    assert abs(score - 0.6) < 1e-9
+
+
+def test_engine_check_gate_honors_custom_review_threshold(tmp_path: Path):
+    """A review.md gate_thresholds override changes actual gate pass/fail, not just the label."""
+    review_content = (
+        "```yaml\n"
+        "max_rounds: 5\n"
+        "min_coverage: 80\n"
+        "gate_thresholds:\n"
+        "  Brainstorm: 0.5\n"
+        "```\n"
+    )
+    policy_dir = _policy_dir_with_review(tmp_path, review_content)
+    engine = Engine(policy_pack_path=str(policy_dir))
+
+    # Same 0.6 score that failed against the 0.80 default now passes at 0.5.
+    passed, score = engine.check_gate(
+        Phase.BRAINSTORM,
+        {
+            "alternative_approaches_considered": True,
+            "risks_identified": True,
+            "success_criteria_defined": False,
+            "reversibility_assessed": False,
+        },
+    )
+    assert passed
+    assert abs(score - 0.6) < 1e-9
+
+    # Plan threshold wasn't overridden, so it keeps the 0.90 default.
+    assert engine._gate_evidence_policy.threshold_for("Plan") == 0.90
+
+
+def test_engine_attach_gate_result_honors_custom_remediation_text(tmp_path: Path):
+    """A review.md gate_remediation override changes the surfaced remediation string."""
+    custom_message = "Custom remediation: please justify the missing risk assessment."
+    review_content = (
+        "```yaml\n"
+        "max_rounds: 5\n"
+        "min_coverage: 80\n"
+        "gate_remediation:\n"
+        f"  risks_identified: \"{custom_message}\"\n"
+        "```\n"
+    )
+    policy_dir = _policy_dir_with_review(tmp_path, review_content)
+    engine = Engine(policy_pack_path=str(policy_dir))
+
+    result = PhaseResult(
+        phase=Phase.BRAINSTORM,
+        outcome="pass",
+        evidence={
+            "alternative_approaches_considered": True,
+            "risks_identified": False,
+            "success_criteria_defined": True,
+            "reversibility_assessed": True,
+        },
+    )
+    engine._attach_gate_result(result)
+    remediation = result.artifacts["gate_result"]["remediation"]
+    assert remediation["risks_identified"] == custom_message
+
+
+def test_engine_gate_retry_phases_can_be_overridden_to_disable_gating(tmp_path: Path):
+    """A review.md gate_retry_phases override can remove a phase from gating entirely."""
+    review_content = (
+        "```yaml\n"
+        "max_rounds: 5\n"
+        "min_coverage: 80\n"
+        "gate_retry_phases:\n"
+        "  - Plan\n"
+        "```\n"
+    )
+    policy_dir = _policy_dir_with_review(tmp_path, review_content)
+    engine = Engine(policy_pack_path=str(policy_dir))
+
+    assert not engine._gate_evidence_policy.is_retry_phase("Brainstorm")
+    assert engine._gate_evidence_policy.is_retry_phase("Plan")
+
+    result = PhaseResult(
+        phase=Phase.BRAINSTORM,
+        outcome="pass",
+        evidence={"risks_identified": False},
+    )
+    engine._attach_gate_result(result)
+    # Brainstorm is no longer a gated phase, so no gate_result is attached at all.
+    assert "gate_result" not in result.artifacts

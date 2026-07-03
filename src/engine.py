@@ -30,7 +30,7 @@ except ImportError:
     from trust_gate import TrustGate, TrustGateResult, arbitrate
 
 try:
-    from .dispatch import Dispatcher, LocalDispatcher
+    from .dispatch import Dispatcher, LocalDispatcher, require_harness_id
     from .phases import (
         BrainstormHandler,
         BuildHandler,
@@ -53,6 +53,7 @@ try:
         CommandRunner,
         DispatchJournal,
         DispatchRequest,
+        GateEvidencePolicy,
         GateResult,
         PreflightPolicy,
         ProviderHealthStore,
@@ -64,7 +65,7 @@ try:
     )
     from .task_graph import annotate_graph_for_supervision
 except ImportError:
-    from dispatch import Dispatcher, LocalDispatcher
+    from dispatch import Dispatcher, LocalDispatcher, require_harness_id
     from phases import (
         BrainstormHandler,
         BuildHandler,
@@ -87,6 +88,7 @@ except ImportError:
         CommandRunner,
         DispatchJournal,
         DispatchRequest,
+        GateEvidencePolicy,
         GateResult,
         PreflightPolicy,
         ProviderHealthStore,
@@ -531,6 +533,12 @@ class _HarnessAwareDispatcher:
         self.fallback_agents: list[str] = []
         self.journal: Any | None = None
         self.workspace_root: str | None = None
+        # The harness_id of the HarnessConfig compiled for the current task
+        # (set by _sync_task_state after ROUTE runs). Backfilled onto every
+        # dispatch that doesn't already carry its own harness_id, so
+        # phase-level dispatch stays traceable to the declared harness even
+        # though phase modules don't set it themselves.
+        self.harness_id: str | None = None
 
     def reset_task_state(self) -> None:
         """Clear per-task routing/session state before a new task starts."""
@@ -538,6 +546,7 @@ class _HarnessAwareDispatcher:
         self.preferred_permission_mode = None
         self.claude_session_id = None
         self.fallback_agents = []
+        self.harness_id = None
 
     def dispatch(self, request: DispatchRequest) -> Any:
         injected_provider = False
@@ -560,6 +569,14 @@ class _HarnessAwareDispatcher:
                     "permission_mode": self.preferred_permission_mode,
                 },
             )
+        if self.harness_id and not request.harness_id:
+            request = _dc_replace(request, harness_id=self.harness_id)
+        # "Declare before dispatch": graph-node/child-task dispatches must
+        # carry a harness_id proving a HarnessConfig was compiled before this
+        # call. Scoped to purpose == "child_task_execution" (see
+        # TaskGraphExecutor) so single-task phase dispatch, which doesn't yet
+        # thread a harness_id through, is unaffected.
+        require_harness_id(request)
         # CLI-backed providers flake more than the deterministic local one —
         # give a non-local provider one retry inside LocalDispatcher when the
         # caller didn't already set a retry budget.
@@ -676,42 +693,6 @@ class _HarnessAwareDispatcher:
         return getattr(self._base, name)
 
 
-# Human-readable explanation and remedy for each gate evidence key.
-_GATE_EVIDENCE_REMEDIATION: dict[str, str] = {
-    "alternative_approaches_considered": (
-        "Brainstorm did not evaluate multiple approaches; ask the provider to set "
-        "evidence.alternative_approaches_considered after considering at least three alternatives."
-    ),
-    "risks_identified": (
-        "Brainstorm did not identify risks; ask the provider to set evidence.risks_identified "
-        "after enumerating potential failure modes or concerns."
-    ),
-    "success_criteria_defined": (
-        "Brainstorm has no explicit success criteria; ask the provider to set "
-        "evidence.success_criteria_defined after articulating measurable acceptance conditions."
-    ),
-    "reversibility_assessed": (
-        "Brainstorm did not assess how the change could be rolled back; ask the provider to set "
-        "evidence.reversibility_assessed after considering reversibility."
-    ),
-    "checkpoint_list": (
-        "Plan has no checkpoint list; the provider should return a sequenced step list and set "
-        "evidence.checkpoint_list."
-    ),
-    "dependency_map": (
-        "Plan has no dependency map; the provider should return outputs.checkpoints/dependencies "
-        "and set evidence.dependency_map."
-    ),
-    "rollback_plan": (
-        "Plan has no rollback plan; the provider should document a recovery procedure and set "
-        "evidence.rollback_plan."
-    ),
-}
-
-# Phases for which the engine runs the bounded gate-retry loop.
-_GATE_RETRY_PHASES = {Phase.BRAINSTORM, Phase.PLAN}
-
-
 class Engine:
     """
     Core Sarathi engine.
@@ -736,6 +717,7 @@ class Engine:
         self.policy_pack_path = policy_pack_path or "policy-pack"
         self.compiled_policy = compile_policy_pack(self.policy_pack_path)
         self.policy_pack = self._load_policy_pack()
+        self._gate_evidence_policy = GateEvidencePolicy.from_review(self.policy_pack.review)
         provider_config = apply_learning_feedback_to_provider_routing(
             self.compiled_policy.get("model_routing"),
             self.compiled_policy.get("learning_feedback"),
@@ -806,7 +788,10 @@ class Engine:
             self.dispatcher.workspace_root = self.workspace_root
 
         self.phase_handlers = self._create_phase_handlers()
-        self.recovery_runner = RecoveryRunner(dispatcher=self.dispatcher)
+        self.recovery_runner = RecoveryRunner(
+            dispatcher=self.dispatcher,
+            escalation=getattr(self.policy_pack, "escalation", {}) or {},
+        )
         self.phases = list(Phase)
 
     def _load_policy_section(self, policy_name: str) -> dict[str, Any]:
@@ -1349,7 +1334,7 @@ class Engine:
         Returns the result to use (whichever has the higher gate score).
         Gate failures after retry are advisory — the task continues regardless.
         """
-        if phase not in _GATE_RETRY_PHASES:
+        if not self._gate_evidence_policy.is_retry_phase(phase.value):
             return first
         if first.outcome == "fail":
             # Recovery machinery owns hard failures; don't interfere.
@@ -1453,6 +1438,13 @@ class Engine:
                         self.dispatcher.fallback_agents = [
                             b.agent_id for b in task.harness_config.fallback_agents
                         ]
+                    # Declare-before-dispatch: make this task's harness_id
+                    # available for the dispatcher to backfill onto every
+                    # dispatch it makes for this task (see
+                    # _HarnessAwareDispatcher.dispatch), including graph-node
+                    # dispatch during BUILD.
+                    if hasattr(self.dispatcher, "harness_id"):
+                        self.dispatcher.harness_id = task.harness_config.harness_id
                 except Exception:
                     logger.exception(
                         "Failed to restore harness_config for task %s; "
@@ -1465,11 +1457,12 @@ class Engine:
 
     def _attach_gate_result(self, result: PhaseResult) -> None:
         """Persist gate evaluation details for phases with confidence thresholds."""
-        if result.phase not in _GATE_RETRY_PHASES:
+        if not self._gate_evidence_policy.is_retry_phase(result.phase.value):
             return
 
         passed, score = self.check_gate(result.phase, result.evidence)
-        threshold = 0.80 if result.phase == Phase.BRAINSTORM else 0.90
+        default_threshold = 0.80 if result.phase == Phase.BRAINSTORM else 0.90
+        threshold = self._gate_evidence_policy.threshold_for(result.phase.value, default_threshold)
         _gate_keys = {
             Phase.BRAINSTORM: {
                 "alternative_approaches_considered",
@@ -1481,7 +1474,11 @@ class Engine:
         }
         expected = _gate_keys.get(result.phase, set())
         missing = [key for key in expected if not result.evidence.get(key)]
-        remediation = {key: _GATE_EVIDENCE_REMEDIATION[key] for key in missing if key in _GATE_EVIDENCE_REMEDIATION}
+        remediation = {
+            key: self._gate_evidence_policy.remediation_for(key)
+            for key in missing
+            if self._gate_evidence_policy.remediation_for(key) is not None
+        }
         if not passed:
             remedy_lines = "".join(f"\n  [{key}] {msg}" for key, msg in remediation.items())
             logger.warning(
@@ -1572,8 +1569,10 @@ class Engine:
         Check if evidence meets the confidence gate for a phase.
 
         When threshold is None the per-phase default applies (Brainstorm 0.80,
-        Plan 0.90). The epsilon absorbs float accumulation error so a score
-        exactly at threshold passes (0.3 + 0.3 + 0.2 < 0.8 in float math).
+        Plan 0.90), unless overridden by the policy pack's review.gate_thresholds
+        block (see GateEvidencePolicy). The epsilon absorbs float accumulation
+        error so a score exactly at threshold passes (0.3 + 0.3 + 0.2 < 0.8 in
+        float math).
 
         Returns (passed, actual_confidence).
         """
@@ -1585,7 +1584,11 @@ class Engine:
                 "success_criteria_defined": 0.2,
                 "reversibility_assessed": 0.2,
             }
-            gate_threshold = 0.80 if threshold is None else threshold
+            gate_threshold = (
+                self._gate_evidence_policy.threshold_for(phase.value, 0.80)
+                if threshold is None
+                else threshold
+            )
             confidence = 0.0
             for key, weight in weights.items():
                 if key in evidence and evidence[key]:
@@ -1599,7 +1602,11 @@ class Engine:
                 "dependency_map": 0.3,
                 "rollback_plan": 0.3,
             }
-            gate_threshold = 0.90 if threshold is None else threshold
+            gate_threshold = (
+                self._gate_evidence_policy.threshold_for(phase.value, 0.90)
+                if threshold is None
+                else threshold
+            )
             confidence = 0.0
             for key, weight in weights.items():
                 if key in evidence and evidence[key]:

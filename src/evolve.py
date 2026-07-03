@@ -111,9 +111,67 @@ class PolicyProposal:
         return "low"
 
 
+@dataclass(frozen=True)
+class EvolutionPolicy:
+    """Runtime policy for learn-evolve quality-signal deviation gating.
+
+    Mirrors the shape of ``QualityLoopPolicy.from_escalation`` in
+    ``src/runtime/quality_policy.py``: values are sourced from the
+    ``learn_evolve`` block of a policy pack's ``escalation.md``, falling back
+    to today's hardcoded defaults (0.1 / 0.8 / 2) when absent.
+    """
+
+    deviation_threshold: float = 0.1
+    pass_gate: float = 0.8
+    proposal_gate: int = 2
+
+    @classmethod
+    def from_escalation(cls, escalation: dict[str, Any] | None = None) -> "EvolutionPolicy":
+        if not isinstance(escalation, dict):
+            return cls()
+        config = escalation.get("learn_evolve")
+        if not isinstance(config, dict):
+            return cls()
+        return cls(
+            deviation_threshold=_non_negative_float(
+                config.get("deviation_threshold"), cls.deviation_threshold
+            ),
+            pass_gate=_non_negative_float(config.get("pass_gate"), cls.pass_gate),
+            proposal_gate=_non_negative_int(config.get("proposal_gate"), cls.proposal_gate),
+        )
+
+
+def _non_negative_float(value: Any, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _non_negative_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
 class Evolver:
     PASS_GATE = 0.8
     PROPOSAL_GATE = 2
+
+    def __init__(self, policy: EvolutionPolicy | None = None):
+        self.policy = policy or EvolutionPolicy()
+        # Instance attributes shadow the class constants above so existing
+        # references to self.PASS_GATE / self.PROPOSAL_GATE stay correct
+        # while remaining tunable via policy without touching call sites.
+        self.PASS_GATE = self.policy.pass_gate
+        self.PROPOSAL_GATE = self.policy.proposal_gate
 
     def ingest_harness_outcome(self, outcome: Any) -> list[PolicyProposal]:
         """
@@ -144,7 +202,7 @@ class Evolver:
             delta = measured_value - expected
             provenance = provenance_map.get(signal_name, "measured")
             weight = _PROVENANCE_WEIGHT.get(provenance, 1.0)
-            if abs(delta * weight) > 0.1:
+            if abs(delta * weight) > self.policy.deviation_threshold:
                 deviations.append((signal_name, delta, weight, provenance))
 
         if not deviations:

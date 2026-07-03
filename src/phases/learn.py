@@ -4,10 +4,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 try:
-    from src.evolve import Evolver
+    from src.evolve import EvolutionPolicy, Evolver
     from src.runtime import LearningStore
 except ImportError:
-    from evolve import Evolver
+    from evolve import EvolutionPolicy, Evolver
     from runtime import LearningStore
 
 if TYPE_CHECKING:
@@ -21,7 +21,8 @@ class LearnHandler:
         self.policy_pack = policy_pack
         self.dispatcher = dispatcher
         self.learning_store = LearningStore()
-        self.evolver = Evolver()
+        escalation = getattr(self.policy_pack, "escalation", {}) or {}
+        self.evolver = Evolver(EvolutionPolicy.from_escalation(escalation))
         self.provider_health = provider_health
 
     def execute(self, task: "TaskContext", phase: "Phase") -> "PhaseResult":

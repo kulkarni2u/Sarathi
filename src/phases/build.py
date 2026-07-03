@@ -169,6 +169,13 @@ class BuildHandler:
                 max_nodes=graph_policy.step_limit,
                 fail_node_id=os.environ.get("SARATHI_GRAPH_FAIL_NODE"),
                 fail_error=os.environ.get("SARATHI_GRAPH_FAIL_ERROR") or "Configured graph node failure",
+                # Propagate the parent task's already-compiled HarnessConfig
+                # (see src/harness.py, promoted onto the task after ROUTE) so
+                # every dispatched graph node — FANOUT branches, JUDGE
+                # candidates, etc. — carries a harness_id. self.graph_executor
+                # is constructed once and reused across tasks, so the harness
+                # must be threaded in per call rather than at construction time.
+                harness_config=getattr(task, "harness_config", None),
             )
             if task_graph else None
         )

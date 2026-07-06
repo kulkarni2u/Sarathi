@@ -574,6 +574,13 @@ class _HarnessAwareDispatcher:
             )
         if self.harness_id and not request.harness_id:
             request = _dc_replace(request, harness_id=self.harness_id)
+        # Health-ordered fallback providers for LocalDispatcher's transient-
+        # failure failover (see LocalDispatcher._attempt_provider_fallback).
+        if self.fallback_agents and not request.constraints.get("fallback_providers"):
+            request = _dc_replace(
+                request,
+                constraints={**request.constraints, "fallback_providers": list(self.fallback_agents)},
+            )
         # "Declare before dispatch": graph-node/child-task dispatches must
         # carry a harness_id proving a HarnessConfig was compiled before this
         # call. Scoped to purpose == "child_task_execution" (see

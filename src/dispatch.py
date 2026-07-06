@@ -7,7 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Any
 
 _DISPATCH_TIMEOUT = int(os.environ.get("SARATHI_DISPATCH_TIMEOUT", "300"))
@@ -287,7 +287,8 @@ class LocalDispatcher(Dispatcher):
                 exc = timeout_exc
 
             transient = _is_transient_failure(response, exc)
-            if not transient or attempt == retry_budget:
+
+            if not transient:
                 if exc is not None:
                     raise exc
                 if transient_failures:
@@ -297,17 +298,104 @@ class LocalDispatcher(Dispatcher):
                     }
                 return response
 
-            # Record what happened and back off before retrying.
-            if exc is not None:
-                transient_failures.append(str(exc))
-            else:
-                transient_failures.append(response.error or "transient failure")
+            if attempt < retry_budget:
+                # Still transient and retry budget remains — record what
+                # happened and back off before retrying the same provider.
+                if exc is not None:
+                    transient_failures.append(str(exc))
+                else:
+                    transient_failures.append(response.error or "transient failure")
 
-            backoff = min(2 ** attempt, 8)
-            _sleep(backoff)
+                backoff = min(2 ** attempt, 8)
+                _sleep(backoff)
+                continue
+
+            # Retry budget exhausted on a transient failure. Before giving up
+            # on this provider entirely, try any fallback providers the
+            # request carries (see _attempt_provider_fallback) — this never
+            # fires for non-transient failures, which return above.
+            fallback_response = self._attempt_provider_fallback(request, response, exc)
+            if fallback_response is not None:
+                if transient_failures:
+                    fallback_response.artifacts.setdefault(
+                        "dispatch_retries",
+                        {"attempts": attempt + 1, "transient_failures": list(transient_failures)},
+                    )
+                return fallback_response
+
+            if exc is not None:
+                raise exc
+            if transient_failures:
+                response.artifacts["dispatch_retries"] = {
+                    "attempts": attempt + 1,
+                    "transient_failures": transient_failures,
+                }
+            return response
 
         # Unreachable: the loop always returns or raises on its last iteration.
         raise AssertionError("LocalDispatcher.dispatch: retry loop exited without returning")
+
+    def _attempt_provider_fallback(
+        self,
+        request: DispatchRequest,
+        response: DispatchResponse | None,
+        exc: Exception | None,
+    ) -> DispatchResponse | None:
+        """Retry a transiently-exhausted dispatch against fallback providers.
+
+        Reads ``request.constraints["fallback_providers"]`` — an ordered list
+        of provider ids. This is the seam where a HarnessConfig's resolved
+        ``fallback_agents`` (see src/harness.py, health-ordered) are expected
+        to land on the request wherever the harness binding is applied to it
+        (e.g. alongside ``constraints["provider"]``); nothing upstream
+        populates it yet (see delivery notes), so today this is a no-op until
+        a caller sets it.
+
+        Tries each fallback once, in the given order, stopping at the first
+        success. Returns ``None`` (caller keeps the original failure/timeout)
+        when there are no fallback candidates or all of them also fail — this
+        method never raises on a fallback's own timeout, it just moves on to
+        the next candidate.
+        """
+        fallback_providers = request.constraints.get("fallback_providers")
+        if not isinstance(fallback_providers, (list, tuple)) or not fallback_providers:
+            return None
+
+        original_provider = request.constraints.get("provider")
+        prior_errors: list[str] = []
+        if exc is not None:
+            prior_errors.append(str(exc))
+        elif response is not None:
+            prior_errors.append(response.error or "transient failure")
+
+        for fallback_provider in fallback_providers:
+            if not isinstance(fallback_provider, str) or not fallback_provider:
+                continue
+            if fallback_provider == original_provider:
+                continue
+
+            fallback_request = _dc_replace(
+                request,
+                constraints={**request.constraints, "provider": fallback_provider},
+            )
+            try:
+                fallback_response = self._dispatch_once(fallback_request)
+            except DispatchTimeoutError as fallback_timeout:
+                prior_errors.append(str(fallback_timeout))
+                continue
+
+            if fallback_response.success:
+                fallback_response.artifacts["served_by_fallback"] = fallback_provider
+                fallback_response.artifacts["fallback_attempted"] = {
+                    "original_provider": original_provider,
+                    "fallback_used": fallback_provider,
+                    "prior_errors": prior_errors,
+                }
+                return fallback_response
+
+            prior_errors.append(fallback_response.error or "transient failure")
+
+        return None
 
     def _dispatch_once(self, request: DispatchRequest) -> DispatchResponse:
         # The provider's own subprocess timeout (request.timeout_seconds) is the

@@ -262,6 +262,14 @@ def _build_fallback_agents(
     minus the primary, filtered to ``available_providers``. When
     ``available_providers`` is None we don't fabricate availability — the
     fallback list stays empty.
+
+    The candidate set itself is still ``_FALLBACK_PROVIDER_ORDER`` (primary
+    selection semantics are untouched) but the final ordering is health-aware:
+    once every candidate's ``health_score`` is known, the list is sorted by
+    descending score so a fallback that's been failing a lot sinks below one
+    that's been healthy, even if the static order says otherwise. The sort is
+    stable, so candidates with equal (e.g. default 1.0, or entirely unknown)
+    scores keep their original ``_FALLBACK_PROVIDER_ORDER`` relative order.
     """
     if not available_providers:
         return []
@@ -275,6 +283,7 @@ def _build_fallback_agents(
         if health_scores and provider_id in health_scores:
             binding.health_score = health_scores[provider_id]
         fallbacks.append(binding)
+    fallbacks.sort(key=lambda binding: -binding.health_score)
     return fallbacks
 
 

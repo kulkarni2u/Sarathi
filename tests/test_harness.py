@@ -10,6 +10,7 @@ from src.harness import (
     HarnessOutcome,
     derive_permission_mode,
     resolve_agent_binding,
+    _build_fallback_agents,
 )
 from src.permissions import PermissionMode
 from src.runtime.agent_spec import AgentSpec, ToolSpec
@@ -204,3 +205,52 @@ def test_from_json_handles_old_format_without_new_fields():
 
     assert restored.tool_bindings == []
     assert restored.agent_spec_key is None
+
+
+# ── health-ordered fallback list ─────────────────────────────────────────────
+
+def test_build_fallback_agents_orders_by_descending_health_score():
+    # Static order is claude, codex, opencode; codex is unhealthy so it
+    # should sink below opencode despite coming first in the static list.
+    fallbacks = _build_fallback_agents(
+        "local",
+        available_providers=["claude", "codex", "opencode"],
+        health_scores={"claude": 0.95, "codex": 0.2, "opencode": 0.6},
+    )
+
+    assert [b.agent_id for b in fallbacks] == ["claude", "opencode", "codex"]
+    assert [b.health_score for b in fallbacks] == [0.95, 0.6, 0.2]
+
+
+def test_build_fallback_agents_stable_sort_preserves_static_order_on_ties():
+    # No health data at all -> every candidate defaults to 1.0 -> the static
+    # _FALLBACK_PROVIDER_ORDER order must survive untouched (stable sort).
+    fallbacks = _build_fallback_agents(
+        "local",
+        available_providers=["opencode", "codex", "claude"],
+    )
+
+    assert [b.agent_id for b in fallbacks] == ["claude", "codex", "opencode"]
+
+
+def test_build_fallback_agents_excludes_primary_and_filters_available():
+    fallbacks = _build_fallback_agents(
+        "claude",
+        available_providers=["claude", "opencode"],
+        health_scores={"opencode": 0.4},
+    )
+
+    assert [b.agent_id for b in fallbacks] == ["opencode"]
+
+
+def test_resolve_agent_binding_primary_selection_unaffected_by_health_ordering():
+    # Primary selection semantics must not change: it always maps
+    # agent_preference -> a single provider id, regardless of health scores.
+    binding = resolve_agent_binding(
+        "highest_capability",
+        available_providers=["claude", "codex"],
+        health_scores={"claude": 0.1, "codex": 0.99},
+    )
+
+    assert binding.agent_id == "claude"
+    assert binding.health_score == 0.1

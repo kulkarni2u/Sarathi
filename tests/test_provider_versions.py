@@ -15,8 +15,12 @@ def test_provider_cli_versions_returns_dict_for_known_providers():
 
     assert isinstance(versions, dict)
     assert set(versions.keys()) == set(_PROVIDER_VERSION_CLIS.keys())
-    for provider, version in versions.items():
-        assert version is None or isinstance(version, str)
+    for provider, info in versions.items():
+        assert isinstance(info, dict)
+        assert "version" in info
+        assert "auth" in info
+        assert info["version"] is None or isinstance(info["version"], str)
+        assert info["auth"] in ("ok", "needs_auth", "unknown")
 
 
 def test_provider_cli_versions_tolerates_missing_cli(monkeypatch):
@@ -24,7 +28,7 @@ def test_provider_cli_versions_tolerates_missing_cli(monkeypatch):
 
     versions = provider_cli_versions()
 
-    assert all(version is None for version in versions.values())
+    assert all(info["version"] is None and info["auth"] == "unknown" for info in versions.values())
 
 
 def test_provider_cli_versions_never_raises_on_subprocess_error(monkeypatch):
@@ -39,4 +43,4 @@ def test_provider_cli_versions_never_raises_on_subprocess_error(monkeypatch):
 
     versions = provider_cli_versions()
 
-    assert all(version is None for version in versions.values())
+    assert all(info["version"] is None and info["auth"] == "unknown" for info in versions.values())

@@ -34,21 +34,71 @@ _PROVIDER_VERSION_CLIS: dict[str, str] = {
 }
 
 
-def provider_cli_versions(timeout: int = 10) -> dict[str, str | None]:
-    """Return ``{provider: version-string-or-None}`` for known provider CLIs.
+def _check_provider_auth_preflight(provider: str, path: str) -> str:
+    """Check provider authentication status; return "ok", "needs_auth", or "unknown"."""
+    if provider == "claude":
+        return "unknown"
 
-    Runs ``<cli> --version`` for each known CLI with a short timeout. Never
+    if provider == "codex":
+        try:
+            result = subprocess.run(
+                [path, "login", "status"],
+                capture_output=True,
+                timeout=5,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                return "ok"
+            output = (result.stdout or "") + (result.stderr or "")
+            if "not logged in" in output.lower():
+                return "needs_auth"
+            # Non-zero exit without clear "not logged in" message: treat as unknown
+            # (could be missing subcommand on older versions)
+            return "unknown"
+        except Exception:
+            return "unknown"
+
+    if provider == "opencode":
+        try:
+            result = subprocess.run(
+                [path, "auth", "list"],
+                capture_output=True,
+                timeout=5,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0 and (result.stdout or "").strip():
+                return "ok"
+            if result.returncode != 0:
+                # Non-zero exit from auth list command suggests not logged in
+                return "needs_auth"
+            # Zero exit but empty output means not logged in
+            return "needs_auth"
+        except Exception:
+            return "unknown"
+
+    return "unknown"
+
+
+def provider_cli_versions(timeout: int = 10) -> dict[str, dict[str, str | None]]:
+    """Return version and auth status for known provider CLIs.
+
+    Returns dict mapping provider name to {"version": version-string-or-None, "auth": auth-status}.
+    Auth status is "ok", "needs_auth", or "unknown".
+
+    Runs ``<cli> --version`` and auth probes for each known CLI with a short timeout. Never
     raises: a missing CLI, a non-zero exit, or a timeout simply yields
-    ``None`` for that provider.
+    ``None`` for that provider's version and "unknown" for auth.
     """
-    versions: dict[str, str | None] = {}
+    result: dict[str, dict[str, str | None]] = {}
     for provider, executable in _PROVIDER_VERSION_CLIS.items():
         path = shutil.which(executable)
         if not path:
-            versions[provider] = None
+            result[provider] = {"version": None, "auth": "unknown"}
             continue
         try:
-            result = subprocess.run(
+            version_result = subprocess.run(
                 [path, "--version"],
                 capture_output=True,
                 text=True,
@@ -56,8 +106,10 @@ def provider_cli_versions(timeout: int = 10) -> dict[str, str | None]:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired, subprocess.SubprocessError):
-            versions[provider] = None
+            result[provider] = {"version": None, "auth": "unknown"}
             continue
-        output = (result.stdout or "").strip() or (result.stderr or "").strip()
-        versions[provider] = output or None
-    return versions
+        output = (version_result.stdout or "").strip() or (version_result.stderr or "").strip()
+        version = output or None
+        auth_status = _check_provider_auth_preflight(provider, path)
+        result[provider] = {"version": version, "auth": auth_status}
+    return result

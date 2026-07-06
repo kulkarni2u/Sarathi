@@ -793,6 +793,62 @@ def _test_and_store_provider(
     return _provider_view(provider_id, spec, config)
 
 
+def _check_provider_auth(provider_id: str, resolved_path: str) -> tuple[str, str | None]:
+    """Check provider authentication status via CLI probes.
+
+    Returns: (auth_status, degraded_reason)
+    where auth_status is "ok", "needs_auth", or "unknown"
+    and degraded_reason is a human-readable message or None.
+
+    Probe errors (timeout, OSError, missing subcommand) yield "unknown" with
+    no degraded_reason, allowing the provider to remain online.
+    """
+    if provider_id == "claude":
+        # Claude has no reliable non-interactive auth check
+        return "unknown", None
+
+    if provider_id == "codex":
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                [resolved_path, "login", "status"],
+                capture_output=True,
+                timeout=5,
+                text=True,
+            )
+            if result.returncode == 0:
+                return "ok", None
+            output = (result.stdout or "") + (result.stderr or "")
+            if "not logged in" in output.lower():
+                return "needs_auth", "CLI installed but not logged in (run: codex login)"
+            # Non-zero exit without clear "not logged in" message: treat as unknown
+            # (could be missing subcommand on older versions)
+            return "unknown", None
+        except Exception:
+            return "unknown", None
+
+    if provider_id == "opencode":
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                [resolved_path, "auth", "list"],
+                capture_output=True,
+                timeout=5,
+                text=True,
+            )
+            if result.returncode == 0 and (result.stdout or "").strip():
+                return "ok", None
+            if result.returncode != 0:
+                # Non-zero exit from auth list command suggests not logged in
+                return "needs_auth", "CLI installed but not logged in (run: opencode auth login)"
+            # Zero exit but empty output means not logged in
+            return "needs_auth", "CLI installed but not logged in (run: opencode auth login)"
+        except Exception:
+            return "unknown", None
+
+    return "unknown", None
+
+
 def _provider_check_config(
     spec: Mapping[str, Any],
     *,
@@ -884,6 +940,22 @@ def _provider_check_config(
             }
     except Exception:
         pass
+
+    auth_status, degraded_reason = _check_provider_auth(spec["id"], resolved_path)
+    if auth_status == "needs_auth":
+        return {
+            "path": path,
+            "auth": "needs_auth",
+            "health": "online",
+            "last_checked_at": _service_now(),
+            "last_error": degraded_reason,
+            "degraded_reason": degraded_reason,
+            **({"api_key": api_key} if api_key else {}),
+            "api_key_configured": sdk_key_available,
+            "base_url": base_url,
+            "model": model,
+        }
+
     return {
         "path": path,
         "auth": auth,

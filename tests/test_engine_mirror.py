@@ -2,6 +2,7 @@
 
 from src.engine import Complexity, Engine, Phase, TaskContext
 from src.engine_mirror import EngineRunRecorder
+from src.service import create_app
 from src.storage import Storage, connect, run_migrations
 
 
@@ -202,3 +203,54 @@ def test_event_types_match_notifications_namespace(tmp_path, monkeypatch):
         ]
         # Final task.completed wins and leaves the mirrored task "done".
         assert mirrored_task["status"] == "done"
+
+
+# --------------------------------------------------------- web cockpit visibility
+
+
+def test_mirrored_task_visible_through_service_app_api(tmp_path, monkeypatch):
+    """End-to-end: an engine-run task shows up through the real ServiceApp API.
+
+    Proves the whole point of the mirror -- a task run via CLI/TUI/MCP (no
+    HTTP server involved at all) becomes visible read-only through the same
+    REST routes the web cockpit polls.
+    """
+    db_path = tmp_path / "sarathi.db"
+    with connect(db_path) as conn:
+        run_migrations(conn)
+    monkeypatch.setenv("SARATHI_MIRROR_DB", str(db_path))
+    monkeypatch.setenv("SARATHI_WORKDIR", str(tmp_path / "workspace-root"))
+
+    engine = Engine()
+    assert engine.run_recorder is not None
+    task = TaskContext(task_id="t-api-visible", description="API visibility check", complexity=Complexity.LOW)
+    engine.run_task(task)
+
+    app = create_app(db_path)
+
+    status, payload = app.handle(
+        "GET", "/api/workspaces", body=None, headers={"x-correlation-id": "verify"}
+    )
+    assert status == 200
+    workspaces = payload["data"]["workspaces"]
+    assert len(workspaces) == 1
+    workspace_id = workspaces[0]["id"]
+
+    status, payload = app.handle(
+        "GET",
+        f"/api/workspaces/{workspace_id}/tasks",
+        body=None,
+        headers={"x-correlation-id": "verify"},
+    )
+    assert status == 200
+    tasks = payload["data"]["tasks"]
+    assert len(tasks) == 1
+    mirrored = tasks[0]
+    assert mirrored["status"] == "done"
+    assert mirrored["metadata"]["engine_task_id"] == "t-api-visible"
+
+    status, payload = app.handle(
+        "GET", f"/api/tasks/{mirrored['id']}", body=None, headers={"x-correlation-id": "verify"}
+    )
+    assert status == 200
+    assert payload["data"]["task"]["status"] == "done"

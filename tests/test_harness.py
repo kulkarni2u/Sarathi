@@ -24,6 +24,12 @@ def test_harness_config_defaults():
     assert hc.requires_human_approval is False
 
 
+def test_harness_config_defaults_to_no_isolation():
+    hc = HarnessConfig()
+    assert hc.isolation_mode == "none"
+    assert hc.isolation_cleanup == "auto"
+
+
 def test_from_task_class_query():
     hc = HarnessConfig.from_task_class(TaskClass.QUERY, "task-001")
     assert hc.task_id == "task-001"
@@ -65,6 +71,17 @@ def test_to_json_roundtrip():
     assert restored.task_class == TaskClass.CODEGEN_PATCH
     assert restored.task_id == "task-003"
     assert len(restored.quality_signals) == len(hc.quality_signals)
+
+
+def test_harness_config_isolation_mode_roundtrip():
+    hc = HarnessConfig.from_task_class(TaskClass.CODEGEN_PATCH, "task-iso")
+    hc.isolation_mode = "worktree"
+    hc.isolation_cleanup = "manual"
+
+    restored = HarnessConfig.from_json(hc.to_json())
+
+    assert restored.isolation_mode == "worktree"
+    assert restored.isolation_cleanup == "manual"
 
 
 def test_from_json_reconstructs_nested_objects():
@@ -200,11 +217,15 @@ def test_from_json_handles_old_format_without_new_fields():
     d = json.loads(hc.to_json())
     d.pop("tool_bindings", None)
     d.pop("agent_spec_key", None)
+    d.pop("isolation_mode", None)
+    d.pop("isolation_cleanup", None)
 
     restored = HarnessConfig.from_json(json.dumps(d))
 
     assert restored.tool_bindings == []
     assert restored.agent_spec_key is None
+    assert restored.isolation_mode == "none"
+    assert restored.isolation_cleanup == "auto"
 
 
 # ── health-ordered fallback list ─────────────────────────────────────────────

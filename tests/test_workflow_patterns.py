@@ -1,6 +1,9 @@
 """Tests for dynamic workflow patterns — NodeType, inject_nodes, graph_from_workflow,
 WorkflowPatternsPolicy, and TaskGraphExecutor pattern handlers."""
 
+import subprocess
+from pathlib import Path
+
 from src.task_graph import (
     NodeType,
     TaskNode,
@@ -322,6 +325,439 @@ def test_executor_judge_node_injects_winner_node():
 # ---------------------------------------------------------------------------
 # "Declare before dispatch": FANOUT/JUDGE child dispatch carries harness_id
 # ---------------------------------------------------------------------------
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _init_repo(path: Path) -> Path:
+    path.mkdir()
+    _git(path, "init")
+    _git(path, "config", "user.email", "test@example.com")
+    _git(path, "config", "user.name", "Test User")
+    (path / "README.md").write_text("# Test\n", encoding="utf-8")
+    _git(path, "add", "README.md")
+    _git(path, "commit", "-m", "init")
+    return path
+
+
+def test_executor_dispatches_execute_node_with_worktree_workspace_constraint(tmp_path):
+    from src.harness import HarnessConfig
+    from src.runtime.contracts import DispatchResponse
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class RecordingDispatcher:
+        def __init__(self):
+            self.requests = []
+            self.workspace_existed_during_dispatch = []
+
+        def dispatch(self, request):
+            self.requests.append(request)
+            workspace_dir = request.constraints.get("workspace_dir")
+            self.workspace_existed_during_dispatch.append(
+                workspace_dir is not None and Path(workspace_dir).exists()
+            )
+            return DispatchResponse(success=True, outputs={})
+
+    workflow = {
+        "nodes": [
+            {
+                "id": "node-a",
+                "title": "Implement branch A",
+                "node_type": "execute",
+            }
+        ]
+    }
+    graph = graph_from_workflow(workflow).to_artifact()
+    dispatcher = RecordingDispatcher()
+    harness = HarnessConfig(
+        harness_id="h-worktree-parent",
+        task_id="task-worktree",
+        isolation_mode="worktree",
+    )
+    executor = TaskGraphExecutor(
+        dispatcher=dispatcher,
+        harness_config=harness,
+        isolation_repo_root=repo,
+    )
+
+    executor.execute_all(graph)
+
+    assert dispatcher.requests
+    request = dispatcher.requests[0]
+    workspace_dir = Path(request.constraints["workspace_dir"])
+    assert request.constraints["isolation_mode"] == "worktree"
+    assert "_sarathi_workspace_dir" not in request.inputs["node"]
+    assert workspace_dir == repo / ".sarathi" / "worktrees" / "task-worktree" / "node-a"
+    assert dispatcher.workspace_existed_during_dispatch == [True]
+    assert not workspace_dir.exists()
+
+
+def test_execute_next_uses_worktree_isolation_and_cleans_up(tmp_path):
+    from src.harness import HarnessConfig
+    from src.runtime.contracts import DispatchResponse
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class RecordingDispatcher:
+        def __init__(self):
+            self.requests = []
+
+        def dispatch(self, request):
+            self.requests.append(request)
+            assert Path(request.constraints["workspace_dir"]).exists()
+            return DispatchResponse(success=True, outputs={})
+
+    graph = graph_from_workflow(
+        {
+            "nodes": [
+                {
+                    "id": "node-a",
+                    "title": "Implement branch A",
+                    "node_type": "execute",
+                }
+            ]
+        }
+    ).to_artifact()
+    dispatcher = RecordingDispatcher()
+    harness = HarnessConfig(
+        harness_id="h-worktree-next",
+        task_id="task-worktree-next",
+        isolation_mode="worktree",
+    )
+    executor = TaskGraphExecutor(
+        dispatcher=dispatcher,
+        harness_config=harness,
+        isolation_repo_root=repo,
+    )
+
+    executor.execute_next(graph)
+
+    workspace_dir = Path(dispatcher.requests[0].constraints["workspace_dir"])
+    assert workspace_dir == repo / ".sarathi" / "worktrees" / "task-worktree-next" / "node-a"
+    assert not workspace_dir.exists()
+
+
+def test_worktree_is_cleaned_up_when_dispatcher_raises(tmp_path):
+    from src.harness import HarnessConfig
+
+    repo = _init_repo(tmp_path / "repo")
+    seen_workspace_dirs = []
+
+    class FailingDispatcher:
+        def dispatch(self, request):
+            workspace_dir = Path(request.constraints["workspace_dir"])
+            seen_workspace_dirs.append(workspace_dir)
+            assert workspace_dir.exists()
+            raise RuntimeError("boom")
+
+    graph = graph_from_workflow(
+        {
+            "nodes": [
+                {
+                    "id": "node-a",
+                    "title": "Implement branch A",
+                    "node_type": "execute",
+                }
+            ]
+        }
+    ).to_artifact()
+    harness = HarnessConfig(
+        harness_id="h-worktree-failure",
+        task_id="task-worktree-failure",
+        isolation_mode="worktree",
+    )
+    executor = TaskGraphExecutor(
+        dispatcher=FailingDispatcher(),
+        harness_config=harness,
+        isolation_repo_root=repo,
+    )
+
+    result = executor.execute_all(graph)
+
+    assert result.graph_state["failed_nodes"] == ["node-a"]
+    assert seen_workspace_dirs
+    assert not seen_workspace_dirs[0].exists()
+
+
+def test_manual_worktree_cleanup_retains_workspace_and_records_metadata(tmp_path):
+    from src.harness import HarnessConfig
+    from src.runtime.contracts import DispatchResponse
+    from src.runtime.isolation import GitWorktreeIsolation
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class RecordingDispatcher:
+        def dispatch(self, request):
+            workspace_dir = Path(request.constraints["workspace_dir"])
+            assert workspace_dir.exists()
+            return DispatchResponse(
+                success=True,
+                outputs={"summary": "candidate complete"},
+                evidence={},
+                artifacts={"workspace_seen": str(workspace_dir)},
+            )
+
+    graph = graph_from_workflow(
+        {
+            "nodes": [
+                {
+                    "id": "node-a",
+                    "title": "Implement branch A",
+                    "node_type": "execute",
+                }
+            ]
+        }
+    ).to_artifact()
+    harness = HarnessConfig(
+        harness_id="h-worktree-retain",
+        task_id="task-worktree-retain",
+        isolation_mode="worktree",
+        isolation_cleanup="manual",
+    )
+    executor = TaskGraphExecutor(
+        dispatcher=RecordingDispatcher(),
+        harness_config=harness,
+        isolation_repo_root=repo,
+    )
+
+    result = executor.execute_all(graph)
+
+    workspace_dir = repo / ".sarathi" / "worktrees" / "task-worktree-retain" / "node-a"
+    assert workspace_dir.exists()
+    node = next(node for node in result.graph_state["nodes"] if node["id"] == "node-a")
+    assert node["isolation"]["mode"] == "worktree"
+    assert node["isolation"]["cleanup"] == "manual"
+    assert node["isolation"]["workspace_dir"] == str(workspace_dir)
+    provider_result = node["last_provider_result"]
+    assert provider_result["isolation"]["workspace_dir"] == str(workspace_dir)
+    assert provider_result["artifacts"]["isolation"]["workspace_dir"] == str(workspace_dir)
+    GitWorktreeIsolation(repo).cleanup_task_worktrees("task-worktree-retain")
+
+
+def test_manual_worktree_cleanup_records_metadata_when_dispatcher_raises(tmp_path):
+    from src.harness import HarnessConfig
+    from src.runtime.isolation import GitWorktreeIsolation
+
+    repo = _init_repo(tmp_path / "repo")
+
+    class FailingDispatcher:
+        def dispatch(self, request):
+            workspace_dir = Path(request.constraints["workspace_dir"])
+            assert workspace_dir.exists()
+            raise RuntimeError("boom")
+
+    graph = graph_from_workflow(
+        {
+            "nodes": [
+                {
+                    "id": "node-a",
+                    "title": "Implement branch A",
+                    "node_type": "execute",
+                }
+            ]
+        }
+    ).to_artifact()
+    harness = HarnessConfig(
+        harness_id="h-worktree-retain-failure",
+        task_id="task-worktree-retain-failure",
+        isolation_mode="worktree",
+        isolation_cleanup="manual",
+    )
+    executor = TaskGraphExecutor(
+        dispatcher=FailingDispatcher(),
+        harness_config=harness,
+        isolation_repo_root=repo,
+    )
+
+    result = executor.execute_all(graph)
+
+    workspace_dir = repo / ".sarathi" / "worktrees" / "task-worktree-retain-failure" / "node-a"
+    assert workspace_dir.exists()
+    node = next(node for node in result.graph_state["nodes"] if node["id"] == "node-a")
+    assert result.graph_state["failed_nodes"] == ["node-a"]
+    assert node["isolation"]["cleanup"] == "manual"
+    assert node["isolation"]["workspace_dir"] == str(workspace_dir)
+    provider_result = node["last_provider_result"]
+    assert provider_result["success"] is False
+    assert provider_result["isolation"]["workspace_dir"] == str(workspace_dir)
+    assert provider_result["artifacts"]["isolation"]["workspace_dir"] == str(workspace_dir)
+    GitWorktreeIsolation(repo).cleanup_task_worktrees("task-worktree-retain-failure")
+
+
+def test_apply_judge_winner_worktree_requires_explicit_approval(tmp_path):
+    from src.runtime.isolation import GitWorktreeIsolation
+
+    repo = _init_repo(tmp_path / "repo")
+    isolation = GitWorktreeIsolation(repo)
+    winner_worktree = isolation.create_worktree(task_id="task-winner", node_id="candidate-a")
+    (winner_worktree / "winner.txt").write_text("winner\n", encoding="utf-8")
+    graph = {
+        "nodes": [
+            {
+                "id": "candidate-a",
+                "isolation": {"mode": "worktree", "workspace_dir": str(winner_worktree)},
+            },
+            {
+                "id": "judge",
+                "node_type": "judge",
+                "last_provider_result": {"outputs": {"winner": "candidate-a"}},
+            },
+        ]
+    }
+    executor = TaskGraphExecutor(isolation_repo_root=repo)
+
+    result = executor.apply_judge_winner_worktree(
+        graph,
+        judge_node_id="judge",
+        approved=False,
+    )
+
+    assert result["applied"] is False
+    assert result["approval_required"] is True
+    assert result["winner_node_id"] == "candidate-a"
+    assert not (repo / "winner.txt").exists()
+    isolation.cleanup_task_worktrees("task-winner")
+
+
+def test_apply_judge_winner_worktree_applies_approved_winner(tmp_path):
+    from src.runtime.isolation import GitWorktreeIsolation
+
+    repo = _init_repo(tmp_path / "repo")
+    isolation = GitWorktreeIsolation(repo)
+    loser_worktree = isolation.create_worktree(task_id="task-winner", node_id="candidate-b")
+    winner_worktree = isolation.create_worktree(task_id="task-winner", node_id="candidate-a")
+    (winner_worktree / "winner.txt").write_text("winner\n", encoding="utf-8")
+    (loser_worktree / "loser.txt").write_text("loser\n", encoding="utf-8")
+    graph = {
+        "nodes": [
+            {
+                "id": "candidate-a",
+                "isolation": {"mode": "worktree", "workspace_dir": str(winner_worktree)},
+            },
+            {
+                "id": "candidate-b",
+                "isolation": {"mode": "worktree", "workspace_dir": str(loser_worktree)},
+            },
+            {
+                "id": "judge",
+                "node_type": "judge",
+                "last_provider_result": {"outputs": {"winner": "candidate-a"}},
+            },
+        ]
+    }
+    executor = TaskGraphExecutor(isolation_repo_root=repo)
+
+    result = executor.apply_judge_winner_worktree(
+        graph,
+        judge_node_id="judge",
+        approved=True,
+    )
+
+    assert result["applied"] is True
+    assert result["files_changed"] == ["winner.txt"]
+    assert result["winner_node_id"] == "candidate-a"
+    assert (repo / "winner.txt").read_text(encoding="utf-8") == "winner\n"
+    assert not (repo / "loser.txt").exists()
+    assert not winner_worktree.exists()
+    assert not loser_worktree.exists()
+    assert "isolation_applications" not in graph
+    assert "isolation_apply" not in next(node for node in graph["nodes"] if node["id"] == "candidate-a")
+    result_graph = result["graph_state"]
+    assert result_graph["isolation_applications"][0]["files_changed"] == ["winner.txt"]
+    winner_node = next(node for node in result_graph["nodes"] if node["id"] == "candidate-a")
+    assert winner_node["isolation_apply"]["files_changed"] == ["winner.txt"]
+
+
+def test_apply_judge_winner_worktree_skips_without_winner_output(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    graph = {
+        "nodes": [
+            {
+                "id": "judge",
+                "node_type": "judge",
+                "last_provider_result": {"outputs": {}},
+            }
+        ]
+    }
+    executor = TaskGraphExecutor(isolation_repo_root=repo)
+
+    result = executor.apply_judge_winner_worktree(
+        graph,
+        judge_node_id="judge",
+        approved=True,
+    )
+
+    assert result == {
+        "applied": False,
+        "judge_node_id": "judge",
+        "reason": "no_winner",
+    }
+
+
+def test_apply_judge_winner_worktree_skips_without_isolation_metadata(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    graph = {
+        "nodes": [
+            {"id": "candidate-a"},
+            {
+                "id": "judge",
+                "node_type": "judge",
+                "last_provider_result": {"outputs": {"winner": "candidate-a"}},
+            },
+        ]
+    }
+    executor = TaskGraphExecutor(isolation_repo_root=repo)
+
+    result = executor.apply_judge_winner_worktree(
+        graph,
+        judge_node_id="judge",
+        approved=True,
+    )
+
+    assert result == {
+        "applied": False,
+        "judge_node_id": "judge",
+        "winner_node_id": "candidate-a",
+        "reason": "no_worktree_isolation",
+    }
+
+
+def test_apply_judge_winner_worktree_skips_when_winner_node_missing(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    graph = {
+        "nodes": [
+            {
+                "id": "judge",
+                "node_type": "judge",
+                "last_provider_result": {"outputs": {"winner": "candidate-a"}},
+            },
+        ]
+    }
+    executor = TaskGraphExecutor(isolation_repo_root=repo)
+
+    result = executor.apply_judge_winner_worktree(
+        graph,
+        judge_node_id="judge",
+        approved=True,
+    )
+
+    assert result == {
+        "applied": False,
+        "judge_node_id": "judge",
+        "winner_node_id": "candidate-a",
+        "reason": "winner_not_found",
+    }
+
 
 def test_fanout_branch_and_synthesize_dispatch_carry_harness_id():
     """Every node FANOUT spawns — parallel branches and the synthesize

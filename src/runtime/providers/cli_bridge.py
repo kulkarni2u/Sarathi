@@ -118,6 +118,9 @@ def dispatch_via_cli_bridge(
     request: DispatchRequest,
 ) -> DispatchResponse:
     provider_name = provider.strip().lower()
+    requested_workspace = request.constraints.get("workspace_dir")
+    if isinstance(requested_workspace, str) and requested_workspace.strip():
+        workspace_root = requested_workspace
     permission_mode = _coerce_permission_mode(request.constraints.get("permission_mode"))
     if provider_name in {"claude", "codex", "opencode"}:
         try:

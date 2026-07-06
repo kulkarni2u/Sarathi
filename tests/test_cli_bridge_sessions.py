@@ -183,6 +183,38 @@ def test_codex_session_id_captured_from_output_file_json(tmp_path):
     assert response.artifacts["codex_session_id"] == "codex-file-session"
 
 
+def test_codex_dispatch_uses_workspace_dir_constraint_for_cwd(tmp_path):
+    parent_workspace = tmp_path / "parent"
+    isolated_workspace = tmp_path / "isolated"
+    parent_workspace.mkdir()
+    isolated_workspace.mkdir()
+    body = (
+        "import json, os, sys\n"
+        "argv = sys.argv[1:]\n"
+        "o_idx = argv.index('-o')\n"
+        "with open(argv[o_idx + 1], 'w') as f:\n"
+        "    f.write(json.dumps({"
+        "'success': True,"
+        "'outputs': {'summary': 'ok'},"
+        "'evidence': {'cwd': os.getcwd()},"
+        "'artifacts': {'cwd': os.getcwd()}"
+        "}))\n"
+    )
+    path = _fake_script(tmp_path, "codex", body)
+
+    response = dispatch_via_cli_bridge(
+        provider="codex",
+        path=path,
+        workspace_root=str(parent_workspace),
+        request=_request(constraints={"workspace_dir": str(isolated_workspace)}),
+    )
+
+    assert response.success is True
+    assert response.evidence["cwd"] == str(isolated_workspace)
+    assert response.artifacts["cwd"] == str(isolated_workspace)
+    assert response.artifacts["workspace_root"] == str(isolated_workspace)
+
+
 # ── dispatch through a fake opencode CLI ─────────────────────────────────────
 
 def test_opencode_resume_flows_through_dispatch_argv(tmp_path):
@@ -216,6 +248,37 @@ def test_opencode_without_session_constraint_falls_back_to_dash_c(tmp_path):
     assert "-c" in command
     assert "--session" not in command
     assert "opencode_session_id" not in response.artifacts
+
+
+def test_opencode_dispatch_uses_workspace_dir_constraint_for_dir_and_cwd(tmp_path):
+    parent_workspace = tmp_path / "parent"
+    isolated_workspace = tmp_path / "isolated"
+    parent_workspace.mkdir()
+    isolated_workspace.mkdir()
+    body = (
+        "import json, os, sys\n"
+        "print(json.dumps({"
+        "'success': True,"
+        "'outputs': {'summary': 'ok'},"
+        "'evidence': {'cwd': os.getcwd(), 'argv': sys.argv[1:]},"
+        "'artifacts': {'cwd': os.getcwd(), 'argv': sys.argv[1:]}"
+        "}))\n"
+    )
+    path = _fake_script(tmp_path, "opencode", body)
+
+    response = dispatch_via_cli_bridge(
+        provider="opencode",
+        path=path,
+        workspace_root=str(parent_workspace),
+        request=_request(constraints={"workspace_dir": str(isolated_workspace)}),
+    )
+
+    assert response.success is True
+    assert response.evidence["cwd"] == str(isolated_workspace)
+    assert response.artifacts["cwd"] == str(isolated_workspace)
+    command = response.artifacts["command"]
+    assert command[command.index("--dir") + 1] == str(isolated_workspace)
+    assert response.artifacts["workspace_root"] == str(isolated_workspace)
 
 
 # ── TUI ChatSession: per-provider session tracking ───────────────────────────

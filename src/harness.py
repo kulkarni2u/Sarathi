@@ -61,6 +61,8 @@ class HarnessConfig:
     # Execution plan
     primary_agent: AgentBinding = field(default_factory=lambda: AgentBinding("local"))
     fallback_agents: list[AgentBinding] = field(default_factory=list)
+    isolation_mode: str = "none"  # none | worktree | container
+    isolation_cleanup: str = "auto"  # auto | manual
 
     # Skill manifest
     eager_skills: list[SkillBinding] = field(default_factory=list)
@@ -102,6 +104,8 @@ class HarnessConfig:
         d.setdefault("assembly_mode", "STANDARD")
         d.setdefault("tool_bindings", [])
         d.setdefault("agent_spec_key", None)
+        d.setdefault("isolation_mode", "none")
+        d.setdefault("isolation_cleanup", "auto")
 
         if d.get("primary_agent"):
             d["primary_agent"] = AgentBinding(**d["primary_agent"])

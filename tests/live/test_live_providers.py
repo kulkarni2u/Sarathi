@@ -106,6 +106,22 @@ permissions:
     )
 
 
+def _prepare_codex_home(source_home: Path, target_home: Path) -> None:
+    """Copy local Codex auth into the isolated HOME used by live tests."""
+    source_codex = source_home / ".codex"
+    auth_path = source_codex / "auth.json"
+    if not auth_path.exists():
+        pytest.skip(f"codex auth not found at {auth_path}; run `codex login`")
+
+    target_codex = target_home / ".codex"
+    target_codex.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(auth_path, target_codex / "auth.json")
+
+    config_path = source_codex / "config.toml"
+    if config_path.exists():
+        shutil.copy2(config_path, target_codex / "config.toml")
+
+
 # ── Claude (real CLI, authenticated) ─────────────────────────────────────────
 
 @pytest.mark.skipif(shutil.which("claude") is None, reason="claude CLI not found on PATH")
@@ -162,7 +178,11 @@ def test_claude_dispatch_end_to_end(tmp_path):
         assert "workspace_unchanged_on_success" not in response.evidence
         if (tmp_path / "hello.txt").exists():
             assert "hello.txt" in workspace_delta["files_changed"]
-            assert reconciliation["divergence"] is False
+            if reconciliation["claimed_files"]:
+                assert reconciliation["divergence"] is False
+            else:
+                assert reconciliation["divergence"] is None
+                assert reconciliation["reason"] == "no claimed file changes to reconcile"
             assert (tmp_path / "hello.txt").read_text(encoding="utf-8").strip() == "hello sarathi"
     else:
         # Claude declined to write the file -- Sarathi must have flagged the
@@ -226,7 +246,10 @@ def test_codex_dispatch_end_to_end(tmp_path, monkeypatch):
     - Permission config is written before dispatch to ~/.codex/config.yaml
     - Evidence shows workspace interaction occurred
     """
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    real_home = Path.home()
+    test_home = tmp_path / "home"
+    _prepare_codex_home(real_home, test_home)
+    monkeypatch.setenv("HOME", str(test_home))
     _init_git_repo(tmp_path)
     _write_provider_permissions_policy(tmp_path)
 
@@ -259,7 +282,7 @@ def test_codex_dispatch_end_to_end(tmp_path, monkeypatch):
     ), f"Usage must have tokens or be estimated: {response.usage}"
 
     # Permission config written before dispatch (marker in ~/.codex/config.yaml)
-    codex_config_path = tmp_path / "home" / ".codex" / "config.yaml"
+    codex_config_path = test_home / ".codex" / "config.yaml"
     assert (
         codex_config_path.exists()
     ), f"Codex permission config must exist at {codex_config_path}"
@@ -280,7 +303,10 @@ def test_codex_dispatch_structured_failure(tmp_path, monkeypatch):
       with success=False, error message populated, and no unhandled exception
     - Failure response has expected artifact fields (command, provider, etc.)
     """
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    real_home = Path.home()
+    test_home = tmp_path / "home"
+    _prepare_codex_home(real_home, test_home)
+    monkeypatch.setenv("HOME", str(test_home))
     _init_git_repo(tmp_path)
     _write_provider_permissions_policy(tmp_path)
 

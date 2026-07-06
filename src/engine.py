@@ -24,12 +24,14 @@ try:
     from .permissions import PermissionScope, build_permission_scope
     from .trust_gate import TrustGate, TrustGateResult, arbitrate
     from .notifications import budget_exhausted_event, build_slack_notifier, phase_event
+    from .engine_mirror import EngineRunRecorder
 except ImportError:
     from task_class import TaskClass, classify_task_class, from_legacy_type
     from harness import HarnessConfig, HarnessOutcome, derive_permission_mode
     from permissions import PermissionScope, build_permission_scope
     from trust_gate import TrustGate, TrustGateResult, arbitrate
     from notifications import budget_exhausted_event, build_slack_notifier, phase_event
+    from engine_mirror import EngineRunRecorder
 
 try:
     from .dispatch import Dispatcher, LocalDispatcher, require_harness_id
@@ -800,6 +802,10 @@ class Engine:
         # Outbound notifications (Slack) — policy-gated, env holds the secret.
         self.notifier = build_slack_notifier(self.compiled_policy.get("notifications"))
 
+        # Best-effort mirror into the service SQLite DB (web cockpit
+        # visibility) — inactive unless .sarathi/sarathi.db already exists.
+        self.run_recorder = EngineRunRecorder.try_create()
+
         self.phase_handlers = self._create_phase_handlers()
         self.recovery_runner = RecoveryRunner(
             dispatcher=self.dispatcher,
@@ -1494,6 +1500,8 @@ class Engine:
         # Save phase log entry
         self.persistence.save_phase_log(task, phase, status)
         self._notify_phase(task, phase, status)
+        if self.run_recorder is not None:
+            self.run_recorder.record_phase(task, phase, status)
 
     def _notify_phase(self, task: TaskContext, phase: Phase, status: str) -> None:
         """Forward attention-worthy phase transitions to the notifier."""

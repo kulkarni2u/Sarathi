@@ -534,6 +534,42 @@ permissions:
 """
         (policy_path / "permissions.md").write_text(permissions_md)
 
+        # Generate notifications.md
+        notifications_md = """# Policy Pack: Notifications
+
+Outbound notifications for attention-worthy lifecycle events. Secrets stay
+in the environment — this file only names the env vars that hold them.
+
+## Slack
+```yaml
+slack:
+  # Flip to true, then export the webhook URL (or bot token) to activate:
+  #   export SARATHI_SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+  enabled: false
+  webhook_env: SARATHI_SLACK_WEBHOOK_URL
+
+  # Bot-token mode instead of a webhook (lets one token post to any channel
+  # the bot is invited to):
+  # bot_token_env: SARATHI_SLACK_BOT_TOKEN
+  # channel: "#sarathi-runs"
+
+  timeout_seconds: 5
+
+  # fnmatch-style patterns; add "phase.*" for per-phase progress messages.
+  events:
+    - task.completed
+    - task.failed
+    - task.paused
+    - task.escalated
+    - task.cancelled
+    - task.timed_out
+    - budget.exhausted
+    - approval.requested
+    - review.rejected
+```
+"""
+        (policy_path / "notifications.md").write_text(notifications_md)
+
         return policy_path
 
     def validate(self, policy_pack_path: Path | None = None) -> list[Any]:

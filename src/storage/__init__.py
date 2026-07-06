@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
+
+logger = logging.getLogger("sarathi.storage")
 
 
 LATEST_SCHEMA_VERSION = 10
@@ -119,10 +122,20 @@ def run_migrations(conn: sqlite3.Connection) -> None:
 
 
 class Storage:
-    """Small repository facade for persisted Sarathi UI records."""
+    """Small repository facade for persisted Sarathi UI records.
 
-    def __init__(self, conn: sqlite3.Connection):
+    ``event_listener`` is an optional observer invoked (best-effort) with each
+    lifecycle event dict right after it is committed — used by the service to
+    fan events out to notification channels without coupling storage to them.
+    """
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        event_listener: Callable[[dict[str, Any]], None] | None = None,
+    ):
         self.conn = conn
+        self._event_listener = event_listener
 
     def create_workspace(
         self,
@@ -1261,6 +1274,11 @@ class Storage:
         self.conn.commit()
         event = self.get_lifecycle_event(event_id)
         assert event is not None
+        if self._event_listener is not None:
+            try:
+                self._event_listener(event)
+            except Exception:
+                logger.warning("Lifecycle event listener failed", exc_info=True)
         return event
 
     def get_lifecycle_event(self, event_id: str) -> dict[str, Any] | None:

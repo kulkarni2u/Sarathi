@@ -23,11 +23,13 @@ try:
     from .harness import HarnessConfig, HarnessOutcome, derive_permission_mode
     from .permissions import PermissionScope, build_permission_scope
     from .trust_gate import TrustGate, TrustGateResult, arbitrate
+    from .notifications import budget_exhausted_event, build_slack_notifier, phase_event
 except ImportError:
     from task_class import TaskClass, classify_task_class, from_legacy_type
     from harness import HarnessConfig, HarnessOutcome, derive_permission_mode
     from permissions import PermissionScope, build_permission_scope
     from trust_gate import TrustGate, TrustGateResult, arbitrate
+    from notifications import budget_exhausted_event, build_slack_notifier, phase_event
 
 try:
     from .dispatch import Dispatcher, LocalDispatcher, require_harness_id
@@ -177,6 +179,7 @@ class PolicyPack:
     task_tracking: dict[str, Any] = field(default_factory=dict)
     learning_feedback: dict[str, Any] = field(default_factory=dict)
     workflow_patterns: dict[str, Any] = field(default_factory=dict)
+    notifications: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -787,6 +790,9 @@ class Engine:
         if hasattr(self.dispatcher, "workspace_root"):
             self.dispatcher.workspace_root = self.workspace_root
 
+        # Outbound notifications (Slack) — policy-gated, env holds the secret.
+        self.notifier = build_slack_notifier(self.compiled_policy.get("notifications"))
+
         self.phase_handlers = self._create_phase_handlers()
         self.recovery_runner = RecoveryRunner(
             dispatcher=self.dispatcher,
@@ -813,6 +819,7 @@ class Engine:
             "learning_feedback",
             "workflow_patterns",
             "permissions",
+            "notifications",
         ):
             setattr(pack, attr, self.compiled_policy.get(attr))
 
@@ -1060,6 +1067,15 @@ class Engine:
                     budget.on_exhausted,
                 )
                 if budget.on_exhausted == "pause":
+                    if self.notifier is not None:
+                        self.notifier.notify(
+                            budget_exhausted_event(
+                                task.task_id,
+                                task.description,
+                                budget.consumed_tokens,
+                                budget.max_total_tokens,
+                            )
+                        )
                     self.persistence.save_task(task)
                     return task
 
@@ -1407,6 +1423,21 @@ class Engine:
         """Log phase transition and persist task state."""
         # Save phase log entry
         self.persistence.save_phase_log(task, phase, status)
+        self._notify_phase(task, phase, status)
+
+    def _notify_phase(self, task: TaskContext, phase: Phase, status: str) -> None:
+        """Forward attention-worthy phase transitions to the notifier."""
+        if self.notifier is None:
+            return
+        event = phase_event(
+            task.task_id,
+            task.description,
+            phase.value,
+            status,
+            final_phase=phase is Phase.LEARN,
+        )
+        if event is not None:
+            self.notifier.notify(event)
 
     def _sync_task_state(self, task: TaskContext, result: PhaseResult) -> None:
         """Promote selected phase artifacts into task-level state."""

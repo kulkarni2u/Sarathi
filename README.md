@@ -366,6 +366,7 @@ policy-pack/
   conventions.md
   escalation.md
   model-routing.md
+  notifications.md
   permissions.md
   review.md
   skills.md
@@ -427,6 +428,34 @@ Provider dispatch evidence can include usage, session IDs, workspace deltas,
 review traces, diff traces, spec traces, retry context, and recovery
 classification. The review phase uses structured evidence when available instead
 of treating a provider response as blanket proof.
+
+## Slack Notifications
+
+Sarathi can post to a Slack channel when a run needs attention: task
+completed/failed, a phase paused for human input, budget exhausted, an
+approval requested, or a review rejected. Notifications are best-effort — a
+Slack outage never blocks a run — and secrets stay in the environment.
+
+Fastest path (incoming webhook):
+
+```bash
+export SARATHI_SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T000/B000/XXXX"
+sarathi run "Fix the failing checkout test" --policy-pack ./policy-pack
+```
+
+Bot-token mode (one token, any channel the bot is invited to):
+
+```bash
+export SARATHI_SLACK_BOT_TOKEN="xoxb-..."
+export SARATHI_SLACK_CHANNEL="#sarathi-runs"
+```
+
+Which events notify is policy: `policy-pack/notifications.md` declares the
+event list for engine runs (CLI/TUI/MCP), with fnmatch patterns such as
+`approval.*` or `phase.*`. The local service and work-queue worker fan out
+their `lifecycle_events` stream using environment-only configuration
+(`SARATHI_SLACK_EVENTS` narrows the event list, comma-separated). See
+`policy-pack/EXAMPLE/notifications.md` for the full reference.
 
 ## Verification Commands
 

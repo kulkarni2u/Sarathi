@@ -21,6 +21,7 @@ POLICY_FILES = {
     "skills": "skills.md",
     "task_tracking": "task-tracking.md",
     "permissions": "permissions.md",
+    "notifications": "notifications.md",
 }
 
 

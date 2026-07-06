@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from urllib.parse import unquote
 
 from src.init import bootstrap_workspace
+from src.notifications import lifecycle_event_listener
 from src.storage import Storage, connect, run_migrations
 
 from .errors import (
@@ -199,6 +200,8 @@ class ServiceApp:
         self.dist_root = Path(dist_root) if dist_root is not None else DEFAULT_DIST_ROOT
         self.auth_enabled = _auth_enabled() if auth_enabled is None else auth_enabled
         self._local = threading.local()
+        # Optional Slack fan-out for lifecycle events (env-configured).
+        self._event_listener = lifecycle_event_listener()
         # Run migrations once at startup on the main thread
         with connect(self.db_path) as _conn:
             run_migrations(_conn)
@@ -209,7 +212,7 @@ class ServiceApp:
         if conn is None:
             conn = connect(self.db_path).__enter__()  # keep connection open
             self._local.conn = conn
-        return conn, Storage(conn)
+        return conn, Storage(conn, event_listener=self._event_listener)
 
     def __call__(
         self,

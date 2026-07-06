@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from src.notifications import lifecycle_event_listener
 from src.storage import Storage, connect, run_migrations
 
 from .providers import DEFAULT_CLAIM_LEASE_SECONDS, _dispatch_subtask
@@ -166,7 +167,7 @@ def run_worker(
 
     with connect(db_path) as conn:
         run_migrations(conn)
-        storage = Storage(conn)
+        storage = Storage(conn, event_listener=lifecycle_event_listener())
 
         while True:
             if should_stop is not None and should_stop():

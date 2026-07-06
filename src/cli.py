@@ -752,6 +752,16 @@ def main() -> None:
         action="store_true",
         help="Render a single snapshot and exit",
     )
+    watch_parser.add_argument(
+        "--follow",
+        action="store_true",
+        help="Stream lifecycle events via SSE instead of polling",
+    )
+    watch_parser.add_argument(
+        "--workspace",
+        type=str,
+        help="Workspace ID (required when using --follow for service tasks)",
+    )
 
     resume_parser = subparsers.add_parser("resume", help="Resume a saved task")
     resume_parser.add_argument(
@@ -2046,8 +2056,157 @@ def _print_task_status(task: TaskContext, *, stale_after_seconds: int = 300) -> 
         print_escalation_summary(bundle)
 
 
+def _parse_sse_stream(lines: list[str]) -> Any:
+    """Parse SSE stream lines into (event_id, event_type, data_dict) tuples.
+
+    Yields (event_id, event_type, data_dict) for each complete SSE frame.
+    Handles multi-line data payloads, ignores junk lines.
+    """
+    event_id = None
+    event_type = None
+    data_lines = []
+
+    for line in lines:
+        line = line.rstrip("\r\n")
+
+        # Blank line signals end of frame
+        if not line:
+            if event_type is not None:
+                # Join multi-line data payloads
+                data_str = "\n".join(data_lines)
+                try:
+                    data = json.loads(data_str)
+                except (json.JSONDecodeError, ValueError):
+                    data = data_str
+                yield (event_id, event_type, data)
+            # Reset for next frame
+            event_id = None
+            event_type = None
+            data_lines = []
+            continue
+
+        # Parse SSE frame lines
+        if line.startswith("id:"):
+            event_id = line[3:].lstrip()
+        elif line.startswith("event:"):
+            event_type = line[6:].lstrip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+        # Ignore comments and other lines
+
+
+def _follow_task_events(base_url: str, token: str, workspace_id: str, task_id: str) -> None:
+    """Stream task lifecycle events from SSE endpoint.
+
+    Opens the SSE stream at {base_url}/api/workspaces/{workspace_id}/tasks/{task_id}/events/stream,
+    parses events, and prints one concise line per event. Handles KeyboardInterrupt cleanly.
+    On connection drop, reconnects once with Last-Event-ID header.
+    """
+    stream_url = f"{base_url.rstrip('/')}/api/workspaces/{workspace_id}/tasks/{task_id}/events/stream"
+    last_event_id = None
+    reconnect_count = 0
+    max_reconnects = 1
+
+    try:
+        while reconnect_count <= max_reconnects:
+            try:
+                request = urllib.request.Request(stream_url)
+                request.add_header("Authorization", f"Bearer {token}")
+                if last_event_id:
+                    request.add_header("Last-Event-ID", last_event_id)
+
+                with urllib.request.urlopen(request, timeout=None) as response:
+                    print(f"Following task {task_id}...")
+                    reconnect_count = 0  # Reset on successful connection
+
+                    # Read lines from the stream
+                    buffer = []
+                    for line_bytes in response:
+                        line = line_bytes.decode("utf-8")
+                        buffer.append(line)
+
+                    # Parse all buffered lines
+                    for event_id, event_type, data in _parse_sse_stream(buffer):
+                        last_event_id = event_id
+                        # Print concise summary
+                        timestamp = time.strftime("%H:%M:%S")
+                        if isinstance(data, dict):
+                            payload_summary = data.get("object_id", "")
+                            if payload_summary:
+                                print(f"{timestamp} [{event_type}] {payload_summary}")
+                            else:
+                                print(f"{timestamp} [{event_type}]")
+                        else:
+                            print(f"{timestamp} [{event_type}]")
+
+                    # Stream ended cleanly
+                    raise SystemExit(0)
+
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    print("Authentication failed. Check your service token.")
+                    raise SystemExit(1)
+                elif e.code == 404:
+                    print("Task or workspace not found.")
+                    raise SystemExit(1)
+                else:
+                    if reconnect_count < max_reconnects:
+                        print(f"Connection failed (HTTP {e.code}). Reconnecting...")
+                        reconnect_count += 1
+                        time.sleep(1)
+                    else:
+                        print(f"Connection dropped. Exiting.")
+                        raise SystemExit(0)
+
+            except urllib.error.URLError as e:
+                if reconnect_count < max_reconnects:
+                    print(f"Connection lost: {e.reason}. Reconnecting...")
+                    reconnect_count += 1
+                    time.sleep(1)
+                else:
+                    print(f"Connection dropped. Exiting.")
+                    raise SystemExit(0)
+
+    except KeyboardInterrupt:
+        print("\nStream stopped.")
+        raise SystemExit(0)
+
+
 def handle_watch(args: argparse.Namespace) -> None:
     """Watch a persisted task and refresh the compact supervision view."""
+    # Check if following via SSE
+    if getattr(args, "follow", False):
+        info = _read_service_discovery()
+        service_url = info.get("url") if isinstance(info, dict) else None
+        service_token = _service_auth_token(info)
+        if not service_url:
+            print("Sarathi desktop service not running — start it with: sarathi desktop")
+            raise SystemExit(1)
+
+        workspace_id = getattr(args, "workspace", None)
+        if not workspace_id:
+            # Try to find workspace by querying service
+            try:
+                workspaces = _service_get_json(service_url, "/api/workspaces", token=service_token).get("workspaces", [])
+            except Exception as e:
+                print(f"Could not discover workspaces: {e}")
+                raise SystemExit(1)
+
+            if not workspaces:
+                print("No workspaces available. Create one with: sarathi desktop")
+                raise SystemExit(1)
+            elif len(workspaces) == 1:
+                workspace_id = workspaces[0].get("id")
+            else:
+                print("Multiple workspaces found. Specify one with: --workspace <id>")
+                for ws in workspaces:
+                    print(f"  - {ws.get('name')} ({ws.get('id')})")
+                raise SystemExit(1)
+
+        _follow_task_events(service_url, service_token, workspace_id, args.task_id)
+        return
+
+    # Default polling behavior
     persistence_cls = globals().get("PersistenceManager")
     if persistence_cls is None:
         try:

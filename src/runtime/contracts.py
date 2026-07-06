@@ -49,6 +49,12 @@ class UsageRecord:
     budget_remaining: int | None = None
     budget_state: BudgetState = "unknown"
     usage_source: UsageSource = "estimated"
+    # Dollar cost for this dispatch, when known. None means "unpriced" — not
+    # zero cost. Populated either from a provider's self-reported cost (e.g.
+    # claude's total_cost_usd) or computed from a policy pricing table (see
+    # src/runtime/pricing.py); self-reported always wins. Optional and
+    # defaulted so existing constructors/serialization keep working.
+    cost_usd: float | None = None
 
     def to_artifact(self) -> dict[str, Any]:
         return {
@@ -63,6 +69,7 @@ class UsageRecord:
             "budget_remaining": self.budget_remaining,
             "budget_state": self.budget_state,
             "usage_source": self.usage_source,
+            "cost_usd": self.cost_usd,
         }
 
     @classmethod
@@ -86,6 +93,7 @@ class UsageRecord:
             budget_remaining=_optional_int(payload.get("budget_remaining")),
             budget_state=_budget_state(payload.get("budget_state")),
             usage_source=_usage_source(payload.get("usage_source")),
+            cost_usd=_optional_float(payload.get("cost_usd")),
         )
 
 
@@ -122,8 +130,16 @@ def build_usage_record(
     response_text: str = "",
     reported_usage: Mapping[str, Any] | None = None,
     budget_limit: int | None = None,
+    reported_cost_usd: float | None = None,
 ) -> UsageRecord:
-    """Create a normalized usage record from provider telemetry or estimates."""
+    """Create a normalized usage record from provider telemetry or estimates.
+
+    ``reported_cost_usd`` is a provider's self-reported dollar cost (e.g.
+    claude CLI's ``total_cost_usd``), when the caller already has it in hand.
+    It takes precedence over anything a pricing table would later compute
+    (see src/runtime/pricing.py) — callers that don't have a self-reported
+    cost should leave this as None and let cost resolution happen downstream.
+    """
     provider_family = provider_family or provider_id
     reported = reported_usage if isinstance(reported_usage, Mapping) else None
 
@@ -198,6 +214,7 @@ def build_usage_record(
         budget_remaining=resolved_budget_remaining,
         budget_state=resolved_budget_state,
         usage_source=usage_source,
+        cost_usd=_optional_float(reported_cost_usd),
     )
 
 
@@ -230,6 +247,15 @@ def _optional_int(value: Any) -> int | None:
         if value is None:
             return None
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
     except (TypeError, ValueError):
         return None
 

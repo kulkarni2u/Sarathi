@@ -65,6 +65,26 @@ def require_harness_id(request: "DispatchRequest") -> None:
         )
 
 
+def _reported_cost_from_artifacts(artifacts: Mapping[str, Any] | None) -> float | None:
+    """Extract a provider's self-reported dollar cost from dispatch artifacts.
+
+    claude's CLI bridge surfaces `total_cost_usd` from its result envelope
+    into `DispatchResponse.artifacts`; other providers may report a plain
+    `cost_usd`. Either wins over a pricing-table computation.
+    """
+    if not isinstance(artifacts, Mapping):
+        return None
+    for key in ("total_cost_usd", "cost_usd"):
+        value = artifacts.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _is_transient_failure(
     response_or_none: "DispatchResponse | None",
     exc_or_none: Exception | None,
@@ -92,6 +112,7 @@ def _is_transient_failure(
 
 try:
     from .runtime import DispatchRequest, DispatchResponse
+    from .runtime.pricing import PricingTable, resolve_cost
     from .runtime.providers import (
         ConfiguredProviderAdapter,
         LocalProviderAdapter,
@@ -99,6 +120,7 @@ try:
     )
 except ImportError:
     from runtime import DispatchRequest, DispatchResponse
+    from runtime.pricing import PricingTable, resolve_cost
     from runtime.providers import (
         ConfiguredProviderAdapter,
         LocalProviderAdapter,
@@ -165,6 +187,12 @@ class LocalDispatcher(Dispatcher):
         provider_config: Mapping[str, Any] | None = None,
     ):
         self.provider = provider or self._provider_from_config(provider_config)
+        # Cost resolution is policy-driven: the model-routing section (which
+        # already reaches us as provider_config) may carry a `pricing:`
+        # mapping. We never hardcode a provider name or a dollar figure here
+        # — see src/runtime/pricing.py for parsing/lookup.
+        self._provider_config: Mapping[str, Any] = provider_config or {}
+        self._pricing_table = PricingTable.from_config(provider_config)
 
     def _provider_from_config(
         self, provider_config: Mapping[str, Any] | None
@@ -172,6 +200,44 @@ class LocalDispatcher(Dispatcher):
         if provider_config:
             return ConfiguredProviderAdapter(provider_config)
         return LocalProviderAdapter()
+
+    def _model_for_provider(self, provider_id: str | None) -> str | None:
+        """Best-effort model name for a provider, from its routing config.
+
+        Provider configs (see policy-pack/EXAMPLE/model-routing.md) declare a
+        fixed `model` per provider entry; this mirrors that lookup without
+        assuming any particular provider exists.
+        """
+        if not provider_id:
+            return None
+        providers_cfg = self._provider_config.get("providers")
+        if not isinstance(providers_cfg, Mapping):
+            return None
+        provider_cfg = providers_cfg.get(provider_id)
+        if not isinstance(provider_cfg, Mapping):
+            return None
+        model = provider_cfg.get("model")
+        return model if isinstance(model, str) and model else None
+
+    def _apply_cost(self, response: "DispatchResponse") -> None:
+        """Fill in `usage.cost_usd` when it isn't already known.
+
+        Precedence: a provider's self-reported cost (already present on the
+        usage record, or surfaced in response.artifacts as `total_cost_usd` /
+        `cost_usd`) always wins over a pricing-table computation, which wins
+        over leaving it unpriced (None).
+        """
+        usage = response.usage
+        if usage is None or usage.cost_usd is not None:
+            return
+        reported = _reported_cost_from_artifacts(response.artifacts)
+        if reported is not None:
+            usage.cost_usd = reported
+            return
+        if self._pricing_table.is_empty():
+            return
+        model = self._model_for_provider(usage.provider_id)
+        usage.cost_usd = resolve_cost(usage, usage.provider_id, model, self._pricing_table)
 
     def dispatch_explore(self, spec: TaskSpec) -> ExploreResult:
         response = self.dispatch(
@@ -252,7 +318,9 @@ class LocalDispatcher(Dispatcher):
         pool = ThreadPoolExecutor(max_workers=1)
         future: Future[DispatchResponse] = pool.submit(self.provider.dispatch, request)
         try:
-            return future.result(timeout=timeout)
+            response = future.result(timeout=timeout)
+            self._apply_cost(response)
+            return response
         except FuturesTimeoutError:
             raise DispatchTimeoutError(
                 f"Provider dispatch timed out after {timeout}s "

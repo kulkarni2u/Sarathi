@@ -53,3 +53,31 @@ providers:
     api_key_env: OPENROUTER_API_KEY
     timeout_seconds: 120
 ```
+
+## Pricing
+
+Only `claude` self-reports its own dollar cost today (the CLI envelope's
+`total_cost_usd`), so codex/opencode/gateway dispatches otherwise get no cost
+at all. This `pricing:` mapping lets the runtime (`src/runtime/pricing.py`)
+compute a `cost_usd` for any provider from its token usage instead. It is
+looked up by `(provider, model)`, with each provider's `default` entry used
+when the exact model isn't listed; a provider/model with no entry here stays
+unpriced (`cost_usd: null`), it does not default to zero.
+
+**The numbers below are illustrative placeholders, not current prices** —
+provider pricing changes over time and varies by tier/region. Set your own
+negotiated or published per-provider/per-model rates before relying on
+`cost_usd` for budgeting; do not ship these example figures as-is.
+
+```yaml
+pricing:
+  codex:
+    default: {input_per_mtok: 1.25, output_per_mtok: 10.0}      # placeholder — set your real rate
+    gpt-5.2-codex: {input_per_mtok: 1.75, output_per_mtok: 14.0} # placeholder — set your real rate
+  opencode:
+    default: {input_per_mtok: 0.8, output_per_mtok: 4.0}        # placeholder — set your real rate
+  # claude is intentionally omitted — its CLI self-reports total_cost_usd,
+  # which always takes precedence over a table-computed cost anyway.
+  # A provider/model absent from this table stays unpriced (cost_usd: null),
+  # it never silently defaults to zero.
+```

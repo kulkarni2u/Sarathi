@@ -217,6 +217,51 @@ def is_error_reply(reply: str) -> bool:
     return bool(_ERROR_REPLY_RE.match(reply))
 
 
+_SESSION_ID_KEYS = (
+    "session_id", "sessionId",
+    "thread_id", "threadId",
+    "conversation_id", "conversationId",
+)
+
+_SESSION_ID_LINE_RE = re.compile(
+    r"(?i)\b(?:session|thread|conversation)[ _-]?id\b\s*[:=]\s*\"?([A-Za-z0-9][A-Za-z0-9._-]{5,})\"?"
+)
+
+
+def _extract_session_id(*chunks: str | None) -> str | None:
+    """Best-effort extraction of a resumable session id from codex/opencode output.
+
+    Neither CLI is guaranteed to emit a machine-readable session id in any
+    one shape, so this is telemetry rather than a hard requirement: any
+    parse failure or absence of an id-looking value returns None instead of
+    raising, so a chat turn never fails because session capture failed.
+    """
+    for chunk in chunks:
+        if not chunk or not chunk.strip():
+            continue
+        try:
+            for line in chunk.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    for key in _SESSION_ID_KEYS:
+                        value = parsed.get(key)
+                        if isinstance(value, str) and value.strip():
+                            return value.strip()
+                    continue
+                match = _SESSION_ID_LINE_RE.search(line)
+                if match:
+                    return match.group(1)
+        except Exception:  # noqa: BLE001 — telemetry only, never fail a chat turn
+            continue
+    return None
+
+
 class ChatSession:
     """Multi-turn chat backed by an agent CLI on PATH.
 
@@ -233,22 +278,36 @@ class ChatSession:
         self.workspace_root = workspace_root or os.getcwd()
         self.timeout = timeout
         self.provider: tuple[str, str] | None = None
-        self.claude_session_id: str | None = None
+        # Per-provider resumable session ids (e.g. {"claude": "sess-1"}).
+        # `claude_session_id` below is a compatibility view onto this dict —
+        # other code and tests still read/write it as a plain attribute.
+        self.session_ids: dict[str, str] = {}
         self.history: list[tuple[str, str]] = []
         self.pending_context: list[str] = []
         self.cancelled = False
         self._active_proc: subprocess.Popen | None = None
         self._proc_lock = threading.Lock()
 
+    @property
+    def claude_session_id(self) -> str | None:
+        return self.session_ids.get("claude")
+
+    @claude_session_id.setter
+    def claude_session_id(self, value: str | None) -> None:
+        if value:
+            self.session_ids["claude"] = value
+        else:
+            self.session_ids.pop("claude", None)
+
     def clear(self) -> None:
-        """Forget the conversation: history, pending context, and CLI session."""
+        """Forget the conversation: history, pending context, and CLI session(s)."""
         self.history = []
         self.pending_context = []
-        self.claude_session_id = None
+        self.session_ids = {}
 
     def reset_session(self) -> None:
-        """Drop the resumable claude session, keeping history and pending context."""
-        self.claude_session_id = None
+        """Drop the resumable provider session(s), keeping history and pending context."""
+        self.session_ids = {}
 
     def cancel(self) -> bool:
         """Kill the in-flight CLI subprocess, if any.
@@ -309,7 +368,7 @@ class ChatSession:
         if not path:
             return False
         self.provider = (name, path)
-        self.claude_session_id = None
+        self.session_ids = {}
         return True
 
     def send(self, message: str) -> str:
@@ -571,8 +630,16 @@ class ChatSession:
         return (completed.stdout or "").strip() or "(empty response)"
 
     def _send_one_shot(self, name: str, path: str, message: str) -> str:
+        session_id = self.session_ids.get(name)
         if name == "opencode":
-            command = [path, "run", "--", self._prompt_with_history(message)]
+            if session_id:
+                # Resuming: the CLI already has the prior turns, so send the
+                # raw message rather than re-folding history into the prompt.
+                command = [path, "run", "--session", session_id, "--", message]
+            else:
+                command = [path, "run", "--", self._prompt_with_history(message)]
+        elif session_id:
+            command = [path, "exec", "resume", session_id, message]
         else:
             command = [path, "exec", self._prompt_with_history(message)]
         completed = subprocess.run(
@@ -582,6 +649,9 @@ class ChatSession:
             timeout=self.timeout,
             cwd=self.workspace_root,
         )
+        found_session_id = _extract_session_id(completed.stdout, completed.stderr)
+        if found_session_id:
+            self.session_ids[name] = found_session_id
         if completed.returncode != 0:
             detail = (completed.stderr or "").strip()[:400]
             return f"{name} exited with {completed.returncode}: {detail}"

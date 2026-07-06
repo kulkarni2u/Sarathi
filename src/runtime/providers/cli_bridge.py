@@ -146,20 +146,45 @@ def dispatch_via_cli_bridge(
     return attach_workspace_evidence(response, before, workspace_root, request, logger=logger)
 
 
+def _build_codex_command(
+    path: str,
+    *,
+    output_path: Path,
+    model: str | None,
+    session_id: str | None,
+    prompt: str,
+) -> list[str]:
+    """Build the `codex exec` argv, inserting `resume <SESSION_ID>` when resuming.
+
+    Documented resume syntax is `codex exec resume <SESSION_ID> [same flags]
+    <prompt>` — the resume subcommand and id slot in right after `exec`, ahead
+    of the flags that a fresh `codex exec` invocation would also carry.
+    Centralized here (rather than inlined in `_run_codex`) so tests can assert
+    on the argv shape without shelling out to a real codex binary.
+    """
+    command = [path, "exec"]
+    if session_id:
+        command.extend(["resume", session_id])
+    command.extend(["--skip-git-repo-check", "-o", str(output_path)])
+    if model:
+        command.extend(["--model", model])
+    command.append(prompt)
+    return command
+
+
 def _run_codex(*, path: str, workspace_root: str, request: DispatchRequest) -> DispatchResponse:
     prompt = _provider_prompt("codex", request, workspace_root)
     with tempfile.NamedTemporaryFile("w+", suffix="-sarathi-codex.txt", delete=False) as handle:
         output_path = Path(handle.name)
-    command = [
+    raw_session_id = request.constraints.get("codex_session_id")
+    session_id = raw_session_id if isinstance(raw_session_id, str) and raw_session_id else None
+    command = _build_codex_command(
         path,
-        "exec",
-        "--skip-git-repo-check",
-        "-o", str(output_path),
-    ]
-    model = _requested_model(request)
-    if model:
-        command.extend(["--model", model])
-    command.append(prompt)
+        output_path=output_path,
+        model=_requested_model(request),
+        session_id=session_id,
+        prompt=prompt,
+    )
     try:
         completed = _run_cli_process(
             command,
@@ -183,6 +208,11 @@ def _run_codex(*, path: str, workspace_root: str, request: DispatchRequest) -> D
             output_path.unlink(missing_ok=True)
         except OSError:
             pass
+    # Codex isn't guaranteed to emit a machine-readable session id; scan the
+    # captured output file plus stdout/stderr defensively and record nothing
+    # if none is found — this is telemetry, not a dispatch requirement.
+    codex_session_id = _extract_session_id(message, completed.stdout, completed.stderr)
+    extra_artifacts = {"codex_session_id": codex_session_id} if codex_session_id else {}
     response = _normalize_native_response(
         provider="codex",
         path=path,
@@ -191,6 +221,7 @@ def _run_codex(*, path: str, workspace_root: str, request: DispatchRequest) -> D
         command=command,
         completed=completed,
         message=message,
+        extra_artifacts=extra_artifacts,
     )
     return _ncp_fetch_after_dispatch(workspace_root, request, response)
 
@@ -325,10 +356,34 @@ def _run_claude(*, path: str, workspace_root: str, request: DispatchRequest) -> 
     return _ncp_fetch_after_dispatch(workspace_root, request, response)
 
 
+def _build_opencode_command(
+    path: str,
+    *,
+    workspace_root: str,
+    session_id: str | None,
+    prompt: str,
+) -> list[str]:
+    """Build the `opencode run` argv.
+
+    Passes `--session <id>` to resume a prior conversation when one is
+    stored in constraints; otherwise falls back to `-c` (continue the most
+    recent local session), which was the prior stateless-continuity default.
+    """
+    command = [path, "run"]
+    if session_id:
+        command.extend(["--session", session_id])
+    else:
+        command.append("-c")
+    command.extend(["--dir", workspace_root, "--", prompt])
+    return command
+
+
 def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -> DispatchResponse:
     """Bridge for OpenCode via CLI (`opencode run`).
 
-    Uses `opencode run -c --dir <workspace> -- <prompt>`.
+    Uses `opencode run -c --dir <workspace> -- <prompt>` by default, or
+    `opencode run --session <id> --dir <workspace> -- <prompt>` when a
+    resumable `opencode_session_id` is present in constraints.
     Tool approvals are pre-granted via opencode.json written by `sarathi init`.
     """
     if _should_use_ncp_handoff(provider="opencode", workspace_root=workspace_root, request=request):
@@ -338,14 +393,15 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
             request=request,
         )
     prompt = _provider_prompt("opencode", request, workspace_root)
-    command = [
+    raw_session_id = request.constraints.get("opencode_session_id")
+    session_id = raw_session_id if isinstance(raw_session_id, str) and raw_session_id else None
+    command = _build_opencode_command(
         path,
-        "run",
-        "-c",
-        "--dir", workspace_root,
-        "--",
-        prompt,
-    ]
+        workspace_root=workspace_root,
+        session_id=session_id,
+        prompt=prompt,
+    )
+    stderr_text = ""
     try:
         result = _run_cli_process(
             command,
@@ -354,6 +410,7 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
         )
         message = result.stdout if result.returncode == 0 else f"Error: {result.stderr}"
         return_code = result.returncode
+        stderr_text = result.stderr or ""
     except subprocess.TimeoutExpired:
         message = f"Timeout after {request.timeout_seconds}s; process group killed"
         return_code = 124
@@ -362,6 +419,10 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
         return_code = 1
 
     completed = subprocess.CompletedProcess(command, return_code, stdout=message, stderr="")
+    # As with codex, OpenCode's session id is best-effort telemetry: scan
+    # stdout/stderr defensively and omit the artifact rather than fail.
+    opencode_session_id = _extract_session_id(message, stderr_text)
+    extra_artifacts = {"opencode_session_id": opencode_session_id} if opencode_session_id else {}
     response = _normalize_native_response(
         provider="opencode",
         path=path,
@@ -370,6 +431,7 @@ def _run_opencode(*, path: str, workspace_root: str, request: DispatchRequest) -
         command=command,
         completed=completed,
         message=message,
+        extra_artifacts=extra_artifacts,
     )
     return _ncp_fetch_after_dispatch(workspace_root, request, response)
 
@@ -524,6 +586,62 @@ def _parse_claude_envelope(raw_output: str) -> dict[str, Any] | None:
         "num_turns": envelope.get("num_turns"),
         "duration_ms": envelope.get("duration_ms"),
     }
+
+
+_SESSION_ID_KEYS = (
+    "session_id", "sessionId",
+    "thread_id", "threadId",
+    "conversation_id", "conversationId",
+)
+
+_SESSION_ID_LINE_RE = re.compile(
+    r"(?i)\b(?:session|thread|conversation)[ _-]?id\b\s*[:=]\s*\"?([A-Za-z0-9][A-Za-z0-9._-]{5,})\"?"
+)
+
+
+def _find_session_id_in_dict(data: dict[str, Any]) -> str | None:
+    for key in _SESSION_ID_KEYS:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_session_id(*chunks: str | None) -> str | None:
+    """Best-effort extraction of a resumable session/thread id from CLI output.
+
+    Codex and OpenCode aren't guaranteed to emit a machine-readable session
+    id in any one shape — it may show up as a JSON envelope, one JSON object
+    per output line, or a plain "session id: <uuid>" line on stderr. This is
+    telemetry, not a dispatch requirement: any parse failure or absence of an
+    id-looking value returns None instead of raising, so a dispatch never
+    fails because session capture failed.
+    """
+    for chunk in chunks:
+        if not chunk or not chunk.strip():
+            continue
+        try:
+            whole = _parse_json_dict(chunk)
+            if whole is not None:
+                found = _find_session_id_in_dict(whole)
+                if found:
+                    return found
+            for line in chunk.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parsed_line = _parse_json_dict(line)
+                if parsed_line is not None:
+                    found = _find_session_id_in_dict(parsed_line)
+                    if found:
+                        return found
+                    continue
+                match = _SESSION_ID_LINE_RE.search(line)
+                if match:
+                    return match.group(1)
+        except Exception:  # noqa: BLE001 — telemetry only, never fail dispatch
+            continue
+    return None
 
 
 def _normalize_native_response(

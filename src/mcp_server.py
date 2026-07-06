@@ -298,12 +298,82 @@ def resume_task(task_id: str, policy_pack: str | None = None) -> dict[str, Any]:
             "current_phase": result.current_phase.value if result.current_phase else None,
             "final_status": "completed" if result.current_phase is None else "paused",
         }
+        stop_reason = getattr(result, "stop_reason", None)
+        if stop_reason:
+            response["stop_reason"] = stop_reason
+            if stop_reason in ("approval_required", "rejected"):
+                response["final_status"] = "awaiting_approval" if stop_reason == "approval_required" else "rejected"
         budget = _budget_snapshot(result)
         if budget is not None:
             response["budget"] = budget
         crash_summary = _crash_reconciliation_summary(result)
         if crash_summary is not None:
             response["crash_reconciliation"] = crash_summary
+        return response
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+def approve_task(task_id: str, note: str | None = None, reject: bool = False, policy_pack: str | None = None) -> dict[str, Any]:
+    """Approve or reject a task paused on a human-attention escalation, then resume it.
+
+    Loads the task from Sarathi's persisted task store and requires its most
+    recent phase result to be an approval-flavored pause (a graph node
+    exhausted its retry budget and needs a human decision -- see
+    ``task_log`` for the escalation detail). Records an ``approval`` artifact
+    with ``approved_by`` set to ``"mcp"`` (and the optional ``note``). When
+    ``reject`` is False (default), the approval is recorded and the task is
+    immediately resumed via the same path as ``resume_task``. When ``reject``
+    is True, the escalation is recorded as rejected and the task is left
+    paused -- it will not auto-advance until a fresh approval is recorded.
+    """
+    try:
+        persistence = PersistenceManager()
+        task = persistence.load_task(task_id)
+        if task is None:
+            return {
+                "ok": False,
+                "error": f"Task {task_id} not found.",
+                "available_tasks": persistence.list_tasks(),
+            }
+
+        resolved_pack, error = _resolve_policy_pack(policy_pack)
+        if error:
+            return {"ok": False, "error": error}
+
+        engine = Engine(policy_pack_path=resolved_pack, enforce_preflight=True, ncp_enabled=False)
+        engine.persistence = persistence
+
+        try:
+            task = engine.record_approval(task, approved_by="mcp", approve=not reject, note=note)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        if reject:
+            return {
+                "ok": True,
+                "task_id": task.task_id,
+                "policy_pack": resolved_pack,
+                "decision": "rejected",
+                "current_phase": task.current_phase.value if task.current_phase else None,
+                "final_status": "rejected",
+            }
+
+        result = engine.resume_task(task)
+        response: dict[str, Any] = {
+            "ok": True,
+            "task_id": result.task_id,
+            "policy_pack": resolved_pack,
+            "decision": "approved",
+            "phases": [_phase_summary(pr) for pr in result.phase_results],
+            "current_phase": result.current_phase.value if result.current_phase else None,
+            "final_status": "completed" if result.current_phase is None else "paused",
+        }
+        stop_reason = getattr(result, "stop_reason", None)
+        if stop_reason:
+            response["stop_reason"] = stop_reason
+            if stop_reason in ("approval_required", "rejected"):
+                response["final_status"] = "awaiting_approval" if stop_reason == "approval_required" else "rejected"
         return response
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -586,6 +656,22 @@ def create_server():
             "is auto-discovered the same way `sarathi resume` does. Returns "
             "the updated phase outcomes and whether the task is now "
             "completed or paused again."
+        ),
+    )
+    server.add_tool(
+        approve_task,
+        name="approve_task",
+        description=(
+            "Approve (or, with reject=True, reject) a task paused on a "
+            "human-attention escalation -- a graph node that exhausted its "
+            "retry budget and needs a human decision (see task_log for the "
+            "escalation detail). Approving records the decision and "
+            "immediately resumes the task via the same path as resume_task. "
+            "Rejecting records the decision and leaves the task paused: it "
+            "will not auto-advance again until a fresh approval is "
+            "recorded. Ordinary resumable pauses (e.g. an incomplete task "
+            "graph with more nodes to run) are unaffected -- use "
+            "resume_task for those."
         ),
     )
     server.add_tool(

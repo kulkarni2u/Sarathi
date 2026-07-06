@@ -1115,6 +1115,14 @@ class Engine:
 
         last_result = task.phase_results[-1]
         last_phase = last_result.phase
+        if self._pause_requires_approval(last_result):
+            approval = last_result.artifacts.get("approval")
+            approved = isinstance(approval, dict) and approval.get("approved") is True
+            if not approved:
+                rejected = isinstance(approval, dict) and approval.get("approved") is False
+                task.stop_reason = "rejected" if rejected else "approval_required"
+                self.persistence.save_task(task)
+                return task
         if self._should_pause_after_phase(last_result):
             next_phase = self._phase_override(last_result, last_phase)
         else:
@@ -1180,6 +1188,61 @@ class Engine:
     def _should_pause_after_phase(self, result: PhaseResult) -> bool:
         """Return True when a phase result requests resumable pause semantics."""
         return bool(result.artifacts.get("pause_execution"))
+
+    def _pause_requires_approval(self, result: PhaseResult) -> bool:
+        """Return True when a resumable pause is approval-flavored, not ordinary.
+
+        Most `pause_execution` pauses (see `src/phases/build.py`) are just
+        "more graph nodes remain, call resume again" — those must keep
+        resuming with a bare `resume_task` call, unchanged. A pause is
+        approval-flavored only when the pausing phase also flagged
+        `evidence["human_attention_required"]`: a graph node exhausted its
+        retry budget and was moved to `waiting_human` (see
+        `require_human_for_graph_node`), the same signal `sarathi log`
+        already keys off to render an escalation summary. Only that narrower
+        case is gated behind an explicit approval/rejection artifact.
+        """
+        return bool(result.artifacts.get("pause_execution")) and bool(
+            result.evidence.get("human_attention_required")
+        )
+
+    def record_approval(
+        self,
+        task: TaskContext,
+        *,
+        approved_by: str,
+        approve: bool = True,
+        note: str | None = None,
+    ) -> TaskContext:
+        """Record a human approval decision on a task paused for approval.
+
+        Attaches an `approval` artifact to the phase result that triggered
+        the approval-flavored pause (see `_pause_requires_approval`) and
+        persists the task via `self.persistence`. Approving clears the
+        transient `approval_required` stop marker so the next `resume_task`
+        call proceeds past the pause; rejecting sets
+        `task.stop_reason = "rejected"` and leaves the pause in place — a
+        rejected task never auto-advances, only a fresh approval unblocks it.
+
+        Raises `ValueError` if the task has no phase history, or if its most
+        recent phase result is not an approval-flavored pause.
+        """
+        if not task.phase_results:
+            raise ValueError(f"Task {task.task_id} has no phase history to approve.")
+        last_result = task.phase_results[-1]
+        if not self._pause_requires_approval(last_result):
+            raise ValueError(
+                f"Task {task.task_id} is not paused on an approval-flavored escalation."
+            )
+        last_result.artifacts["approval"] = {
+            "approved_by": approved_by,
+            "approved_at": datetime.now().isoformat(),
+            "approved": bool(approve),
+            "note": note,
+        }
+        task.stop_reason = None if approve else "rejected"
+        self.persistence.save_task(task)
+        return task
 
     def _phase_override(self, result: PhaseResult, current_phase: Phase) -> Phase:
         """Resolve the next phase override from a phase result."""

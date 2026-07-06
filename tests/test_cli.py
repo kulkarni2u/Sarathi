@@ -944,3 +944,143 @@ def test_handle_validate_reports_uncapped_when_no_budget_section(tmp_path, capsy
     assert "cost_budget_tokens: uncapped" in output
     assert "max_tool_calls: uncapped" in output
     assert "required_approval_gates: none" in output
+
+
+def _write_waiting_human_policy_pack(policy_dir: Path) -> None:
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    files = {
+        "complexity.md": "classification_thresholds: present\nskip_rules: present\n",
+        "conventions.md": "conventions: present\nbrainstorming_protocol: present\n",
+        "commands.md": "```yaml\ntest:\n  command: \"echo test\"\n```\n",
+        "review.md": "max_rounds: 5\nmin_coverage: 80\n",
+        "escalation.md": "auto_fix: configured\nreview: configured\n",
+        "skills.md": "pattern_detection: enabled\nevolution_threshold: 0.8\n",
+        "task-tracking.md": """```yaml
+task: configured
+options: configured
+graph_execution:
+  step_limit: 1
+  max_retries: 1
+  require_human_after_retries: true
+```
+""",
+    }
+    for name, content in files.items():
+        (policy_dir / name).write_text(content)
+
+
+def _run_cli_with_persistence(persistence, policy_dir, fn):
+    original_pm = cli.PersistenceManager if hasattr(cli, "PersistenceManager") else None
+    original_discover = cli.discover_policy_pack
+    cli.PersistenceManager = lambda: persistence
+    cli.discover_policy_pack = lambda start_path=".": str(policy_dir)
+    try:
+        fn()
+    finally:
+        cli.discover_policy_pack = original_discover
+        if original_pm is None:
+            delattr(cli, "PersistenceManager")
+        else:
+            cli.PersistenceManager = original_pm
+
+
+def test_handle_approve_approves_and_resumes_waiting_human_task(tmp_path, capsys, monkeypatch):
+    policy_dir = tmp_path / "policy-pack"
+    _write_waiting_human_policy_pack(policy_dir)
+    monkeypatch.setenv("SARATHI_GRAPH_FAIL_NODE", "step-1")
+
+    persistence = PersistenceManager(str(tmp_path / "tasks"))
+    engine = cli.Engine(policy_pack_path=str(policy_dir))
+    engine.persistence = persistence
+    task = TaskContext(task_id="task-approve", description="Fix bug", complexity=Complexity.LOW)
+    paused_task = engine.run_task(task)
+    assert paused_task.phase_results[-1].evidence["human_attention_required"] is True
+    persistence.save_task(paused_task)
+    monkeypatch.delenv("SARATHI_GRAPH_FAIL_NODE")
+
+    _run_cli_with_persistence(
+        persistence,
+        policy_dir,
+        lambda: cli.handle_approve(Namespace(task_id="task-approve", note="looks safe", reject=False)),
+    )
+
+    output = capsys.readouterr().out
+    assert "Approved task: task-approve" in output
+    assert "Resumed task: task-approve" in output
+
+    reloaded = persistence.load_task("task-approve")
+    # The approval was recorded on the phase result that triggered the pause;
+    # find it among the persisted phase results.
+    approvals = [pr.artifacts.get("approval") for pr in reloaded.phase_results if pr.artifacts.get("approval")]
+    assert approvals, "expected an approval artifact to be persisted"
+    assert approvals[0]["approved"] is True
+    assert approvals[0]["note"] == "looks safe"
+
+
+def test_handle_approve_rejects_waiting_human_task(tmp_path, capsys, monkeypatch):
+    policy_dir = tmp_path / "policy-pack"
+    _write_waiting_human_policy_pack(policy_dir)
+    monkeypatch.setenv("SARATHI_GRAPH_FAIL_NODE", "step-1")
+
+    persistence = PersistenceManager(str(tmp_path / "tasks"))
+    engine = cli.Engine(policy_pack_path=str(policy_dir))
+    engine.persistence = persistence
+    task = TaskContext(task_id="task-reject", description="Fix bug", complexity=Complexity.LOW)
+    paused_task = engine.run_task(task)
+    persistence.save_task(paused_task)
+
+    _run_cli_with_persistence(
+        persistence,
+        policy_dir,
+        lambda: cli.handle_approve(Namespace(task_id="task-reject", note="not safe", reject=True)),
+    )
+
+    output = capsys.readouterr().out
+    assert "Rejected task: task-reject" in output
+    assert "Resumed task:" not in output
+
+    reloaded = persistence.load_task("task-reject")
+    approvals = [pr.artifacts.get("approval") for pr in reloaded.phase_results if pr.artifacts.get("approval")]
+    assert approvals
+    assert approvals[0]["approved"] is False
+
+
+def test_handle_approve_nonexistent_task_exits_nonzero(tmp_path, capsys):
+    persistence = PersistenceManager(str(tmp_path / "tasks"))
+    policy_dir = tmp_path / "policy-pack"
+    _write_policy_pack(policy_dir)
+
+    with pytest.raises(SystemExit) as error:
+        _run_cli_with_persistence(
+            persistence,
+            policy_dir,
+            lambda: cli.handle_approve(Namespace(task_id="does-not-exist", note=None, reject=False)),
+        )
+
+    assert error.value.code == 1
+    output = capsys.readouterr().out
+    assert "not found" in output
+
+
+def test_handle_approve_non_paused_task_exits_nonzero(tmp_path, capsys):
+    policy_dir = tmp_path / "policy-pack"
+    _write_policy_pack(policy_dir)
+    persistence = PersistenceManager(str(tmp_path / "tasks"))
+    task = TaskContext(
+        task_id="task-not-paused",
+        description="Fix bug",
+        complexity=Complexity.LOW,
+        phase_results=[PhaseResult(phase=Phase.ROUTE, outcome="pass")],
+    )
+    persistence.save_task(task)
+
+    with pytest.raises(SystemExit) as error:
+        _run_cli_with_persistence(
+            persistence,
+            policy_dir,
+            lambda: cli.handle_approve(Namespace(task_id="task-not-paused", note=None, reject=False)),
+        )
+
+    assert error.value.code == 1
+    output = capsys.readouterr().out
+    assert "Cannot approve task" in output

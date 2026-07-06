@@ -1,5 +1,6 @@
 """CLI implementation for Sarathi."""
 import argparse
+import getpass
 import json
 import os
 import re
@@ -758,6 +759,24 @@ def main() -> None:
         help="Task ID to resume",
     )
 
+    approve_parser = subparsers.add_parser(
+        "approve", help="Approve (or reject) a task paused on a human-attention escalation, then resume it"
+    )
+    approve_parser.add_argument(
+        "task_id",
+        help="Task ID to approve",
+    )
+    approve_parser.add_argument(
+        "--note",
+        default=None,
+        help="Optional note to attach to the approval decision",
+    )
+    approve_parser.add_argument(
+        "--reject",
+        action="store_true",
+        help="Reject the escalation instead of approving it",
+    )
+
     subparsers.add_parser("list", help="List saved task IDs under .sarathi/tasks")
     proposals_parser = subparsers.add_parser("proposals", help="Show or review policy proposals from persisted learnings")
     proposals_parser.add_argument(
@@ -902,6 +921,8 @@ def main() -> None:
         handle_watch(args)
     elif args.command == "resume":
         handle_resume(args)
+    elif args.command == "approve":
+        handle_approve(args)
     elif args.command == "list":
         handle_list_tasks()
     elif args.command == "proposals":
@@ -2089,6 +2110,63 @@ def handle_resume(args: argparse.Namespace) -> None:
         )
         if current_role is not None:
             print(f"Current agent: {current_role['name']}")
+    print(f"Phases executed: {len(result.phase_results)}")
+
+
+def _current_username() -> str:
+    """Best-effort local username for approval attribution."""
+    try:
+        return getpass.getuser()
+    except Exception:
+        return os.environ.get("USER") or "local"
+
+
+def handle_approve(args: argparse.Namespace) -> None:
+    """Handle the approve command: record an approval/rejection, then resume."""
+    persistence_cls = globals().get("PersistenceManager")
+    if persistence_cls is None:
+        try:
+            from .engine import PersistenceManager as persistence_cls
+        except ImportError:
+            from engine import PersistenceManager as persistence_cls
+
+    persistence = persistence_cls()
+    task = persistence.load_task(args.task_id)
+
+    if task is None:
+        print(f"Task {args.task_id} not found. Available tasks: {persistence.list_tasks()}")
+        raise SystemExit(1)
+
+    policy_pack = discover_policy_pack()
+    if not policy_pack:
+        print("Error: No policy pack found. Run 'sarathi init' first or specify --policy-pack")
+        raise SystemExit(1)
+    engine = Engine(policy_pack_path=policy_pack, enforce_preflight=True)
+    engine.persistence = persistence
+
+    approve = not args.reject
+    try:
+        task = engine.record_approval(
+            task,
+            approved_by=_current_username(),
+            approve=approve,
+            note=args.note,
+        )
+    except ValueError as exc:
+        print(f"Cannot approve task {args.task_id}: {exc}")
+        raise SystemExit(1)
+
+    if not approve:
+        print(f"Rejected task: {task.task_id}")
+        if args.note:
+            print(f"Reason: {args.note}")
+        return
+
+    print(f"Approved task: {task.task_id}")
+    result = engine.resume_task(task)
+    print(f"Resumed task: {result.task_id}")
+    if result.current_phase is not None:
+        print(f"Current phase: {result.current_phase.value}")
     print(f"Phases executed: {len(result.phase_results)}")
 
 

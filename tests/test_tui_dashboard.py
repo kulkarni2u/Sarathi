@@ -12,7 +12,7 @@ import pytest
 textual = pytest.importorskip("textual")
 
 from src import tui_data
-from src.engine import Complexity, PersistenceManager, Phase, PhaseResult, TaskContext
+from src.engine import Complexity, Engine, PersistenceManager, Phase, PhaseResult, TaskContext
 from src.tui import ChatScreen, SarathiDashboard, TasksScreen
 from textual.widgets import DataTable, Input, Static
 
@@ -751,6 +751,90 @@ def test_request_cancel_with_no_active_run_returns_false(persistence):
 
             assert app._run_active is False
             assert app.request_cancel() is False
+
+    asyncio.run(scenario())
+
+
+def _waiting_human_pack(tmp_path):
+    pack = tmp_path / "policy-pack"
+    pack.mkdir()
+    files = {
+        "complexity.md": "classification_thresholds: present\nskip_rules: present\n",
+        "conventions.md": "conventions: present\nbrainstorming_protocol: present\n",
+        "commands.md": "```yaml\ntest:\n  command: \"echo test\"\n```\n",
+        "review.md": "max_rounds: 5\nmin_coverage: 80\n",
+        "escalation.md": "auto_fix: configured\nreview: configured\n",
+        "skills.md": "pattern_detection: enabled\nevolution_threshold: 0.8\n",
+        "task-tracking.md": """```yaml
+task: configured
+options: configured
+graph_execution:
+  step_limit: 1
+  max_retries: 1
+  require_human_after_retries: true
+```
+""",
+    }
+    for name, content in files.items():
+        (pack / name).write_text(content)
+    return pack
+
+
+def test_approve_binding_approves_and_resumes_paused_task(persistence, tmp_path, monkeypatch):
+    pack = _waiting_human_pack(tmp_path)
+    monkeypatch.setattr("src.tui._discover_policy_pack", lambda *a, **k: str(pack))
+    monkeypatch.setenv("SARATHI_GRAPH_FAIL_NODE", "step-1")
+
+    engine = Engine(policy_pack_path=str(pack))
+    engine.persistence = persistence
+    task = TaskContext(task_id="t-approve", description="Fix bug", complexity=Complexity.LOW)
+    paused = engine.run_task(task)
+    assert paused.phase_results[-1].evidence["human_attention_required"] is True
+    monkeypatch.delenv("SARATHI_GRAPH_FAIL_NODE")
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.switch_mode("tasks")
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, TasksScreen)
+            screen.selected_task_id = "t-approve"
+
+            await pilot.press("a")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+            reloaded = persistence.load_task("t-approve")
+            approvals = [
+                pr.artifacts.get("approval") for pr in reloaded.phase_results if pr.artifacts.get("approval")
+            ]
+            assert approvals
+            assert approvals[0]["approved"] is True
+            assert approvals[0]["approved_by"]
+
+    asyncio.run(scenario())
+
+
+def test_approve_binding_with_no_task_selected_notifies_warning(persistence):
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            app.switch_mode("tasks")
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, TasksScreen)
+            screen.selected_task_id = None
+
+            await pilot.press("a")
+            await pilot.pause()
+            # Should not raise; nothing further to assert beyond survival —
+            # the warning notification path (no worker spawned) is covered
+            # by action_approve returning early.
 
     asyncio.run(scenario())
 

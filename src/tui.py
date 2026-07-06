@@ -23,9 +23,11 @@ from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 try:
     from . import tui_data
+    from .engine import Engine
 except ImportError:
     # Support direct execution via sarathi.py, which prepends src/ to sys.path.
     import tui_data
+    from engine import Engine
 
 
 SARATHI_BANNER = r"""
@@ -138,6 +140,16 @@ def _discover_policy_pack(start_path: str = ".") -> str | None:
     except ImportError:
         from cli import discover_policy_pack
     return discover_policy_pack(start_path)
+
+
+def _current_username() -> str:
+    """Best-effort local username for approval attribution."""
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except Exception:
+        return os.environ.get("USER") or "local"
 
 
 class NewTaskScreen(ModalScreen):
@@ -576,6 +588,7 @@ class TasksScreen(Screen):
         Binding("n", "new_task", "New task"),
         Binding("p", "proposals", "Proposals"),
         Binding("u", "resume", "Resume task"),
+        Binding("a", "approve", "Approve task"),
         Binding("i", "init_workspace", "Init pack"),
         Binding("c", "cancel_run", "Cancel run"),
     ]
@@ -714,7 +727,59 @@ class TasksScreen(Screen):
             self.app.call_from_thread(self.app.post_chat_event, message)
             return
         phase = result.current_phase.value if result.current_phase else "Completed"
-        message = f"Resumed {task_id}: now at {phase}"
+        stop_reason = getattr(result, "stop_reason", None)
+        if stop_reason == "approval_required":
+            message = f"{task_id} is paused at {phase} pending approval — press `a` to approve."
+            self.app.call_from_thread(self.notify, message, severity="warning")
+        elif stop_reason == "rejected":
+            message = f"{task_id} was rejected at {phase} and stays paused."
+            self.app.call_from_thread(self.notify, message, severity="warning")
+        else:
+            message = f"Resumed {task_id}: now at {phase}"
+            self.app.call_from_thread(self.notify, message)
+        self.app.call_from_thread(self.app.post_chat_event, message)
+        self.app.call_from_thread(self.refresh_data)
+
+    def action_approve(self) -> None:
+        task_id = self.selected_task_id
+        if task_id is None:
+            self.notify("No task selected.", severity="warning")
+            return
+        policy_pack = _discover_policy_pack(self.app.workspace)
+        if not policy_pack:
+            self.notify(
+                "No policy pack found — run /init (or `sarathi init`) first.",
+                severity="error",
+            )
+            return
+        self.notify(f"Approving {task_id}…")
+        self.run_worker(
+            lambda: self._approve(task_id, policy_pack),
+            thread=True,
+            exclusive=True,
+            group="resume",
+        )
+
+    def _approve(self, task_id: str, policy_pack: str) -> None:
+        persistence = self.app.persistence
+        task = persistence.load_task(task_id)
+        if task is None:
+            message = f"Approve failed: task {task_id} not found."
+            self.app.call_from_thread(self.notify, message, severity="error")
+            return
+
+        engine = Engine(policy_pack_path=policy_pack, enforce_preflight=True)
+        engine.persistence = persistence
+        try:
+            task = engine.record_approval(task, approved_by=_current_username())
+        except ValueError as exc:
+            message = f"Approve failed: {exc}"
+            self.app.call_from_thread(self.notify, message, severity="error")
+            return
+
+        result = engine.resume_task(task, task_timeout=DEFAULT_TASK_TIMEOUT)
+        phase = result.current_phase.value if result.current_phase else "Completed"
+        message = f"Approved {task_id}: resumed, now at {phase}"
         self.app.call_from_thread(self.notify, message)
         self.app.call_from_thread(self.app.post_chat_event, message)
         self.app.call_from_thread(self.refresh_data)

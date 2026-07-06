@@ -8,6 +8,11 @@ from typing import Any
 
 import yaml
 
+try:
+    from .proposal_sync import ProposalSync
+except ImportError:
+    from proposal_sync import ProposalSync
+
 logger = logging.getLogger("sarathi.evolve")
 
 # Provenance weighting applied to quality-signal deltas before they can
@@ -591,13 +596,36 @@ class Evolver:
 
 
 class ProposalReviewStore:
-    """Human review/apply workflow for generated policy proposals."""
+    """Human review/apply workflow for generated policy proposals.
 
-    def __init__(self, policy_pack_path: str | Path):
+    Decisions are always persisted to ``.sarathi-proposals/<id>.json`` under
+    the policy pack -- that file layout is relied on directly by
+    ``src/policy/compiler.py`` (``_load_learning_feedback``) and must keep
+    working unmodified regardless of anything below.
+
+    When the owning workspace already has a ``.sarathi/sarathi.db`` (i.e. it
+    has been bootstrapped for the service / web cockpit at some point), each
+    decision is additionally mirrored into that database -- a durable,
+    queryable row plus a ``proposal.accepted``/``proposal.rejected``
+    lifecycle event -- via ``proposal_sync.ProposalSync``. See that module's
+    docstring for the full design. Pass ``mirror=False`` when the caller
+    already owns a ``Storage`` handle for the right workspace and will record
+    the SQLite side itself (this is what ``src/service/proposals.py`` does,
+    to avoid emitting the lifecycle event twice for a single action).
+    """
+
+    def __init__(self, policy_pack_path: str | Path, mirror: bool = True):
         self.policy_pack_path = Path(policy_pack_path)
         self.workspace_root = self.policy_pack_path.parent
         self.review_dir = self.policy_pack_path / ".sarathi-proposals"
         self.review_dir.mkdir(parents=True, exist_ok=True)
+        self._sync: ProposalSync | None = None
+        if mirror:
+            try:
+                self._sync = ProposalSync.try_create(self.workspace_root, self.review_dir)
+            except Exception:  # best-effort by contract: never break store construction
+                logger.warning("proposal_sync activation failed", exc_info=True)
+                self._sync = None
 
     def accept(self, proposal: PolicyProposal) -> dict[str, Any]:
         policy_file = self._resolve_target_path(proposal)
@@ -608,11 +636,15 @@ class ProposalReviewStore:
             policy_file.write_text(self._apply_to_policy_text(current, proposal))
         decision = self._decision("accepted", proposal)
         self._write_decision(decision)
+        if self._sync is not None:
+            self._sync.record_decision(decision)
         return decision
 
     def reject(self, proposal: PolicyProposal, reason: str | None = None) -> dict[str, Any]:
         decision = self._decision("rejected", proposal, reason=reason)
         self._write_decision(decision)
+        if self._sync is not None:
+            self._sync.record_decision(decision)
         return decision
 
     def preview_acceptance(self, proposal: PolicyProposal) -> dict[str, Any]:

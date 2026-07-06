@@ -31,6 +31,20 @@ criteria, and a size (S ≈ hours, M ≈ 1–3 days, L ≈ 1–2 weeks).
 > your locally installed codex/opencode versions
 > (`SARATHI_LIVE_TESTS=1 pytest tests/live -q`).
 
+- ☑ 1.1 Escalation approval on CLI (`sarathi approve`), TUI (`a` key),
+  MCP (`approve_task`); resume gated on approval-flavored pauses only
+- ☑ 1.2 Health-gated failover (calendar-decayed health scores, latency
+  EWMA, health-ordered fallbacks, dispatch-level transient failover)
+- ☑ 1.3 SSE end-to-end (web cockpit EventSource with polling fallback;
+  `sarathi watch --follow` streams lifecycle events with Last-Event-ID)
+- ☑ 1.4-A Dual-write (`src/engine_mirror.py`): engine runs mirrored into
+  sarathi.db and visible through the web cockpit API when the DB exists
+- ☑ 1.4-B Unified proposals (`src/proposal_sync.py` + migration 011):
+  SQLite `proposal_decisions` + lifecycle events mirror every surface's
+  accept/reject; JSON stays authoritative for the policy compiler
+- 1.4-C (CLI/TUI as full service clients) remains open — see Phase 1
+  section below.
+
 ---
 
 ## Phase 0 — Make codex/opencode first-class (dogfood blockers)

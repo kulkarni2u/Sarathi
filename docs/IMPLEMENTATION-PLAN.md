@@ -15,6 +15,21 @@ criteria, and a size (S ≈ hours, M ≈ 1–3 days, L ≈ 1–2 weeks).
 
 - ☑ Slack channel notifications (shipped: `src/notifications.py`, both
   execution paths, policy-gated via `notifications.md`)
+- ☑ 0.1 Session resume for codex/opencode (`codex exec resume <id>`,
+  `opencode --session <id>`, per-provider session tracking in the TUI)
+- ☑ 0.2 Streaming for codex/opencode in TUI chat (`codex exec --json`
+  JSONL deltas; opencode incremental stdout; dispatch-table refactor)
+- ☑ 0.3 Real live tests for codex/opencode (assert dispatch, usage,
+  permission writes, structured failure; still skip without CLIs)
+- ☑ 0.4 Cross-provider cost model (`pricing:` in model-routing.md,
+  `src/runtime/pricing.py`, `UsageRecord.cost_usd` at the dispatcher)
+- ☑ 0.5 Auth detection (`codex login status` / `opencode auth list`
+  probes; `auth: ok|needs_auth|unknown` + actionable degraded_reason)
+
+> Phase 0 caveat: resume/streaming argv shapes follow documented CLI
+> syntax and are unit-tested against fake CLIs; validate once against
+> your locally installed codex/opencode versions
+> (`SARATHI_LIVE_TESTS=1 pytest tests/live -q`).
 
 ---
 

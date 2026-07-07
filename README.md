@@ -378,6 +378,18 @@ It also generates local bootstrap artifacts, including a deterministic
 `.sarathi/wiki` repo map unless `--no-wiki` is passed. The generated wiki is
 local and model-free.
 
+### Importing Policy Packs
+
+Use `sarathi init . --from <source>` to bootstrap a policy pack from an existing pack
+instead of generating defaults. Sources can be:
+
+- **Local directory**: `sarathi init . --from ./path/to/pack`
+- **Recipe name**: `sarathi init . --from bakeoff` (uses an installed recipe)
+- **Git URL**: `sarathi init . --from https://github.com/user/repo` (clones and extracts pack)
+
+Missing standard files are filled with generated defaults, so partial packs still
+yield complete, valid ones. Pass `--force` to overwrite an existing non-empty pack.
+
 Policy files control:
 
 - what commands can run during verification

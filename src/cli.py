@@ -12,7 +12,7 @@ from typing import Any
 
 try:
     from .evolve import Evolver, ProposalReviewStore
-    from .init import InitWorkflow, bootstrap_workspace
+    from .init import InitWorkflow, bootstrap_workspace, import_policy_pack_from_source
     from .policy import compile_policy_pack
     from .policy.layering import extract_server_caps
     from .runtime import AutoresearchStore, UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
@@ -32,7 +32,7 @@ try:
 except ImportError:
     # Support direct execution via sarathi.py, which prepends src/ to sys.path.
     from evolve import Evolver, ProposalReviewStore
-    from init import InitWorkflow, bootstrap_workspace
+    from init import InitWorkflow, bootstrap_workspace, import_policy_pack_from_source
     from policy import compile_policy_pack
     from policy.layering import extract_server_caps
     from runtime import AutoresearchStore, UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
@@ -623,6 +623,17 @@ def main() -> None:
         action="store_true",
         help="Skip generated .sarathi/wiki creation.",
     )
+    init_parser.add_argument(
+        "--from",
+        dest="from_source",
+        default=None,
+        help="Import policy pack from: local directory, recipe name (e.g. bakeoff), or git URL",
+    )
+    init_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing non-empty policy-pack directory when using --from",
+    )
 
     # Validate command
     validate_parser = subparsers.add_parser("validate", help="Validate a policy pack")
@@ -953,9 +964,71 @@ def main() -> None:
 
 def handle_init(args: argparse.Namespace) -> None:
     """Handle the init command."""
+    from_source = getattr(args, "from_source", None)
+    force = getattr(args, "force", False)
+
     print(f"Initializing Sarathi policy pack at: {args.target_path}")
     print(f"Using engine: {args.engine}")
+    if from_source:
+        print(f"Importing from: {from_source}")
+        if force:
+            print("  (--force: will overwrite existing pack)")
 
+    # Handle --from import workflow
+    if from_source:
+        print("\n[1/3] Import: Loading policy pack from source...")
+        import_result = import_policy_pack_from_source(
+            from_source,
+            args.target_path,
+            force=force
+        )
+
+        if import_result.get("status") == "error":
+            print(f"  Error: {import_result.get('error')}")
+            sys.exit(1)
+
+        policy_path = Path(import_result.get("path"))
+        print(f"  ✓ Imported {import_result.get('files_copied')} files from {from_source}")
+        if import_result.get("warnings"):
+            for warning in import_result.get("warnings", []):
+                print(f"  ⚠ {warning}")
+
+        # Validate the imported pack
+        print("\n[2/3] Validate: Checking imported policy pack...")
+        workflow = InitWorkflow(target_path=args.target_path, engine_path=args.engine)
+        validation_results = workflow.validate(policy_path)
+        passed = sum(1 for r in validation_results if r.status.value == "PASS")
+        warnings = sum(1 for r in validation_results if r.status.value == "DRIFT")
+        todos = sum(1 for r in validation_results if r.status.value == "TODO")
+        print(f"  Results: {passed} PASS, {warnings} DRIFT, {todos} TODO")
+
+        # Generate wiki if needed
+        print("\n[3/3] Bootstrap: Finalizing workspace artifacts...")
+        if not getattr(args, "no_wiki", False):
+            try:
+                from .repo_wiki import generate_repo_wiki
+            except ImportError:
+                from repo_wiki import generate_repo_wiki
+            wiki_result = generate_repo_wiki(Path(args.target_path))
+            print(f"  Wiki: {wiki_result.get('status')} → {wiki_result.get('path')}")
+
+        # Write provider-native permission config files
+        try:
+            from .runtime.providers.cli_bridge import ensure_provider_permissions
+        except ImportError:
+            from runtime.providers.cli_bridge import ensure_provider_permissions
+        written = ensure_provider_permissions(args.target_path)
+        for provider, config_path in written.items():
+            print(f"  Wrote {provider} permissions → {config_path}")
+
+        print("\n✓ Policy pack imported successfully!")
+        print(f"\nNext steps:")
+        print(f"  1. Review imported files in {policy_path}/")
+        print(f"  2. Customize policy-pack/*.md to your team's needs")
+        print(f"  3. Run: sarathi validate {policy_path}")
+        return
+
+    # Original bootstrap workflow for non-import case
     # Phase 1: Inspect
     print("\n[1/5] Inspect: Scanning repository...")
     workflow = InitWorkflow(target_path=args.target_path, engine_path=args.engine)
@@ -997,7 +1070,6 @@ def handle_init(args: argparse.Namespace) -> None:
     if args.ncp:
         print("\n[6/6] NCP: Initializing Neural Context Protocol...")
         import subprocess
-        import sys
 
         # Determine init target — use explicit target_path or CWD
         init_target = Path(args.target_path)

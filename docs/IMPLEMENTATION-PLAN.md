@@ -52,6 +52,17 @@ criteria, and a size (S ≈ hours, M ≈ 1–3 days, L ≈ 1–2 weeks).
   scorecards from recorded evidence (cost/latency/blast-radius/test rate),
   `.sarathi/bakeoff_history.json` winner recording, and evolve proposals
   targeting model-routing.md at ≥5 wins / ≥70% win rate per task class
+- ☑ 3.1 Declarative provider registry (`src/runtime/providers/registry.py`):
+  one `NativeProviderSpec` per provider; dispatch, permissions, preflight,
+  auth probes, TUI chat/streaming, and fallback order all registry-driven;
+  fifth-provider proof test registers a provider via one spec
+- ☑ 3.4 Copilot resolved: explicitly experimental — `gh copilot` has no
+  non-interactive permission surface; reason recorded in the spec and
+  surfaced as the service catalog's degraded_reason
+- ☑ 3.5 Web cockpit JS tests: Vitest wired into vite.config.ts; 51 unit
+  tests over the SSE/polling transport and API client
+- ☑ 3.7 (part 1) `sarathi init --from <dir|recipe|git-url>` imports shared
+  policy packs with default gap-filling and --force protection
 
 ---
 

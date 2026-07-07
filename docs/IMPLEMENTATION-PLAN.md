@@ -44,6 +44,14 @@ criteria, and a size (S ≈ hours, M ≈ 1–3 days, L ≈ 1–2 weeks).
   accept/reject; JSON stays authoritative for the policy compiler
 - 1.4-C (CLI/TUI as full service clients) remains open — see Phase 1
   section below.
+- ☑ 2.2 Git worktree isolation per graph branch (`src/runtime/isolation.py`,
+  `HarnessConfig.isolation_mode`; contributed via codex/opencode dogfood)
+- ☑ 2.1 Bakeoff recipe (`policy-pack/RECIPES/bakeoff/`): codex vs opencode
+  candidates in isolated worktrees with judged merge (`--recipe bakeoff`)
+- ☑ 2.3 Measured JUDGE (`src/runtime/judge_scoring.py`): policy-driven
+  scorecards from recorded evidence (cost/latency/blast-radius/test rate),
+  `.sarathi/bakeoff_history.json` winner recording, and evolve proposals
+  targeting model-routing.md at ≥5 wins / ≥70% win rate per task class
 
 ---
 

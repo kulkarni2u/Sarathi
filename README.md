@@ -441,6 +441,36 @@ review traces, diff traces, spec traces, retry context, and recovery
 classification. The review phase uses structured evidence when available instead
 of treating a provider response as blanket proof.
 
+### Adding a native CLI provider
+
+The four shipped native CLI providers (`claude`, `codex`, `opencode`,
+`copilot`) are declared, not hardcoded: `src/runtime/providers/registry.py`
+defines a `NativeProviderSpec` dataclass capturing everything the rest of the
+codebase used to branch on per provider — dispatch function, prompt
+transport, permission modes and writer, version/auth probes, TUI chat
+support, and fallback priority. `cli_bridge.py`, `service/providers.py`,
+`preflight.py`, `tui_data.py`, and `harness.py` all consult
+`registry.get_spec()` / `registry.all_specs()` instead of listing provider
+names.
+
+Adding a new agentic CLI (cursor-agent, gemini-cli, amp, ...) means building
+one `NativeProviderSpec` and calling `register_spec` — no other file needs to
+change. See `tests/test_provider_registry.py` for a worked example that
+registers a throwaway fifth provider and proves it flows through the
+dispatch chain, the permission-writer wiring, the preflight version probe,
+and the TUI chat provider list.
+
+**Copilot status**: `gh copilot` is registered but marked experimental —
+its `permission_writer` is `None` because the CLI exposes no non-interactive
+permission/config surface (no config file it reads, no flag to pre-approve
+tool use before a run, unlike claude's `settings.json`, codex's
+`config.yaml`, or opencode's `opencode.json`). It is also excluded from the
+TUI chat provider list (`tui_chat_support=False`): `gh copilot -p` is a
+one-shot suggestion command, not a session-oriented chat CLI, so it has no
+resumable session id or streaming output shape. Both facts are documented on
+its spec (`permission_writer_unavailable_reason`) and surfaced in the
+service catalog's `degraded_reason` for the desktop UI.
+
 ## Slack Notifications
 
 Sarathi can post to a Slack channel when a run needs attention: task

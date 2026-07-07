@@ -5,6 +5,11 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 
+try:
+    from .providers.registry import all_specs
+except ImportError:
+    from runtime.providers.registry import all_specs
+
 
 @dataclass
 class PreflightPolicy:
@@ -25,59 +30,34 @@ class PreflightPolicy:
 
 
 # CLI binaries Sarathi can dispatch to or shell out to, mapped to the flag
-# that prints a version string.
-_PROVIDER_VERSION_CLIS: dict[str, str] = {
-    "claude": "claude",
-    "codex": "codex",
-    "opencode": "opencode",
-    "gh": "gh",
-}
+# that prints a version string. Built from the native provider registry so a
+# newly registered provider's version probe (and, for copilot's oddity where
+# the probed executable "gh" doesn't share its provider name "copilot", its
+# own `version_probe_key`) shows up here automatically.
+def _provider_version_clis() -> dict[str, str]:
+    return {spec.version_probe_key: spec.version_probe_executable for spec in all_specs().values()}
+
+
+def __getattr__(name: str):  # noqa: D103 — PEP 562 module-level dynamic attribute
+    # `_PROVIDER_VERSION_CLIS` is recomputed on every access (instead of a
+    # frozen snapshot taken at import time) so providers registered after
+    # this module was first imported — e.g. a test registering a fifth
+    # provider — still show up in it and in provider_cli_versions().
+    if name == "_PROVIDER_VERSION_CLIS":
+        return _provider_version_clis()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _check_provider_auth_preflight(provider: str, path: str) -> str:
-    """Check provider authentication status; return "ok", "needs_auth", or "unknown"."""
-    if provider == "claude":
-        return "unknown"
+    """Check provider authentication status; return "ok", "needs_auth", or "unknown".
 
-    if provider == "codex":
-        try:
-            result = subprocess.run(
-                [path, "login", "status"],
-                capture_output=True,
-                timeout=5,
-                text=True,
-                check=False,
-            )
-            if result.returncode == 0:
-                return "ok"
-            output = (result.stdout or "") + (result.stderr or "")
-            if "not logged in" in output.lower():
-                return "needs_auth"
-            # Non-zero exit without clear "not logged in" message: treat as unknown
-            # (could be missing subcommand on older versions)
-            return "unknown"
-        except Exception:
-            return "unknown"
-
-    if provider == "opencode":
-        try:
-            result = subprocess.run(
-                [path, "auth", "list"],
-                capture_output=True,
-                timeout=5,
-                text=True,
-                check=False,
-            )
-            if result.returncode == 0 and (result.stdout or "").strip():
-                return "ok"
-            if result.returncode != 0:
-                # Non-zero exit from auth list command suggests not logged in
-                return "needs_auth"
-            # Zero exit but empty output means not logged in
-            return "needs_auth"
-        except Exception:
-            return "unknown"
-
+    ``provider`` is a ``_PROVIDER_VERSION_CLIS`` key (a ``version_probe_key``,
+    e.g. "gh" for copilot) rather than necessarily a registered provider name;
+    when it doesn't match any spec's auth probe this returns "unknown".
+    """
+    for spec in all_specs().values():
+        if spec.version_probe_key == provider and spec.auth_probe is not None:
+            return spec.auth_probe(path)[0]
     return "unknown"
 
 
@@ -92,7 +72,7 @@ def provider_cli_versions(timeout: int = 10) -> dict[str, dict[str, str | None]]
     ``None`` for that provider's version and "unknown" for auth.
     """
     result: dict[str, dict[str, str | None]] = {}
-    for provider, executable in _PROVIDER_VERSION_CLIS.items():
+    for provider, executable in _provider_version_clis().items():
         path = shutil.which(executable)
         if not path:
             result[provider] = {"version": None, "auth": "unknown"}

@@ -21,10 +21,37 @@ from typing import Any, Callable
 try:
     from .engine import Engine, PersistenceManager, TaskContext
     from .evolve import Evolver, PolicyProposal, ProposalReviewStore
+    from .runtime.providers.registry import specs_by_fallback_priority
 except ImportError:
     # Support direct execution via sarathi.py, which prepends src/ to sys.path.
     from engine import Engine, PersistenceManager, TaskContext
     from evolve import Evolver, PolicyProposal, ProposalReviewStore
+    from runtime.providers.registry import specs_by_fallback_priority
+
+
+class _DynamicChatProviders:
+    """Descriptor recomputing the ordered TUI-chat-capable provider tuple
+    from the native provider registry on each access (class or instance),
+    instead of a tuple frozen at import time — so a provider registered
+    after this module first loaded (e.g. a test adding a fifth provider)
+    still appears. See `NativeProviderSpec.tui_chat_support`/`fallback_priority`."""
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> tuple[str, ...]:
+        return tuple(
+            spec.name for spec in specs_by_fallback_priority() if spec.tui_chat_support
+        )
+
+
+class _DynamicStreamingHandlers:
+    """Descriptor recomputing the provider-name -> streaming-method-name table
+    from the registry on each access. See `NativeProviderSpec.tui_streaming_handler`."""
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> dict[str, str]:
+        return {
+            spec.name: spec.tui_streaming_handler
+            for spec in specs_by_fallback_priority()
+            if spec.tui_chat_support and spec.tui_streaming_handler is not None
+        }
 
 
 def default_persistence(storage_path: str | None = None) -> PersistenceManager:
@@ -305,17 +332,16 @@ class ChatSession:
     for lifecycle dispatches.
     """
 
-    PROVIDERS = ("claude", "opencode", "codex")
+    # Both are registry-backed descriptors (see _DynamicChatProviders /
+    # _DynamicStreamingHandlers above) rather than frozen literals, so a
+    # provider registered via `registry.register_spec` shows up here too.
+    # Order matches each spec's `fallback_priority` (today: claude, codex,
+    # opencode); providers absent from `_STREAMING_HANDLERS` (or with no CLI
+    # on PATH) fall back to the blocking `send` in `send_streaming` below.
+    PROVIDERS = _DynamicChatProviders()
     HISTORY_TURNS = 6
 
-    # Provider name -> name of the `_send_*_streaming` method that handles
-    # it. Providers absent from this table (or with no CLI on PATH) fall
-    # back to the blocking `send` in `send_streaming` below.
-    _STREAMING_HANDLERS = {
-        "claude": "_send_claude_streaming",
-        "codex": "_send_codex_streaming",
-        "opencode": "_send_opencode_streaming",
-    }
+    _STREAMING_HANDLERS = _DynamicStreamingHandlers()
 
     def __init__(self, workspace_root: str | None = None, timeout: int = 180):
         self.workspace_root = workspace_root or os.getcwd()

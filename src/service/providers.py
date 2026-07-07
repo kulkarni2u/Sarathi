@@ -18,6 +18,7 @@ from src.runtime import (
     build_artifact_index,
     normalize_agent_output,
 )
+from src.runtime.providers.registry import all_specs, get_spec
 from src.storage import Storage
 from src.task_class import TASK_CLASS_DEFAULTS, TaskClass, classify_task_class, from_legacy_type
 from src.tui_data import ChatSession, is_error_reply
@@ -487,29 +488,10 @@ def _provider_dispatch_adapter_config(
         "command": command or [],
         "timeout_seconds": 300,
     }
-    if provider_id == "claude" and (config.get("api_key_configured") or _native_bridge_provider(provider_id, resolved_path or "") == "claude"):
-        provider_payload = {
-            "type": "anthropic_sdk",
-            "workspace_root": str(workspace["root_path"]),
-            "provider_path": resolved_path,
-            **({"api_key": config.get("api_key")} if isinstance(config.get("api_key"), str) and config.get("api_key") else {}),
-            **({"base_url": config.get("base_url")} if isinstance(config.get("base_url"), str) and config.get("base_url") else {}),
-            **({"model": config.get("model")} if isinstance(config.get("model"), str) and config.get("model") else {}),
-            "timeout_seconds": 300,
-            "fallback_to_cli": resolved_path is not None,
-        }
-    elif provider_id == "codex" and (config.get("api_key_configured") or _native_bridge_provider(provider_id, resolved_path or "") == "codex"):
-        provider_payload = {
-            "type": "openai_sdk",
-            "workspace_root": str(workspace["root_path"]),
-            "provider_path": resolved_path,
-            **({"api_key": config.get("api_key")} if isinstance(config.get("api_key"), str) and config.get("api_key") else {}),
-            **({"base_url": config.get("base_url")} if isinstance(config.get("base_url"), str) and config.get("base_url") else {}),
-            **({"model": config.get("model")} if isinstance(config.get("model"), str) and config.get("model") else {}),
-            "timeout_seconds": 300,
-            "fallback_to_cli": resolved_path is not None,
-        }
-    elif provider_id == "opencode":
+    native_spec = get_spec(provider_id)
+    sdk = native_spec.sdk_transport if native_spec is not None else None
+    if sdk is not None and sdk.requires_cli_path:
+        # No credential-only mode (opencode today): a resolved CLI is mandatory.
         if resolved_path is None:
             raise ServiceError(
                 "provider_unavailable",
@@ -517,11 +499,25 @@ def _provider_dispatch_adapter_config(
                 409,
             )
         provider_payload = {
-            "type": "opencode_sdk",
+            "type": sdk.transport_type,
             "workspace_root": str(workspace["root_path"]),
             "provider_path": resolved_path,
             "timeout_seconds": 300,
             "fallback_to_cli": True,
+        }
+    elif sdk is not None and (
+        config.get("api_key_configured")
+        or _native_bridge_provider(provider_id, resolved_path or "") == provider_id
+    ):
+        provider_payload = {
+            "type": sdk.transport_type,
+            "workspace_root": str(workspace["root_path"]),
+            "provider_path": resolved_path,
+            **({"api_key": config.get("api_key")} if isinstance(config.get("api_key"), str) and config.get("api_key") else {}),
+            **({"base_url": config.get("base_url")} if isinstance(config.get("base_url"), str) and config.get("base_url") else {}),
+            **({"model": config.get("model")} if isinstance(config.get("model"), str) and config.get("model") else {}),
+            "timeout_seconds": 300,
+            "fallback_to_cli": resolved_path is not None,
         }
     elif resolved_path is None:
         raise ServiceError(
@@ -561,14 +557,9 @@ def _provider_dispatch_command(
 
 def _native_bridge_provider(provider_id: str, path: str) -> str | None:
     executable = Path(path).name.lower()
-    if provider_id == "codex" and executable == "codex":
-        return "codex"
-    if provider_id == "copilot" and executable in {"gh", "github-copilot", "copilot"}:
-        return "copilot"
-    if provider_id == "claude" and executable == "claude":
-        return "claude"
-    if provider_id == "opencode" and executable in {"opencode", "opencode-cli"}:
-        return "opencode"
+    spec = get_spec(provider_id)
+    if spec is not None and executable in spec.executables:
+        return spec.name
     return None
 
 
@@ -594,7 +585,7 @@ def _graph_node_from_subtask(subtask: dict[str, Any]) -> dict[str, Any]:
 
 
 def _provider_specs() -> dict[str, dict[str, Any]]:
-    specs = [
+    specs: list[dict[str, Any]] = [
         {
             "id": "local",
             "name": "Local deterministic",
@@ -607,55 +598,12 @@ def _provider_specs() -> dict[str, dict[str, Any]]:
             "capabilities": ["child_task_execution", "planning", "review_fixture"],
             "degraded_reason": None,
         },
-        {
-            "id": "codex",
-            "name": "Codex",
-            "provider_type": "cli",
-            "transport_kind": "sdk",
-            "transport_posture": "sdk",
-            "health": "configured_by_user",
-            "auth": "workspace_setting",
-            "path": "codex",
-            "capabilities": ["coding", "planning", "review"],
-            "degraded_reason": "OpenAI SDK is the primary path with automatic Codex CLI fallback when credentials are unavailable.",
-        },
-        {
-            "id": "claude",
-            "name": "Claude",
-            "provider_type": "cli",
-            "transport_kind": "sdk",
-            "transport_posture": "sdk",
-            "health": "configured_by_user",
-            "auth": "workspace_setting",
-            "path": "claude",
-            "capabilities": ["research", "critique", "review"],
-            "degraded_reason": "Anthropic SDK is the primary path with automatic Claude CLI fallback when credentials are unavailable.",
-        },
-        {
-            "id": "copilot",
-            "name": "Copilot",
-            "provider_type": "agent",
-            "transport_kind": "cli",
-            "transport_posture": "cli_fallback",
-            "health": "configured_by_user",
-            "auth": "github_auth",
-            "path": "GitHub Copilot",
-            "capabilities": ["coding", "pull_request_assist"],
-            "degraded_reason": "GitHub-native integration is planned, but current transport remains CLI-oriented.",
-        },
-        {
-            "id": "opencode",
-            "name": "OpenCode",
-            "provider_type": "cli",
-            "transport_kind": "sdk",
-            "transport_posture": "sdk",
-            "health": "configured_by_user",
-            "auth": "workspace_setting",
-            "path": "opencode",
-            "capabilities": ["coding", "planning", "review"],
-            "degraded_reason": None,
-        },
     ]
+    # Every native CLI provider's catalog entry lives on its NativeProviderSpec
+    # (registered in src/runtime/providers/cli_bridge.py) — adding a provider
+    # there is enough to make it show up here, no literal list to extend.
+    for native_spec in all_specs().values():
+        specs.append({"id": native_spec.name, **native_spec.service_catalog})
     return {spec["id"]: spec for spec in specs}
 
 
@@ -794,59 +742,21 @@ def _test_and_store_provider(
 
 
 def _check_provider_auth(provider_id: str, resolved_path: str) -> tuple[str, str | None]:
-    """Check provider authentication status via CLI probes.
+    """Check provider authentication status via the provider's registered auth probe.
 
     Returns: (auth_status, degraded_reason)
     where auth_status is "ok", "needs_auth", or "unknown"
     and degraded_reason is a human-readable message or None.
 
     Probe errors (timeout, OSError, missing subcommand) yield "unknown" with
-    no degraded_reason, allowing the provider to remain online.
+    no degraded_reason, allowing the provider to remain online. Providers with
+    no registered spec, or no ``auth_probe`` (e.g. claude has no reliable
+    non-interactive auth check), always report "unknown".
     """
-    if provider_id == "claude":
-        # Claude has no reliable non-interactive auth check
+    spec = get_spec(provider_id)
+    if spec is None or spec.auth_probe is None:
         return "unknown", None
-
-    if provider_id == "codex":
-        try:
-            import subprocess as _sp
-            result = _sp.run(
-                [resolved_path, "login", "status"],
-                capture_output=True,
-                timeout=5,
-                text=True,
-            )
-            if result.returncode == 0:
-                return "ok", None
-            output = (result.stdout or "") + (result.stderr or "")
-            if "not logged in" in output.lower():
-                return "needs_auth", "CLI installed but not logged in (run: codex login)"
-            # Non-zero exit without clear "not logged in" message: treat as unknown
-            # (could be missing subcommand on older versions)
-            return "unknown", None
-        except Exception:
-            return "unknown", None
-
-    if provider_id == "opencode":
-        try:
-            import subprocess as _sp
-            result = _sp.run(
-                [resolved_path, "auth", "list"],
-                capture_output=True,
-                timeout=5,
-                text=True,
-            )
-            if result.returncode == 0 and (result.stdout or "").strip():
-                return "ok", None
-            if result.returncode != 0:
-                # Non-zero exit from auth list command suggests not logged in
-                return "needs_auth", "CLI installed but not logged in (run: opencode auth login)"
-            # Zero exit but empty output means not logged in
-            return "needs_auth", "CLI installed but not logged in (run: opencode auth login)"
-        except Exception:
-            return "unknown", None
-
-    return "unknown", None
+    return spec.auth_probe(resolved_path)
 
 
 def _provider_check_config(
@@ -866,13 +776,15 @@ def _provider_check_config(
             "last_checked_at": _service_now(),
             "last_error": None,
         }
-    sdk_key_available = False
-    if spec["id"] == "codex":
-        sdk_key_available = bool(api_key or os.getenv("OPENAI_API_KEY"))
-    elif spec["id"] == "claude":
-        sdk_key_available = bool(api_key or os.getenv("ANTHROPIC_API_KEY"))
+    native_spec = get_spec(spec["id"])
+    sdk = native_spec.sdk_transport if native_spec is not None else None
+    # Only providers with an api_key_env (claude, codex today) can be
+    # "sdk-configured" this way; opencode's sdk_transport has none (it has
+    # no credential-only mode) so this is always False for it, and None/local
+    # specs fall out naturally too.
+    sdk_key_available = bool(sdk is not None and sdk.api_key_env and (api_key or os.getenv(sdk.api_key_env)))
     resolved_path = shutil.which(path) if not Path(path).is_absolute() else (path if Path(path).exists() else None)
-    if spec["id"] in {"codex", "claude"} and sdk_key_available:
+    if sdk_key_available:
         if auth == "missing":
             return {
                 "path": path,

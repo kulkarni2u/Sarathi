@@ -18,6 +18,11 @@ except ImportError:
     from permissions import PermissionMode
 
 try:
+    from .runtime.providers.registry import specs_by_fallback_priority
+except ImportError:
+    from runtime.providers.registry import specs_by_fallback_priority
+
+try:
     from .runtime.agent_spec import AgentSpec
 except ImportError:
     try:
@@ -206,15 +211,29 @@ class HarnessConfig:
         )
 
 
-_PREFERENCE_TO_PROVIDER: dict[str, str] = {
+_STATIC_PREFERENCE_TO_PROVIDER: dict[str, str] = {
     "fastest":            "local",
     "balanced":           "local",
-    "highest_capability": "claude",
     "sarathi_native":     "local",
 }
 
-# Static preference order for fallback candidates when a primary agent fails.
-_FALLBACK_PROVIDER_ORDER: list[str] = ["claude", "codex", "opencode"]
+
+def _fallback_provider_order() -> list[str]:
+    """Native providers in shared fallback-priority order (registry-driven).
+
+    A single source of truth for "which provider tries next" — consulted
+    here for the static fallback candidate list, and by `_preference_to_provider`
+    below to resolve "highest_capability" to whichever provider currently
+    sorts first, instead of a literal provider name.
+    """
+    return [spec.name for spec in specs_by_fallback_priority()]
+
+
+def _preference_to_provider() -> dict[str, str]:
+    ordered = _fallback_provider_order()
+    mapping = dict(_STATIC_PREFERENCE_TO_PROVIDER)
+    mapping["highest_capability"] = ordered[0] if ordered else "local"
+    return mapping
 
 
 _PERMISSION_MODE_BY_SCOPE: dict[str, PermissionMode] = {
@@ -246,7 +265,7 @@ def resolve_agent_binding(
     health_scores: dict[str, float] | None = None,
 ) -> AgentBinding:
     """Map an AssemblyDefaults.agent_preference string to a concrete AgentBinding."""
-    provider_id = _PREFERENCE_TO_PROVIDER.get(agent_preference, "local")
+    provider_id = _preference_to_provider().get(agent_preference, "local")
     if available_providers and provider_id not in available_providers:
         provider_id = available_providers[0] if available_providers else "local"
     binding = AgentBinding(agent_id=provider_id)
@@ -262,23 +281,23 @@ def _build_fallback_agents(
 ) -> list[AgentBinding]:
     """Build the ordered fallback agent list for a resolved primary agent.
 
-    Fallbacks are the OTHER distinct providers from ``_FALLBACK_PROVIDER_ORDER``,
-    minus the primary, filtered to ``available_providers``. When
-    ``available_providers`` is None we don't fabricate availability — the
-    fallback list stays empty.
+    Fallbacks are the OTHER distinct providers from ``_fallback_provider_order()``
+    (the registry's shared ``fallback_priority`` ordering), minus the primary,
+    filtered to ``available_providers``. When ``available_providers`` is None
+    we don't fabricate availability — the fallback list stays empty.
 
-    The candidate set itself is still ``_FALLBACK_PROVIDER_ORDER`` (primary
+    The candidate set itself is still ``_fallback_provider_order()`` (primary
     selection semantics are untouched) but the final ordering is health-aware:
     once every candidate's ``health_score`` is known, the list is sorted by
     descending score so a fallback that's been failing a lot sinks below one
     that's been healthy, even if the static order says otherwise. The sort is
     stable, so candidates with equal (e.g. default 1.0, or entirely unknown)
-    scores keep their original ``_FALLBACK_PROVIDER_ORDER`` relative order.
+    scores keep their original ``_fallback_provider_order()`` relative order.
     """
     if not available_providers:
         return []
     fallbacks: list[AgentBinding] = []
-    for provider_id in _FALLBACK_PROVIDER_ORDER:
+    for provider_id in _fallback_provider_order():
         if provider_id == primary_provider_id:
             continue
         if provider_id not in available_providers:

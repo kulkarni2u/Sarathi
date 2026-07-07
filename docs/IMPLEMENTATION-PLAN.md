@@ -63,6 +63,15 @@ criteria, and a size (S ≈ hours, M ≈ 1–3 days, L ≈ 1–2 weeks).
   tests over the SSE/polling transport and API client
 - ☑ 3.7 (part 1) `sarathi init --from <dir|recipe|git-url>` imports shared
   policy packs with default gap-filling and --force protection
+- ☑ 3.2 Diff review surface (`src/review_data.py` + TUI DiffReviewScreen,
+  `d` on a task): hunk-aware parser, file-level approve/reject decisions
+  persisted as artifacts and fed into the REVIEW phase's dispatch inputs
+- ☑ 3.3 Issue-as-queue: `POST .../github/issues/sync` drafts tasks from
+  labeled issues idempotently; `GET /tasks/{id}/pr-body` assembles the
+  audit-trail PR body (phases, measured signals, evidence, issue link);
+  optional `gh pr create` helper (`src/pr_body.py`)
+- ☑ 3.6 `sarathi chat` is now a real inline terminal REPL (streaming,
+  /model switching, Ctrl-C cancels the reply, not the session)
 
 ---
 

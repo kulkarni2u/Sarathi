@@ -651,7 +651,7 @@ def main() -> None:
     # Dashboard command (terminal UI)
     tui_parser = subparsers.add_parser(
         "tui",
-        aliases=["dashboard", "chat"],
+        aliases=["dashboard"],
         help="Open the terminal dashboard (tasks, phase logs, proposals)",
     )
     tui_parser.add_argument(
@@ -663,6 +663,27 @@ def main() -> None:
         "--workspace",
         default=None,
         help="Folder/repo to operate on (default: current directory)",
+    )
+
+    # Chat command (inline REPL)
+    chat_parser = subparsers.add_parser(
+        "chat",
+        help="Start an interactive terminal chat REPL",
+    )
+    chat_parser.add_argument(
+        "--provider",
+        default=None,
+        help="Agent CLI to use (default: first available on PATH from claude, opencode, codex)",
+    )
+    chat_parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Folder/repo to operate on (default: current directory)",
+    )
+    chat_parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Disable streaming; use blocking send instead",
     )
 
     subparsers.add_parser("desktop", help="Run the local Sarathi desktop stack")
@@ -922,8 +943,11 @@ def main() -> None:
     if args.command == "setup":
         handle_setup(args)
         return
-    if args.command in ("tui", "dashboard", "chat"):
+    if args.command in ("tui", "dashboard"):
         handle_tui(args)
+        return
+    if args.command == "chat":
+        handle_chat(args)
         return
     if args.command == "desktop":
         handle_desktop(args)
@@ -1428,6 +1452,131 @@ def handle_run(args: argparse.Namespace) -> None:
             f"| {pr.phase.value:<20} | {phase_agent_name(pr):<12} |"
             f" {pr.outcome:<10} | {pr.iterations:<10} | {gate_status:<8} |"
         )
+
+
+def handle_chat(
+    args: argparse.Namespace,
+    input_fn=None,
+    output_fn=None,
+) -> None:
+    """Interactive inline terminal REPL for free-form chat with agent CLIs.
+
+    Args:
+        args: Parsed arguments with 'provider', 'workspace', 'no_stream' attributes.
+        input_fn: Optional callable for testing; defaults to input().
+        output_fn: Optional callable for testing; defaults to print().
+    """
+    try:
+        from .tui_data import ChatSession
+    except ImportError:
+        from tui_data import ChatSession
+
+    if input_fn is None:
+        input_fn = input
+    if output_fn is None:
+        output_fn = print
+
+    workspace = getattr(args, "workspace", None) or os.getcwd()
+    provider_name = getattr(args, "provider", None)
+    no_stream = getattr(args, "no_stream", False)
+
+    session = ChatSession(workspace_root=workspace)
+
+    # Resolve provider: explicit flag, or first available
+    if provider_name:
+        if not session.set_provider(provider_name):
+            available = ", ".join(name for name, _ in session.available_providers())
+            if available:
+                output_fn(f"Error: Unknown provider '{provider_name}'. Available: {available}")
+            else:
+                output_fn("Error: No agent CLIs found on PATH (looked for: claude, opencode, codex)")
+            sys.exit(1)
+    else:
+        provider = session.resolve_provider()
+        if provider is None:
+            available_providers = session.available_providers()
+            if not available_providers:
+                output_fn("Error: No agent CLIs found on PATH (looked for: claude, opencode, codex)")
+                output_fn("\nSupported providers:")
+                for prov_name in session.PROVIDERS:
+                    output_fn(f"  - {prov_name}")
+                sys.exit(1)
+
+    provider = session.resolve_provider()
+    if provider:
+        provider_name_active, _ = provider
+        output_fn(f"Sarathi Chat | provider: {provider_name_active} | workspace: {workspace} | /help for commands")
+
+    # Main REPL loop
+    try:
+        while True:
+            try:
+                user_input = input_fn("you> ")
+            except EOFError:
+                # Ctrl-D
+                break
+
+            if not user_input.strip():
+                continue
+
+            # Handle slash commands
+            if user_input.startswith("/"):
+                parts = user_input[1:].split(maxsplit=1)
+                command = parts[0].lower()
+                arg = parts[1] if len(parts) > 1 else None
+
+                if command == "quit":
+                    break
+                elif command == "help":
+                    output_fn("\nSlash commands:")
+                    output_fn("  /quit              exit the chat")
+                    output_fn("  /model [name]      show or switch provider")
+                    output_fn("  /help              show this help")
+                    output_fn("")
+                    continue
+                elif command == "model":
+                    if arg:
+                        if session.set_provider(arg):
+                            provider = session.resolve_provider()
+                            if provider:
+                                provider_name_active, _ = provider
+                                output_fn(f"Provider switched to: {provider_name_active}")
+                        else:
+                            available = ", ".join(
+                                name for name, _ in session.available_providers()
+                            )
+                            output_fn(f"Error: Unknown provider '{arg}'. Available: {available}")
+                    else:
+                        provider = session.resolve_provider()
+                        if provider:
+                            provider_name_active, _ = provider
+                            output_fn(f"Current provider: {provider_name_active}")
+                    continue
+                else:
+                    output_fn(f"Unknown command: /{command}. Use /help for available commands.")
+                    continue
+
+            # Send message (streaming or blocking)
+            try:
+                if no_stream:
+                    reply = session.send(user_input)
+                    output_fn(f"assistant> {reply}\n")
+                else:
+                    # Stream with callback
+                    def on_text(accumulated: str) -> None:
+                        # Note: for terminal, use print() to avoid carriage return issues
+                        # but for testability, we store state in output collection
+                        pass
+
+                    reply = session.send_streaming(user_input, on_text=on_text)
+                    output_fn(f"assistant> {reply}\n")
+            except KeyboardInterrupt:
+                # Ctrl-C during a reply: cancel and keep the REPL alive
+                session.cancel()
+                output_fn("(cancelled)")
+    except KeyboardInterrupt:
+        # Ctrl-C at the prompt
+        output_fn("\n(interrupted)")
 
 
 def handle_tui(args: argparse.Namespace) -> None:

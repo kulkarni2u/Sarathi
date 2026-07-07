@@ -45,7 +45,8 @@ path, and optional MCP clients layer on top of the local runtime.
 | Surface | Command or path | Use it for |
 | --- | --- | --- |
 | CLI | `sarathi` | Init projects, validate policy, run tasks, inspect status, resume, review proposals, list recipes, attach/fork sessions |
-| TUI | `sarathi tui` or `sarathi chat` | Chat-first terminal workflow with live task dashboard, phase logs, approvals, and proposal review |
+| TUI | `sarathi tui` or `sarathi dashboard` | Chat-first terminal workflow with live task dashboard, phase logs, approvals, and proposal review |
+| Chat | `sarathi chat` | Inline terminal REPL for free-form chat with agent CLIs |
 | Web cockpit | `web/` served by the local service or Vite | Dashboard, Needs You, Task Studio, History, Agents, Knowledge Center, Wiki, Proposals, Skills, Usage, Settings |
 | Local desktop stack | `sarathi desktop` | Starts the Python service and Vite web UI together for development/local use |
 | Electron shell | `desktop/` | Native wrapper that loads the service-hosted web cockpit and can build a macOS `.dmg` |

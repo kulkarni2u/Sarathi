@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import json
+import os
+import re
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Any, Mapping
-from urllib.parse import urlparse
+from typing import Any, Callable, Mapping
+from urllib.parse import quote, urlparse
 
 from src.init import InitWorkflow
 from src.storage import Storage
@@ -17,6 +22,14 @@ from .preferences import (
     _optional_dict,
     _optional_text,
 )
+
+# GitHub REST API base and the optional bearer-token env var. Mirrors the
+# injectable-opener, bare-urllib pattern used by ``src/notifications.py`` for
+# Slack: no third-party HTTP client, best-effort auth from the environment.
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_TOKEN_ENV = "GITHUB_TOKEN"
+
+_GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$")
 
 
 def _derive_task_title(prompt: str) -> str:
@@ -177,6 +190,326 @@ def _build_github_issue_reference(
     if repository.get("remote_url"):
         issue["repository"]["remote_url"] = repository["remote_url"]
     return issue, repository
+
+
+def _create_github_issue_task_draft(
+    storage: Storage,
+    workspace_id: str,
+    issue: dict[str, Any],
+    repository: dict[str, Any] | None,
+    *,
+    title: str | None = None,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Draft a PRD/AC-gated task from a GitHub issue reference.
+
+    Shared by the single-issue import route (``.../github/issues/import``)
+    and the label-sync route (``.../github/issues/sync``) so both paths
+    emit the exact same shape of task, messages, approval gate, and
+    lifecycle events.
+    """
+    task_title = title or f"GitHub issue #{issue['number']}"
+    task_metadata = _task_draft_metadata(
+        issue["url"] or f"GitHub issue #{issue['number']}",
+        project_id=project_id,
+    )
+    task_metadata["source"] = "github_issue"
+    task_metadata["github_issue"] = issue
+    repository_metadata: dict[str, Any] = {}
+    if issue.get("full_name"):
+        repository_metadata["github"] = {
+            "host": issue["host"],
+            "owner": issue["owner"],
+            "name": issue["name"],
+            "full_name": issue["full_name"],
+            "repository_url": issue["repository_url"],
+        }
+    if repository is not None:
+        repository_metadata.update(_github_repository_metadata(repository))
+        if repository.get("remote_url"):
+            repository_metadata["remote_url"] = repository["remote_url"]
+    if repository_metadata:
+        task_metadata["repository"] = repository_metadata
+
+    task = storage.create_task(
+        workspace_id=workspace_id,
+        title=task_title,
+        status="prd_pending",
+        description=issue["url"] or f"Imported GitHub issue #{issue['number']}.",
+        metadata=task_metadata,
+        project_id=task_metadata.get("project_id"),
+    )
+    user_message = storage.create_message(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        role="user",
+        content=issue["url"] or f"GitHub issue #{issue['number']}",
+        metadata={"target": "Sarathi", "source": "github_issue_import"},
+    )
+    sarathi_message = storage.create_message(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        role="sarathi",
+        content=(
+            "I drafted the PRD/AC shell from the GitHub issue reference and opened "
+            "the PRD/AC approval gate before graph generation."
+        ),
+        metadata={"draft_task_id": task["id"], "gate": "PRD/AC", "source": "github_issue_import"},
+    )
+    gate = storage.create_approval_gate(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        name="PRD/AC",
+        status="pending",
+        metadata={
+            "requires_human": True,
+            "source_issue": issue["url"] or f"GitHub issue #{issue['number']}",
+            "acceptance_criteria": task_metadata["acceptance_criteria"],
+        },
+    )
+    storage.create_lifecycle_event(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        event_type="task.draft_created",
+        payload={"object_id": task["id"], "gate": gate["id"]},
+    )
+    storage.create_lifecycle_event(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        event_type="approval.requested",
+        payload={"object_id": gate["id"], "name": gate["name"]},
+    )
+    return {
+        "task": task,
+        "approval_gate": gate,
+        "messages": [user_message, sarathi_message],
+    }
+
+
+def _parse_github_remote(remote_url: str | None) -> tuple[str, str] | None:
+    """Best-effort ``owner/repo`` extraction from a git remote URL.
+
+    Handles both ``https://github.com/owner/repo(.git)`` and
+    ``git@github.com:owner/repo(.git)`` forms.
+    """
+    if not remote_url:
+        return None
+    match = _GITHUB_REMOTE_RE.search(remote_url.strip())
+    if not match:
+        return None
+    return match.group("owner"), match.group("repo")
+
+
+def _repository_full_name_from_row(repository: Mapping[str, Any] | None) -> str | None:
+    if repository is None:
+        return None
+    metadata = repository.get("metadata")
+    if isinstance(metadata, Mapping):
+        github_meta = metadata.get("github")
+        if isinstance(github_meta, Mapping) and github_meta.get("full_name"):
+            return str(github_meta["full_name"])
+    parsed = _parse_github_remote(repository.get("remote_url"))
+    if parsed:
+        return f"{parsed[0]}/{parsed[1]}"
+    return None
+
+
+def _resolve_sync_target(
+    storage: Storage,
+    workspace_id: str,
+    body: Mapping[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    """Resolve the ``owner/repo`` full name and (if known) the attached
+    workspace repository row for a label-sync request.
+
+    Priority: explicit ``repository_id`` > explicit ``repository`` (an
+    ``owner/repo`` string) > the single repository attached to the
+    workspace. An ambiguous request (multiple repositories, none named)
+    raises rather than guessing.
+    """
+    explicit_full_name = _optional_text(body, "repository")
+    repository_id = _optional_text(body, "repository_id")
+    repository: dict[str, Any] | None = None
+
+    if repository_id is not None:
+        repository = storage.get_workspace_repository(repository_id)
+        if repository is None or repository["workspace_id"] != workspace_id:
+            raise ServiceError("not_found", "Repository not found.", 404)
+    elif explicit_full_name is None:
+        repositories = storage.list_workspace_repositories(workspace_id)
+        if len(repositories) == 1:
+            repository = repositories[0]
+        elif len(repositories) > 1:
+            raise ServiceError(
+                "invalid_request",
+                "Multiple repositories are attached to this workspace; pass "
+                "'repository_id' or 'repository' (\"owner/repo\") to disambiguate.",
+                400,
+            )
+
+    full_name = explicit_full_name.strip().strip("/") if explicit_full_name else _repository_full_name_from_row(repository)
+    if not full_name:
+        raise ServiceError(
+            "invalid_request",
+            "Could not determine a GitHub 'owner/repo' to sync; pass 'repository' "
+            "(\"owner/repo\") or attach a GitHub repository to the workspace.",
+            400,
+        )
+
+    if repository is None:
+        for candidate in storage.list_workspace_repositories(workspace_id):
+            if _repository_full_name_from_row(candidate) == full_name:
+                repository = candidate
+                break
+
+    return full_name, repository
+
+
+def _fetch_open_issues_by_label(
+    full_name: str,
+    label: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    opener: Callable[..., Any] | None = None,
+) -> list[dict[str, Any]]:
+    """List open issues carrying ``label`` from ``owner/repo`` via bare urllib.
+
+    No third-party HTTP client (matches the rest of the repo's dispatch
+    style: no SDK imports). ``GITHUB_TOKEN`` is read from ``env`` (defaults
+    to ``os.environ``) and sent as a bearer token when present; public
+    repositories work without it. ``opener`` is injectable for tests
+    (default ``urllib.request.urlopen``), mirroring
+    ``src/notifications.py``'s ``SlackNotifier``.
+
+    GitHub's issues-list endpoint also returns pull requests; those are
+    filtered out here (they carry a ``pull_request`` key).
+    """
+    env = os.environ if env is None else env
+    opener = opener or urllib.request.urlopen
+    url = (
+        f"{GITHUB_API_BASE}/repos/{full_name}/issues"
+        f"?labels={quote(label)}&state=open&per_page=100"
+    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "sarathi-service",
+    }
+    token = env.get(GITHUB_TOKEN_ENV)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with opener(request, timeout=10) as response:
+            status = getattr(response, "status", 200)
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        raise ServiceError(
+            "github_error", f"GitHub API returned HTTP {exc.code} for {full_name}.", 502
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise ServiceError(
+            "github_error", f"Failed to reach the GitHub API: {exc.reason}.", 502
+        ) from exc
+    if status is not None and int(status) >= 300:
+        raise ServiceError("github_error", f"GitHub API returned HTTP {status}.", 502)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ServiceError("github_error", "GitHub API returned invalid JSON.", 502) from exc
+    if not isinstance(payload, list):
+        raise ServiceError("github_error", "Unexpected GitHub API response shape.", 502)
+    return [item for item in payload if isinstance(item, dict) and "pull_request" not in item]
+
+
+def _find_existing_github_issue_draft(
+    storage: Storage,
+    workspace_id: str,
+    full_name: str,
+    issue_number: int,
+) -> dict[str, Any] | None:
+    """Find a previously-drafted task for this issue, keyed by repo + number.
+
+    This is what makes ``sync`` idempotent: re-running it never creates a
+    second draft for an issue already imported (whether by a prior sync or
+    by the single-issue import route).
+    """
+    for task in storage.list_tasks_for_workspace(workspace_id):
+        metadata = task.get("metadata")
+        if not isinstance(metadata, Mapping):
+            continue
+        github_issue = metadata.get("github_issue")
+        if not isinstance(github_issue, Mapping):
+            continue
+        if github_issue.get("number") != issue_number:
+            continue
+        if github_issue.get("full_name") == full_name:
+            return task
+    return None
+
+
+def _sync_github_issues_by_label(
+    storage: Storage,
+    workspace_id: str,
+    body: Mapping[str, Any],
+    *,
+    env: Mapping[str, str] | None = None,
+    opener: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """List open issues carrying ``label`` and draft a task for each new one.
+
+    Idempotent: issues already drafted (matched by repository full name +
+    issue number, see ``_find_existing_github_issue_draft``) are reported in
+    ``skipped`` rather than re-drafted.
+    """
+    label = _optional_text(body, "label") or "sarathi"
+    context = _optional_dict(body, "context") or {}
+    project_id = _task_context_project_id(context)
+
+    full_name, repository = _resolve_sync_target(storage, workspace_id, body)
+    raw_issues = _fetch_open_issues_by_label(full_name, label, env=env, opener=opener)
+
+    created: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for raw_issue in raw_issues:
+        issue_number = raw_issue.get("number")
+        if not isinstance(issue_number, int):
+            continue
+        existing = _find_existing_github_issue_draft(storage, workspace_id, full_name, issue_number)
+        if existing is not None:
+            skipped.append({"number": issue_number, "task_id": existing["id"]})
+            continue
+
+        issue_url = raw_issue.get("html_url") or f"https://github.com/{full_name}/issues/{issue_number}"
+        issue = _parse_github_issue_url(issue_url)
+        issue["repository"] = {
+            "host": issue["host"],
+            "owner": issue["owner"],
+            "name": issue["name"],
+            "full_name": issue["full_name"],
+            "repository_url": issue["repository_url"],
+        }
+        if repository is not None:
+            issue["repository"].update(_github_repository_metadata(repository))
+            if repository.get("remote_url"):
+                issue["repository"]["remote_url"] = repository["remote_url"]
+
+        raw_title = raw_issue.get("title")
+        result = _create_github_issue_task_draft(
+            storage,
+            workspace_id,
+            issue,
+            repository,
+            title=str(raw_title) if raw_title else None,
+            project_id=project_id,
+        )
+        created.append(result)
+
+    return {
+        "label": label,
+        "repository": full_name,
+        "created": created,
+        "skipped": skipped,
+    }
 
 
 def _find_policy_pack_dir(storage: Storage, workspace_id: str) -> Path | None:

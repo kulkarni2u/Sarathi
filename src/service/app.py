@@ -13,6 +13,7 @@ from urllib.parse import unquote
 
 from src.init import bootstrap_workspace
 from src.notifications import lifecycle_event_listener
+from src.pr_body import build_pr_body
 from src.storage import Storage, connect, run_migrations
 
 from .errors import (
@@ -29,13 +30,14 @@ from .static_files import resolve_static_file
 from .usage_stats import build_usage_stats
 from .intake import (
     _build_github_issue_reference,
+    _create_github_issue_task_draft,
     _derive_task_title,
     _emit_brainstorm_event,
     _get_policy_pack,
-    _github_repository_metadata,
     _initialize_workspace_repository,
     _preview_repository_intake,
     _put_policy_pack_file,
+    _sync_github_issues_by_label,
     _task_context_project_id,
     _task_draft_metadata,
     _write_brainstorm_spec,
@@ -1060,81 +1062,28 @@ class ServiceApp:
             context = _optional_dict(body, "context") or {}
             project_id = _task_context_project_id(context)
             issue, repository = _build_github_issue_reference(storage, workspace_id, body)
-            task_title = _optional_text(body, "title") or f"GitHub issue #{issue['number']}"
-            task_metadata = _task_draft_metadata(
-                issue["url"] or f"GitHub issue #{issue['number']}",
+            result = _create_github_issue_task_draft(
+                storage,
+                workspace_id,
+                issue,
+                repository,
+                title=_optional_text(body, "title"),
                 project_id=project_id,
             )
-            task_metadata["source"] = "github_issue"
-            task_metadata["github_issue"] = issue
-            repository_metadata: dict[str, Any] = {}
-            if issue["full_name"]:
-                repository_metadata["github"] = {
-                    "host": issue["host"],
-                    "owner": issue["owner"],
-                    "name": issue["name"],
-                    "full_name": issue["full_name"],
-                    "repository_url": issue["repository_url"],
-                }
-            if repository is not None:
-                repository_metadata.update(_github_repository_metadata(repository))
-                if repository.get("remote_url"):
-                    repository_metadata["remote_url"] = repository["remote_url"]
-            if repository_metadata:
-                task_metadata["repository"] = repository_metadata
-            task = storage.create_task(
-                workspace_id=workspace_id,
-                title=task_title,
-                status="prd_pending",
-                description=issue["url"] or f"Imported GitHub issue #{issue['number']}.",
-                metadata=task_metadata,
-                project_id=task_metadata.get("project_id"),
-            )
-            user_message = storage.create_message(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                role="user",
-                content=issue["url"] or f"GitHub issue #{issue['number']}",
-                metadata={"target": "Sarathi", "source": "github_issue_import"},
-            )
-            sarathi_message = storage.create_message(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                role="sarathi",
-                content=(
-                    "I drafted the PRD/AC shell from the GitHub issue reference and opened "
-                    "the PRD/AC approval gate before graph generation."
-                ),
-                metadata={"draft_task_id": task["id"], "gate": "PRD/AC", "source": "github_issue_import"},
-            )
-            gate = storage.create_approval_gate(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                name="PRD/AC",
-                status="pending",
-                metadata={
-                    "requires_human": True,
-                    "source_issue": issue["url"] or f"GitHub issue #{issue['number']}",
-                    "acceptance_criteria": task_metadata["acceptance_criteria"],
-                },
-            )
-            storage.create_lifecycle_event(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                event_type="task.draft_created",
-                payload={"object_id": task["id"], "gate": gate["id"]},
-            )
-            storage.create_lifecycle_event(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                event_type="approval.requested",
-                payload={"object_id": gate["id"], "name": gate["name"]},
-            )
-            return 201, {
-                "task": task,
-                "approval_gate": gate,
-                "messages": [user_message, sarathi_message],
-            }
+            return 201, result
+
+        if (
+            method == "POST"
+            and len(parts) == 5
+            and parts[0] == "workspaces"
+            and parts[2] == "github"
+            and parts[3] == "issues"
+            and parts[4] == "sync"
+        ):
+            workspace_id = parts[1]
+            if storage.get_workspace(workspace_id) is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, _sync_github_issues_by_label(storage, workspace_id, body)
 
         if method == "GET" and len(parts) == 2 and parts[0] == "tasks":
             task = storage.get_task(parts[1])
@@ -1191,6 +1140,10 @@ class ServiceApp:
                 return 200, {
                     "approval_gates": storage.list_approval_gates_for_task(parts[1])
                 }
+            if resource == "pr-body":
+                task_like = dict(task)
+                task_like["lifecycle_events"] = storage.list_events(task_id=task["id"])
+                return 200, {"body": build_pr_body(task_like)}
 
         if (
             method == "GET"

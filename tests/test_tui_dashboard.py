@@ -4,6 +4,7 @@ Skipped automatically when the optional `textual` dependency is missing.
 """
 import asyncio
 import json
+import subprocess
 import threading
 import time
 
@@ -13,7 +14,7 @@ textual = pytest.importorskip("textual")
 
 from src import tui_data
 from src.engine import Complexity, Engine, PersistenceManager, Phase, PhaseResult, TaskContext
-from src.tui import ChatScreen, SarathiDashboard, TasksScreen
+from src.tui import ChatScreen, DiffReviewScreen, SarathiDashboard, TasksScreen
 from textual.widgets import DataTable, Input, Static
 
 
@@ -835,6 +836,106 @@ def test_approve_binding_with_no_task_selected_notifies_warning(persistence):
             # Should not raise; nothing further to assert beyond survival —
             # the warning notification path (no worker spawned) is covered
             # by action_approve returning early.
+
+    asyncio.run(scenario())
+
+
+def _init_git_repo_with_uncommitted_change(path, filename="seed.txt"):
+    subprocess.run(["git", "init"], cwd=path, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, capture_output=True, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=path, capture_output=True, check=True)
+    (path / filename).write_text("seed\n")
+    subprocess.run(["git", "add", filename], cwd=path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "seed"], cwd=path, capture_output=True, check=True)
+    (path / filename).write_text("seed\nmodified\n")
+
+
+def test_diff_review_binding_opens_screen_lists_diff_and_records_rejection(persistence, tmp_path):
+    # No recorded review diff on task "t-1" (see the `persistence` fixture),
+    # so DiffReviewScreen falls back to a live `git diff` against the
+    # workspace it was opened with.
+    _init_git_repo_with_uncommitted_change(tmp_path)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, workspace=str(tmp_path), refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            app.switch_mode("tasks")
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, TasksScreen)
+            screen.selected_task_id = "t-1"
+
+            await pilot.press("d")
+            await pilot.pause()
+
+            diff_screen = app.screen
+            assert isinstance(diff_screen, DiffReviewScreen)
+            table = diff_screen.query_one("#diff-files", DataTable)
+            assert table.row_count == 1
+
+            await pilot.press("x")
+            await pilot.pause()
+
+            reloaded = persistence.load_task("t-1")
+            diff_review = reloaded.phase_results[-1].artifacts["diff_review"]
+            assert diff_review["decisions"][0]["path"] == "seed.txt"
+            assert diff_review["decisions"][0]["decision"] == "rejected"
+            assert diff_screen.decisions["seed.txt"] == "rejected"
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, TasksScreen)
+
+    asyncio.run(scenario())
+
+
+def test_diff_review_binding_with_no_task_selected_notifies_warning(persistence):
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            app.switch_mode("tasks")
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, TasksScreen)
+            screen.selected_task_id = None
+
+            await pilot.press("d")
+            await pilot.pause()
+            # No screen change; action_diff_review returns early with a warning.
+            assert isinstance(app.screen, TasksScreen)
+
+    asyncio.run(scenario())
+
+
+def test_diff_review_screen_approve_then_reject_updates_decision(persistence, tmp_path):
+    _init_git_repo_with_uncommitted_change(tmp_path)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, workspace=str(tmp_path), refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            app.switch_mode("tasks")
+            await pilot.pause()
+            app.screen.selected_task_id = "t-1"
+
+            await pilot.press("d")
+            await pilot.pause()
+            diff_screen = app.screen
+            assert isinstance(diff_screen, DiffReviewScreen)
+
+            await pilot.press("a")
+            await pilot.pause()
+            assert diff_screen.decisions["seed.txt"] == "approved"
+
+            await pilot.press("x")
+            await pilot.pause()
+            assert diff_screen.decisions["seed.txt"] == "rejected"
+
+            reloaded = persistence.load_task("t-1")
+            decisions = reloaded.phase_results[-1].artifacts["diff_review"]["decisions"]
+            # Re-deciding the same file replaces the earlier entry.
+            assert len(decisions) == 1
+            assert decisions[0]["decision"] == "rejected"
 
     asyncio.run(scenario())
 

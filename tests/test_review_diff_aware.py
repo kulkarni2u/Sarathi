@@ -290,6 +290,66 @@ def test_review_handler_dispatch_includes_measured_changes_and_workspace_diff(mo
     assert review_inputs_summary["diff_truncated"] is False
 
 
+def test_review_handler_surfaces_rejected_diff_review_decisions(monkeypatch, tmp_path):
+    """A file rejected via the TUI's DiffReviewScreen (recorded onto a Build
+    phase result by `record_review_decision`) must reach the Review phase's
+    dispatch inputs and prompt on the next run, so the reviewer treats it as
+    a finding that must be addressed — see `src/review_data.find_diff_review`
+    and its use in `ReviewHandler._review_inputs`/`execute`."""
+    monkeypatch.setenv("SARATHI_WORKDIR", str(tmp_path))  # not a git repo -> no live diff noise
+
+    artifacts = {
+        "diff_review": {
+            "decisions": [
+                {
+                    "path": "src/risky.py",
+                    "hunk_index": None,
+                    "decision": "rejected",
+                    "note": "unsafe eval",
+                    "decided_at": "2026-07-07T00:00:00",
+                },
+                {
+                    "path": "src/fine.py",
+                    "hunk_index": None,
+                    "decision": "approved",
+                    "note": None,
+                    "decided_at": "2026-07-07T00:00:00",
+                },
+            ]
+        }
+    }
+    task = _task_with_build_result(artifacts)
+    dispatcher = _CapturingDispatcher()
+    handler = ReviewHandler(policy_pack=PolicyPack(), dispatcher=dispatcher)
+
+    result = handler.execute(task=task, phase=Phase.REVIEW)
+
+    assert dispatcher.last_request is not None
+    diff_review = dispatcher.last_request.inputs["diff_review"]
+    rejected = [d for d in diff_review["decisions"] if d["decision"] == "rejected"]
+    assert rejected and rejected[0]["path"] == "src/risky.py"
+    assert "src/risky.py" in dispatcher.last_request.prompt
+
+    assert result.evidence["diff_review_rejected_files"] == ["src/risky.py"]
+    assert result.artifacts["review_inputs_summary"]["diff_review_rejected_files"] == 1
+    assert result.artifacts["review_inputs"]["diff_review"] == artifacts["diff_review"]
+
+
+def test_review_handler_no_diff_review_decisions_omits_them(monkeypatch, tmp_path):
+    monkeypatch.setenv("SARATHI_WORKDIR", str(tmp_path))
+
+    task = _task_with_build_result({"task_graph_execution": {"events": []}})
+    dispatcher = _CapturingDispatcher()
+    handler = ReviewHandler(policy_pack=PolicyPack(), dispatcher=dispatcher)
+
+    result = handler.execute(task=task, phase=Phase.REVIEW)
+
+    assert dispatcher.last_request.inputs["diff_review"] == {}
+    assert result.evidence["diff_review_rejected_files"] == []
+    assert result.artifacts["review_inputs_summary"]["diff_review_rejected_files"] == 0
+    assert "diff_review" not in result.artifacts["review_inputs"]
+
+
 def test_review_handler_no_measured_evidence_records_absence(monkeypatch, tmp_path):
     monkeypatch.setenv("SARATHI_WORKDIR", str(tmp_path))  # not a git repo
 

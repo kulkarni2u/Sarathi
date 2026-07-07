@@ -9,10 +9,12 @@ try:
     from src.task_graph import graph_summary
     from src.runtime import QualityLoopPolicy, ReviewRunner
     from src.runtime.workspace_evidence import collect_review_context
+    from src.review_data import find_diff_review, rejected_paths
 except ImportError:
     from task_graph import graph_summary
     from runtime import QualityLoopPolicy, ReviewRunner
     from runtime.workspace_evidence import collect_review_context
+    from review_data import find_diff_review, rejected_paths
 
 if TYPE_CHECKING:
     from src.engine import Phase, PhaseResult, TaskContext
@@ -40,16 +42,28 @@ class ReviewHandler:
         if workspace_diff.get("measured"):
             review_inputs["workspace_diff"] = workspace_diff
 
+        diff_review = review_inputs.get("diff_review") or {}
+        rejected_diff_paths = rejected_paths(diff_review)
+
         review_inputs_summary = {
             "measured_changes_present": bool(measured_changes),
             "diff_bytes": len((workspace_diff.get("diff") or "").encode("utf-8")),
             "diff_truncated": bool(workspace_diff.get("diff_truncated", False)),
+            "diff_review_rejected_files": len(rejected_diff_paths),
         }
 
         # Attempt a provider-backed review dispatch if dispatcher is available
         dispatch_response = None
         if self.dispatcher is not None:
             build_artifact = self._build_artifact(task)
+            rejection_note = (
+                "\n\nA human reviewer already rejected these files in an earlier "
+                "diff review pass: " + ", ".join(rejected_diff_paths) + ". Treat "
+                "their notes in diff_review.decisions as findings that must be "
+                "addressed before this can pass."
+                if rejected_diff_paths
+                else ""
+            )
             dispatch_response = self.dispatcher.dispatch(
                 DispatchRequest(
                     mode="execute",
@@ -64,6 +78,7 @@ class ReviewHandler:
                         "self-reported summary. Set evidence.spec_met, "
                         "evidence.code_quality_acceptable, and evidence.no_blocking_issues "
                         "based on what was actually measured in the workspace."
+                        + rejection_note
                     ),
                     inputs={
                         "task_description": task.description,
@@ -72,6 +87,7 @@ class ReviewHandler:
                         "acceptance_criteria": review_inputs.get("acceptance_criteria", []),
                         "measured_changes": measured_changes,
                         "workspace_diff": workspace_diff,
+                        "diff_review": diff_review,
                     },
                     expected_outputs=["findings", "score", "outcome", "summary"],
                     constraints={"provider": "claude"},
@@ -116,6 +132,7 @@ class ReviewHandler:
             "provider_review": dispatch_response is not None and dispatch_response.success,
             "retry_recommended": retry_recommended,
             "auto_fix_allowed": auto_fix_allowed,
+            "diff_review_rejected_files": rejected_diff_paths,
         }
 
         artifacts: dict[str, Any] = {
@@ -265,6 +282,9 @@ class ReviewHandler:
         diff_summary = self._diff_summary()
         if diff_summary:
             inputs["diff_summary"] = diff_summary
+        diff_review = find_diff_review(task)
+        if diff_review:
+            inputs["diff_review"] = diff_review
         return inputs
 
     def _diff_summary(self) -> dict:

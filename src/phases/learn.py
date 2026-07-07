@@ -1,6 +1,7 @@
 """Learn phase handler."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 try:
@@ -17,13 +18,19 @@ if TYPE_CHECKING:
 class LearnHandler:
     """Extract lessons learned from task execution."""
 
-    def __init__(self, policy_pack, dispatcher=None, provider_health=None):
+    def __init__(self, policy_pack, dispatcher=None, provider_health=None, workspace_root=None):
         self.policy_pack = policy_pack
         self.dispatcher = dispatcher
         self.learning_store = LearningStore()
         escalation = getattr(self.policy_pack, "escalation", {}) or {}
         self.evolver = Evolver(EvolutionPolicy.from_escalation(escalation))
         self.provider_health = provider_health
+        # Optional workspace root so measured JUDGE routing feedback (Piece
+        # 2.3) can find `.sarathi/bakeoff_history.json` (written by
+        # TaskGraphExecutor -- see src/runtime/judge_scoring.py). None (the
+        # default) means "not wired up here" -- generate_policy_proposals
+        # simply gets no bake-off history and behaves exactly as before.
+        self.workspace_root = workspace_root
 
     def execute(self, task: "TaskContext", phase: "Phase") -> "PhaseResult":
         from src.engine import PhaseResult
@@ -31,6 +38,7 @@ class LearnHandler:
         artifacts = self.learning_store.build_artifacts(task)
         proposals = self.evolver.generate_policy_proposals(
             learning_records=[artifacts["learning_record"]],
+            bakeoff_history=self._load_bakeoff_history(),
         )
 
         # Wire HarnessOutcome into Evolver when harness_config is available (Piece 5)
@@ -83,3 +91,22 @@ class LearnHandler:
             self.provider_health.record(outcome.agent_used, success)
         except Exception:
             pass
+
+    def _load_bakeoff_history(self) -> list | None:
+        """Load measured JUDGE bake-off history for routing-feedback proposals.
+
+        Returns ``None`` (not ``[]``) when no ``workspace_root`` was
+        configured or the history can't be read, so
+        ``Evolver.propose_from_bakeoff_history`` short-circuits exactly like
+        it does when no history exists at all.
+        """
+        if self.workspace_root is None:
+            return None
+        try:
+            try:
+                from src.runtime.judge_scoring import BakeoffHistoryStore
+            except ImportError:
+                from runtime.judge_scoring import BakeoffHistoryStore
+            return BakeoffHistoryStore(Path(self.workspace_root) / ".sarathi").load()
+        except Exception:
+            return None

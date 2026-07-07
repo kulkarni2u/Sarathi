@@ -17,6 +17,12 @@ try:
     from src.runtime.context import ContextCompiler
     from src.runtime.contracts import DispatchRequest
     from src.runtime.isolation import GitWorktreeIsolation
+    from src.runtime.judge_scoring import (
+        BakeoffHistoryStore,
+        JudgeScoringPolicy,
+        assemble_judge_scorecard,
+        format_scorecard_for_prompt,
+    )
     from src.runtime.output_index import build_artifact_index, normalize_agent_output
     from src.runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
     from src.task_graph import (
@@ -31,6 +37,12 @@ except ImportError:
     from runtime.context import ContextCompiler
     from runtime.contracts import DispatchRequest
     from runtime.isolation import GitWorktreeIsolation
+    from runtime.judge_scoring import (
+        BakeoffHistoryStore,
+        JudgeScoringPolicy,
+        assemble_judge_scorecard,
+        format_scorecard_for_prompt,
+    )
     from runtime.output_index import build_artifact_index, normalize_agent_output
     from runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
     from task_graph import (
@@ -117,6 +129,7 @@ class TaskGraphExecutor:
         max_parallel: int | None = None,
         harness_config: Any = None,
         isolation_repo_root: str | Path | None = None,
+        judge_scoring_policy: "JudgeScoringPolicy | None" = None,
     ):
         self.dispatcher = dispatcher
         self.dispatch_phase = dispatch_phase
@@ -126,6 +139,11 @@ class TaskGraphExecutor:
         self.ncp_whisper_router = ncp_whisper_router
         self.ncp_persistence_adapter = ncp_persistence_adapter
         self.workflow_patterns_policy = workflow_patterns_policy
+        # Measured JUDGE scoring (src/runtime/judge_scoring.py): parsed from a
+        # policy pack's `judge_scoring:` review.md block. None (the default)
+        # means the feature is off — JUDGE dispatch and post-execution
+        # injection stay byte-for-byte what they were before this existed.
+        self.judge_scoring_policy = judge_scoring_policy
         # The HarnessConfig (src/harness.py) compiled for the parent task,
         # if any. Every node this executor dispatches carries the harness_id
         # of this config on its DispatchRequest — the "declare before
@@ -245,7 +263,12 @@ class TaskGraphExecutor:
         try:
             [(ready, provider_result)] = self._dispatch_batch([ready], current, harness_config=effective_harness)
             updated, event, _failed = self._apply_node_result(
-                current, ready, provider_result, fail_node_id=fail_node_id, fail_error=fail_error
+                current,
+                ready,
+                provider_result,
+                fail_node_id=fail_node_id,
+                fail_error=fail_error,
+                harness_config=effective_harness,
             )
         finally:
             self._cleanup_isolated_task(effective_harness, current)
@@ -324,7 +347,12 @@ class TaskGraphExecutor:
                     break
                 for ready, provider_result in self._dispatch_batch(batch, current, harness_config=effective_harness):
                     current, event, failed = self._apply_node_result(
-                        current, ready, provider_result, fail_node_id=fail_node_id, fail_error=fail_error
+                        current,
+                        ready,
+                        provider_result,
+                        fail_node_id=fail_node_id,
+                        fail_error=fail_error,
+                        harness_config=effective_harness,
                     )
                     events.append(event)
                     executed += 1
@@ -381,6 +409,7 @@ class TaskGraphExecutor:
         *,
         fail_node_id: str | None,
         fail_error: str | None,
+        harness_config: Any = None,
     ) -> tuple[dict, GraphExecutionEvent, bool]:
         """Apply one node's execution result to the graph. Returns (graph, event, failed)."""
         node_id = ready["id"]
@@ -402,7 +431,7 @@ class TaskGraphExecutor:
             ncp_err = self._ncp_post_node_complete(ready, provider_result)
             if ncp_err and isinstance(provider_result, dict):
                 provider_result.setdefault("ncp_warnings", []).append(f"write_output_failed: {ncp_err}")
-            updated = self._post_execute_inject(ready, updated, provider_result)
+            updated = self._post_execute_inject(ready, updated, provider_result, harness_config=harness_config)
             action = "completed"
             finished_key = "completed_at"
             failed = False
@@ -536,7 +565,7 @@ class TaskGraphExecutor:
         return any(pol.is_enabled(p) for p in pattern_names)
 
     def _post_execute_inject(
-        self, node: dict, graph: dict, provider_result: dict | None
+        self, node: dict, graph: dict, provider_result: dict | None, harness_config: Any = None
     ) -> dict:
         """After a node completes, inject follow-on nodes and emit NCP signals."""
         node_type = node.get("node_type", NodeType.EXECUTE)
@@ -561,6 +590,7 @@ class TaskGraphExecutor:
                 WorkflowPattern.ADVERSARIAL_VERIFICATION, WorkflowPattern.TOURNAMENT
             ):
                 return graph
+            self._record_bakeoff_outcome(node, provider_result, harness_config=harness_config)
             updated = self._inject_judge_result(node, graph, provider_result)
             winner_id = f"{node['id']}-winner"
             err = self._ncp_emit_judge_whisper(node, winner_id, provider_result)
@@ -784,6 +814,50 @@ class TaskGraphExecutor:
         )
         return inject_nodes(graph, parent_id=parent_id, new_nodes=children)
 
+    def _record_bakeoff_outcome(
+        self, node: dict, provider_result: dict | None, *, harness_config: Any = None
+    ) -> None:
+        """Persist a judged-fanout winner into the bake-off history for evolve.py.
+
+        No-ops (never raises) unless a judge scorecard was actually recorded
+        on this dispatch (``artifacts["judge_scorecard"]``, only present when
+        a ``judge_scoring_policy`` is configured and the JUDGE's outputs name
+        a winner matching a scored branch) — absent scoring, this is a pure
+        no-op and today's behavior is unchanged.
+        """
+        if not isinstance(provider_result, dict):
+            return
+        scorecard = (provider_result.get("artifacts") or {}).get("judge_scorecard")
+        if not isinstance(scorecard, list) or not scorecard:
+            return
+        outputs = provider_result.get("outputs", {})
+        winner_ref = str(outputs.get("winner", "")).strip() if isinstance(outputs, dict) else ""
+        if not winner_ref:
+            return
+        winner_entry = next(
+            (entry for entry in scorecard if str(entry.get("branch")) == winner_ref), None
+        )
+        if winner_entry is None:
+            return
+
+        effective_harness = harness_config if harness_config is not None else self.harness_config
+        task_class_attr = getattr(effective_harness, "task_class", None)
+        task_class = getattr(task_class_attr, "value", None) or str(task_class_attr or "") or "unknown"
+
+        try:
+            BakeoffHistoryStore(self.isolation_repo_root / ".sarathi").record(
+                task_class=task_class,
+                judge_node_id=str(node.get("id", "")),
+                winner_branch=winner_ref,
+                provider=winner_entry.get("provider"),
+                weighted_score=winner_entry.get("weighted_score"),
+                scorecard=scorecard,
+            )
+        except Exception:
+            # Bake-off history is best-effort observability, never a reason
+            # to fail graph execution.
+            pass
+
     def _inject_judge_result(
         self, node: dict, graph: dict, provider_result: dict | None
     ) -> dict:
@@ -896,6 +970,30 @@ class TaskGraphExecutor:
         else:
             context_pack_artifact, token_budget = self._local_context(node_for_context, graph)
 
+        # Measured JUDGE scoring (src/runtime/judge_scoring.py): when this is a
+        # JUDGE node and a judge_scoring policy is configured, assemble a
+        # deterministic per-branch scorecard from the branches' already-measured
+        # dispatch evidence and fold it into the judge's own context/prompt, so
+        # the LLM judge sees real cost/latency/blast-radius/test signals
+        # alongside the branch outputs it already receives. Absent a policy (the
+        # default), this is a no-op and `judge_scorecard` stays unset — today's
+        # JUDGE dispatch is unaffected.
+        judge_scorecard: list[dict[str, Any]] = []
+        if node_type == NodeType.JUDGE and self.judge_scoring_policy is not None:
+            judge_scorecard = assemble_judge_scorecard(
+                self.judge_scoring_policy, node_for_context, graph
+            )
+            if judge_scorecard:
+                context_pack_artifact = dict(context_pack_artifact)
+                agent_input = dict(context_pack_artifact.get("agent_input", {}))
+                prior_findings = list(agent_input.get("prior_findings", []))
+                prior_findings.extend(format_scorecard_for_prompt(judge_scorecard))
+                agent_input["prior_findings"] = prior_findings
+                context_pack_artifact["agent_input"] = agent_input
+                compilation = dict(context_pack_artifact.get("compilation", {}))
+                compilation["judge_scorecard_injected"] = True
+                context_pack_artifact["compilation"] = compilation
+
         constraints = {"purpose": "child_task_execution"}
         node_provider = node_for_context.get("pattern_config", {}).get("provider")
         if node_provider:
@@ -928,6 +1026,7 @@ class TaskGraphExecutor:
                 "node": dict(node_for_context),
                 "task_description": str(node_for_context.get("title", "")),
                 "context_pack": context_pack_artifact,
+                **({"judge_scorecard": judge_scorecard} if judge_scorecard else {}),
             },
             expected_outputs=["implementation_plan", "work_unit_result", "evidence"],
             constraints=constraints,
@@ -948,6 +1047,8 @@ class TaskGraphExecutor:
             if isolation_metadata:
                 result["isolation"] = isolation_metadata
                 result["artifacts"]["isolation"] = isolation_metadata
+            if judge_scorecard:
+                result["artifacts"]["judge_scorecard"] = judge_scorecard
             return result
         artifact_index = build_artifact_index(response)
         agent_output = normalize_agent_output(
@@ -960,7 +1061,7 @@ class TaskGraphExecutor:
             "success": response.success,
             "outputs": response.outputs,
             "evidence": response.evidence,
-            "artifacts": response.artifacts,
+            "artifacts": dict(response.artifacts) if judge_scorecard else response.artifacts,
             "agent_output": agent_output,
             "artifact_index": artifact_index,
             "context_pack": context_pack_artifact,
@@ -971,6 +1072,8 @@ class TaskGraphExecutor:
                 "trimmed_sections": context_pack_artifact.get("compilation", {}).get("trimmed_sections"),
             },
         }
+        if judge_scorecard:
+            result["artifacts"]["judge_scorecard"] = judge_scorecard
         if response.usage:
             result["usage"] = response.usage.to_artifact()
             ncp = self.ncp_context_adapter

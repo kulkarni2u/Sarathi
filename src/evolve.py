@@ -129,6 +129,13 @@ class EvolutionPolicy:
     deviation_threshold: float = 0.1
     pass_gate: float = 0.8
     proposal_gate: int = 2
+    # Measured JUDGE routing feedback (src/runtime/judge_scoring.py's bake-off
+    # history -> a model-routing.md proposal): a provider needs at least
+    # `bakeoff_min_wins` judged wins for a task class, at or above
+    # `bakeoff_min_win_rate` of that class's judged bake-offs, before
+    # `Evolver.propose_from_bakeoff_history` proposes routing that class to it.
+    bakeoff_min_wins: int = 5
+    bakeoff_min_win_rate: float = 0.7
 
     @classmethod
     def from_escalation(cls, escalation: dict[str, Any] | None = None) -> "EvolutionPolicy":
@@ -143,6 +150,12 @@ class EvolutionPolicy:
             ),
             pass_gate=_non_negative_float(config.get("pass_gate"), cls.pass_gate),
             proposal_gate=_non_negative_int(config.get("proposal_gate"), cls.proposal_gate),
+            bakeoff_min_wins=_non_negative_int(
+                config.get("bakeoff_min_wins"), cls.bakeoff_min_wins
+            ),
+            bakeoff_min_win_rate=_non_negative_float(
+                config.get("bakeoff_min_win_rate"), cls.bakeoff_min_win_rate
+            ),
         )
 
 
@@ -177,6 +190,8 @@ class Evolver:
         # while remaining tunable via policy without touching call sites.
         self.PASS_GATE = self.policy.pass_gate
         self.PROPOSAL_GATE = self.policy.proposal_gate
+        self.BAKEOFF_MIN_WINS = self.policy.bakeoff_min_wins
+        self.BAKEOFF_MIN_WIN_RATE = self.policy.bakeoff_min_win_rate
 
     def ingest_harness_outcome(self, outcome: Any) -> list[PolicyProposal]:
         """
@@ -283,10 +298,96 @@ class Evolver:
         self,
         learning_records: list[Any] | None = None,
         patterns: list[Pattern] | None = None,
+        bakeoff_history: list[dict[str, Any]] | None = None,
     ) -> list[PolicyProposal]:
         """Generate policy proposals without applying them to policy files."""
         proposals = self.propose_from_learning_records(learning_records or [])
         proposals.extend(self.propose_from_patterns(patterns or []))
+        proposals.extend(self.propose_from_bakeoff_history(bakeoff_history))
+        return proposals
+
+    def propose_from_bakeoff_history(
+        self,
+        history: list[dict[str, Any]] | None,
+        *,
+        min_wins: int | None = None,
+        min_win_rate: float | None = None,
+    ) -> list[PolicyProposal]:
+        """Turn repeated measured JUDGE wins into a model-routing.md proposal.
+
+        Reads records written by ``TaskGraphExecutor._record_bakeoff_outcome``
+        via ``src/runtime/judge_scoring.py``'s ``BakeoffHistoryStore``
+        (``{"task_class", "provider", "weighted_score", ...}`` per judged
+        fan-out). When one provider has won at least ``min_wins`` (default
+        from policy, itself defaulting to 5) judged bake-offs for a task
+        class, at or above ``min_win_rate`` (default from policy, itself
+        defaulting to 0.7) of that class's judged bake-offs, this proposes
+        routing that task class to the winning provider — closing the loop
+        from measured bake-off evidence back into ``model-routing.md``.
+
+        Absent history (``None`` or empty), returns ``[]`` — this is a pure
+        additive extension, so ``generate_policy_proposals`` behaves exactly
+        as before when no bake-off history is supplied.
+        """
+        if not history:
+            return []
+        resolved_min_wins = self.BAKEOFF_MIN_WINS if min_wins is None else min_wins
+        resolved_min_win_rate = self.BAKEOFF_MIN_WIN_RATE if min_win_rate is None else min_win_rate
+
+        totals: dict[str, dict[str, Any]] = {}
+        for record in history:
+            if not isinstance(record, dict):
+                continue
+            provider = record.get("provider")
+            if not provider:
+                continue
+            task_class = str(record.get("task_class") or "unknown")
+            bucket = totals.setdefault(task_class, {"total": 0, "wins": {}, "scores": {}})
+            bucket["total"] += 1
+            wins = bucket["wins"]
+            wins[str(provider)] = wins.get(str(provider), 0) + 1
+            score = record.get("weighted_score")
+            if isinstance(score, (int, float)) and not isinstance(score, bool):
+                bucket["scores"].setdefault(str(provider), []).append(float(score))
+
+        proposals: list[PolicyProposal] = []
+        for task_class, data in sorted(totals.items()):
+            total = data["total"]
+            for provider, wins in sorted(data["wins"].items()):
+                if wins < resolved_min_wins:
+                    continue
+                win_rate = wins / total if total else 0.0
+                if win_rate < resolved_min_win_rate:
+                    continue
+                scores = data["scores"].get(provider, [])
+                avg_score = sum(scores) / len(scores) if scores else None
+                avg_score_text = f"{avg_score:.2f}" if avg_score is not None else "n/a"
+                proposals.append(
+                    PolicyProposal(
+                        title=f"Route {task_class} to {provider}",
+                        policy_file="model-routing.md",
+                        rationale=(
+                            f"{provider} won {wins} of {total} judged bake-off(s) "
+                            f"({win_rate:.0%} win rate) for task class {task_class}, "
+                            f"avg weighted score {avg_score_text}."
+                        ),
+                        suggested_change=(
+                            f"Route {task_class} tasks to {provider} (e.g. via a "
+                            f"phase_providers/task_class override in model-routing.md) instead "
+                            "of the current default."
+                        ),
+                        evidence_refs=[f"bakeoff:{task_class}:{provider}:{wins}/{total}"],
+                        confidence=min(1.0, win_rate),
+                        source="bakeoff_history",
+                        routing_hint={
+                            "task_class": task_class,
+                            "preferred_provider": provider,
+                            "wins": wins,
+                            "total": total,
+                            "win_rate": round(win_rate, 3),
+                        },
+                    )
+                )
         return proposals
 
     def propose_from_learning_records(self, records: list[Any]) -> list[PolicyProposal]:

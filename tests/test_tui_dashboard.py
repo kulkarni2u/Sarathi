@@ -663,7 +663,7 @@ def test_cancel_command_stops_active_run(persistence, tmp_path, monkeypatch):
         current_phase = Phase.BUILD
         stop_reason = "cancelled"
 
-    def fake_start_task(persistence, description, policy_pack, context=None, cancel_check=None, task_timeout=None):
+    def fake_start_task(persistence, description, policy_pack, context=None, cancel_check=None, task_timeout=None, **kwargs):
         # Block until the app sets the cancel event via /cancel.
         for _ in range(200):
             if cancel_check is not None and cancel_check():
@@ -714,7 +714,7 @@ def test_cancel_run_binding_stops_active_run(persistence, tmp_path, monkeypatch)
         current_phase = Phase.VERIFY
         stop_reason = "cancelled"
 
-    def fake_start_task(persistence, description, policy_pack, context=None, cancel_check=None, task_timeout=None):
+    def fake_start_task(persistence, description, policy_pack, context=None, cancel_check=None, task_timeout=None, **kwargs):
         for _ in range(200):
             if cancel_check is not None and cancel_check():
                 break
@@ -949,7 +949,7 @@ def test_timeout_reports_timed_out_message(persistence, tmp_path, monkeypatch):
         current_phase = Phase.REVIEW
         stop_reason = "timeout"
 
-    def fake_start_task(persistence, description, policy_pack, context=None, cancel_check=None, task_timeout=None):
+    def fake_start_task(persistence, description, policy_pack, context=None, cancel_check=None, task_timeout=None, **kwargs):
         return DummyResult()
 
     monkeypatch.setattr(tui_data, "start_task", fake_start_task)

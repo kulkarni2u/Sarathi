@@ -54,6 +54,48 @@ class _DynamicStreamingHandlers:
         }
 
 
+def _try_service_client():
+    """Return a service client if the local service is reachable, else None."""
+    try:
+        from .service_client import ServiceClient
+
+        client = ServiceClient()
+        if client.available:
+            client.list_workspaces()  # verify reachability
+            return client
+    except Exception:
+        pass
+    return None
+
+
+def can_start_task_via_service(workspace: str | None = None) -> bool:
+    """True if the local service is reachable and a workspace can be selected
+    for service draft creation."""
+    client = _try_service_client()
+    if client is None:
+        return False
+    ws = client.select_workspace(cwd=workspace or os.getcwd())
+    return ws is not None
+
+
+class _ServiceTaskPhase:
+    """Lightweight phase-like object exposing a ``.value`` attribute so
+    existing TUI ``current_phase.value`` access works without None."""
+
+    def __init__(self, value: str):
+        self.value = value
+
+
+class _ServiceTaskResult:
+    """Lightweight object compatible with ``TaskContext`` for service-created
+    tasks returned by ``start_task`` when running via the service."""
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        self.current_phase = _ServiceTaskPhase("prd_pending")
+        self.stop_reason = "approval_required/service_draft"
+
+
 def default_persistence(storage_path: str | None = None) -> PersistenceManager:
     return PersistenceManager(storage_path)
 
@@ -66,12 +108,35 @@ def _cli():
     return cli
 
 
-def task_summaries(persistence: PersistenceManager) -> list[dict[str, Any]]:
-    """List persisted tasks, newest first, reading the raw JSON files.
+def _service_task_summary(task: dict[str, Any]) -> dict[str, Any]:
+    metadata = task.get("metadata") or {}
+    return {
+        "task_id": task.get("id", ""),
+        "description": task.get("title") or task.get("description", ""),
+        "complexity": metadata.get("complexity", ""),
+        "current_phase": task.get("status", "prd_pending"),
+        "phases": 0,
+        "last_phase": "",
+        "last_outcome": "",
+        "last_updated": task.get("updated_at") or task.get("created_at", ""),
+    }
 
-    Reads the files directly instead of `load_task` so the list view stays
-    cheap and tolerant of records written by newer/older engine versions.
-    """
+
+def task_summaries(persistence: PersistenceManager) -> list[dict[str, Any]]:
+    """List tasks — from the local service when reachable, else JSON files."""
+    client = _try_service_client()
+    if client is not None:
+        ws = client.select_workspace(cwd=os.getcwd())
+        if ws is not None:
+            try:
+                tasks = client.list_tasks(ws["id"])
+            except RuntimeError:
+                pass
+            else:
+                summaries = [_service_task_summary(t) for t in tasks]
+                summaries.sort(key=lambda item: item["last_updated"], reverse=True)
+                return summaries
+
     summaries: list[dict[str, Any]] = []
     for task_id in persistence.list_tasks():
         path = persistence.storage_path / f"{task_id}.json"
@@ -100,7 +165,26 @@ def task_summaries(persistence: PersistenceManager) -> list[dict[str, Any]]:
 
 
 def status_snapshot(persistence: PersistenceManager, task_id: str) -> str | None:
-    """Compact supervision snapshot, identical to `sarathi status <task_id>`."""
+    """Compact supervision snapshot — from the service when available, else local."""
+    client = _try_service_client()
+    if client is not None:
+        task = client.get_task(task_id)
+        if task is not None:
+            title = task.get("title") or task.get("description", "")
+            status = task.get("status", "")
+            metadata = task.get("metadata") or {}
+            created = str(task.get("created_at", ""))[:19].replace("T", " ")
+            updated = str(task.get("updated_at", ""))[:19].replace("T", " ")
+            lines = [
+                f"Task: {task_id}",
+                f"Description: {title}",
+                f"Complexity: {metadata.get('complexity', '-')}",
+                f"Status: {status}",
+                f"Created: {created}",
+                f"Updated: {updated}",
+            ]
+            return "\n".join(lines)
+
     task = persistence.load_task(task_id)
     if task is None:
         return None
@@ -111,7 +195,13 @@ def status_snapshot(persistence: PersistenceManager, task_id: str) -> str | None
 
 
 def phase_rows(persistence: PersistenceManager, task_id: str) -> list[dict[str, Any]]:
-    """Per-phase result rows for a persisted task."""
+    """Per-phase result rows — from the service when available, else local."""
+    client = _try_service_client()
+    if client is not None:
+        task = client.get_task(task_id)
+        if task is not None:
+            return []  # service tasks have engine phases only after graph execution
+
     task = persistence.load_task(task_id)
     if task is None:
         return []
@@ -131,7 +221,26 @@ def phase_rows(persistence: PersistenceManager, task_id: str) -> list[dict[str, 
 def phase_log_tail(
     persistence: PersistenceManager, task_id: str, max_lines: int = 200
 ) -> list[str]:
-    """Tail of the phase transition log written by the engine."""
+    """Tail of the phase transition log — from service events when available,
+    else from the engine log file."""
+    client = _try_service_client()
+    if client is not None:
+        task = client.get_task(task_id)
+        if task is not None:
+            events = client.get_events(task_id)
+            lines = []
+            for ev in events[-max_lines:]:
+                lines.append(
+                    json.dumps(
+                        {
+                            "timestamp": ev.get("created_at", ""),
+                            "task_id": task_id,
+                            "event_type": ev.get("event_type", ""),
+                        }
+                    )
+                )
+            return lines
+
     log_file = persistence.storage_path / f"{task_id}_phases.log"
     if not log_file.exists():
         return []
@@ -195,20 +304,42 @@ def start_task(
     context: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
     task_timeout: float | None = None,
+    workspace: str | None = None,
 ) -> TaskContext:
-    """Create a new task from a description and run it through the lifecycle.
+    """Create a new task — via the service when reachable, otherwise via the
+    engine lifecycle.
 
-    Mirrors `sarathi run` with auto-detected complexity; raises RuntimeError
-    when preflight validation blocks execution.
+    When the local service is reachable and a workspace can be selected,
+    creates a service task draft (PRD/AC shell) and returns a lightweight
+    result object (``_ServiceTaskResult``) with ``task_id`` and
+    ``current_phase = None``.  The TUI treats this as "completed" from the
+    engine perspective; the actual task awaits PRD/AC approval on the
+    service.
 
-    When `context` is given (and non-empty), it is appended to the task
-    description as recent chat context, but `task_id` and `complexity` are
-    still derived from the bare `description` so the transcript doesn't
-    pollute task identity.
+    ``workspace`` is passed to ``ServiceClient.select_workspace`` as the
+    ``cwd`` for matching against service workspace root paths.  Defaults to
+    ``os.getcwd()`` when omitted.
 
-    `cancel_check` and `task_timeout` are forwarded to `Engine.run_task` for
-    cooperative cancellation and a wall-clock cap (see `task.stop_reason`).
+    In all other cases, delegates to the engine (same as ``sarathi run``).
     """
+    client = _try_service_client()
+    if client is not None:
+        ws = client.select_workspace(cwd=workspace or os.getcwd())
+        if ws is not None:
+            ws_id = ws.get("id")
+            if isinstance(ws_id, str) and ws_id:
+                prompt = description
+                if context:
+                    prompt = f"{description}\n\nContext from chat conversation:\n{context}"
+                try:
+                    result = client.create_task_draft(ws_id, prompt)
+                    task = result.get("task") or {}
+                    task_id = task.get("id", "")
+                    if task_id:
+                        return _ServiceTaskResult(task_id=task_id)
+                except RuntimeError:
+                    pass  # fall through to engine
+
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         engine = Engine(policy_pack_path=str(policy_pack), enforce_preflight=True)
         engine.persistence = persistence

@@ -137,6 +137,117 @@ sarathi init .
 sarathi init /path/to/project --engine ./sarathi/engine
 ```
 
+## Importing Policy Packs (`--from`)
+
+Import an existing policy pack instead of generating one from scratch:
+
+```bash
+# From a local directory
+sarathi init . --from /path/to/existing/policy-pack
+
+# From a shipped recipe by name
+sarathi init . --from bakeoff
+
+# From a git repository
+sarathi init . --from https://github.com/org/policy-pack.git
+
+# From a registry entry (shipped recipes)
+sarathi init . --from registry:bakeoff
+
+# From a registry entry with version hint
+sarathi init . --from bakeoff@latest
+```
+
+### Import Sources
+
+The `--from` option accepts these source types:
+
+| Pattern | Example | Description |
+|---------|---------|-------------|
+| Local path | `--from ./my-pack` | Absolute or relative directory path |
+| Recipe name | `--from bakeoff` | Name of a shipped recipe under `policy-pack/RECIPES/` |
+| Git URL | `--from https://...` | Any `https://`, `http://`, `git@`, `file://` URL |
+| Registry entry | `--from registry:<name>` | Unambiguous lookup in the registry |
+| Versioned entry | `--from <name>@<version>` | Registry lookup when the base name exists in the registry |
+
+### Gap-filling
+
+If the imported pack is missing any standard files (`complexity.md`, `commands.md`,
+`review.md`, etc.), Sarathi generates sensible defaults for them automatically.
+
+### Force Overwrite
+
+Use `--force` to overwrite an existing `policy-pack/` directory:
+
+```bash
+sarathi init . --from bakeoff --force
+```
+
+### Registry Manifests
+
+The default registry includes all shipped recipes under `policy-pack/RECIPES/`.
+To extend with your own entries, export `SARATHI_REGISTRY` pointing to a JSON
+manifest file.
+
+Each entry supports three styles:
+
+| Style | Example | Use case |
+|-------|---------|----------|
+| Plain | `"source": "..."` | Default source, no version label |
+| Labelled | `"source": "...", "version": "v1"` | Single entry with a version tag |
+| Versioned | `"source": "...", "versions": { "v1": {...}, "v2": {...} }` | Multi-version with optional default |
+
+**Plain entry** — resolved via `registry:<name>`:
+
+```json
+{
+  "registries": {
+    "my-org": {
+      "description": "My org's curated policy packs",
+      "entries": {
+        "secure-defaults": {
+          "description": "Security-hardened base pack",
+          "source": "/path/to/secure-defaults"
+        }
+      }
+    }
+  }
+}
+```
+
+**Multi-version entry** — `source` is the default (used by `registry:<name>`);
+each version gets its own `source` (used by `<name>@<version>`):
+
+```json
+{
+  "registries": {
+    "my-org": {
+      "entries": {
+        "my-pack": {
+          "description": "A versioned pack",
+          "source": "/path/to/latest",
+          "versions": {
+            "v1": { "source": "/path/to/v1" },
+            "v2": { "source": "/path/to/v2" }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+If no `source` is set and only `versions` exist, `registry:<name>` resolves
+to the first version's source.
+
+```bash
+export SARATHI_REGISTRY=/path/to/registry-manifest.json
+sarathi init . --from registry:secure-defaults
+sarathi init . --from my-pack@v2
+```
+
+External registry entries override built-in entries when names collide.
+
 ## Output Structure
 
 ```

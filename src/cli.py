@@ -627,7 +627,8 @@ def main() -> None:
         "--from",
         dest="from_source",
         default=None,
-        help="Import policy pack from: local directory, recipe name (e.g. bakeoff), or git URL",
+        help="Import policy pack from: local directory, recipe name (e.g. bakeoff), "
+             "git URL, or registry entry (registry:<name> or <name>@<version>)",
     )
     init_parser.add_argument(
         "--force",
@@ -1347,9 +1348,67 @@ def _run_recipe(args: argparse.Namespace, policy_pack: str) -> None:
     print(f"  Measured token cost: {total_tokens}")
 
 
+def _run_via_service(args: argparse.Namespace) -> bool:
+    """If the local service is reachable, no --recipe, no --dry-run, and a
+    workspace can be selected, create a service task draft and print a
+    summary — returning True to indicate the caller should return early.
+
+    Returns False for any fallback condition (no service, ambiguous/no
+    workspace, --recipe, --dry-run).
+    """
+    if getattr(args, "recipe", None) or getattr(args, "dry_run", False):
+        return False
+    try:
+        from .service_client import ServiceClient
+
+        client = ServiceClient()
+        if not client.available:
+            return False
+        client.list_workspaces()  # verify reachability
+    except Exception:
+        return False
+
+    ws = client.select_workspace(cwd=os.getcwd())
+    if ws is None:
+        return False
+
+    workspace_id = ws.get("id")
+    workspace_name = ws.get("name") or workspace_id
+    if not isinstance(workspace_id, str) or not workspace_id:
+        return False
+
+    prompt = args.task_description
+    title = None
+    context = None
+    try:
+        result = client.create_task_draft(workspace_id, prompt, title=title, context=context)
+    except RuntimeError as exc:
+        print(f"Service task creation failed: {exc}")
+        print("Falling back to engine…")
+        return False
+
+    task = result.get("task") or {}
+    gate = result.get("approval_gate") or {}
+    task_id = task.get("id", "")
+    gate_id = gate.get("id", "")
+    print(f"Created service task draft: {task_id}")
+    print(f"  Workspace: {workspace_name} ({workspace_id})")
+    print(f"  PRD/AC approval gate: {gate_id}")
+    print("  The task is awaiting PRD/AC approval.")
+    print("  Use the web cockpit or `sarathi desktop` to review and approve.")
+    return True
+
+
 def handle_run(args: argparse.Namespace) -> None:
     """Handle the run command."""
-    # Auto-discover policy pack
+    # Service route: when the service is reachable, no --recipe, no --dry-run,
+    # and a workspace is selectable, create a task draft without needing a
+    # policy pack.  The engine path still needs a policy pack below.
+    if not getattr(args, "recipe", None) and not getattr(args, "dry_run", False):
+        if _run_via_service(args):
+            return
+
+    # Auto-discover policy pack (needed for engine and recipe paths)
     policy_pack = args.policy_pack
     if not policy_pack:
         policy_pack = discover_policy_pack()
@@ -1598,7 +1657,28 @@ def handle_tui(args: argparse.Namespace) -> None:
 
 
 def handle_list_tasks() -> None:
-    """List task IDs persisted by the engine."""
+    """List task IDs — from the service when reachable, else local persistence."""
+    try:
+        from .service_client import ServiceClient
+
+        client = ServiceClient()
+        if client.available:
+            client.list_workspaces()  # verify reachability
+            ws = client.select_workspace(cwd=os.getcwd())
+            if ws is not None:
+                tasks = client.list_tasks(ws["id"])
+                if not tasks:
+                    print("No tasks found on the service.")
+                    return
+                print(f"Service tasks (workspace: {ws.get('name') or ws['id']}):")
+                for t in tasks:
+                    status = t.get("status", "")
+                    title = t.get("title", "")
+                    print(f"  {t['id']:<40} {status:<15} {title}")
+                return
+    except Exception:
+        pass
+
     persistence_cls = globals().get("PersistenceManager")
     if persistence_cls is None:
         try:
@@ -2100,8 +2180,68 @@ def _find_proposal(proposals, proposal_id: str):
     return None
 
 
+def _log_via_service(task_id: str) -> bool:
+    """Print a service task log if the task exists on the service.
+    Returns True if handled, False for fallback."""
+    try:
+        from .service_client import ServiceClient
+
+        client = ServiceClient()
+        if not client.available:
+            return False
+        client.list_workspaces()  # verify reachability
+    except Exception:
+        return False
+
+    task = client.get_task(task_id)
+    if task is None:
+        return False
+
+    title = task.get("title", "")
+    description = task.get("description", "")
+    status = task.get("status", "")
+    metadata = task.get("metadata") or {}
+
+    print(f"Task: {task_id}")
+    print(f"Description: {title or description}")
+    print(f"Complexity: {metadata.get('complexity', '-')}")
+    print(f"Status: {status}")
+    print()
+
+    messages = client.get_messages(task_id)
+    if messages:
+        print(f"Messages ({len(messages)}):")
+        print("-" * 60)
+        for msg in messages[-10:]:
+            role = msg.get("role", "?")
+            content = (msg.get("content") or "")[:200]
+            print(f"  [{role}] {content}")
+        print()
+
+    approvals = client.get_approvals(task_id)
+    if approvals:
+        print("Approval Gates:")
+        for gate in approvals:
+            gate_name = gate.get("name", "?")
+            gate_status = gate.get("status", "?")
+            print(f"  - {gate_name}: {gate_status}")
+
+    events = client.get_events(task_id)
+    if events:
+        print(f"\nLifecycle Events ({len(events)}):")
+        for ev in events:
+            ts = str(ev.get("created_at", ""))[:19].replace("T", " ")
+            etype = ev.get("event_type", "")
+            print(f"  {ts}  {etype}")
+
+    return True
+
+
 def handle_log(args: argparse.Namespace) -> None:
-    """Handle the log command."""
+    """Handle the log command — tries the service first, then local persistence."""
+    if _log_via_service(args.task_id):
+        return
+
     persistence_cls = globals().get("PersistenceManager")
     if persistence_cls is None:
         try:
@@ -2159,8 +2299,63 @@ def handle_log(args: argparse.Namespace) -> None:
             print(f"  Error reading log: {e}")
 
 
+def _status_via_service(task_id: str) -> bool:
+    """Print a service task status if the task exists on the service.
+    Returns True if handled, False for fallback."""
+    try:
+        from .service_client import ServiceClient
+
+        client = ServiceClient()
+        if not client.available:
+            return False
+        client.list_workspaces()  # verify reachability
+    except Exception:
+        return False
+
+    task = client.get_task(task_id)
+    if task is None:
+        return False
+
+    title = task.get("title", "")
+    description = task.get("description", "")
+    status = task.get("status", "")
+    metadata = task.get("metadata") or {}
+    created = str(task.get("created_at", ""))[:19].replace("T", " ")
+    updated = str(task.get("updated_at", ""))[:19].replace("T", " ")
+
+    print(f"Task: {task_id}")
+    print(f"Description: {title or description}")
+    print(f"Complexity: {metadata.get('complexity', '-')}")
+    print(f"Status: {status}")
+    print(f"Created: {created}")
+    print(f"Updated: {updated}")
+    print()
+
+    approvals = client.get_approvals(task_id)
+    if approvals:
+        print("Approval Gates:")
+        for gate in approvals:
+            gate_name = gate.get("name", "?")
+            gate_status = gate.get("status", "?")
+            print(f"  - {gate_name}: {gate_status}")
+    print()
+
+    events = client.get_events(task_id)
+    if events:
+        last_event = events[-1]
+        ts = str(last_event.get("created_at", ""))[:19].replace("T", " ")
+        etype = last_event.get("event_type", "")
+        print(f"Last event: {ts}  {etype}")
+    else:
+        print("No lifecycle events recorded.")
+    return True
+
+
 def handle_status(args: argparse.Namespace) -> None:
-    """Handle the status command."""
+    """Handle the status command — tries the service first, then local persistence."""
+    if _status_via_service(args.task_id):
+        return
+
     persistence_cls = globals().get("PersistenceManager")
     if persistence_cls is None:
         try:

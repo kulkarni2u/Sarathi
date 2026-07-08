@@ -1164,7 +1164,7 @@ class SarathiApp(App):
             )
             return False
         policy_pack = _discover_policy_pack(self.workspace)
-        if not policy_pack:
+        if not policy_pack and not tui_data.can_start_task_via_service(self.workspace):
             self.notify(
                 "No policy pack found — run /init (or `sarathi init`) first.",
                 severity="error",
@@ -1180,17 +1180,18 @@ class SarathiApp(App):
         )
         return True
 
-    def _start(self, description: str, policy_pack: str, context: str | None = None) -> None:
+    def _start(self, description: str, policy_pack: str | None, context: str | None = None) -> None:
         cancel_event = self._run_cancel
         try:
             try:
                 result = tui_data.start_task(
                     self.persistence,
                     description,
-                    policy_pack,
+                    policy_pack or "",
                     context=context,
                     cancel_check=cancel_event.is_set if cancel_event is not None else None,
                     task_timeout=DEFAULT_TASK_TIMEOUT,
+                    workspace=self.workspace,
                 )
             except Exception as exc:
                 self.call_from_thread(self.notify, f"Task failed: {exc}", severity="error")

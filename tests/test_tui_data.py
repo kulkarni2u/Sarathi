@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from src import tui_data
+from src import service_client
 from src.engine import Complexity, PersistenceManager, Phase, PhaseResult, TaskContext
 
 
@@ -953,3 +954,312 @@ def test_add_context_wraps_next_message_once(monkeypatch):
     session.send("anything else?")
     second_sent = captured[1]
     assert "Context for this conversation" not in second_sent
+
+
+# ---------------------------------------------------------------------------
+# Service-client unification: TUI data functions route through the local
+# service when available, falling back to local persistence otherwise.
+# ---------------------------------------------------------------------------
+
+_SERVICE_DISCOVERY = {"url": "http://fake-svc:8765"}
+
+
+def _configure_service(monkeypatch):
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: _SERVICE_DISCOVERY)
+
+    def fake_get(url, path, *, token=None):
+        if "/api/workspaces" in path and "tasks" not in path and "events" not in path:
+            return {
+                "ok": True,
+                "data": {
+                    "workspaces": [
+                        {
+                            "id": "ws-1",
+                            "name": "Test",
+                            "root_path": str(Path.cwd()),
+                        }
+                    ]
+                },
+            }
+        if "/api/workspaces/" in path and "/tasks" in path:
+            return {
+                "ok": True,
+                "data": {
+                    "tasks": [
+                        {
+                            "id": "svc-t-1",
+                            "title": "Svc task",
+                            "description": "A service task",
+                            "status": "prd_pending",
+                            "metadata": {"complexity": "medium"},
+                            "created_at": "2026-07-07T10:00:00Z",
+                            "updated_at": "2026-07-07T10:00:00Z",
+                        }
+                    ]
+                },
+            }
+        if "/api/tasks/" in path and "/messages" in path:
+            return {"ok": True, "data": {"messages": []}}
+        if "/api/tasks/" in path and "/approvals" in path:
+            return {"ok": True, "data": {"approval_gates": []}}
+        if "/api/events" in path:
+            return {
+                "ok": True,
+                "data": {
+                    "events": [
+                        {"id": "ev-1", "event_type": "task.draft_created", "created_at": "2026-07-07T10:00:00Z"}
+                    ]
+                },
+            }
+        if "/api/tasks/" in path:
+            return {
+                "ok": True,
+                "data": {
+                    "task": {
+                        "id": "svc-t-1",
+                        "workspace_id": "ws-1",
+                        "title": "Svc task",
+                        "description": "A service task",
+                        "status": "prd_pending",
+                        "metadata": {"complexity": "medium"},
+                        "created_at": "2026-07-07T10:00:00Z",
+                        "updated_at": "2026-07-07T10:00:00Z",
+                    }
+                },
+            }
+        return {"ok": True, "data": {}}
+
+    monkeypatch.setattr(service_client, "_service_get", fake_get)
+
+    def fake_post(url, path, body, *, token=None):
+        return {
+            "ok": True,
+            "data": {
+                "task": {"id": "svc-draft-1", "title": "Draft", "status": "prd_pending"},
+                "approval_gate": {"id": "gate-1", "name": "PRD/AC", "status": "pending"},
+                "messages": [],
+            },
+        }
+
+    monkeypatch.setattr(service_client, "_service_post", fake_post)
+
+
+def test_task_summaries_via_service(monkeypatch, persistence):
+    _configure_service(monkeypatch)
+
+    summaries = tui_data.task_summaries(persistence)
+
+    assert len(summaries) == 1
+    assert summaries[0]["task_id"] == "svc-t-1"
+    assert summaries[0]["description"] == "Svc task"
+    assert summaries[0]["current_phase"] == "prd_pending"
+
+
+def test_task_summaries_fallback_on_no_service(monkeypatch, persistence, seeded):
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: None)
+
+    summaries = tui_data.task_summaries(persistence)
+
+    assert len(summaries) == 2
+    assert summaries[0]["task_id"] == "t-running"
+
+
+def test_status_snapshot_via_service(monkeypatch, persistence):
+    _configure_service(monkeypatch)
+
+    snapshot = tui_data.status_snapshot(persistence, "svc-t-1")
+
+    assert snapshot is not None
+    assert "svc-t-1" in snapshot
+    assert "Svc task" in snapshot
+    assert "prd_pending" in snapshot
+
+
+def test_status_snapshot_fallback_when_not_in_service(monkeypatch, seeded):
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: None)
+
+    snapshot = tui_data.status_snapshot(seeded, "t-running")
+
+    assert snapshot is not None
+    assert "t-running" in snapshot
+
+
+def test_phase_rows_via_service(monkeypatch, persistence):
+    _configure_service(monkeypatch)
+
+    rows = tui_data.phase_rows(persistence, "svc-t-1")
+
+    assert rows == []
+
+
+def test_phase_rows_fallback(monkeypatch, seeded):
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: None)
+
+    rows = tui_data.phase_rows(seeded, "t-running")
+
+    assert len(rows) == 2
+
+
+def test_phase_log_tail_via_service(monkeypatch, persistence):
+    _configure_service(monkeypatch)
+
+    lines = tui_data.phase_log_tail(persistence, "svc-t-1", max_lines=10)
+
+    assert len(lines) == 1
+    data = json.loads(lines[0])
+    assert data["event_type"] == "task.draft_created"
+
+
+def test_phase_log_tail_fallback(monkeypatch, seeded):
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: None)
+
+    lines = tui_data.phase_log_tail(seeded, "t-running", max_lines=2)
+
+    assert len(lines) == 2
+
+
+def test_start_task_via_service_returns_lightweight_result(monkeypatch, persistence):
+    _configure_service(monkeypatch)
+
+    result = tui_data.start_task(persistence, "Test task", "policy-pack")
+
+    assert isinstance(result, tui_data._ServiceTaskResult)
+    assert result.task_id == "svc-draft-1"
+    assert result.current_phase.value == "prd_pending"
+    assert result.stop_reason == "approval_required/service_draft"
+
+
+def test_start_task_fallback_when_service_unavailable(monkeypatch, persistence):
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: None)
+
+    policy_pack = Path(__file__).resolve().parents[1] / "policy-pack" / "EXAMPLE"
+
+    result = tui_data.start_task(persistence, "Fix typo in README", policy_pack)
+
+    assert isinstance(result, tui_data.TaskContext)
+    assert result.phase_results
+
+
+def test_select_workspace_path_segment_safe(monkeypatch):
+    """select_workspace must not match /tmp/app when searching for /tmp/app2."""
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: _SERVICE_DISCOVERY)
+
+    close_match = Path("/tmp/app2" if Path.cwd() != "/tmp/app2" else "/tmp/app2-alt")
+
+    def fake_get(url, path, *, token=None):
+        return {
+            "ok": True,
+            "data": {
+                "workspaces": [
+                    {"id": "ws-app", "name": "App", "root_path": "/tmp/app"},
+                    {"id": "ws-app2", "name": "App2", "root_path": str(close_match)},
+                ]
+            },
+        }
+
+    monkeypatch.setattr(service_client, "_service_get", fake_get)
+
+    client = service_client.ServiceClient()
+    result = client.select_workspace(cwd="/tmp/app2/sub")
+    assert result is not None
+    assert result["id"] == "ws-app2", (
+        f"Expected ws-app2 for /tmp/app2/sub, got {result['id']}"
+    )
+
+
+def test_task_summaries_empty_service_returns_empty(monkeypatch, persistence):
+    """task_summaries must return [] when the selected service workspace has zero tasks,
+    not fall back to stale local tasks."""
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: _SERVICE_DISCOVERY)
+
+    def fake_get(url, path, *, token=None):
+        if "/api/workspaces" in path and "tasks" not in path and "events" not in path:
+            return {
+                "ok": True,
+                "data": {
+                    "workspaces": [
+                        {
+                            "id": "ws-empty",
+                            "name": "Empty",
+                            "root_path": str(Path.cwd()),
+                        }
+                    ]
+                },
+            }
+        if "/api/workspaces/" in path and "/tasks" in path:
+            return {"ok": True, "data": {"tasks": []}}
+        return {"ok": True, "data": {}}
+
+    monkeypatch.setattr(service_client, "_service_get", fake_get)
+
+    summaries = tui_data.task_summaries(persistence)
+    assert summaries == [], f"Expected [], got {summaries}"
+
+
+def test_can_start_task_via_service_true(monkeypatch):
+    _configure_service(monkeypatch)
+    assert tui_data.can_start_task_via_service() is True
+
+
+def test_can_start_task_via_service_false_no_service(monkeypatch):
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: None)
+    assert tui_data.can_start_task_via_service() is False
+
+
+def test_can_start_task_via_service_false_no_workspace(monkeypatch):
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: _SERVICE_DISCOVERY)
+
+    def fake_get(url, path, *, token=None):
+        if "workspaces" in path and "tasks" not in path and "events" not in path:
+            return {
+                "ok": True,
+                "data": {
+                    "workspaces": [
+                        {"id": "ws-other", "name": "Other", "root_path": "/some/other/path"},
+                        {"id": "ws-foo", "name": "Foo", "root_path": "/foo"},
+                    ]
+                },
+            }
+        return {"ok": True, "data": {}}
+
+    monkeypatch.setattr(service_client, "_service_get", fake_get)
+
+    assert tui_data.can_start_task_via_service(workspace="/does_not_match_any") is False
+
+
+def test_can_start_task_via_service_with_explicit_workspace(monkeypatch):
+    """Passing workspace=custom/path should select a workspace matching
+    that path rather than os.getcwd()."""
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: _SERVICE_DISCOVERY)
+
+    custom_path = "/custom/workspace"
+
+    def fake_get(url, path, *, token=None):
+        if "workspaces" in path and "tasks" not in path and "events" not in path:
+            return {
+                "ok": True,
+                "data": {
+                    "workspaces": [
+                        {"id": "ws-custom", "name": "Custom", "root_path": custom_path},
+                        {"id": "ws-other", "name": "Other", "root_path": "/other"},
+                    ]
+                },
+            }
+        return {"ok": True, "data": {}}
+
+    monkeypatch.setattr(service_client, "_service_get", fake_get)
+
+    assert tui_data.can_start_task_via_service(workspace=custom_path) is True
+    assert tui_data.can_start_task_via_service(workspace="/nonexistent_ws_path") is False
+
+
+def test_start_task_via_service_passes_workspace_to_select_workspace(monkeypatch, persistence):
+    """start_task should forward workspace to select_workspace so the
+    TUI's self.workspace is used instead of os.getcwd()."""
+    _configure_service(monkeypatch)
+
+    result = tui_data.start_task(persistence, "Test task", "policy-pack", workspace="/custom/ws")
+
+    assert isinstance(result, tui_data._ServiceTaskResult)
+    assert result.task_id == "svc-draft-1"
+    assert result.stop_reason == "approval_required/service_draft"

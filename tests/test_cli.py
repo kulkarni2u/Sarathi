@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from src import cli
+from src import service_client
 from src.engine import Complexity, PersistenceManager, Phase, PhaseResult, TaskContext
 
 
@@ -1084,3 +1085,336 @@ def test_handle_approve_non_paused_task_exits_nonzero(tmp_path, capsys):
     assert error.value.code == 1
     output = capsys.readouterr().out
     assert "Cannot approve task" in output
+
+
+# ---------------------------------------------------------------------------
+# Service-client unification: CLI handlers route through the local service
+# when available, falling back to local persistence otherwise.
+# ---------------------------------------------------------------------------
+
+_SERVICE_DISCOVERY = {"url": "http://fake-svc:8765"}
+
+
+def _make_get_fn(*, known_task_ids=None):
+    """Factory: returns a _service_get mock that knows about workspaces and
+    optionally known task IDs.  When a task ID is not known (or
+    known_task_ids is None), returns ok-with-null-data so the caller sees
+    ``get_task(…) → None`` and falls through to local persistence."""
+    known = set(known_task_ids or [])
+
+    def _fake_get(url, path, *, token=None):
+        if "/api/workspaces" in path and "tasks" not in path and "events" not in path:
+            return {
+                "ok": True,
+                "data": {
+                    "workspaces": [
+                        {
+                            "id": "ws-1",
+                            "name": "Test Workspace",
+                            "root_path": str(Path.cwd()),
+                        }
+                    ]
+                },
+            }
+        if "/api/workspaces/" in path and "/tasks" in path:
+            return {
+                "ok": True,
+                "data": {
+                    "tasks": [
+                        {
+                            "id": "svc-task-1",
+                            "title": "Svc task",
+                            "description": "A service task",
+                            "status": "prd_pending",
+                            "metadata": {"complexity": "low"},
+                            "created_at": "2026-07-07T10:00:00Z",
+                            "updated_at": "2026-07-07T10:00:00Z",
+                        }
+                    ]
+                },
+            }
+        if "/api/tasks/" in path and "/messages" in path:
+            _id = _extract_task_id(path, "/api/tasks/", "/messages")
+            if _id not in known:
+                return {"ok": True, "data": {}}
+            return {
+                "ok": True,
+                "data": {
+                    "messages": [
+                        {"role": "user", "content": "do it", "created_at": "2026-07-07T10:00:00Z"}
+                    ]
+                },
+            }
+        if "/api/tasks/" in path and "/approvals" in path:
+            _id = _extract_task_id(path, "/api/tasks/", "/approvals")
+            if _id not in known:
+                return {"ok": True, "data": {}}
+            return {
+                "ok": True,
+                "data": {
+                    "approval_gates": [
+                        {
+                            "id": "gate-1",
+                            "name": "PRD/AC",
+                            "status": "pending",
+                        }
+                    ]
+                },
+            }
+        if "/api/events" in path:
+            from urllib.parse import parse_qs, urlparse
+
+            qs = parse_qs(urlparse(path).query)
+            _id = (qs.get("task_id") or [""])[0]
+            if _id not in known:
+                return {"ok": True, "data": {}}
+            return {
+                "ok": True,
+                "data": {
+                    "events": [
+                        {
+                            "id": "ev-1",
+                            "event_type": "task.draft_created",
+                            "created_at": "2026-07-07T10:00:00Z",
+                        }
+                    ]
+                },
+            }
+        if "/api/tasks/" in path:
+            _id = _extract_task_id(path, "/api/tasks/")
+            if _id not in known:
+                return {"ok": True, "data": {}}
+            return {
+                "ok": True,
+                "data": {
+                    "task": {
+                        "id": _id,
+                        "workspace_id": "ws-1",
+                        "title": "Test task",
+                        "description": "A test",
+                        "status": "prd_pending",
+                        "metadata": {"complexity": "low"},
+                        "created_at": "2026-07-07T10:00:00Z",
+                        "updated_at": "2026-07-07T10:00:00Z",
+                    }
+                },
+            }
+        return {"ok": True, "data": {}}
+
+    return _fake_get
+
+
+def _extract_task_id(path, prefix, suffix=""):
+    """Extract a task ID from a URL path like /api/tasks/ID/messages."""
+    rest = path.split(prefix, 1)[-1] if prefix in path else path
+    if suffix:
+        rest = rest.split(suffix, 1)[0]
+    return rest.strip("/").split("/", 1)[0].strip() if rest else ""
+
+
+def _service_post_task_draft(url, path, body, *, token=None):
+    return {
+        "ok": True,
+        "data": {
+            "task": {"id": "svc-task-1", "title": "Test task", "status": "prd_pending"},
+            "approval_gate": {"id": "gate-1", "name": "PRD/AC", "status": "pending"},
+            "messages": [
+                {"role": "user", "content": body.get("prompt", "")},
+                {"role": "sarathi", "content": "Draft created."},
+            ],
+        },
+    }
+
+
+def _configure_service(monkeypatch, *, known_task_ids=None):
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: _SERVICE_DISCOVERY)
+    monkeypatch.setattr(service_client, "_service_get", _make_get_fn(known_task_ids=known_task_ids))
+    monkeypatch.setattr(service_client, "_service_post", _service_post_task_draft)
+
+
+def _clear_service(monkeypatch):
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: None)
+
+
+def test_handle_run_via_service_creates_draft(monkeypatch, capsys):
+    _configure_service(monkeypatch)
+
+    args = Namespace(
+        task_description="Test task",
+        policy_pack=None,
+        complexity="auto",
+        dry_run=False,
+        ncp_mode="direct",
+        ncp_router=False,
+        recipe=None,
+        agent=None,
+        agents_dir=None,
+        ncp=False,
+        no_ncp=False,
+    )
+    cli.handle_run(args)
+    output = capsys.readouterr().out
+
+    assert "Created service task draft: svc-task-1" in output
+    assert "PRD/AC approval gate: gate-1" in output
+    assert "awaiting PRD/AC approval" in output
+
+
+def test_handle_run_via_service_skipped_when_dry_run(monkeypatch, capsys, tmp_path):
+    _configure_service(monkeypatch)
+    policy_dir = tmp_path / "policy-pack"
+    _write_policy_pack(policy_dir)
+
+    args = Namespace(
+        task_description="Test task",
+        policy_pack=str(policy_dir),
+        complexity="auto",
+        dry_run=True,
+        ncp_mode="direct",
+        ncp_router=False,
+        recipe=None,
+        agent=None,
+        agents_dir=None,
+        ncp=False,
+        no_ncp=False,
+    )
+    cli.handle_run(args)
+    output = capsys.readouterr().out
+
+    assert "Created service task draft" not in output
+    assert "Route" in output
+
+
+def test_handle_run_fallback_when_no_service(monkeypatch, capsys, tmp_path):
+    _clear_service(monkeypatch)
+    policy_dir = tmp_path / "policy-pack"
+    _write_policy_pack(policy_dir)
+
+    args = Namespace(
+        task_description="Fix bug",
+        policy_pack=str(policy_dir),
+        complexity="low",
+        dry_run=False,
+        ncp_mode="direct",
+        ncp_router=False,
+        recipe=None,
+        agent=None,
+        agents_dir=None,
+        ncp=False,
+        no_ncp=False,
+    )
+    cli.handle_run(args)
+    output = capsys.readouterr().out
+
+    assert "Created service task draft" not in output
+    assert "Executing lifecycle phases:" in output
+    assert "Task completed:" in output
+
+
+def test_handle_status_via_service(monkeypatch, capsys):
+    _configure_service(monkeypatch, known_task_ids={"svc-task-1"})
+
+    cli.handle_status(Namespace(task_id="svc-task-1"))
+    output = capsys.readouterr().out
+
+    assert "Task: svc-task-1" in output
+    assert "Status: prd_pending" in output
+    assert "Approval Gates:" in output
+    assert "PRD/AC: pending" in output
+
+
+def test_handle_status_fallback_when_task_not_in_service(monkeypatch, capsys, tmp_path):
+    _configure_service(monkeypatch, known_task_ids=set())
+
+    persistence = PersistenceManager(str(tmp_path / "tasks"))
+    task = TaskContext(
+        task_id="local-task-1",
+        description="Local task",
+        complexity=Complexity.LOW,
+        preflight_validation={"passed": 2, "warning_count": 0, "todo": 0},
+    )
+    persistence.save_task(task)
+
+    original_pm = cli.PersistenceManager if hasattr(cli, "PersistenceManager") else None
+    cli.PersistenceManager = lambda: persistence
+    try:
+        cli.handle_status(Namespace(task_id="local-task-1"))
+    finally:
+        if original_pm is None:
+            delattr(cli, "PersistenceManager")
+        else:
+            cli.PersistenceManager = original_pm
+
+    output = capsys.readouterr().out
+    assert "Task: local-task-1" in output
+    assert "Local task" in output
+
+
+def test_handle_status_fallback_when_service_unavailable(monkeypatch, capsys, tmp_path):
+    _clear_service(monkeypatch)
+    persistence = PersistenceManager(str(tmp_path / "tasks"))
+    task = TaskContext(
+        task_id="local-task-2",
+        description="Local task",
+        complexity=Complexity.LOW,
+    )
+    persistence.save_task(task)
+
+    original_pm = cli.PersistenceManager if hasattr(cli, "PersistenceManager") else None
+    cli.PersistenceManager = lambda: persistence
+    try:
+        cli.handle_status(Namespace(task_id="local-task-2"))
+    finally:
+        if original_pm is None:
+            delattr(cli, "PersistenceManager")
+        else:
+            cli.PersistenceManager = original_pm
+
+    output = capsys.readouterr().out
+    assert "Task: local-task-2" in output
+
+
+def test_handle_log_via_service(monkeypatch, capsys):
+    _configure_service(monkeypatch, known_task_ids={"svc-task-1"})
+
+    cli.handle_log(Namespace(task_id="svc-task-1"))
+    output = capsys.readouterr().out
+
+    assert "Task: svc-task-1" in output
+    assert "Status: prd_pending" in output
+    assert "Lifecycle Events" in output
+
+
+def test_handle_list_tasks_via_service(monkeypatch, capsys):
+    _configure_service(monkeypatch)
+
+    cli.handle_list_tasks()
+    output = capsys.readouterr().out
+
+    assert "Service tasks" in output
+    assert "svc-task-1" in output
+
+
+def test_handle_list_tasks_fallback(monkeypatch, capsys, tmp_path):
+    _clear_service(monkeypatch)
+    persistence = PersistenceManager(str(tmp_path / "tasks"))
+    task = TaskContext(
+        task_id="local-list-1",
+        description="Local",
+        complexity=Complexity.LOW,
+    )
+    persistence.save_task(task)
+
+    original_pm = cli.PersistenceManager if hasattr(cli, "PersistenceManager") else None
+    cli.PersistenceManager = lambda: persistence
+    try:
+        cli.handle_list_tasks()
+    finally:
+        if original_pm is None:
+            delattr(cli, "PersistenceManager")
+        else:
+            cli.PersistenceManager = original_pm
+
+    output = capsys.readouterr().out
+    assert "Saved tasks" in output
+    assert "local-list-1" in output

@@ -10,7 +10,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .app import RawResponse, create_app
 from .errors import (
@@ -72,7 +72,7 @@ def create_http_server(
                 self._handle_sse()
                 return
 
-            body, error = self._read_json_body()
+            body, raw_body, error = self._read_body()
             if error is not None:
                 correlation_id = _correlation_id(self.headers)
                 self._write_json(error.status, _error(error, correlation_id))
@@ -83,6 +83,7 @@ def create_http_server(
                 self.path,
                 body=body,
                 headers=dict(self.headers.items()),
+                raw_body=raw_body,
             )
             if isinstance(result, RawResponse):
                 self._write_raw(result)
@@ -129,23 +130,40 @@ def create_http_server(
             self.wfile.write(encoded)
             self.wfile.flush()
 
-        def _read_json_body(self) -> tuple[dict[str, Any] | None, ServiceError | None]:
+        def _read_body(self) -> tuple[dict[str, Any] | None, str | None, ServiceError | None]:
+            """Read and parse the request body.
+
+            Returns ``(parsed_dict, raw_body_string, error)``.  JSON and
+            ``application/x-www-form-urlencoded`` are supported.  The raw
+            body string is returned so that callers (e.g. Slack signing
+            verification) can recompute HMAC signatures.
+            """
             try:
                 length = int(self.headers.get("content-length") or "0")
             except ValueError:
-                return None, ServiceError("invalid_request", "Content-Length must be numeric.", 400)
+                return None, None, ServiceError("invalid_request", "Content-Length must be numeric.", 400)
             if length > MAX_BODY_BYTES:
-                return None, ServiceError("request_too_large", "Request body is too large.", 413)
+                return None, None, ServiceError("request_too_large", "Request body is too large.", 413)
             if length == 0:
-                return None, None
+                return None, None, None
             try:
-                decoded = self.rfile.read(length).decode("utf-8")
-                payload = json.loads(decoded)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                return None, ServiceError("invalid_json", "Request body must be valid JSON.", 400)
+                raw = self.rfile.read(length).decode("utf-8")
+            except UnicodeDecodeError:
+                return None, None, ServiceError("invalid_request", "Request body must be valid UTF-8.", 400)
+
+            content_type = (self.headers.get("content-type") or "").lower()
+            if "application/x-www-form-urlencoded" in content_type:
+                parsed = parse_qs(raw)
+                body = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+                return body, raw, None
+
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                return None, raw, ServiceError("invalid_json", "Request body must be valid JSON.", 400)
             if not isinstance(payload, dict):
-                return None, ServiceError("invalid_request", "Request body must be a JSON object.", 400)
-            return payload, None
+                return None, raw, ServiceError("invalid_request", "Request body must be a JSON object.", 400)
+            return payload, raw, None
 
         def _write_json(self, status: int, payload: dict[str, Any]) -> None:
             encoded = json.dumps(payload, sort_keys=True).encode("utf-8")

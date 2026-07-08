@@ -31,15 +31,18 @@ from .usage_stats import build_usage_stats
 from .intake import (
     _build_github_issue_reference,
     _create_github_issue_task_draft,
+    _create_slack_task_draft,
     _derive_task_title,
     _emit_brainstorm_event,
     _get_policy_pack,
     _initialize_workspace_repository,
+    _parse_slack_body,
     _preview_repository_intake,
     _put_policy_pack_file,
     _sync_github_issues_by_label,
     _task_context_project_id,
     _task_draft_metadata,
+    _verify_slack_request,
     _write_brainstorm_spec,
 )
 from .openapi import build_openapi_spec
@@ -223,8 +226,9 @@ class ServiceApp:
         *,
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        raw_body: str | None = None,
     ) -> tuple[int, dict[str, Any]] | RawResponse:
-        return self.handle(method, path, body=body, headers=headers)
+        return self.handle(method, path, body=body, headers=headers, raw_body=raw_body)
 
     # First path segments that are served by the JSON API router (`_route`).
     # A GET to any other top-level path falls back to the static web bundle.
@@ -248,6 +252,7 @@ class ServiceApp:
         *,
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        raw_body: str | None = None,
         skip_auth: bool = False,
     ) -> tuple[int, dict[str, Any]] | RawResponse:
         correlation_id = _correlation_id(headers)
@@ -269,6 +274,21 @@ class ServiceApp:
                 public_response = self._public_get_response(raw_parts, correlation_id)
                 if public_response is not None:
                     return public_response
+
+            # Slack slash-command intake — self-authenticating via HMAC
+            # signing secret, so it bypasses the bearer-token authorize.
+            if (
+                is_api_request
+                and method == "POST"
+                and len(raw_parts) == 6
+                and raw_parts[1] == "workspaces"
+                and raw_parts[3] == "slack"
+                and raw_parts[4] == "commands"
+                and raw_parts[5] == "task"
+            ):
+                return self._handle_slack_command(
+                    raw_parts[2], body or {}, headers, raw_body
+                )
 
             principal = None if skip_auth else self._authorize(headers)
             parts = raw_parts[1:] if is_api_request else raw_parts
@@ -1786,6 +1806,45 @@ class ServiceApp:
             return 200, {"session": approved, "task": task}
 
         raise ServiceError("not_found", "Endpoint not found.", 404)
+
+    def _handle_slack_command(
+        self,
+        workspace_id: str,
+        body: Mapping[str, Any],
+        headers: Mapping[str, str] | None,
+        raw_body: str | None,
+    ) -> RawResponse | tuple[int, dict[str, Any]]:
+        """Handle a Slack slash-command ``/task`` request.
+
+        Verifies the Slack HMAC signature (if ``SARATHI_SLACK_SIGNING_SECRET``
+        is set), parses the form body, creates a PRD/AC-gated task draft, and
+        returns a Slack-friendly JSON response.
+        """
+        slack_data = _parse_slack_body(body)
+        _verify_slack_request(headers, raw_body)
+
+        conn, storage = self._storage()
+        if storage.get_workspace(workspace_id) is None:
+            raise ServiceError("not_found", "Workspace not found.", 404)
+
+        result = _create_slack_task_draft(storage, workspace_id, slack_data)
+
+        task = result["task"]
+        gate = result["approval_gate"]
+        slack_reply = json.dumps({
+            "response_type": "ephemeral",
+            "text": (
+                f"Task draft created (ID: {task['id']}). "
+                f"PRD/AC approval gate: {gate['id']}."
+            ),
+            "task_id": task["id"],
+            "approval_gate_id": gate["id"],
+        })
+        return RawResponse(
+            200,
+            "application/json",
+            slack_reply.encode("utf-8"),
+        )
 
     def _authorize(self, headers: Mapping[str, str] | None) -> Principal | None:
         # Opt-in multi-user mode: the bearer must be the admin token or an

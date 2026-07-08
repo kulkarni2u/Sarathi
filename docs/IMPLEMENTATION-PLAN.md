@@ -42,8 +42,7 @@ criteria, and a size (S ≈ hours, M ≈ 1–3 days, L ≈ 1–2 weeks).
 - ☑ 1.4-B Unified proposals (`src/proposal_sync.py` + migration 011):
   SQLite `proposal_decisions` + lifecycle events mirror every surface's
   accept/reject; JSON stays authoritative for the policy compiler
-- 1.4-C (CLI/TUI as full service clients) remains open — see Phase 1
-  section below.
+- ☑ 1.4-C (CLI/TUI as full service clients) — see Phase 1 section below.
 - ☑ 2.2 Git worktree isolation per graph branch (`src/runtime/isolation.py`,
   `HarnessConfig.isolation_mode`; contributed via codex/opencode dogfood)
 - ☑ 2.1 Bakeoff recipe (`policy-pack/RECIPES/bakeoff/`): codex vs opencode
@@ -243,14 +242,22 @@ Stage it — do not attempt a big-bang merge:
   `ProposalReviewStore` a thin adapter over it; migrate existing
   `.sarathi-proposals/*.json` on first touch. A proposal accepted in the TUI
   is the same proposal the web Proposals view shows.
-- **C. CLI/TUI as service clients when the service runs (L, later):**
-  the discovery plumbing already exists (`~/.sarathi/service.json`;
-  `attach`/`fork`/`reuse` already do HTTP). Route `run`/`status`/`log`
-  through the service when it's up, engine-in-process when it isn't.
+- **☑ C. CLI/TUI as service clients when the service runs (M):**
+  the discovery plumbing already existed (`~/.sarathi/service.json`;
+  `attach`/`fork`/`reuse` already do HTTP). A new `src/service_client.py`
+  module provides a reusable `ServiceClient` class that verifies the
+  service URL is reachable, selects a workspace by id/name/root-path/cwd,
+  and wraps task-draft creation, task listing/status/log, and event/message
+  reads.  CLI handlers for `run`/`status`/`log`/`list` and TUI data
+  functions (`task_summaries`/`status_snapshot`/`phase_rows`/
+  `phase_log_tail`/`start_task`) now try the service first and fall
+  back to local persistence when the service is unreachable or no workspace
+  is selectable.  The service route works without a policy pack; the engine
+  fallback requires one.
 
-Files: `src/engine.py` (recorder hook — mirror the notifications pattern),
-`src/storage/__init__.py`, `src/evolve.py`, `src/service/proposals.py`,
-migration in storage schema, tests.
+Files: `src/service_client.py` (new), `src/cli.py` (handlers),
+`src/tui_data.py` (data layer), `tests/test_cli.py`,
+`tests/test_tui_data.py`.
 
 Accept (A+B): a `sarathi run` task appears in web History with its phase
 log; proposal accept/reject is consistent across TUI, CLI, MCP, and web.
@@ -346,7 +353,7 @@ Ordered, but schedule opportunistically.
   Either implement a real inline CLI chat or rename/document.
 - **3.7 Policy pack registry — M.** `sarathi init --from <pack-url>`;
   version packs; positions packs as shareable governance artifacts.
-- **3.8 Inbound Slack — M/L.** Slash-command task intake pairing with 3.3
+- ☑ **3.8 Inbound Slack — M/L.** Slash-command task intake pairing with 3.3
   (outbound shipped ☑).
 
 ---

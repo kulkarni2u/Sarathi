@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import json
 import os
 
 try:
@@ -634,6 +635,230 @@ def bootstrap_workspace(
     }
 
 
+# ── Policy-pack registry ────────────────────────────────────────────────────
+
+
+@dataclass
+class RegistryEntry:
+    """A named entry in a policy-pack registry.
+
+    ``source`` is a string that the ``--from`` pipeline already understands:
+    a local directory path, recipe name, or git/http/file URL (cloned via ``git``).
+    """
+
+    name: str
+    source: str
+    description: str = ""
+    version: str | None = None
+
+
+def _build_default_registry_entries() -> dict[str, list[RegistryEntry]]:
+    """Build the default bundled registry mapping known recipe names.
+
+    Each entry resolves through the existing recipe-name resolution so no
+    extra file I/O is needed for the common case.
+    """
+    recipes_dir = _get_installed_recipes_dir()
+    if recipes_dir is not None and recipes_dir.exists():
+        # Auto-discover recipe subdirectories
+        entries: dict[str, list[RegistryEntry]] = {}
+        for child in sorted(recipes_dir.iterdir()):
+            if child.is_dir() and (child / "recipe.md").exists():
+                entries[child.name] = [
+                    RegistryEntry(
+                        name=child.name,
+                        source=child.name,
+                        description=f"Shipped recipe: {child.name}",
+                    )
+                ]
+        return entries
+    return {}
+
+
+def _load_registry_manifest(path: str | Path) -> dict[str, list[RegistryEntry]]:
+    """Load an external registry manifest from a JSON file.
+
+    Supported entry shapes::
+
+        {
+          "registries": {
+            "<registry-name>": {
+              "description": "...",
+              "entries": {
+                "<pack-name>": {
+                  "description": "...",
+                  "source": "<default-source>",          # optional default
+                  "version": "v1",                        # simple labelled entry
+                  "versions": {                           # multi-version
+                    "v1": {"source": "<v1-source>"},
+                    "v2": {"source": "<v2-source>"}
+                  }
+                }
+              }
+            }
+          }
+        }
+
+    Returns a flat ``{name: [RegistryEntry]}`` dict.
+    """
+    result: dict[str, list[RegistryEntry]] = {}
+    try:
+        raw = json.loads(Path(path).read_text())
+    except FileNotFoundError as e:
+        raise ValueError(
+            f"Registry manifest not found: {path}. "
+            "Check that SARATHI_REGISTRY points to an existing file."
+        ) from e
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Registry manifest at {path} contains invalid JSON: {e}"
+        ) from e
+    except OSError as e:
+        raise ValueError(
+            f"Cannot read registry manifest at {path}: {e}"
+        ) from e
+
+    registries = raw.get("registries") or {}
+    if not isinstance(registries, dict):
+        raise ValueError(
+            f"Invalid registry manifest at {path}: "
+            f"'registries' must be a dict, got {type(registries).__name__}"
+        )
+    for _reg_name, reg_body in registries.items():
+        if not isinstance(reg_body, dict):
+            raise ValueError(
+                f"Invalid registry manifest at {path}: "
+                f"registry {_reg_name!r} body must be a dict, "
+                f"got {type(reg_body).__name__}"
+            )
+        entries = reg_body.get("entries") or {}
+        if not isinstance(entries, dict):
+            raise ValueError(
+                f"Invalid registry manifest at {path}: "
+                f"entries in registry {_reg_name!r} must be a dict, "
+                f"got {type(entries).__name__}"
+            )
+        for entry_name, entry_body in entries.items():
+            if not isinstance(entry_body, dict):
+                raise ValueError(
+                    f"Invalid registry manifest at {path}: "
+                    f"entry {entry_name!r} must be a dict, "
+                    f"got {type(entry_body).__name__}"
+                )
+            description = entry_body.get("description", "")
+            default_source = entry_body.get("source", "")
+            versions = entry_body.get("versions") or {}
+            simple_version = entry_body.get("version")
+
+            if versions:
+                for ver, ver_body in versions.items():
+                    if isinstance(ver_body, dict):
+                        ver_source = ver_body.get("source", "")
+                    elif isinstance(ver_body, str):
+                        ver_source = ver_body
+                    else:
+                        ver_source = ""
+                    result.setdefault(entry_name, []).append(
+                        RegistryEntry(
+                            name=entry_name,
+                            source=ver_source or default_source,
+                            description=description,
+                            version=str(ver),
+                        )
+                    )
+                if default_source:
+                    result.setdefault(entry_name, []).append(
+                        RegistryEntry(
+                            name=entry_name,
+                            source=default_source,
+                            description=description,
+                            version=None,
+                        )
+                    )
+            elif simple_version is not None:
+                result.setdefault(entry_name, []).append(
+                    RegistryEntry(
+                        name=entry_name,
+                        source=entry_body.get("source", ""),
+                        description=description,
+                        version=str(simple_version),
+                    )
+                )
+            else:
+                result.setdefault(entry_name, []).append(
+                    RegistryEntry(
+                        name=entry_name,
+                        source=default_source,
+                        description=description,
+                        version=entry_body.get("version"),
+                    )
+                )
+    return result
+
+
+def _get_registry_entries() -> dict[str, list[RegistryEntry]]:
+    """Return merged registry entries: defaults + external (from env / config).
+
+    External manifest takes precedence over defaults when names collide.
+    """
+    entries = _build_default_registry_entries()
+
+    # Load from SARATHI_REGISTRY env var (path to JSON manifest)
+    ext_path = os.environ.get("SARATHI_REGISTRY")
+    if ext_path:
+        ext_entries = _load_registry_manifest(ext_path)
+        for name, entry_list in ext_entries.items():
+            entries[name] = entry_list  # external overrides default
+
+    return entries
+
+
+def _resolve_registry_source(source: str) -> str | None:
+    """Resolve ``registry:<name>`` or ``<name>@<version>`` to a concrete source.
+
+    Returns the resolved source string (ready for ``import_policy_pack_from_source``)
+    or ``None`` if the source is not a registry reference.
+    """
+    # registry:<name> — unambiguous prefix
+    registry_prefix = "registry:"
+    if source.startswith(registry_prefix):
+        name = source[len(registry_prefix):].strip()
+        entries = _get_registry_entries()
+        match = entries.get(name)
+        if not match:
+            raise ValueError(
+                f"Unknown registry entry: {name!r}. "
+                f"Available: {', '.join(sorted(entries)) or '(none)'}"
+            )
+        # Prefer default entry (version=None), fall back to first versioned entry
+        for entry in match:
+            if entry.version is None:
+                return entry.source
+        return match[0].source
+
+    # <name>@<version> — only attempt if name parses as a simple identifier
+    # and the name exists in the registry. Avoids false matches on paths
+    # containing '@' (e.g. file names with @ symbol).
+    if "@" in source and not source.startswith(("file://", "git@", "http://", "https://")):
+        name, _, maybe_version = source.partition("@")
+        if maybe_version and not name.startswith("/"):
+            entries = _get_registry_entries()
+            if name in entries:
+                entry_list = entries[name]
+                for entry in entry_list:
+                    if entry.version == maybe_version:
+                        return entry.source
+                available = sorted(
+                    e.version for e in entry_list if e.version is not None
+                )
+                raise ValueError(
+                    f"Version {maybe_version!r} not found for registry entry {name!r}. "
+                    f"Available versions: {', '.join(available) or '(none)'}"
+                )
+
+    return None  # Not a registry reference
+
+
 def _get_installed_recipes_dir() -> Path | None:
     """Return the path to the installed policy-pack/RECIPES directory."""
     import sys
@@ -786,6 +1011,14 @@ def import_policy_pack_from_source(
     # Resolve source - but for git URLs, we need to clone to temp and copy
     source_to_use = source
     temp_clone_dir = None
+
+    # Check for registry references (registry:<name> or <name>@<version>)
+    try:
+        resolved = _resolve_registry_source(source)
+        if resolved is not None:
+            source = resolved  # Replace original source with resolved value
+    except ValueError as e:
+        return {"status": "error", "error": str(e)}
 
     # Check if it's a git URL that needs cloning
     is_git_url = (

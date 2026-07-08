@@ -24,6 +24,14 @@ and approvals. Every surface is a client over that same source of truth.
       MCP server + Python API integrations
 ```
 
+**CLI/TUI service awareness.** When the local service is running
+(``~/.sarathi/service.json`` is present and reachable), ``sarathi run``,
+``sarathi status``, ``sarathi log``, ``sarathi list``, and the TUI data
+layer automatically route through the service — creating PRD/AC task drafts
+and reading live service state. When the service is unavailable, every
+surface falls back transparently to the existing in-process engine and
+local JSON persistence.  No flag or environment variable is needed.
+
 ## Why Sarathi Exists
 
 AI coding tools are powerful, but most runs are still loose conversations:
@@ -499,6 +507,13 @@ event list for engine runs (CLI/TUI/MCP), with fnmatch patterns such as
 their `lifecycle_events` stream using environment-only configuration
 (`SARATHI_SLACK_EVENTS` narrows the event list, comma-separated). See
 `policy-pack/EXAMPLE/notifications.md` for the full reference.
+
+### Inbound Slash Commands
+
+Sarathi exposes `POST /api/workspaces/{id}/slack/commands/task` to create
+task drafts directly from Slack. HMAC signing is enforced when
+`SARATHI_SLACK_SIGNING_SECRET` is set. The endpoint returns a Slack-friendly
+JSON payload with `response_type`, `text`, `task_id`, and `approval_gate_id`.
 
 ## Verification Commands
 

@@ -62,6 +62,7 @@ try:
         PreflightPolicy,
         ProviderHealthStore,
         RecoveryRunner,
+        RoleSubrolePolicy,
         register_agent_role,
         TaskBudget,
         phase_agent_role_artifact,
@@ -97,6 +98,7 @@ except ImportError:
         PreflightPolicy,
         ProviderHealthStore,
         RecoveryRunner,
+        RoleSubrolePolicy,
         register_agent_role,
         TaskBudget,
         phase_agent_role_artifact,
@@ -281,6 +283,11 @@ class RouteHandler(PhaseHandler):
                 if assembly_mode == "STANDARD":
                     self._harness_cache[task_class.value] = harness
 
+        role_plan = RoleSubrolePolicy.from_skills_section(self.policy_pack.skills).role_plan(
+            task_description=task.description,
+            file_paths=self._task_file_paths(task),
+        )
+        harness.role_plan = role_plan
         harness_dict = json.loads(harness.to_json())
 
         evidence = {
@@ -292,6 +299,7 @@ class RouteHandler(PhaseHandler):
             "requires_human_approval": harness.requires_human_approval,
             "assembly_mode": assembly_mode,
             "cache_hit": assembly_mode == "FAST",
+            "subroles_selected": role_plan["selected_count"],
         }
 
         artifacts = {
@@ -301,6 +309,7 @@ class RouteHandler(PhaseHandler):
             "permission_scope": harness.permission_scope,
             "permission_mode": derive_permission_mode(harness.permission_scope).value,
             "assembly_mode": assembly_mode,
+            "role_plan": role_plan,
         }
 
         if agent_spec is not None:
@@ -313,6 +322,17 @@ class RouteHandler(PhaseHandler):
             evidence=evidence,
             artifacts=artifacts,
         )
+
+    def _task_file_paths(self, task: TaskContext) -> list[str]:
+        """Extract optional file hints from task metadata for subrole routing."""
+        file_paths: list[str] = []
+        for key in ("files", "file_paths", "changed_files", "paths"):
+            value = task.complexity_evidence.get(key)
+            if isinstance(value, str):
+                file_paths.append(value)
+            elif isinstance(value, list):
+                file_paths.extend(str(item) for item in value if str(item).strip())
+        return file_paths
 
     def _classify_task_type(self, description: str) -> str:
         """Legacy ad-hoc task type string (preserved for backward compatibility)."""

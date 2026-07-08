@@ -91,6 +91,7 @@ class HarnessConfig:
     # Declarative user-agent bindings (T5.2)
     tool_bindings: list[dict[str, Any]] = field(default_factory=list)
     agent_spec_key: str | None = None
+    role_plan: dict[str, Any] = field(default_factory=lambda: {"selected_subroles": [], "selected_count": 0})
 
     # Assembly defaults snapshot
     defaults: AssemblyDefaults | None = None
@@ -109,6 +110,7 @@ class HarnessConfig:
         d.setdefault("assembly_mode", "STANDARD")
         d.setdefault("tool_bindings", [])
         d.setdefault("agent_spec_key", None)
+        d.setdefault("role_plan", {"selected_subroles": [], "selected_count": 0})
         d.setdefault("isolation_mode", "none")
         d.setdefault("isolation_cleanup", "auto")
 

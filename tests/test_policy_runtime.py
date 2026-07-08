@@ -56,6 +56,13 @@ def test_packaged_skill_policy_files_include_current_templates():
     assert "skill/policy-pack/TEMPLATE/workflow-patterns.md" in template_files
 
 
+def test_packaged_template_policy_pack_parses_without_errors():
+    compiled = compile_policy_pack("skill/policy-pack/TEMPLATE")
+
+    assert compiled.parse_errors == {}
+    assert "subroles" in compiled.get("skills")
+
+
 def test_distribution_name_is_sarathi_ai_with_sarathi_console_scripts():
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 

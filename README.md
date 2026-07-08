@@ -575,6 +575,7 @@ Sarathi compiles a `HarnessConfig` during ROUTE. That artifact pre-declares:
 - permission scope
 - primary agent binding
 - assembly mode
+- role plan with policy-selected domain subroles
 - quality targets
 - cost/latency signals
 
@@ -588,8 +589,14 @@ hc = HarnessConfig.from_task_class(TaskClass.CODEGEN_PATCH, task_id="task-001")
 print(hc.context_scope)
 print(hc.permission_scope)
 print(hc.primary_agent.agent_id)
+print(hc.role_plan)
 print(hc.quality_signals)
 ```
+
+Role subroles are extensible overlays declared in `policy-pack/skills.md`.
+They preserve Sarathi's stable lifecycle roles while letting ROUTE mark the
+specialist lens a task needs, such as `security_review`, `data_migration`, or a
+project-defined domain review.
 
 Sarathi measures outcomes after execution:
 

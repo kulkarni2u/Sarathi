@@ -64,6 +64,7 @@ from .recovery import (
     validate_recovery_classification_config,
 )
 from .review import ReviewFinding, ReviewRunner, ReviewVerdict
+from .role_router import RoleSubrole, RoleSubrolePolicy
 from .sandbox import (
     build_sandbox_executor,
     docker_available,
@@ -147,6 +148,8 @@ __all__ = [
     "ReviewFinding",
     "ReviewRunner",
     "ReviewVerdict",
+    "RoleSubrole",
+    "RoleSubrolePolicy",
     "SandboxExecutor",
     "SandboxResult",
     "DockerSandboxExecutor",

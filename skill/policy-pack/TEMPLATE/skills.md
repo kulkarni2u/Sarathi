@@ -78,6 +78,48 @@ task_to_skill:
 
 ---
 
+## Role Subroles
+
+Subroles are extensible domain overlays on top of Sarathi's stable lifecycle
+roles. Add as many as your team needs; these examples are not a closed list.
+
+```yaml
+subroles:
+  security_review:
+    description: "[TEMPLATE: Security-sensitive review overlay]"
+    applies_when:
+      keywords: ["auth", "token", "secret", "permission"]
+      files: ["**/auth*.*", "**/security*.*"]
+    compatible_base_roles: ["nirnaya", "prajna"]
+    evidence_required: ["threat_model", "secret_scan", "permission_boundary_checked"]
+    review_mode: "adversarial_verification"
+
+  data_migration:
+    description: "[TEMPLATE: Data migration and backfill overlay]"
+    applies_when:
+      keywords: ["migration", "backfill", "schema", "alter table"]
+      files: ["migrations/**", "alembic/**"]
+    compatible_base_roles: ["disha", "nirnaya"]
+    evidence_required: ["rollback_plan", "records_affected", "dry_run_or_backup"]
+
+  network_architecture:
+    description: "[TEMPLATE: Network, endpoint, gateway, and transport overlay]"
+    applies_when:
+      keywords: ["network", "socket", "proxy", "gateway", "tls", "endpoint"]
+    compatible_base_roles: ["disha", "prajna"]
+    evidence_required: ["topology_summary", "failure_modes", "security_boundary"]
+
+  custom_domain_review:
+    description: "[TEMPLATE: Add your own domain-specific overlay]"
+    applies_when:
+      keywords: ["custom-domain-keyword"]
+      files: ["path/or/glob/**"]
+    compatible_base_roles: ["nirnaya"]
+    evidence_required: ["custom_evidence_item"]
+```
+
+---
+
 ## Skill Discovery Paths
 
 1. File extension analysis (`.py` → Python, `.ts` → TypeScript)

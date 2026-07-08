@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -11,6 +12,8 @@ from src.runtime import get_agent_role, list_phase_agent_roles
 from src.storage import Storage
 
 from .errors import ServiceError
+
+logger = logging.getLogger("sarathi.service.proposals")
 
 
 def _workspace_proposals(storage: Storage, workspace: dict[str, Any]) -> dict[str, Any]:
@@ -55,7 +58,7 @@ def _workspace_proposal_detail(
     target = _find_workspace_proposal(storage, workspace, proposal_id)
     if target is None:
         raise ServiceError("not_found", f"Proposal {proposal_id} not found.", 404)
-    preview = ProposalReviewStore(policy_pack_path).preview_acceptance(target)
+    preview = ProposalReviewStore(policy_pack_path, mirror=False).preview_acceptance(target)
     return {
         "workspace_id": workspace["id"],
         "proposal": target.to_artifact(),
@@ -71,8 +74,9 @@ def _accept_proposal(storage: Storage, workspace: dict[str, Any], proposal_id: s
     target = _find_workspace_proposal(storage, workspace, proposal_id)
     if target is None:
         raise ServiceError("not_found", f"Proposal {proposal_id} not found.", 404)
-    store = ProposalReviewStore(policy_pack_path)
+    store = ProposalReviewStore(policy_pack_path, mirror=False)
     decision = store.accept(target)
+    _record_decision_row(storage, workspace["id"], decision)
     storage.create_lifecycle_event(
         workspace_id=workspace["id"],
         event_type="proposal.accepted",
@@ -94,14 +98,40 @@ def _reject_proposal(
     target = _find_workspace_proposal(storage, workspace, proposal_id)
     if target is None:
         raise ServiceError("not_found", f"Proposal {proposal_id} not found.", 404)
-    store = ProposalReviewStore(policy_pack_path)
+    store = ProposalReviewStore(policy_pack_path, mirror=False)
     decision = store.reject(target, reason=reason)
+    _record_decision_row(storage, workspace["id"], decision)
     storage.create_lifecycle_event(
         workspace_id=workspace["id"],
         event_type="proposal.rejected",
         payload={"proposal_id": proposal_id, "title": target.title, "reason": reason},
     )
     return {"workspace_id": workspace["id"], "proposal_id": proposal_id, "decision": decision}
+
+
+def _record_decision_row(storage: Storage, workspace_id: str, decision: dict[str, Any]) -> None:
+    """Persist the decision as a queryable row, best-effort.
+
+    The service already owns the correct ``Storage`` handle and
+    ``workspace_id`` here (no path-based workspace lookup needed, unlike
+    ``proposal_sync.ProposalSync``), so this writes the row directly rather
+    than going through the mirror. It never raises -- a storage hiccup must
+    not turn an otherwise-successful accept/reject into a user-facing error.
+    """
+    try:
+        storage.upsert_proposal_decision(
+            workspace_id=workspace_id,
+            proposal_id=str(decision.get("id") or ""),
+            status=str(decision.get("status") or ""),
+            policy_file=decision.get("policy_file"),
+            title=decision.get("title"),
+            source=decision.get("source"),
+            reason=decision.get("reason"),
+            payload=decision,
+            reviewed_at=decision.get("reviewed_at"),
+        )
+    except Exception:
+        logger.warning("Failed to record proposal decision row", exc_info=True)
 
 
 def _synthesize_learning_records(storage: Storage, workspace_id: str) -> list[dict[str, Any]]:

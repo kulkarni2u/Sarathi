@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import json
 import os
 
 try:
@@ -534,6 +535,42 @@ permissions:
 """
         (policy_path / "permissions.md").write_text(permissions_md)
 
+        # Generate notifications.md
+        notifications_md = """# Policy Pack: Notifications
+
+Outbound notifications for attention-worthy lifecycle events. Secrets stay
+in the environment — this file only names the env vars that hold them.
+
+## Slack
+```yaml
+slack:
+  # Flip to true, then export the webhook URL (or bot token) to activate:
+  #   export SARATHI_SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+  enabled: false
+  webhook_env: SARATHI_SLACK_WEBHOOK_URL
+
+  # Bot-token mode instead of a webhook (lets one token post to any channel
+  # the bot is invited to):
+  # bot_token_env: SARATHI_SLACK_BOT_TOKEN
+  # channel: "#sarathi-runs"
+
+  timeout_seconds: 5
+
+  # fnmatch-style patterns; add "phase.*" for per-phase progress messages.
+  events:
+    - task.completed
+    - task.failed
+    - task.paused
+    - task.escalated
+    - task.cancelled
+    - task.timed_out
+    - budget.exhausted
+    - approval.requested
+    - review.rejected
+```
+"""
+        (policy_path / "notifications.md").write_text(notifications_md)
+
         return policy_path
 
     def validate(self, policy_pack_path: Path | None = None) -> list[Any]:
@@ -596,3 +633,523 @@ def bootstrap_workspace(
             "test_patterns": inspection.get("test_patterns", []),
         },
     }
+
+
+# ── Policy-pack registry ────────────────────────────────────────────────────
+
+
+@dataclass
+class RegistryEntry:
+    """A named entry in a policy-pack registry.
+
+    ``source`` is a string that the ``--from`` pipeline already understands:
+    a local directory path, recipe name, or git/http/file URL (cloned via ``git``).
+    """
+
+    name: str
+    source: str
+    description: str = ""
+    version: str | None = None
+
+
+def _build_default_registry_entries() -> dict[str, list[RegistryEntry]]:
+    """Build the default bundled registry mapping known recipe names.
+
+    Each entry resolves through the existing recipe-name resolution so no
+    extra file I/O is needed for the common case.
+    """
+    recipes_dir = _get_installed_recipes_dir()
+    if recipes_dir is not None and recipes_dir.exists():
+        # Auto-discover recipe subdirectories
+        entries: dict[str, list[RegistryEntry]] = {}
+        for child in sorted(recipes_dir.iterdir()):
+            if child.is_dir() and (child / "recipe.md").exists():
+                entries[child.name] = [
+                    RegistryEntry(
+                        name=child.name,
+                        source=child.name,
+                        description=f"Shipped recipe: {child.name}",
+                    )
+                ]
+        return entries
+    return {}
+
+
+def _load_registry_manifest(path: str | Path) -> dict[str, list[RegistryEntry]]:
+    """Load an external registry manifest from a JSON file.
+
+    Supported entry shapes::
+
+        {
+          "registries": {
+            "<registry-name>": {
+              "description": "...",
+              "entries": {
+                "<pack-name>": {
+                  "description": "...",
+                  "source": "<default-source>",          # optional default
+                  "version": "v1",                        # simple labelled entry
+                  "versions": {                           # multi-version
+                    "v1": {"source": "<v1-source>"},
+                    "v2": {"source": "<v2-source>"}
+                  }
+                }
+              }
+            }
+          }
+        }
+
+    Returns a flat ``{name: [RegistryEntry]}`` dict.
+    """
+    result: dict[str, list[RegistryEntry]] = {}
+    try:
+        raw = json.loads(Path(path).read_text())
+    except FileNotFoundError as e:
+        raise ValueError(
+            f"Registry manifest not found: {path}. "
+            "Check that SARATHI_REGISTRY points to an existing file."
+        ) from e
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Registry manifest at {path} contains invalid JSON: {e}"
+        ) from e
+    except OSError as e:
+        raise ValueError(
+            f"Cannot read registry manifest at {path}: {e}"
+        ) from e
+
+    registries = raw.get("registries") or {}
+    if not isinstance(registries, dict):
+        raise ValueError(
+            f"Invalid registry manifest at {path}: "
+            f"'registries' must be a dict, got {type(registries).__name__}"
+        )
+    for _reg_name, reg_body in registries.items():
+        if not isinstance(reg_body, dict):
+            raise ValueError(
+                f"Invalid registry manifest at {path}: "
+                f"registry {_reg_name!r} body must be a dict, "
+                f"got {type(reg_body).__name__}"
+            )
+        entries = reg_body.get("entries") or {}
+        if not isinstance(entries, dict):
+            raise ValueError(
+                f"Invalid registry manifest at {path}: "
+                f"entries in registry {_reg_name!r} must be a dict, "
+                f"got {type(entries).__name__}"
+            )
+        for entry_name, entry_body in entries.items():
+            if not isinstance(entry_body, dict):
+                raise ValueError(
+                    f"Invalid registry manifest at {path}: "
+                    f"entry {entry_name!r} must be a dict, "
+                    f"got {type(entry_body).__name__}"
+                )
+            description = entry_body.get("description", "")
+            default_source = entry_body.get("source", "")
+            versions = entry_body.get("versions") or {}
+            simple_version = entry_body.get("version")
+
+            if versions:
+                for ver, ver_body in versions.items():
+                    if isinstance(ver_body, dict):
+                        ver_source = ver_body.get("source", "")
+                    elif isinstance(ver_body, str):
+                        ver_source = ver_body
+                    else:
+                        ver_source = ""
+                    result.setdefault(entry_name, []).append(
+                        RegistryEntry(
+                            name=entry_name,
+                            source=ver_source or default_source,
+                            description=description,
+                            version=str(ver),
+                        )
+                    )
+                if default_source:
+                    result.setdefault(entry_name, []).append(
+                        RegistryEntry(
+                            name=entry_name,
+                            source=default_source,
+                            description=description,
+                            version=None,
+                        )
+                    )
+            elif simple_version is not None:
+                result.setdefault(entry_name, []).append(
+                    RegistryEntry(
+                        name=entry_name,
+                        source=entry_body.get("source", ""),
+                        description=description,
+                        version=str(simple_version),
+                    )
+                )
+            else:
+                result.setdefault(entry_name, []).append(
+                    RegistryEntry(
+                        name=entry_name,
+                        source=default_source,
+                        description=description,
+                        version=entry_body.get("version"),
+                    )
+                )
+    return result
+
+
+def _get_registry_entries() -> dict[str, list[RegistryEntry]]:
+    """Return merged registry entries: defaults + external (from env / config).
+
+    External manifest takes precedence over defaults when names collide.
+    """
+    entries = _build_default_registry_entries()
+
+    # Load from SARATHI_REGISTRY env var (path to JSON manifest)
+    ext_path = os.environ.get("SARATHI_REGISTRY")
+    if ext_path:
+        ext_entries = _load_registry_manifest(ext_path)
+        for name, entry_list in ext_entries.items():
+            entries[name] = entry_list  # external overrides default
+
+    return entries
+
+
+def _resolve_registry_source(source: str) -> str | None:
+    """Resolve ``registry:<name>`` or ``<name>@<version>`` to a concrete source.
+
+    Returns the resolved source string (ready for ``import_policy_pack_from_source``)
+    or ``None`` if the source is not a registry reference.
+    """
+    # registry:<name> — unambiguous prefix
+    registry_prefix = "registry:"
+    if source.startswith(registry_prefix):
+        name = source[len(registry_prefix):].strip()
+        entries = _get_registry_entries()
+        match = entries.get(name)
+        if not match:
+            raise ValueError(
+                f"Unknown registry entry: {name!r}. "
+                f"Available: {', '.join(sorted(entries)) or '(none)'}"
+            )
+        # Prefer default entry (version=None), fall back to first versioned entry
+        for entry in match:
+            if entry.version is None:
+                return entry.source
+        return match[0].source
+
+    # <name>@<version> — only attempt if name parses as a simple identifier
+    # and the name exists in the registry. Avoids false matches on paths
+    # containing '@' (e.g. file names with @ symbol).
+    if "@" in source and not source.startswith(("file://", "git@", "http://", "https://")):
+        name, _, maybe_version = source.partition("@")
+        if maybe_version and not name.startswith("/"):
+            entries = _get_registry_entries()
+            if name in entries:
+                entry_list = entries[name]
+                for entry in entry_list:
+                    if entry.version == maybe_version:
+                        return entry.source
+                available = sorted(
+                    e.version for e in entry_list if e.version is not None
+                )
+                raise ValueError(
+                    f"Version {maybe_version!r} not found for registry entry {name!r}. "
+                    f"Available versions: {', '.join(available) or '(none)'}"
+                )
+
+    return None  # Not a registry reference
+
+
+def _get_installed_recipes_dir() -> Path | None:
+    """Return the path to the installed policy-pack/RECIPES directory."""
+    import sys
+
+    # Check main repo (go up through .claude/worktrees/agent-xxx)
+    # For git worktrees: /path/src/init.py -> /path/.claude/worktrees/agent-xxx
+    # We need to go up to /path (main repo)
+    main_repo = Path(__file__).resolve().parents[4] / "policy-pack" / "RECIPES"
+    if main_repo.exists():
+        return main_repo
+
+    # Check relative to this file (source checkout / worktree)
+    source_recipes = Path(__file__).resolve().parents[1] / "policy-pack" / "RECIPES"
+    if source_recipes.exists():
+        return source_recipes
+
+    # Check relative to site-packages (installed package)
+    try:
+        import sarathi
+        installed_recipes = Path(sarathi.__file__).parents[0] / "policy-pack" / "RECIPES"
+        if installed_recipes.exists():
+            return installed_recipes
+    except (ImportError, AttributeError):
+        pass
+
+    # Check sys.prefix
+    prefix_recipes = Path(sys.prefix) / "share" / "sarathi" / "policy-pack" / "RECIPES"
+    if prefix_recipes.exists():
+        return prefix_recipes
+
+    return None
+
+
+def _resolve_source_pack_dir(source: str) -> Path:
+    """Resolve a --from source to a policy pack directory.
+
+    Resolution order:
+    1. Local directory (absolute or relative path)
+    2. Recipe name matching policy-pack/RECIPES/<name>
+    3. Git URL (git clone --depth 1 to temp dir)
+
+    Returns the directory path; raises ValueError if source cannot be resolved.
+    """
+    source = source.strip()
+
+    # Check for local directory
+    local_path = Path(source).expanduser()
+    if local_path.exists() and local_path.is_dir():
+        return local_path.resolve()
+
+    # Check for recipe name
+    recipes_dir = _get_installed_recipes_dir()
+    if recipes_dir is not None:
+        recipe_path = recipes_dir / source
+        if recipe_path.exists() and recipe_path.is_dir():
+            return recipe_path.resolve()
+
+    # Check for git URL
+    is_git_url = (
+        source.startswith("https://") or
+        source.startswith("http://") or
+        source.startswith("git@") or
+        source.startswith("file://") or
+        source.endswith(".git")
+    )
+
+    if is_git_url:
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            clone_path = tmpdir_path / "repo"
+
+            # Clone the repository with --depth 1 for speed
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", source, str(clone_path)],
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0:
+                raise ValueError(f"Failed to clone {source}: {result.stderr}")
+
+            # Check if policy-pack is a subdirectory
+            policy_pack_subdir = clone_path / "policy-pack"
+            if policy_pack_subdir.exists() and policy_pack_subdir.is_dir():
+                # Check if it contains markdown files (basic policy pack detection)
+                md_files = list(policy_pack_subdir.glob("*.md"))
+                if md_files:
+                    # We need to copy this back out of the temp directory
+                    # so we'll just return the path for now and let the caller
+                    # handle the copy. But we can't return a path in a temp dir.
+                    # So let's read and return the files ourselves.
+                    return policy_pack_subdir.resolve()
+
+            # Otherwise, treat the clone root as the policy pack
+            return clone_path.resolve()
+
+    raise ValueError(
+        f"Source not found: {source!r}\n"
+        f"  Expected: local directory path, recipe name (e.g., 'bakeoff'), "
+        f"or git URL (https://..., git@..., file://)"
+    )
+
+
+def import_policy_pack_from_source(
+    source: str,
+    target_path: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Import a policy pack from a source into target_path/policy-pack.
+
+    Returns a dict with:
+    - status: "imported" or "error"
+    - path: path to the imported policy-pack
+    - source: the resolved source directory
+    - files_copied: number of .md files and agents copied
+    - warnings: list of issues (validation, missing files, etc.)
+    """
+    import shutil
+    import tempfile
+
+    target = Path(target_path).expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+
+    target_pack = target / "policy-pack"
+
+    # Check if target pack exists and is non-empty
+    if target_pack.exists():
+        existing_files = list(target_pack.glob("*.md"))
+        if existing_files and not force:
+            return {
+                "status": "error",
+                "path": str(target_pack),
+                "error": f"Policy pack already exists at {target_pack}. Use --force to overwrite.",
+            }
+        if not force:
+            # Only delete if empty
+            try:
+                if any(target_pack.iterdir()):
+                    return {
+                        "status": "error",
+                        "path": str(target_pack),
+                        "error": f"Policy pack directory not empty at {target_pack}. Use --force to overwrite.",
+                    }
+            except Exception:
+                pass
+
+    # Resolve source - but for git URLs, we need to clone to temp and copy
+    source_to_use = source
+    temp_clone_dir = None
+
+    # Check for registry references (registry:<name> or <name>@<version>)
+    try:
+        resolved = _resolve_registry_source(source)
+        if resolved is not None:
+            source = resolved  # Replace original source with resolved value
+    except ValueError as e:
+        return {"status": "error", "error": str(e)}
+
+    # Check if it's a git URL that needs cloning
+    is_git_url = (
+        source.startswith("https://") or
+        source.startswith("http://") or
+        source.startswith("git@") or
+        source.startswith("file://") or
+        source.endswith(".git")
+    )
+
+    if is_git_url:
+        import subprocess
+        temp_clone_dir = tempfile.TemporaryDirectory()
+        tmpdir_path = Path(temp_clone_dir.name)
+        clone_path = tmpdir_path / "repo"
+
+        # Clone the repository
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", source, str(clone_path)],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            temp_clone_dir.cleanup()
+            return {
+                "status": "error",
+                "error": f"Failed to clone {source}: {result.stderr}",
+            }
+
+        # Check if policy-pack is a subdirectory
+        policy_pack_subdir = clone_path / "policy-pack"
+        if policy_pack_subdir.exists() and policy_pack_subdir.is_dir():
+            source_to_use = str(policy_pack_subdir)
+        else:
+            source_to_use = str(clone_path)
+    else:
+        # Resolve local path or recipe name
+        try:
+            source_path = _resolve_source_pack_dir(source)
+            source_to_use = str(source_path)
+        except ValueError as e:
+            return {"status": "error", "error": str(e)}
+
+    try:
+        source_pack = Path(source_to_use)
+
+        if not source_pack.exists():
+            return {
+                "status": "error",
+                "error": f"Resolved source path does not exist: {source_pack}",
+            }
+
+        # Create target pack directory
+        target_pack.mkdir(parents=True, exist_ok=True)
+
+        # Copy .md files
+        files_copied = 0
+        md_files = list(source_pack.glob("*.md"))
+        for md_file in md_files:
+            if md_file.name.startswith("."):
+                continue  # Skip dotfiles
+            dest = target_pack / md_file.name
+            shutil.copy2(md_file, dest)
+            files_copied += 1
+
+        # Copy agents/ subdirectory if it exists
+        source_agents = source_pack / "agents"
+        if source_agents.exists() and source_agents.is_dir():
+            target_agents = target_pack / "agents"
+            if target_agents.exists():
+                shutil.rmtree(target_agents)
+            shutil.copytree(source_agents, target_agents)
+
+        # Generate missing standard files with defaults
+        workflow = InitWorkflow(target_path=str(target), engine_path="markdown")
+        inspection = workflow.inspect()
+        interview = workflow.interview(inspection)
+
+        # Define standard files that should be present
+        standard_files = {
+            "complexity.md": False,
+            "conventions.md": False,
+            "commands.md": False,
+            "review.md": False,
+            "escalation.md": False,
+            "model-routing.md": False,
+            "skills.md": False,
+            "task-tracking.md": False,
+            "permissions.md": False,
+            "notifications.md": False,
+        }
+
+        # Check which files are missing
+        warnings = []
+        for std_file in standard_files:
+            if not (target_pack / std_file).exists():
+                warnings.append(f"Missing {std_file} - filling with generated defaults")
+
+        # Generate and fill missing files by running the normal bootstrap
+        if warnings:
+            # Generate all files using the normal workflow
+            temp_inspection = workflow.inspect()
+            temp_interview = workflow.interview(temp_inspection)
+
+            # Create a temporary workflow to generate defaults
+            temp_dir = target_pack / ".temp_gen"
+            temp_dir.mkdir(exist_ok=True)
+            temp_workflow = InitWorkflow(target_path=str(temp_dir), engine_path="markdown")
+            temp_workflow.generate(temp_inspection, temp_interview)
+
+            # Copy missing files from temp_dir/policy-pack to target_pack
+            temp_pack = temp_dir / "policy-pack"
+            if temp_pack.exists():
+                for std_file in standard_files:
+                    if not (target_pack / std_file).exists():
+                        temp_file = temp_pack / std_file
+                        if temp_file.exists():
+                            shutil.copy2(temp_file, target_pack / std_file)
+
+            # Clean up temp directory
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
+
+        return {
+            "status": "imported",
+            "path": str(target_pack),
+            "source": source_to_use,
+            "files_copied": files_copied,
+            "warnings": warnings,
+        }
+    finally:
+        if temp_clone_dir is not None:
+            temp_clone_dir.cleanup()

@@ -1,5 +1,6 @@
 """CLI implementation for Sarathi."""
 import argparse
+import getpass
 import json
 import os
 import re
@@ -11,7 +12,7 @@ from typing import Any
 
 try:
     from .evolve import Evolver, ProposalReviewStore
-    from .init import InitWorkflow, bootstrap_workspace
+    from .init import InitWorkflow, bootstrap_workspace, import_policy_pack_from_source
     from .policy import compile_policy_pack
     from .policy.layering import extract_server_caps
     from .runtime import AutoresearchStore, UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
@@ -31,7 +32,7 @@ try:
 except ImportError:
     # Support direct execution via sarathi.py, which prepends src/ to sys.path.
     from evolve import Evolver, ProposalReviewStore
-    from init import InitWorkflow, bootstrap_workspace
+    from init import InitWorkflow, bootstrap_workspace, import_policy_pack_from_source
     from policy import compile_policy_pack
     from policy.layering import extract_server_caps
     from runtime import AutoresearchStore, UsageRecord, list_agent_roles, list_phase_agent_roles, register_agent_role
@@ -622,6 +623,18 @@ def main() -> None:
         action="store_true",
         help="Skip generated .sarathi/wiki creation.",
     )
+    init_parser.add_argument(
+        "--from",
+        dest="from_source",
+        default=None,
+        help="Import policy pack from: local directory, recipe name (e.g. bakeoff), "
+             "git URL, or registry entry (registry:<name> or <name>@<version>)",
+    )
+    init_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing non-empty policy-pack directory when using --from",
+    )
 
     # Validate command
     validate_parser = subparsers.add_parser("validate", help="Validate a policy pack")
@@ -639,7 +652,7 @@ def main() -> None:
     # Dashboard command (terminal UI)
     tui_parser = subparsers.add_parser(
         "tui",
-        aliases=["dashboard", "chat"],
+        aliases=["dashboard"],
         help="Open the terminal dashboard (tasks, phase logs, proposals)",
     )
     tui_parser.add_argument(
@@ -651,6 +664,27 @@ def main() -> None:
         "--workspace",
         default=None,
         help="Folder/repo to operate on (default: current directory)",
+    )
+
+    # Chat command (inline REPL)
+    chat_parser = subparsers.add_parser(
+        "chat",
+        help="Start an interactive terminal chat REPL",
+    )
+    chat_parser.add_argument(
+        "--provider",
+        default=None,
+        help="Agent CLI to use (default: first available on PATH from claude, opencode, codex)",
+    )
+    chat_parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Folder/repo to operate on (default: current directory)",
+    )
+    chat_parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Disable streaming; use blocking send instead",
     )
 
     subparsers.add_parser("desktop", help="Run the local Sarathi desktop stack")
@@ -751,11 +785,39 @@ def main() -> None:
         action="store_true",
         help="Render a single snapshot and exit",
     )
+    watch_parser.add_argument(
+        "--follow",
+        action="store_true",
+        help="Stream lifecycle events via SSE instead of polling",
+    )
+    watch_parser.add_argument(
+        "--workspace",
+        type=str,
+        help="Workspace ID (required when using --follow for service tasks)",
+    )
 
     resume_parser = subparsers.add_parser("resume", help="Resume a saved task")
     resume_parser.add_argument(
         "task_id",
         help="Task ID to resume",
+    )
+
+    approve_parser = subparsers.add_parser(
+        "approve", help="Approve (or reject) a task paused on a human-attention escalation, then resume it"
+    )
+    approve_parser.add_argument(
+        "task_id",
+        help="Task ID to approve",
+    )
+    approve_parser.add_argument(
+        "--note",
+        default=None,
+        help="Optional note to attach to the approval decision",
+    )
+    approve_parser.add_argument(
+        "--reject",
+        action="store_true",
+        help="Reject the escalation instead of approving it",
     )
 
     subparsers.add_parser("list", help="List saved task IDs under .sarathi/tasks")
@@ -882,8 +944,11 @@ def main() -> None:
     if args.command == "setup":
         handle_setup(args)
         return
-    if args.command in ("tui", "dashboard", "chat"):
+    if args.command in ("tui", "dashboard"):
         handle_tui(args)
+        return
+    if args.command == "chat":
+        handle_chat(args)
         return
     if args.command == "desktop":
         handle_desktop(args)
@@ -902,6 +967,8 @@ def main() -> None:
         handle_watch(args)
     elif args.command == "resume":
         handle_resume(args)
+    elif args.command == "approve":
+        handle_approve(args)
     elif args.command == "list":
         handle_list_tasks()
     elif args.command == "proposals":
@@ -922,9 +989,71 @@ def main() -> None:
 
 def handle_init(args: argparse.Namespace) -> None:
     """Handle the init command."""
+    from_source = getattr(args, "from_source", None)
+    force = getattr(args, "force", False)
+
     print(f"Initializing Sarathi policy pack at: {args.target_path}")
     print(f"Using engine: {args.engine}")
+    if from_source:
+        print(f"Importing from: {from_source}")
+        if force:
+            print("  (--force: will overwrite existing pack)")
 
+    # Handle --from import workflow
+    if from_source:
+        print("\n[1/3] Import: Loading policy pack from source...")
+        import_result = import_policy_pack_from_source(
+            from_source,
+            args.target_path,
+            force=force
+        )
+
+        if import_result.get("status") == "error":
+            print(f"  Error: {import_result.get('error')}")
+            sys.exit(1)
+
+        policy_path = Path(import_result.get("path"))
+        print(f"  ✓ Imported {import_result.get('files_copied')} files from {from_source}")
+        if import_result.get("warnings"):
+            for warning in import_result.get("warnings", []):
+                print(f"  ⚠ {warning}")
+
+        # Validate the imported pack
+        print("\n[2/3] Validate: Checking imported policy pack...")
+        workflow = InitWorkflow(target_path=args.target_path, engine_path=args.engine)
+        validation_results = workflow.validate(policy_path)
+        passed = sum(1 for r in validation_results if r.status.value == "PASS")
+        warnings = sum(1 for r in validation_results if r.status.value == "DRIFT")
+        todos = sum(1 for r in validation_results if r.status.value == "TODO")
+        print(f"  Results: {passed} PASS, {warnings} DRIFT, {todos} TODO")
+
+        # Generate wiki if needed
+        print("\n[3/3] Bootstrap: Finalizing workspace artifacts...")
+        if not getattr(args, "no_wiki", False):
+            try:
+                from .repo_wiki import generate_repo_wiki
+            except ImportError:
+                from repo_wiki import generate_repo_wiki
+            wiki_result = generate_repo_wiki(Path(args.target_path))
+            print(f"  Wiki: {wiki_result.get('status')} → {wiki_result.get('path')}")
+
+        # Write provider-native permission config files
+        try:
+            from .runtime.providers.cli_bridge import ensure_provider_permissions
+        except ImportError:
+            from runtime.providers.cli_bridge import ensure_provider_permissions
+        written = ensure_provider_permissions(args.target_path)
+        for provider, config_path in written.items():
+            print(f"  Wrote {provider} permissions → {config_path}")
+
+        print("\n✓ Policy pack imported successfully!")
+        print(f"\nNext steps:")
+        print(f"  1. Review imported files in {policy_path}/")
+        print(f"  2. Customize policy-pack/*.md to your team's needs")
+        print(f"  3. Run: sarathi validate {policy_path}")
+        return
+
+    # Original bootstrap workflow for non-import case
     # Phase 1: Inspect
     print("\n[1/5] Inspect: Scanning repository...")
     workflow = InitWorkflow(target_path=args.target_path, engine_path=args.engine)
@@ -966,7 +1095,6 @@ def handle_init(args: argparse.Namespace) -> None:
     if args.ncp:
         print("\n[6/6] NCP: Initializing Neural Context Protocol...")
         import subprocess
-        import sys
 
         # Determine init target — use explicit target_path or CWD
         init_target = Path(args.target_path)
@@ -1220,9 +1348,67 @@ def _run_recipe(args: argparse.Namespace, policy_pack: str) -> None:
     print(f"  Measured token cost: {total_tokens}")
 
 
+def _run_via_service(args: argparse.Namespace) -> bool:
+    """If the local service is reachable, no --recipe, no --dry-run, and a
+    workspace can be selected, create a service task draft and print a
+    summary — returning True to indicate the caller should return early.
+
+    Returns False for any fallback condition (no service, ambiguous/no
+    workspace, --recipe, --dry-run).
+    """
+    if getattr(args, "recipe", None) or getattr(args, "dry_run", False):
+        return False
+    try:
+        from .service_client import ServiceClient
+
+        client = ServiceClient()
+        if not client.available:
+            return False
+        client.list_workspaces()  # verify reachability
+    except Exception:
+        return False
+
+    ws = client.select_workspace(cwd=os.getcwd())
+    if ws is None:
+        return False
+
+    workspace_id = ws.get("id")
+    workspace_name = ws.get("name") or workspace_id
+    if not isinstance(workspace_id, str) or not workspace_id:
+        return False
+
+    prompt = args.task_description
+    title = None
+    context = None
+    try:
+        result = client.create_task_draft(workspace_id, prompt, title=title, context=context)
+    except RuntimeError as exc:
+        print(f"Service task creation failed: {exc}")
+        print("Falling back to engine…")
+        return False
+
+    task = result.get("task") or {}
+    gate = result.get("approval_gate") or {}
+    task_id = task.get("id", "")
+    gate_id = gate.get("id", "")
+    print(f"Created service task draft: {task_id}")
+    print(f"  Workspace: {workspace_name} ({workspace_id})")
+    print(f"  PRD/AC approval gate: {gate_id}")
+    print("  The task is awaiting PRD/AC approval.")
+    print("  Use the web cockpit or `sarathi desktop` to review and approve.")
+    return True
+
+
 def handle_run(args: argparse.Namespace) -> None:
     """Handle the run command."""
-    # Auto-discover policy pack
+    # Service route: when the service is reachable, no --recipe, no --dry-run,
+    # and a workspace is selectable, create a task draft without needing a
+    # policy pack.  The engine path still needs a policy pack below.
+    if not getattr(args, "recipe", None) and not getattr(args, "dry_run", False):
+        if _run_via_service(args):
+            return
+
+    # Auto-discover policy pack (needed for engine and recipe paths)
     policy_pack = args.policy_pack
     if not policy_pack:
         policy_pack = discover_policy_pack()
@@ -1327,6 +1513,131 @@ def handle_run(args: argparse.Namespace) -> None:
         )
 
 
+def handle_chat(
+    args: argparse.Namespace,
+    input_fn=None,
+    output_fn=None,
+) -> None:
+    """Interactive inline terminal REPL for free-form chat with agent CLIs.
+
+    Args:
+        args: Parsed arguments with 'provider', 'workspace', 'no_stream' attributes.
+        input_fn: Optional callable for testing; defaults to input().
+        output_fn: Optional callable for testing; defaults to print().
+    """
+    try:
+        from .tui_data import ChatSession
+    except ImportError:
+        from tui_data import ChatSession
+
+    if input_fn is None:
+        input_fn = input
+    if output_fn is None:
+        output_fn = print
+
+    workspace = getattr(args, "workspace", None) or os.getcwd()
+    provider_name = getattr(args, "provider", None)
+    no_stream = getattr(args, "no_stream", False)
+
+    session = ChatSession(workspace_root=workspace)
+
+    # Resolve provider: explicit flag, or first available
+    if provider_name:
+        if not session.set_provider(provider_name):
+            available = ", ".join(name for name, _ in session.available_providers())
+            if available:
+                output_fn(f"Error: Unknown provider '{provider_name}'. Available: {available}")
+            else:
+                output_fn("Error: No agent CLIs found on PATH (looked for: claude, opencode, codex)")
+            sys.exit(1)
+    else:
+        provider = session.resolve_provider()
+        if provider is None:
+            available_providers = session.available_providers()
+            if not available_providers:
+                output_fn("Error: No agent CLIs found on PATH (looked for: claude, opencode, codex)")
+                output_fn("\nSupported providers:")
+                for prov_name in session.PROVIDERS:
+                    output_fn(f"  - {prov_name}")
+                sys.exit(1)
+
+    provider = session.resolve_provider()
+    if provider:
+        provider_name_active, _ = provider
+        output_fn(f"Sarathi Chat | provider: {provider_name_active} | workspace: {workspace} | /help for commands")
+
+    # Main REPL loop
+    try:
+        while True:
+            try:
+                user_input = input_fn("you> ")
+            except EOFError:
+                # Ctrl-D
+                break
+
+            if not user_input.strip():
+                continue
+
+            # Handle slash commands
+            if user_input.startswith("/"):
+                parts = user_input[1:].split(maxsplit=1)
+                command = parts[0].lower()
+                arg = parts[1] if len(parts) > 1 else None
+
+                if command == "quit":
+                    break
+                elif command == "help":
+                    output_fn("\nSlash commands:")
+                    output_fn("  /quit              exit the chat")
+                    output_fn("  /model [name]      show or switch provider")
+                    output_fn("  /help              show this help")
+                    output_fn("")
+                    continue
+                elif command == "model":
+                    if arg:
+                        if session.set_provider(arg):
+                            provider = session.resolve_provider()
+                            if provider:
+                                provider_name_active, _ = provider
+                                output_fn(f"Provider switched to: {provider_name_active}")
+                        else:
+                            available = ", ".join(
+                                name for name, _ in session.available_providers()
+                            )
+                            output_fn(f"Error: Unknown provider '{arg}'. Available: {available}")
+                    else:
+                        provider = session.resolve_provider()
+                        if provider:
+                            provider_name_active, _ = provider
+                            output_fn(f"Current provider: {provider_name_active}")
+                    continue
+                else:
+                    output_fn(f"Unknown command: /{command}. Use /help for available commands.")
+                    continue
+
+            # Send message (streaming or blocking)
+            try:
+                if no_stream:
+                    reply = session.send(user_input)
+                    output_fn(f"assistant> {reply}\n")
+                else:
+                    # Stream with callback
+                    def on_text(accumulated: str) -> None:
+                        # Note: for terminal, use print() to avoid carriage return issues
+                        # but for testability, we store state in output collection
+                        pass
+
+                    reply = session.send_streaming(user_input, on_text=on_text)
+                    output_fn(f"assistant> {reply}\n")
+            except KeyboardInterrupt:
+                # Ctrl-C during a reply: cancel and keep the REPL alive
+                session.cancel()
+                output_fn("(cancelled)")
+    except KeyboardInterrupt:
+        # Ctrl-C at the prompt
+        output_fn("\n(interrupted)")
+
+
 def handle_tui(args: argparse.Namespace) -> None:
     """Launch the terminal dashboard."""
     try:
@@ -1346,7 +1657,28 @@ def handle_tui(args: argparse.Namespace) -> None:
 
 
 def handle_list_tasks() -> None:
-    """List task IDs persisted by the engine."""
+    """List task IDs — from the service when reachable, else local persistence."""
+    try:
+        from .service_client import ServiceClient
+
+        client = ServiceClient()
+        if client.available:
+            client.list_workspaces()  # verify reachability
+            ws = client.select_workspace(cwd=os.getcwd())
+            if ws is not None:
+                tasks = client.list_tasks(ws["id"])
+                if not tasks:
+                    print("No tasks found on the service.")
+                    return
+                print(f"Service tasks (workspace: {ws.get('name') or ws['id']}):")
+                for t in tasks:
+                    status = t.get("status", "")
+                    title = t.get("title", "")
+                    print(f"  {t['id']:<40} {status:<15} {title}")
+                return
+    except Exception:
+        pass
+
     persistence_cls = globals().get("PersistenceManager")
     if persistence_cls is None:
         try:
@@ -1848,8 +2180,68 @@ def _find_proposal(proposals, proposal_id: str):
     return None
 
 
+def _log_via_service(task_id: str) -> bool:
+    """Print a service task log if the task exists on the service.
+    Returns True if handled, False for fallback."""
+    try:
+        from .service_client import ServiceClient
+
+        client = ServiceClient()
+        if not client.available:
+            return False
+        client.list_workspaces()  # verify reachability
+    except Exception:
+        return False
+
+    task = client.get_task(task_id)
+    if task is None:
+        return False
+
+    title = task.get("title", "")
+    description = task.get("description", "")
+    status = task.get("status", "")
+    metadata = task.get("metadata") or {}
+
+    print(f"Task: {task_id}")
+    print(f"Description: {title or description}")
+    print(f"Complexity: {metadata.get('complexity', '-')}")
+    print(f"Status: {status}")
+    print()
+
+    messages = client.get_messages(task_id)
+    if messages:
+        print(f"Messages ({len(messages)}):")
+        print("-" * 60)
+        for msg in messages[-10:]:
+            role = msg.get("role", "?")
+            content = (msg.get("content") or "")[:200]
+            print(f"  [{role}] {content}")
+        print()
+
+    approvals = client.get_approvals(task_id)
+    if approvals:
+        print("Approval Gates:")
+        for gate in approvals:
+            gate_name = gate.get("name", "?")
+            gate_status = gate.get("status", "?")
+            print(f"  - {gate_name}: {gate_status}")
+
+    events = client.get_events(task_id)
+    if events:
+        print(f"\nLifecycle Events ({len(events)}):")
+        for ev in events:
+            ts = str(ev.get("created_at", ""))[:19].replace("T", " ")
+            etype = ev.get("event_type", "")
+            print(f"  {ts}  {etype}")
+
+    return True
+
+
 def handle_log(args: argparse.Namespace) -> None:
-    """Handle the log command."""
+    """Handle the log command — tries the service first, then local persistence."""
+    if _log_via_service(args.task_id):
+        return
+
     persistence_cls = globals().get("PersistenceManager")
     if persistence_cls is None:
         try:
@@ -1907,8 +2299,63 @@ def handle_log(args: argparse.Namespace) -> None:
             print(f"  Error reading log: {e}")
 
 
+def _status_via_service(task_id: str) -> bool:
+    """Print a service task status if the task exists on the service.
+    Returns True if handled, False for fallback."""
+    try:
+        from .service_client import ServiceClient
+
+        client = ServiceClient()
+        if not client.available:
+            return False
+        client.list_workspaces()  # verify reachability
+    except Exception:
+        return False
+
+    task = client.get_task(task_id)
+    if task is None:
+        return False
+
+    title = task.get("title", "")
+    description = task.get("description", "")
+    status = task.get("status", "")
+    metadata = task.get("metadata") or {}
+    created = str(task.get("created_at", ""))[:19].replace("T", " ")
+    updated = str(task.get("updated_at", ""))[:19].replace("T", " ")
+
+    print(f"Task: {task_id}")
+    print(f"Description: {title or description}")
+    print(f"Complexity: {metadata.get('complexity', '-')}")
+    print(f"Status: {status}")
+    print(f"Created: {created}")
+    print(f"Updated: {updated}")
+    print()
+
+    approvals = client.get_approvals(task_id)
+    if approvals:
+        print("Approval Gates:")
+        for gate in approvals:
+            gate_name = gate.get("name", "?")
+            gate_status = gate.get("status", "?")
+            print(f"  - {gate_name}: {gate_status}")
+    print()
+
+    events = client.get_events(task_id)
+    if events:
+        last_event = events[-1]
+        ts = str(last_event.get("created_at", ""))[:19].replace("T", " ")
+        etype = last_event.get("event_type", "")
+        print(f"Last event: {ts}  {etype}")
+    else:
+        print("No lifecycle events recorded.")
+    return True
+
+
 def handle_status(args: argparse.Namespace) -> None:
-    """Handle the status command."""
+    """Handle the status command — tries the service first, then local persistence."""
+    if _status_via_service(args.task_id):
+        return
+
     persistence_cls = globals().get("PersistenceManager")
     if persistence_cls is None:
         try:
@@ -2025,8 +2472,157 @@ def _print_task_status(task: TaskContext, *, stale_after_seconds: int = 300) -> 
         print_escalation_summary(bundle)
 
 
+def _parse_sse_stream(lines: list[str]) -> Any:
+    """Parse SSE stream lines into (event_id, event_type, data_dict) tuples.
+
+    Yields (event_id, event_type, data_dict) for each complete SSE frame.
+    Handles multi-line data payloads, ignores junk lines.
+    """
+    event_id = None
+    event_type = None
+    data_lines = []
+
+    for line in lines:
+        line = line.rstrip("\r\n")
+
+        # Blank line signals end of frame
+        if not line:
+            if event_type is not None:
+                # Join multi-line data payloads
+                data_str = "\n".join(data_lines)
+                try:
+                    data = json.loads(data_str)
+                except (json.JSONDecodeError, ValueError):
+                    data = data_str
+                yield (event_id, event_type, data)
+            # Reset for next frame
+            event_id = None
+            event_type = None
+            data_lines = []
+            continue
+
+        # Parse SSE frame lines
+        if line.startswith("id:"):
+            event_id = line[3:].lstrip()
+        elif line.startswith("event:"):
+            event_type = line[6:].lstrip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+        # Ignore comments and other lines
+
+
+def _follow_task_events(base_url: str, token: str, workspace_id: str, task_id: str) -> None:
+    """Stream task lifecycle events from SSE endpoint.
+
+    Opens the SSE stream at {base_url}/api/workspaces/{workspace_id}/tasks/{task_id}/events/stream,
+    parses events, and prints one concise line per event. Handles KeyboardInterrupt cleanly.
+    On connection drop, reconnects once with Last-Event-ID header.
+    """
+    stream_url = f"{base_url.rstrip('/')}/api/workspaces/{workspace_id}/tasks/{task_id}/events/stream"
+    last_event_id = None
+    reconnect_count = 0
+    max_reconnects = 1
+
+    try:
+        while reconnect_count <= max_reconnects:
+            try:
+                request = urllib.request.Request(stream_url)
+                request.add_header("Authorization", f"Bearer {token}")
+                if last_event_id:
+                    request.add_header("Last-Event-ID", last_event_id)
+
+                with urllib.request.urlopen(request, timeout=None) as response:
+                    print(f"Following task {task_id}...")
+                    reconnect_count = 0  # Reset on successful connection
+
+                    # Read lines from the stream
+                    buffer = []
+                    for line_bytes in response:
+                        line = line_bytes.decode("utf-8")
+                        buffer.append(line)
+
+                    # Parse all buffered lines
+                    for event_id, event_type, data in _parse_sse_stream(buffer):
+                        last_event_id = event_id
+                        # Print concise summary
+                        timestamp = time.strftime("%H:%M:%S")
+                        if isinstance(data, dict):
+                            payload_summary = data.get("object_id", "")
+                            if payload_summary:
+                                print(f"{timestamp} [{event_type}] {payload_summary}")
+                            else:
+                                print(f"{timestamp} [{event_type}]")
+                        else:
+                            print(f"{timestamp} [{event_type}]")
+
+                    # Stream ended cleanly
+                    raise SystemExit(0)
+
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    print("Authentication failed. Check your service token.")
+                    raise SystemExit(1)
+                elif e.code == 404:
+                    print("Task or workspace not found.")
+                    raise SystemExit(1)
+                else:
+                    if reconnect_count < max_reconnects:
+                        print(f"Connection failed (HTTP {e.code}). Reconnecting...")
+                        reconnect_count += 1
+                        time.sleep(1)
+                    else:
+                        print(f"Connection dropped. Exiting.")
+                        raise SystemExit(0)
+
+            except urllib.error.URLError as e:
+                if reconnect_count < max_reconnects:
+                    print(f"Connection lost: {e.reason}. Reconnecting...")
+                    reconnect_count += 1
+                    time.sleep(1)
+                else:
+                    print(f"Connection dropped. Exiting.")
+                    raise SystemExit(0)
+
+    except KeyboardInterrupt:
+        print("\nStream stopped.")
+        raise SystemExit(0)
+
+
 def handle_watch(args: argparse.Namespace) -> None:
     """Watch a persisted task and refresh the compact supervision view."""
+    # Check if following via SSE
+    if getattr(args, "follow", False):
+        info = _read_service_discovery()
+        service_url = info.get("url") if isinstance(info, dict) else None
+        service_token = _service_auth_token(info)
+        if not service_url:
+            print("Sarathi desktop service not running — start it with: sarathi desktop")
+            raise SystemExit(1)
+
+        workspace_id = getattr(args, "workspace", None)
+        if not workspace_id:
+            # Try to find workspace by querying service
+            try:
+                workspaces = _service_get_json(service_url, "/api/workspaces", token=service_token).get("workspaces", [])
+            except Exception as e:
+                print(f"Could not discover workspaces: {e}")
+                raise SystemExit(1)
+
+            if not workspaces:
+                print("No workspaces available. Create one with: sarathi desktop")
+                raise SystemExit(1)
+            elif len(workspaces) == 1:
+                workspace_id = workspaces[0].get("id")
+            else:
+                print("Multiple workspaces found. Specify one with: --workspace <id>")
+                for ws in workspaces:
+                    print(f"  - {ws.get('name')} ({ws.get('id')})")
+                raise SystemExit(1)
+
+        _follow_task_events(service_url, service_token, workspace_id, args.task_id)
+        return
+
+    # Default polling behavior
     persistence_cls = globals().get("PersistenceManager")
     if persistence_cls is None:
         try:
@@ -2089,6 +2685,63 @@ def handle_resume(args: argparse.Namespace) -> None:
         )
         if current_role is not None:
             print(f"Current agent: {current_role['name']}")
+    print(f"Phases executed: {len(result.phase_results)}")
+
+
+def _current_username() -> str:
+    """Best-effort local username for approval attribution."""
+    try:
+        return getpass.getuser()
+    except Exception:
+        return os.environ.get("USER") or "local"
+
+
+def handle_approve(args: argparse.Namespace) -> None:
+    """Handle the approve command: record an approval/rejection, then resume."""
+    persistence_cls = globals().get("PersistenceManager")
+    if persistence_cls is None:
+        try:
+            from .engine import PersistenceManager as persistence_cls
+        except ImportError:
+            from engine import PersistenceManager as persistence_cls
+
+    persistence = persistence_cls()
+    task = persistence.load_task(args.task_id)
+
+    if task is None:
+        print(f"Task {args.task_id} not found. Available tasks: {persistence.list_tasks()}")
+        raise SystemExit(1)
+
+    policy_pack = discover_policy_pack()
+    if not policy_pack:
+        print("Error: No policy pack found. Run 'sarathi init' first or specify --policy-pack")
+        raise SystemExit(1)
+    engine = Engine(policy_pack_path=policy_pack, enforce_preflight=True)
+    engine.persistence = persistence
+
+    approve = not args.reject
+    try:
+        task = engine.record_approval(
+            task,
+            approved_by=_current_username(),
+            approve=approve,
+            note=args.note,
+        )
+    except ValueError as exc:
+        print(f"Cannot approve task {args.task_id}: {exc}")
+        raise SystemExit(1)
+
+    if not approve:
+        print(f"Rejected task: {task.task_id}")
+        if args.note:
+            print(f"Reason: {args.note}")
+        return
+
+    print(f"Approved task: {task.task_id}")
+    result = engine.resume_task(task)
+    print(f"Resumed task: {result.task_id}")
+    if result.current_phase is not None:
+        print(f"Current phase: {result.current_phase.value}")
     print(f"Phases executed: {len(result.phase_results)}")
 
 

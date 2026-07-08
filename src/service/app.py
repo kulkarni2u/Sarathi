@@ -12,6 +12,8 @@ from typing import Any, Mapping
 from urllib.parse import unquote
 
 from src.init import bootstrap_workspace
+from src.notifications import lifecycle_event_listener
+from src.pr_body import build_pr_body
 from src.storage import Storage, connect, run_migrations
 
 from .errors import (
@@ -28,15 +30,19 @@ from .static_files import resolve_static_file
 from .usage_stats import build_usage_stats
 from .intake import (
     _build_github_issue_reference,
+    _create_github_issue_task_draft,
+    _create_slack_task_draft,
     _derive_task_title,
     _emit_brainstorm_event,
     _get_policy_pack,
-    _github_repository_metadata,
     _initialize_workspace_repository,
+    _parse_slack_body,
     _preview_repository_intake,
     _put_policy_pack_file,
+    _sync_github_issues_by_label,
     _task_context_project_id,
     _task_draft_metadata,
+    _verify_slack_request,
     _write_brainstorm_spec,
 )
 from .openapi import build_openapi_spec
@@ -199,6 +205,8 @@ class ServiceApp:
         self.dist_root = Path(dist_root) if dist_root is not None else DEFAULT_DIST_ROOT
         self.auth_enabled = _auth_enabled() if auth_enabled is None else auth_enabled
         self._local = threading.local()
+        # Optional Slack fan-out for lifecycle events (env-configured).
+        self._event_listener = lifecycle_event_listener()
         # Run migrations once at startup on the main thread
         with connect(self.db_path) as _conn:
             run_migrations(_conn)
@@ -209,7 +217,7 @@ class ServiceApp:
         if conn is None:
             conn = connect(self.db_path).__enter__()  # keep connection open
             self._local.conn = conn
-        return conn, Storage(conn)
+        return conn, Storage(conn, event_listener=self._event_listener)
 
     def __call__(
         self,
@@ -218,8 +226,9 @@ class ServiceApp:
         *,
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        raw_body: str | None = None,
     ) -> tuple[int, dict[str, Any]] | RawResponse:
-        return self.handle(method, path, body=body, headers=headers)
+        return self.handle(method, path, body=body, headers=headers, raw_body=raw_body)
 
     # First path segments that are served by the JSON API router (`_route`).
     # A GET to any other top-level path falls back to the static web bundle.
@@ -243,6 +252,7 @@ class ServiceApp:
         *,
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        raw_body: str | None = None,
         skip_auth: bool = False,
     ) -> tuple[int, dict[str, Any]] | RawResponse:
         correlation_id = _correlation_id(headers)
@@ -264,6 +274,21 @@ class ServiceApp:
                 public_response = self._public_get_response(raw_parts, correlation_id)
                 if public_response is not None:
                     return public_response
+
+            # Slack slash-command intake — self-authenticating via HMAC
+            # signing secret, so it bypasses the bearer-token authorize.
+            if (
+                is_api_request
+                and method == "POST"
+                and len(raw_parts) == 6
+                and raw_parts[1] == "workspaces"
+                and raw_parts[3] == "slack"
+                and raw_parts[4] == "commands"
+                and raw_parts[5] == "task"
+            ):
+                return self._handle_slack_command(
+                    raw_parts[2], body or {}, headers, raw_body
+                )
 
             principal = None if skip_auth else self._authorize(headers)
             parts = raw_parts[1:] if is_api_request else raw_parts
@@ -1057,81 +1082,28 @@ class ServiceApp:
             context = _optional_dict(body, "context") or {}
             project_id = _task_context_project_id(context)
             issue, repository = _build_github_issue_reference(storage, workspace_id, body)
-            task_title = _optional_text(body, "title") or f"GitHub issue #{issue['number']}"
-            task_metadata = _task_draft_metadata(
-                issue["url"] or f"GitHub issue #{issue['number']}",
+            result = _create_github_issue_task_draft(
+                storage,
+                workspace_id,
+                issue,
+                repository,
+                title=_optional_text(body, "title"),
                 project_id=project_id,
             )
-            task_metadata["source"] = "github_issue"
-            task_metadata["github_issue"] = issue
-            repository_metadata: dict[str, Any] = {}
-            if issue["full_name"]:
-                repository_metadata["github"] = {
-                    "host": issue["host"],
-                    "owner": issue["owner"],
-                    "name": issue["name"],
-                    "full_name": issue["full_name"],
-                    "repository_url": issue["repository_url"],
-                }
-            if repository is not None:
-                repository_metadata.update(_github_repository_metadata(repository))
-                if repository.get("remote_url"):
-                    repository_metadata["remote_url"] = repository["remote_url"]
-            if repository_metadata:
-                task_metadata["repository"] = repository_metadata
-            task = storage.create_task(
-                workspace_id=workspace_id,
-                title=task_title,
-                status="prd_pending",
-                description=issue["url"] or f"Imported GitHub issue #{issue['number']}.",
-                metadata=task_metadata,
-                project_id=task_metadata.get("project_id"),
-            )
-            user_message = storage.create_message(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                role="user",
-                content=issue["url"] or f"GitHub issue #{issue['number']}",
-                metadata={"target": "Sarathi", "source": "github_issue_import"},
-            )
-            sarathi_message = storage.create_message(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                role="sarathi",
-                content=(
-                    "I drafted the PRD/AC shell from the GitHub issue reference and opened "
-                    "the PRD/AC approval gate before graph generation."
-                ),
-                metadata={"draft_task_id": task["id"], "gate": "PRD/AC", "source": "github_issue_import"},
-            )
-            gate = storage.create_approval_gate(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                name="PRD/AC",
-                status="pending",
-                metadata={
-                    "requires_human": True,
-                    "source_issue": issue["url"] or f"GitHub issue #{issue['number']}",
-                    "acceptance_criteria": task_metadata["acceptance_criteria"],
-                },
-            )
-            storage.create_lifecycle_event(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                event_type="task.draft_created",
-                payload={"object_id": task["id"], "gate": gate["id"]},
-            )
-            storage.create_lifecycle_event(
-                workspace_id=workspace_id,
-                task_id=task["id"],
-                event_type="approval.requested",
-                payload={"object_id": gate["id"], "name": gate["name"]},
-            )
-            return 201, {
-                "task": task,
-                "approval_gate": gate,
-                "messages": [user_message, sarathi_message],
-            }
+            return 201, result
+
+        if (
+            method == "POST"
+            and len(parts) == 5
+            and parts[0] == "workspaces"
+            and parts[2] == "github"
+            and parts[3] == "issues"
+            and parts[4] == "sync"
+        ):
+            workspace_id = parts[1]
+            if storage.get_workspace(workspace_id) is None:
+                raise ServiceError("not_found", "Workspace not found.", 404)
+            return 200, _sync_github_issues_by_label(storage, workspace_id, body)
 
         if method == "GET" and len(parts) == 2 and parts[0] == "tasks":
             task = storage.get_task(parts[1])
@@ -1188,6 +1160,10 @@ class ServiceApp:
                 return 200, {
                     "approval_gates": storage.list_approval_gates_for_task(parts[1])
                 }
+            if resource == "pr-body":
+                task_like = dict(task)
+                task_like["lifecycle_events"] = storage.list_events(task_id=task["id"])
+                return 200, {"body": build_pr_body(task_like)}
 
         if (
             method == "GET"
@@ -1830,6 +1806,45 @@ class ServiceApp:
             return 200, {"session": approved, "task": task}
 
         raise ServiceError("not_found", "Endpoint not found.", 404)
+
+    def _handle_slack_command(
+        self,
+        workspace_id: str,
+        body: Mapping[str, Any],
+        headers: Mapping[str, str] | None,
+        raw_body: str | None,
+    ) -> RawResponse | tuple[int, dict[str, Any]]:
+        """Handle a Slack slash-command ``/task`` request.
+
+        Verifies the Slack HMAC signature (if ``SARATHI_SLACK_SIGNING_SECRET``
+        is set), parses the form body, creates a PRD/AC-gated task draft, and
+        returns a Slack-friendly JSON response.
+        """
+        slack_data = _parse_slack_body(body)
+        _verify_slack_request(headers, raw_body)
+
+        conn, storage = self._storage()
+        if storage.get_workspace(workspace_id) is None:
+            raise ServiceError("not_found", "Workspace not found.", 404)
+
+        result = _create_slack_task_draft(storage, workspace_id, slack_data)
+
+        task = result["task"]
+        gate = result["approval_gate"]
+        slack_reply = json.dumps({
+            "response_type": "ephemeral",
+            "text": (
+                f"Task draft created (ID: {task['id']}). "
+                f"PRD/AC approval gate: {gate['id']}."
+            ),
+            "task_id": task["id"],
+            "approval_gate_id": gate["id"],
+        })
+        return RawResponse(
+            200,
+            "application/json",
+            slack_reply.encode("utf-8"),
+        )
 
     def _authorize(self, headers: Mapping[str, str] | None) -> Principal | None:
         # Opt-in multi-user mode: the bearer must be the admin token or an

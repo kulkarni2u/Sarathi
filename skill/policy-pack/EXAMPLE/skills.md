@@ -113,6 +113,48 @@ task_to_skill:
 
 ---
 
+## Role Subroles
+
+Subroles are domain overlays on top of Sarathi's stable lifecycle roles. They do
+not replace roles such as `Disha`, `Nirnaya`, or `Prajna`; ROUTE uses them to
+record which specialist lens should be applied for this task.
+
+```yaml
+subroles:
+  security_review:
+    description: "Security-sensitive review overlay for auth, secrets, and permission boundaries."
+    applies_when:
+      keywords: ["auth", "oauth", "token", "secret", "permission", "jwt"]
+      files: ["**/auth*.py", "**/security*.py", "**/*permission*.py"]
+    compatible_base_roles: ["nirnaya", "prajna"]
+    evidence_required: ["threat_model", "secret_scan", "permission_boundary_checked"]
+    review_mode: "adversarial_verification"
+
+  data_migration:
+    description: "Data migration overlay for schema changes, backfills, and records-at-risk work."
+    applies_when:
+      keywords: ["migration", "backfill", "schema", "alter table", "records"]
+      files: ["migrations/**", "alembic/**", "**/*migration*.py"]
+    compatible_base_roles: ["disha", "nirnaya"]
+    evidence_required: ["rollback_plan", "records_affected", "dry_run_or_backup"]
+
+  network_architecture:
+    description: "Network architecture overlay for endpoints, gateways, proxies, and transport boundaries."
+    applies_when:
+      keywords: ["network", "socket", "proxy", "gateway", "tls", "endpoint"]
+    compatible_base_roles: ["disha", "prajna"]
+    evidence_required: ["topology_summary", "failure_modes", "security_boundary"]
+
+  performance_review:
+    description: "Performance review overlay for latency, throughput, and scaling-sensitive work."
+    applies_when:
+      keywords: ["latency", "throughput", "performance", "scaling", "hot path"]
+    compatible_base_roles: ["prajna", "nirnaya"]
+    evidence_required: ["baseline_metric", "bottleneck_hypothesis", "regression_check"]
+```
+
+---
+
 ## Skill Discovery Paths
 
 1. **File extension**: `.py` → language_python

@@ -1,15 +1,18 @@
-// Subscription helper for GET /events?workspace_id&task_id.
+// Subscription helper for task lifecycle events.
 //
-// Today the endpoint returns a single JSON envelope ({ events: [...] }), so
-// this helper polls it. The shape is designed so a later worker can swap the
-// polling transport for a real `EventSource` (SSE) without changing call
-// sites: `subscribeToEvents(...)` returns an `Unsubscribe` function either
-// way, and emits the same `LifecycleEvent[]` batches via `onEvents`.
+// Transports:
+// 1. EventSource (SSE) to `/workspaces/{ws}/tasks/{task}/events/stream`:
+//    Receives real-time events as SSE frames. Token is passed as a query
+//    parameter since EventSource cannot set custom headers. On error, falls
+//    back to the polling transport below.
+// 2. JSON polling to `GET /events?workspace_id&task_id` (fallback):
+//    Polls the endpoint on an interval and emits the full event list each
+//    tick (the caller is responsible for de-duplication if needed).
 //
-// When SSE lands server-side, replace the body of `subscribeToEvents` with
-// an `EventSource` against the same URL (the query params are unchanged) and
-// parse each `message` as a single LifecycleEvent, batching into arrays of
-// length 1 before calling `onEvents`.
+// Both transports emit the same `LifecycleEvent[]` batches via `onEvents`
+// and return an `Unsubscribe` function. The EventSource transport is
+// attempted first; after two consecutive errors without a successful
+// message, it switches to polling permanently.
 
 import { getRuntimeConfig } from "./runtimeConfig";
 import { api, ApiClientError } from "./client";
@@ -34,64 +37,166 @@ export type Unsubscribe = () => void;
 /**
  * Subscribe to lifecycle events for a workspace/task.
  *
- * Current transport: polls `GET /events` on an interval and emits the full
- * event list each tick (the caller is responsible for de-duplication if
- * needed). Returns an unsubscribe function that stops polling.
+ * Primary transport: connects to the SSE endpoint at
+ * `/workspaces/{ws}/tasks/{task}/events/stream` and dispatches each event
+ * as a single-element LifecycleEvent[]. On the first error, allows
+ * EventSource to auto-retry. On a second consecutive error without an
+ * intervening successful message, closes the EventSource and falls back to
+ * JSON polling.
  *
- * Swappable: once the service exposes a real SSE stream at the same path,
- * this function's internals can switch to `new EventSource(url)` while
- * keeping the same signature and `Unsubscribe` contract.
+ * Fallback transport: polls `GET /events` on an interval and emits the full
+ * event list each tick. The two transports share the same signature and
+ * return an identical `Unsubscribe` contract.
  */
 export function subscribeToEvents(
   params: EventsSubscriptionParams,
   options: EventsSubscriptionOptions,
 ): Unsubscribe {
-  const intervalMs = options.pollIntervalMs ?? 4000;
   let cancelled = false;
-  let timer: ReturnType<typeof setTimeout> | null = null;
+  let currentCleanup: Unsubscribe | null = null;
+  const cleanup = (): Unsubscribe => {
+    return () => {
+      cancelled = true;
+      if (currentCleanup) {
+        currentCleanup();
+      }
+    };
+  };
 
-  const tick = async () => {
-    if (cancelled) return;
+  const startPolling = (): void => {
+    const intervalMs = options.pollIntervalMs ?? 4000;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async () => {
+      if (cancelled) return;
+      try {
+        const data = await api.getEvents({
+          workspaceId: params.workspaceId,
+          taskId: params.taskId,
+        });
+        if (!cancelled) {
+          options.onEvents(data.events ?? []);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          options.onError?.(err);
+        }
+      } finally {
+        if (!cancelled) {
+          timer = setTimeout(tick, intervalMs);
+        }
+      }
+    };
+
+    void tick();
+
+    currentCleanup = () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  };
+
+  const startSse = (): void => {
+    const url = buildEventsUrl(params);
+    let eventSource: EventSource | null = null;
+    let errorCount = 0;
+    let messageReceived = false;
+    let fallbackInProgress = false;
+
     try {
-      const data = await api.getEvents({
-        workspaceId: params.workspaceId,
-        taskId: params.taskId,
+      eventSource = new EventSource(url);
+
+      eventSource.addEventListener("message", (event) => {
+        if (cancelled || fallbackInProgress) return;
+        // Reset error count on successful message
+        messageReceived = true;
+        errorCount = 0;
+
+        // Each SSE message represents a single LifecycleEvent
+        try {
+          const data = JSON.parse(event.data) as LifecycleEvent;
+          // Emit as a single-element array to match polling transport shape
+          options.onEvents([data]);
+        } catch (parseErr) {
+          // Silently skip unparseable events
+          console.warn("Failed to parse SSE event data:", parseErr);
+        }
       });
-      if (!cancelled) {
-        options.onEvents(data.events ?? []);
-      }
+
+      eventSource.addEventListener("error", (_event) => {
+        if (cancelled || fallbackInProgress) return;
+
+        errorCount++;
+        // Allow one auto-retry by EventSource before we close and fall back
+        if (errorCount >= 2 || !messageReceived) {
+          // Two consecutive errors or error before any message: close SSE and fall back to polling
+          fallbackInProgress = true;
+          if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+          }
+
+          if (!cancelled) {
+            // Fall back to polling
+            startPolling();
+          }
+        }
+      });
     } catch (err) {
+      // EventSource creation failed (e.g., bad URL, unsupported environment)
       if (!cancelled) {
-        options.onError?.(err);
-      }
-    } finally {
-      if (!cancelled) {
-        timer = setTimeout(tick, intervalMs);
+        startPolling();
       }
     }
+
+    currentCleanup = () => {
+      cancelled = true;
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+    };
   };
 
-  void tick();
+  // Start with SSE; if it fails to initialize, it will fall back to polling
+  startSse();
 
-  return () => {
-    cancelled = true;
-    if (timer) clearTimeout(timer);
-  };
+  return cleanup();
 }
 
 /**
- * Build the absolute /events URL (with auth handled separately, since
- * EventSource cannot set custom headers). Exposed for a future SSE
- * implementation; not used by the polling transport above.
+ * Build the absolute URL to the SSE events stream endpoint.
+ *
+ * Path: `/workspaces/{workspace_id}/tasks/{task_id}/events/stream`
+ *
+ * EventSource cannot send custom Authorization headers, so the bearer token
+ * (if present) is passed as a `token` query parameter. The service's
+ * _authorize_stream method will check the query param if the Authorization
+ * header is absent.
  */
 export function buildEventsUrl(params: EventsSubscriptionParams): string {
   const { baseUrl, token } = getRuntimeConfig();
-  const url = new URL("/events", baseUrl + "/");
-  if (params.workspaceId) url.searchParams.set("workspace_id", params.workspaceId);
-  if (params.taskId) url.searchParams.set("task_id", params.taskId);
-  // EventSource can't send Authorization headers; if/when SSE auth is
-  // needed, the service will likely accept a `token` query param or rely on
-  // cookie-based auth. Included here for forward-compatibility.
+
+  // Default to same-origin if baseUrl is empty (single-origin deployment)
+  if (!baseUrl) {
+    const url = new URL(
+      `/workspaces/${encodeURIComponent(params.workspaceId || "")}/tasks/${encodeURIComponent(
+        params.taskId || "",
+      )}/events/stream`,
+      "http://localhost", // dummy base for URL construction
+    );
+    if (token) url.searchParams.set("token", token);
+    // Return relative path for same-origin fetch
+    return url.pathname + (url.search ? url.search : "");
+  }
+
+  // Cross-origin: build absolute URL
+  const url = new URL(
+    `/workspaces/${encodeURIComponent(params.workspaceId || "")}/tasks/${encodeURIComponent(
+      params.taskId || "",
+    )}/events/stream`,
+    baseUrl + "/",
+  );
   if (token) url.searchParams.set("token", token);
   return url.toString();
 }

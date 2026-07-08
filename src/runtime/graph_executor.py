@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 try:
     from datetime import UTC
@@ -15,6 +16,13 @@ except ImportError:
 try:
     from src.runtime.context import ContextCompiler
     from src.runtime.contracts import DispatchRequest
+    from src.runtime.isolation import GitWorktreeIsolation
+    from src.runtime.judge_scoring import (
+        BakeoffHistoryStore,
+        JudgeScoringPolicy,
+        assemble_judge_scorecard,
+        format_scorecard_for_prompt,
+    )
     from src.runtime.output_index import build_artifact_index, normalize_agent_output
     from src.runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
     from src.task_graph import (
@@ -28,6 +36,13 @@ try:
 except ImportError:
     from runtime.context import ContextCompiler
     from runtime.contracts import DispatchRequest
+    from runtime.isolation import GitWorktreeIsolation
+    from runtime.judge_scoring import (
+        BakeoffHistoryStore,
+        JudgeScoringPolicy,
+        assemble_judge_scorecard,
+        format_scorecard_for_prompt,
+    )
     from runtime.output_index import build_artifact_index, normalize_agent_output
     from runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
     from task_graph import (
@@ -113,6 +128,8 @@ class TaskGraphExecutor:
         workflow_patterns_policy: "WorkflowPatternsPolicy | None" = None,
         max_parallel: int | None = None,
         harness_config: Any = None,
+        isolation_repo_root: str | Path | None = None,
+        judge_scoring_policy: "JudgeScoringPolicy | None" = None,
     ):
         self.dispatcher = dispatcher
         self.dispatch_phase = dispatch_phase
@@ -122,6 +139,11 @@ class TaskGraphExecutor:
         self.ncp_whisper_router = ncp_whisper_router
         self.ncp_persistence_adapter = ncp_persistence_adapter
         self.workflow_patterns_policy = workflow_patterns_policy
+        # Measured JUDGE scoring (src/runtime/judge_scoring.py): parsed from a
+        # policy pack's `judge_scoring:` review.md block. None (the default)
+        # means the feature is off — JUDGE dispatch and post-execution
+        # injection stay byte-for-byte what they were before this existed.
+        self.judge_scoring_policy = judge_scoring_policy
         # The HarnessConfig (src/harness.py) compiled for the parent task,
         # if any. Every node this executor dispatches carries the harness_id
         # of this config on its DispatchRequest — the "declare before
@@ -131,6 +153,7 @@ class TaskGraphExecutor:
         # pass a fresher ``harness_config`` into execute_*() per call instead
         # of relying on this constructor default.
         self.harness_config = harness_config
+        self.isolation_repo_root = Path(isolation_repo_root).resolve() if isolation_repo_root else Path.cwd()
         if max_parallel is None:
             try:
                 max_parallel = int(os.environ.get("SARATHI_GRAPH_MAX_PARALLEL", "4"))
@@ -145,6 +168,53 @@ class TaskGraphExecutor:
         caller doesn't override it for this specific call.
         """
         return harness_config if harness_config is not None else self.harness_config
+
+    @staticmethod
+    def _uses_worktree_isolation(harness_config: Any) -> bool:
+        return getattr(harness_config, "isolation_mode", "none") == "worktree"
+
+    @staticmethod
+    def _isolation_cleanup_mode(harness_config: Any) -> str:
+        mode = getattr(harness_config, "isolation_cleanup", "auto")
+        return mode if isinstance(mode, str) and mode else "auto"
+
+    @staticmethod
+    def _isolation_task_id(harness_config: Any, graph: dict | None) -> str:
+        task_id = getattr(harness_config, "task_id", "") or ""
+        if task_id:
+            return task_id
+        if graph is not None:
+            graph_task_id = graph.get("task_id") or graph.get("id")
+            if graph_task_id:
+                return str(graph_task_id)
+        return "graph"
+
+    def _prepare_isolated_batch(
+        self,
+        batch: list[dict],
+        graph: dict | None,
+        harness_config: Any,
+    ) -> list[dict]:
+        task_id = self._isolation_task_id(harness_config, graph)
+        isolation = GitWorktreeIsolation(self.isolation_repo_root)
+        isolated: list[dict] = []
+        for node in batch:
+            node_copy = dict(node)
+            worktree_path = isolation.create_worktree(
+                task_id=task_id,
+                node_id=str(node.get("id", "node")),
+            )
+            node_copy["_sarathi_workspace_dir"] = str(worktree_path)
+            isolated.append(node_copy)
+        return isolated
+
+    def _cleanup_isolated_task(self, harness_config: Any, graph: dict | None) -> None:
+        if not self._uses_worktree_isolation(harness_config):
+            return
+        if self._isolation_cleanup_mode(harness_config) == "manual":
+            return
+        task_id = self._isolation_task_id(harness_config, graph)
+        GitWorktreeIsolation(self.isolation_repo_root).cleanup_task_worktrees(task_id)
 
     @staticmethod
     def _timestamp() -> str:
@@ -170,6 +240,9 @@ class TaskGraphExecutor:
             context_pack = provider_result.get("context_pack")
             if isinstance(context_pack, dict):
                 node["context_pack"] = dict(context_pack)
+            isolation = provider_result.get("isolation")
+            if isinstance(isolation, dict):
+                node["isolation"] = dict(isolation)
             break
         return graph
 
@@ -186,10 +259,19 @@ class TaskGraphExecutor:
         if ready is None:
             return GraphExecutionResult(graph_state=current, events=[])
 
-        provider_result = self._dispatch_node(ready, graph=current, harness_config=harness_config)
-        updated, event, _failed = self._apply_node_result(
-            current, ready, provider_result, fail_node_id=fail_node_id, fail_error=fail_error
-        )
+        effective_harness = self._resolve_harness(harness_config)
+        try:
+            [(ready, provider_result)] = self._dispatch_batch([ready], current, harness_config=effective_harness)
+            updated, event, _failed = self._apply_node_result(
+                current,
+                ready,
+                provider_result,
+                fail_node_id=fail_node_id,
+                fail_error=fail_error,
+                harness_config=effective_harness,
+            )
+        finally:
+            self._cleanup_isolated_task(effective_harness, current)
         return GraphExecutionResult(graph_state=updated, events=[event])
 
     def execute_some(
@@ -254,21 +336,30 @@ class TaskGraphExecutor:
         executed = 0
         stop = False
 
-        while not stop:
-            remaining = None if max_nodes is None else max_nodes - executed
-            if remaining is not None and remaining <= 0:
-                break
-            batch = self._ready_batch(current, limit=remaining)
-            if not batch:
-                break
-            for ready, provider_result in self._dispatch_batch(batch, current, harness_config=harness_config):
-                current, event, failed = self._apply_node_result(
-                    current, ready, provider_result, fail_node_id=fail_node_id, fail_error=fail_error
-                )
-                events.append(event)
-                executed += 1
-                if failed:
-                    stop = True
+        effective_harness = self._resolve_harness(harness_config)
+        try:
+            while not stop:
+                remaining = None if max_nodes is None else max_nodes - executed
+                if remaining is not None and remaining <= 0:
+                    break
+                batch = self._ready_batch(current, limit=remaining)
+                if not batch:
+                    break
+                for ready, provider_result in self._dispatch_batch(batch, current, harness_config=effective_harness):
+                    current, event, failed = self._apply_node_result(
+                        current,
+                        ready,
+                        provider_result,
+                        fail_node_id=fail_node_id,
+                        fail_error=fail_error,
+                        harness_config=effective_harness,
+                    )
+                    events.append(event)
+                    executed += 1
+                    if failed:
+                        stop = True
+        finally:
+            self._cleanup_isolated_task(effective_harness, current)
 
         return GraphExecutionResult(graph_state=current, events=events)
 
@@ -295,14 +386,17 @@ class TaskGraphExecutor:
         the dispatcher and providers run subprocesses/network calls, so threads
         parallelize them effectively. Results are returned in batch order.
         """
+        effective_harness = self._resolve_harness(harness_config)
+        if self._uses_worktree_isolation(effective_harness):
+            batch = self._prepare_isolated_batch(batch, graph, effective_harness)
         if len(batch) == 1 or self.max_parallel <= 1 or self.dispatcher is None:
             return [
-                (node, self._dispatch_node(node, graph=graph, harness_config=harness_config))
+                (node, self._dispatch_node(node, graph=graph, harness_config=effective_harness))
                 for node in batch
             ]
         with ThreadPoolExecutor(max_workers=min(self.max_parallel, len(batch))) as pool:
             futures = [
-                pool.submit(self._dispatch_node, node, graph=graph, harness_config=harness_config)
+                pool.submit(self._dispatch_node, node, graph=graph, harness_config=effective_harness)
                 for node in batch
             ]
             return [(node, future.result()) for node, future in zip(batch, futures)]
@@ -315,6 +409,7 @@ class TaskGraphExecutor:
         *,
         fail_node_id: str | None,
         fail_error: str | None,
+        harness_config: Any = None,
     ) -> tuple[dict, GraphExecutionEvent, bool]:
         """Apply one node's execution result to the graph. Returns (graph, event, failed)."""
         node_id = ready["id"]
@@ -336,7 +431,7 @@ class TaskGraphExecutor:
             ncp_err = self._ncp_post_node_complete(ready, provider_result)
             if ncp_err and isinstance(provider_result, dict):
                 provider_result.setdefault("ncp_warnings", []).append(f"write_output_failed: {ncp_err}")
-            updated = self._post_execute_inject(ready, updated, provider_result)
+            updated = self._post_execute_inject(ready, updated, provider_result, harness_config=harness_config)
             action = "completed"
             finished_key = "completed_at"
             failed = False
@@ -365,6 +460,99 @@ class TaskGraphExecutor:
         """Inject new nodes into a live graph depending on parent_id."""
         return inject_nodes(graph, parent_id=parent_id, new_nodes=new_nodes)
 
+    def apply_judge_winner_worktree(
+        self,
+        graph: dict,
+        *,
+        judge_node_id: str,
+        approved: bool,
+    ) -> dict[str, Any]:
+        """Apply the retained worktree for an explicitly approved JUDGE winner."""
+        updated_graph = deepcopy(graph)
+        judge_node = self._find_graph_node(updated_graph, judge_node_id)
+        judge_outputs = self._node_provider_outputs(judge_node)
+        winner_node_id = str(judge_outputs.get("winner", "")).strip()
+        if not winner_node_id:
+            return {
+                "applied": False,
+                "judge_node_id": judge_node_id,
+                "reason": "no_winner",
+            }
+
+        winner_node = self._find_graph_node(updated_graph, winner_node_id)
+        if winner_node is None:
+            return {
+                "applied": False,
+                "judge_node_id": judge_node_id,
+                "winner_node_id": winner_node_id,
+                "reason": "winner_not_found",
+            }
+
+        isolation = self._node_isolation_metadata(winner_node)
+        workspace_dir = isolation.get("workspace_dir") if isolation else None
+        if not workspace_dir:
+            return {
+                "applied": False,
+                "judge_node_id": judge_node_id,
+                "winner_node_id": winner_node_id,
+                "reason": "no_worktree_isolation",
+            }
+
+        result = GitWorktreeIsolation(self.isolation_repo_root).apply_worktree_changes(
+            workspace_dir,
+            approved=approved,
+        )
+        result["judge_node_id"] = judge_node_id
+        result["winner_node_id"] = winner_node_id
+        if result.get("applied") is True and winner_node is not None:
+            winner_node["isolation_apply"] = dict(result)
+            updated_graph.setdefault("isolation_applications", []).append(dict(result))
+            self._cleanup_graph_worktrees(updated_graph)
+            result["graph_state"] = updated_graph
+        return result
+
+    @staticmethod
+    def _find_graph_node(graph: dict, node_id: str) -> dict | None:
+        return next(
+            (node for node in graph.get("nodes", []) if node.get("id") == node_id),
+            None,
+        )
+
+    @staticmethod
+    def _node_provider_outputs(node: dict | None) -> dict:
+        if not isinstance(node, dict):
+            return {}
+        provider_result = node.get("last_provider_result")
+        if isinstance(provider_result, dict) and isinstance(provider_result.get("outputs"), dict):
+            return provider_result["outputs"]
+        return {}
+
+    @staticmethod
+    def _node_isolation_metadata(node: dict | None) -> dict:
+        if not isinstance(node, dict):
+            return {}
+        isolation = node.get("isolation")
+        if isinstance(isolation, dict):
+            return isolation
+        provider_result = node.get("last_provider_result")
+        if isinstance(provider_result, dict) and isinstance(provider_result.get("isolation"), dict):
+            return provider_result["isolation"]
+        return {}
+
+    def _cleanup_graph_worktrees(self, graph: dict) -> None:
+        isolation = GitWorktreeIsolation(self.isolation_repo_root)
+        for node in graph.get("nodes", []):
+            metadata = self._node_isolation_metadata(node)
+            workspace_dir = metadata.get("workspace_dir") if metadata else None
+            if not isinstance(workspace_dir, str) or not workspace_dir:
+                continue
+            worktree_path = Path(workspace_dir).resolve()
+            try:
+                worktree_path.relative_to(isolation.worktrees_root)
+            except ValueError:
+                continue
+            isolation.cleanup_worktree(worktree_path)
+
     # ------------------------------------------------------------------
     # Pattern-specific post-execution injection
     # ------------------------------------------------------------------
@@ -377,7 +565,7 @@ class TaskGraphExecutor:
         return any(pol.is_enabled(p) for p in pattern_names)
 
     def _post_execute_inject(
-        self, node: dict, graph: dict, provider_result: dict | None
+        self, node: dict, graph: dict, provider_result: dict | None, harness_config: Any = None
     ) -> dict:
         """After a node completes, inject follow-on nodes and emit NCP signals."""
         node_type = node.get("node_type", NodeType.EXECUTE)
@@ -402,6 +590,7 @@ class TaskGraphExecutor:
                 WorkflowPattern.ADVERSARIAL_VERIFICATION, WorkflowPattern.TOURNAMENT
             ):
                 return graph
+            self._record_bakeoff_outcome(node, provider_result, harness_config=harness_config)
             updated = self._inject_judge_result(node, graph, provider_result)
             winner_id = f"{node['id']}-winner"
             err = self._ncp_emit_judge_whisper(node, winner_id, provider_result)
@@ -625,6 +814,50 @@ class TaskGraphExecutor:
         )
         return inject_nodes(graph, parent_id=parent_id, new_nodes=children)
 
+    def _record_bakeoff_outcome(
+        self, node: dict, provider_result: dict | None, *, harness_config: Any = None
+    ) -> None:
+        """Persist a judged-fanout winner into the bake-off history for evolve.py.
+
+        No-ops (never raises) unless a judge scorecard was actually recorded
+        on this dispatch (``artifacts["judge_scorecard"]``, only present when
+        a ``judge_scoring_policy`` is configured and the JUDGE's outputs name
+        a winner matching a scored branch) — absent scoring, this is a pure
+        no-op and today's behavior is unchanged.
+        """
+        if not isinstance(provider_result, dict):
+            return
+        scorecard = (provider_result.get("artifacts") or {}).get("judge_scorecard")
+        if not isinstance(scorecard, list) or not scorecard:
+            return
+        outputs = provider_result.get("outputs", {})
+        winner_ref = str(outputs.get("winner", "")).strip() if isinstance(outputs, dict) else ""
+        if not winner_ref:
+            return
+        winner_entry = next(
+            (entry for entry in scorecard if str(entry.get("branch")) == winner_ref), None
+        )
+        if winner_entry is None:
+            return
+
+        effective_harness = harness_config if harness_config is not None else self.harness_config
+        task_class_attr = getattr(effective_harness, "task_class", None)
+        task_class = getattr(task_class_attr, "value", None) or str(task_class_attr or "") or "unknown"
+
+        try:
+            BakeoffHistoryStore(self.isolation_repo_root / ".sarathi").record(
+                task_class=task_class,
+                judge_node_id=str(node.get("id", "")),
+                winner_branch=winner_ref,
+                provider=winner_entry.get("provider"),
+                weighted_score=winner_entry.get("weighted_score"),
+                scorecard=scorecard,
+            )
+        except Exception:
+            # Bake-off history is best-effort observability, never a reason
+            # to fail graph execution.
+            pass
+
     def _inject_judge_result(
         self, node: dict, graph: dict, provider_result: dict | None
     ) -> dict:
@@ -712,31 +945,62 @@ class TaskGraphExecutor:
         if self.dispatcher is None:
             return None
 
-        node_type = str(node.get("node_type", NodeType.EXECUTE)).lower()
+        workspace_dir = node.get("_sarathi_workspace_dir")
+        node_for_context = dict(node)
+        node_for_context.pop("_sarathi_workspace_dir", None)
+
+        node_type = str(node_for_context.get("node_type", NodeType.EXECUTE)).lower()
         ncp = self.ncp_context_adapter
 
         # Typed nodes and EXECUTE branch nodes get NCP-aware context.
         # Branch nodes have '-branch-' in their id and receive fanout/classify whispers.
         # Fall back to local ContextCompiler on any NCP error.
-        is_branch = "-branch-" in str(node.get("id", ""))
+        is_branch = "-branch-" in str(node_for_context.get("id", ""))
         if ncp is not None and (node_type not in (NodeType.EXECUTE, "execute") or is_branch):
             try:
                 context_pack_artifact = ncp.compile_typed_node_context(
-                    node=node, graph=graph, phase=self.dispatch_phase,
+                    node=node_for_context, graph=graph, phase=self.dispatch_phase,
                 )
                 token_budget = (
                     context_pack_artifact.get("agent_input", {}).get("token_budget")
                 )
             except Exception:
-                context_pack_artifact, token_budget = self._local_context(node, graph)
+                context_pack_artifact, token_budget = self._local_context(node_for_context, graph)
                 context_pack_artifact.setdefault("compilation", {})["ncp_fallback"] = True
         else:
-            context_pack_artifact, token_budget = self._local_context(node, graph)
+            context_pack_artifact, token_budget = self._local_context(node_for_context, graph)
+
+        # Measured JUDGE scoring (src/runtime/judge_scoring.py): when this is a
+        # JUDGE node and a judge_scoring policy is configured, assemble a
+        # deterministic per-branch scorecard from the branches' already-measured
+        # dispatch evidence and fold it into the judge's own context/prompt, so
+        # the LLM judge sees real cost/latency/blast-radius/test signals
+        # alongside the branch outputs it already receives. Absent a policy (the
+        # default), this is a no-op and `judge_scorecard` stays unset — today's
+        # JUDGE dispatch is unaffected.
+        judge_scorecard: list[dict[str, Any]] = []
+        if node_type == NodeType.JUDGE and self.judge_scoring_policy is not None:
+            judge_scorecard = assemble_judge_scorecard(
+                self.judge_scoring_policy, node_for_context, graph
+            )
+            if judge_scorecard:
+                context_pack_artifact = dict(context_pack_artifact)
+                agent_input = dict(context_pack_artifact.get("agent_input", {}))
+                prior_findings = list(agent_input.get("prior_findings", []))
+                prior_findings.extend(format_scorecard_for_prompt(judge_scorecard))
+                agent_input["prior_findings"] = prior_findings
+                context_pack_artifact["agent_input"] = agent_input
+                compilation = dict(context_pack_artifact.get("compilation", {}))
+                compilation["judge_scorecard_injected"] = True
+                context_pack_artifact["compilation"] = compilation
 
         constraints = {"purpose": "child_task_execution"}
-        node_provider = node.get("pattern_config", {}).get("provider")
+        node_provider = node_for_context.get("pattern_config", {}).get("provider")
         if node_provider:
             constraints["provider"] = node_provider
+        if workspace_dir:
+            constraints["isolation_mode"] = "worktree"
+            constraints["workspace_dir"] = workspace_dir
 
         # "Declare before dispatch": stamp the harness_id of the HarnessConfig
         # already compiled for the parent task (in ROUTE) onto this node's
@@ -745,16 +1009,24 @@ class TaskGraphExecutor:
         # budget contract as the task it belongs to. See src/harness.py.
         effective_harness = self._resolve_harness(harness_config)
         harness_id = getattr(effective_harness, "harness_id", None)
+        isolation_metadata = None
+        if workspace_dir:
+            isolation_metadata = {
+                "mode": "worktree",
+                "cleanup": self._isolation_cleanup_mode(effective_harness),
+                "workspace_dir": workspace_dir,
+            }
 
         request = DispatchRequest(
             mode="execute",
-            task_id=str(node.get("id", "unknown")),
+            task_id=str(node_for_context.get("id", "unknown")),
             phase=self.dispatch_phase,
-            prompt=str(node.get("title", node.get("id", "Execute graph node"))),
+            prompt=str(node_for_context.get("title", node_for_context.get("id", "Execute graph node"))),
             inputs={
-                "node": dict(node),
-                "task_description": str(node.get("title", "")),
+                "node": dict(node_for_context),
+                "task_description": str(node_for_context.get("title", "")),
                 "context_pack": context_pack_artifact,
+                **({"judge_scorecard": judge_scorecard} if judge_scorecard else {}),
             },
             expected_outputs=["implementation_plan", "work_unit_result", "evidence"],
             constraints=constraints,
@@ -766,11 +1038,18 @@ class TaskGraphExecutor:
         try:
             response = self.dispatcher.dispatch(request)
         except Exception as exc:
-            return {
+            result = {
                 "dispatched": True,
                 "success": False,
                 "error": f"Dispatcher child-task execution failed: {exc}",
+                "artifacts": {},
             }
+            if isolation_metadata:
+                result["isolation"] = isolation_metadata
+                result["artifacts"]["isolation"] = isolation_metadata
+            if judge_scorecard:
+                result["artifacts"]["judge_scorecard"] = judge_scorecard
+            return result
         artifact_index = build_artifact_index(response)
         agent_output = normalize_agent_output(
             response,
@@ -782,7 +1061,7 @@ class TaskGraphExecutor:
             "success": response.success,
             "outputs": response.outputs,
             "evidence": response.evidence,
-            "artifacts": response.artifacts,
+            "artifacts": dict(response.artifacts) if judge_scorecard else response.artifacts,
             "agent_output": agent_output,
             "artifact_index": artifact_index,
             "context_pack": context_pack_artifact,
@@ -793,13 +1072,15 @@ class TaskGraphExecutor:
                 "trimmed_sections": context_pack_artifact.get("compilation", {}).get("trimmed_sections"),
             },
         }
+        if judge_scorecard:
+            result["artifacts"]["judge_scorecard"] = judge_scorecard
         if response.usage:
             result["usage"] = response.usage.to_artifact()
             ncp = self.ncp_context_adapter
             if ncp is not None and hasattr(ncp, "_call_log_cost"):
                 try:
                     ncp._call_log_cost(
-                        agent_id=f"s.sarathi.node.{node.get('id', 'unknown')}",
+                        agent_id=f"s.sarathi.node.{node_for_context.get('id', 'unknown')}",
                         model=response.usage.provider_id or "unknown",
                         input_tokens=response.usage.input_tokens,
                         output_tokens=response.usage.output_tokens,
@@ -811,4 +1092,7 @@ class TaskGraphExecutor:
             result["error"] = response.error
         if response.raw_transcript_ref:
             result["raw_transcript_ref"] = response.raw_transcript_ref
+        if isolation_metadata:
+            result["isolation"] = isolation_metadata
+            result.setdefault("artifacts", {}).setdefault("isolation", isolation_metadata)
         return result

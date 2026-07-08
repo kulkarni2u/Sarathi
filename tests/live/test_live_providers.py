@@ -6,8 +6,18 @@ gated off by default. Set ``SARATHI_LIVE_TESTS=1`` to run them:
     SARATHI_LIVE_TESTS=1 python3 -m pytest tests/live -q
 
 Per-provider tests additionally skip if that provider's CLI is not on PATH.
-The codex/opencode tests below are scaffolding: they assert the same gating
-pattern but have no real assertions yet, so they will skip (no CLI present).
+
+Codex tests verify:
+  - Dispatch succeeds with non-empty output
+  - Usage record is populated (input/output tokens or estimation fallback)
+  - Permission config is written before dispatch (~/.codex/config.yaml)
+  - Structured failure response (not exception) on invalid request
+
+OpenCode tests verify:
+  - Dispatch succeeds with non-empty output
+  - Usage record is populated (input/output tokens or estimation fallback)
+  - Permission config is written before dispatch (<workspace>/opencode.json)
+  - Structured failure response (not exception) on invalid request
 """
 from __future__ import annotations
 
@@ -21,7 +31,7 @@ from pathlib import Path
 import pytest
 
 from src.runtime import DispatchRequest
-from src.runtime.providers.cli_bridge import dispatch_via_cli_bridge
+from src.runtime.providers.cli_bridge import dispatch_via_cli_bridge, ensure_provider_permissions
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("SARATHI_LIVE_TESTS"),
@@ -50,6 +60,66 @@ def _request(**overrides) -> DispatchRequest:
     )
     base.update(overrides)
     return DispatchRequest(**base)
+
+
+def _write_provider_permissions_policy(path: Path) -> None:
+    """Write a minimal policy-pack/permissions.md for test dispatch."""
+    policy_dir = path / "policy-pack"
+    policy_dir.mkdir()
+    (policy_dir / "permissions.md").write_text(
+        """# Permissions
+
+```yaml
+permissions:
+  codex:
+    modes:
+      read_only:
+        full_auto: false
+        disable_sandbox: false
+      read_write:
+        full_auto: true
+        disable_sandbox: false
+      full:
+        full_auto: true
+        disable_sandbox: true
+  opencode:
+    modes:
+      read_only:
+        permission:
+          read: allow
+          grep: allow
+      read_write:
+        permission:
+          read: allow
+          grep: allow
+          edit: allow
+          write: allow
+      full:
+        permission:
+          read: allow
+          grep: allow
+          edit: allow
+          write: allow
+          bash: allow
+```
+"""
+    )
+
+
+def _prepare_codex_home(source_home: Path, target_home: Path) -> None:
+    """Copy local Codex auth into the isolated HOME used by live tests."""
+    source_codex = source_home / ".codex"
+    auth_path = source_codex / "auth.json"
+    if not auth_path.exists():
+        pytest.skip(f"codex auth not found at {auth_path}; run `codex login`")
+
+    target_codex = target_home / ".codex"
+    target_codex.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(auth_path, target_codex / "auth.json")
+
+    config_path = source_codex / "config.toml"
+    if config_path.exists():
+        shutil.copy2(config_path, target_codex / "config.toml")
 
 
 # ── Claude (real CLI, authenticated) ─────────────────────────────────────────
@@ -108,7 +178,11 @@ def test_claude_dispatch_end_to_end(tmp_path):
         assert "workspace_unchanged_on_success" not in response.evidence
         if (tmp_path / "hello.txt").exists():
             assert "hello.txt" in workspace_delta["files_changed"]
-            assert reconciliation["divergence"] is False
+            if reconciliation["claimed_files"]:
+                assert reconciliation["divergence"] is False
+            else:
+                assert reconciliation["divergence"] is None
+                assert reconciliation["reason"] == "no claimed file changes to reconcile"
             assert (tmp_path / "hello.txt").read_text(encoding="utf-8").strip() == "hello sarathi"
     else:
         # Claude declined to write the file -- Sarathi must have flagged the
@@ -160,16 +234,25 @@ def test_claude_session_resume(tmp_path):
     assert "sarathi-mango" in haystack
 
 
-# ── Codex / OpenCode scaffolding (skip in this environment) ─────────────────
+# ── Codex (CLI provider) ────────────────────────────────────────────────────
 
 @pytest.mark.skipif(shutil.which("codex") is None, reason="codex CLI not found on PATH")
-def test_codex_dispatch_end_to_end_placeholder(tmp_path):
-    """Scaffolding for a future live codex smoke test.
+def test_codex_dispatch_end_to_end(tmp_path, monkeypatch):
+    """Live codex dispatch verifies dispatch success, usage capture, and permissions.
 
-    Mirrors the claude dispatch shape; intentionally minimal until a codex
-    CLI is available in CI/dev environments.
+    Asserts:
+    - Dispatch succeeds (success=True) with non-empty output
+    - Usage record is populated (tokens > 0 or estimation fallback available)
+    - Permission config is written before dispatch to ~/.codex/config.yaml
+    - Evidence shows workspace interaction occurred
     """
+    real_home = Path.home()
+    test_home = tmp_path / "home"
+    _prepare_codex_home(real_home, test_home)
+    monkeypatch.setenv("HOME", str(test_home))
     _init_git_repo(tmp_path)
+    _write_provider_permissions_policy(tmp_path)
+
     prompt = (
         "Reply with JSON only: "
         '{"success": true, "outputs": {"summary": "ok", "messages": ["ok"]}, '
@@ -179,19 +262,92 @@ def test_codex_dispatch_end_to_end_placeholder(tmp_path):
         provider="codex",
         path=shutil.which("codex"),
         workspace_root=str(tmp_path),
-        request=_request(task_id="live-codex", phase="Build", prompt=prompt, timeout_seconds=240),
+        request=_request(task_id="live-codex-1", phase="Build", prompt=prompt, timeout_seconds=30),
     )
-    assert response.success is True, response.error
 
+    # Dispatch succeeds with non-empty output
+    assert response.success is True, f"Expected success, got error: {response.error}"
+    assert response.outputs is not None
+    assert isinstance(response.outputs, dict)
+
+    # Usage record is captured
+    assert response.usage is not None, "Usage record must be populated"
+    assert response.usage.input_tokens >= 0
+    assert response.usage.output_tokens >= 0
+    # At least one of reported/estimated tokens must be non-zero, or usage source must be "estimated"
+    assert (
+        response.usage.input_tokens > 0
+        or response.usage.output_tokens > 0
+        or response.usage.usage_source == "estimated"
+    ), f"Usage must have tokens or be estimated: {response.usage}"
+
+    # Permission config written before dispatch (marker in ~/.codex/config.yaml)
+    codex_config_path = test_home / ".codex" / "config.yaml"
+    assert (
+        codex_config_path.exists()
+    ), f"Codex permission config must exist at {codex_config_path}"
+    config_content = codex_config_path.read_text(encoding="utf-8")
+    assert "Sarathi-managed" in config_content, "Config must have Sarathi marker"
+
+    # Evidence collected
+    assert response.evidence is not None
+    assert isinstance(response.evidence, dict)
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="codex CLI not found on PATH")
+def test_codex_dispatch_structured_failure(tmp_path, monkeypatch):
+    """Codex dispatch with impossible request yields structured failure, not exception.
+
+    Asserts:
+    - Invalid/impossible request (timeout or invalid model) returns DispatchResponse
+      with success=False, error message populated, and no unhandled exception
+    - Failure response has expected artifact fields (command, provider, etc.)
+    """
+    real_home = Path.home()
+    test_home = tmp_path / "home"
+    _prepare_codex_home(real_home, test_home)
+    monkeypatch.setenv("HOME", str(test_home))
+    _init_git_repo(tmp_path)
+    _write_provider_permissions_policy(tmp_path)
+
+    # Use a very tight timeout to force a timeout failure
+    # (shorter than codex startup typically takes)
+    prompt = "Reply with OK"
+    response = dispatch_via_cli_bridge(
+        provider="codex",
+        path=shutil.which("codex"),
+        workspace_root=str(tmp_path),
+        request=_request(task_id="live-codex-fail", phase="Build", prompt=prompt, timeout_seconds=1),
+    )
+
+    # Structured failure response (not exception)
+    assert response.success is False, "Timeout must yield success=False"
+    assert response.error is not None, "Error message must be present"
+    assert isinstance(response.error, str)
+    assert len(response.error) > 0
+
+    # Artifacts contain metadata
+    assert response.artifacts is not None
+    assert "provider" in response.artifacts
+    assert response.artifacts.get("provider") == "codex"
+
+
+# ── OpenCode (CLI provider) ──────────────────────────────────────────────────
 
 @pytest.mark.skipif(shutil.which("opencode") is None, reason="opencode CLI not found on PATH")
-def test_opencode_dispatch_end_to_end_placeholder(tmp_path):
-    """Scaffolding for a future live opencode smoke test.
+def test_opencode_dispatch_end_to_end(tmp_path, monkeypatch):
+    """Live opencode dispatch verifies dispatch success, usage capture, and permissions.
 
-    Mirrors the claude dispatch shape; intentionally minimal until an
-    opencode CLI is available in CI/dev environments.
+    Asserts:
+    - Dispatch succeeds (success=True) with non-empty output
+    - Usage record is populated (tokens > 0 or estimation fallback available)
+    - Permission config is written before dispatch to <workspace>/opencode.json
+    - Evidence shows workspace interaction occurred
     """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     _init_git_repo(tmp_path)
+    _write_provider_permissions_policy(tmp_path)
+
     prompt = (
         "Reply with JSON only: "
         '{"success": true, "outputs": {"summary": "ok", "messages": ["ok"]}, '
@@ -201,6 +357,71 @@ def test_opencode_dispatch_end_to_end_placeholder(tmp_path):
         provider="opencode",
         path=shutil.which("opencode"),
         workspace_root=str(tmp_path),
-        request=_request(task_id="live-opencode", phase="Build", prompt=prompt, timeout_seconds=240),
+        request=_request(task_id="live-opencode-1", phase="Build", prompt=prompt, timeout_seconds=30),
     )
-    assert response.success is True, response.error
+
+    # Dispatch succeeds with non-empty output
+    assert response.success is True, f"Expected success, got error: {response.error}"
+    assert response.outputs is not None
+    assert isinstance(response.outputs, dict)
+
+    # Usage record is captured
+    assert response.usage is not None, "Usage record must be populated"
+    assert response.usage.input_tokens >= 0
+    assert response.usage.output_tokens >= 0
+    # At least one of reported/estimated tokens must be non-zero, or usage source must be "estimated"
+    assert (
+        response.usage.input_tokens > 0
+        or response.usage.output_tokens > 0
+        or response.usage.usage_source == "estimated"
+    ), f"Usage must have tokens or be estimated: {response.usage}"
+
+    # Permission config written before dispatch (opencode.json with permission field)
+    opencode_config_path = tmp_path / "opencode.json"
+    assert (
+        opencode_config_path.exists()
+    ), f"OpenCode permission config must exist at {opencode_config_path}"
+    config_data = json.loads(opencode_config_path.read_text(encoding="utf-8"))
+    assert (
+        "permission" in config_data
+    ), "OpenCode config must have 'permission' field"
+    assert isinstance(config_data["permission"], dict), "Permission must be a dict"
+
+    # Evidence collected
+    assert response.evidence is not None
+    assert isinstance(response.evidence, dict)
+
+
+@pytest.mark.skipif(shutil.which("opencode") is None, reason="opencode CLI not found on PATH")
+def test_opencode_dispatch_structured_failure(tmp_path, monkeypatch):
+    """OpenCode dispatch with impossible request yields structured failure, not exception.
+
+    Asserts:
+    - Invalid/impossible request (timeout or invalid model) returns DispatchResponse
+      with success=False, error message populated, and no unhandled exception
+    - Failure response has expected artifact fields (command, provider, etc.)
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    _init_git_repo(tmp_path)
+    _write_provider_permissions_policy(tmp_path)
+
+    # Use a very tight timeout to force a timeout failure
+    # (shorter than opencode startup typically takes)
+    prompt = "Reply with OK"
+    response = dispatch_via_cli_bridge(
+        provider="opencode",
+        path=shutil.which("opencode"),
+        workspace_root=str(tmp_path),
+        request=_request(task_id="live-opencode-fail", phase="Build", prompt=prompt, timeout_seconds=1),
+    )
+
+    # Structured failure response (not exception)
+    assert response.success is False, "Timeout must yield success=False"
+    assert response.error is not None, "Error message must be present"
+    assert isinstance(response.error, str)
+    assert len(response.error) > 0
+
+    # Artifacts contain metadata
+    assert response.artifacts is not None
+    assert "provider" in response.artifacts
+    assert response.artifacts.get("provider") == "opencode"

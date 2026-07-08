@@ -24,6 +24,14 @@ and approvals. Every surface is a client over that same source of truth.
       MCP server + Python API integrations
 ```
 
+**CLI/TUI service awareness.** When the local service is running
+(``~/.sarathi/service.json`` is present and reachable), ``sarathi run``,
+``sarathi status``, ``sarathi log``, ``sarathi list``, and the TUI data
+layer automatically route through the service — creating PRD/AC task drafts
+and reading live service state. When the service is unavailable, every
+surface falls back transparently to the existing in-process engine and
+local JSON persistence.  No flag or environment variable is needed.
+
 ## Why Sarathi Exists
 
 AI coding tools are powerful, but most runs are still loose conversations:
@@ -45,7 +53,8 @@ path, and optional MCP clients layer on top of the local runtime.
 | Surface | Command or path | Use it for |
 | --- | --- | --- |
 | CLI | `sarathi` | Init projects, validate policy, run tasks, inspect status, resume, review proposals, list recipes, attach/fork sessions |
-| TUI | `sarathi tui` or `sarathi chat` | Chat-first terminal workflow with live task dashboard, phase logs, approvals, and proposal review |
+| TUI | `sarathi tui` or `sarathi dashboard` | Chat-first terminal workflow with live task dashboard, phase logs, approvals, and proposal review |
+| Chat | `sarathi chat` | Inline terminal REPL for free-form chat with agent CLIs |
 | Web cockpit | `web/` served by the local service or Vite | Dashboard, Needs You, Task Studio, History, Agents, Knowledge Center, Wiki, Proposals, Skills, Usage, Settings |
 | Local desktop stack | `sarathi desktop` | Starts the Python service and Vite web UI together for development/local use |
 | Electron shell | `desktop/` | Native wrapper that loads the service-hosted web cockpit and can build a macOS `.dmg` |
@@ -366,6 +375,7 @@ policy-pack/
   conventions.md
   escalation.md
   model-routing.md
+  notifications.md
   permissions.md
   review.md
   skills.md
@@ -376,6 +386,18 @@ policy-pack/
 It also generates local bootstrap artifacts, including a deterministic
 `.sarathi/wiki` repo map unless `--no-wiki` is passed. The generated wiki is
 local and model-free.
+
+### Importing Policy Packs
+
+Use `sarathi init . --from <source>` to bootstrap a policy pack from an existing pack
+instead of generating defaults. Sources can be:
+
+- **Local directory**: `sarathi init . --from ./path/to/pack`
+- **Recipe name**: `sarathi init . --from bakeoff` (uses an installed recipe)
+- **Git URL**: `sarathi init . --from https://github.com/user/repo` (clones and extracts pack)
+
+Missing standard files are filled with generated defaults, so partial packs still
+yield complete, valid ones. Pass `--force` to overwrite an existing non-empty pack.
 
 Policy files control:
 
@@ -427,6 +449,71 @@ Provider dispatch evidence can include usage, session IDs, workspace deltas,
 review traces, diff traces, spec traces, retry context, and recovery
 classification. The review phase uses structured evidence when available instead
 of treating a provider response as blanket proof.
+
+### Adding a native CLI provider
+
+The four shipped native CLI providers (`claude`, `codex`, `opencode`,
+`copilot`) are declared, not hardcoded: `src/runtime/providers/registry.py`
+defines a `NativeProviderSpec` dataclass capturing everything the rest of the
+codebase used to branch on per provider — dispatch function, prompt
+transport, permission modes and writer, version/auth probes, TUI chat
+support, and fallback priority. `cli_bridge.py`, `service/providers.py`,
+`preflight.py`, `tui_data.py`, and `harness.py` all consult
+`registry.get_spec()` / `registry.all_specs()` instead of listing provider
+names.
+
+Adding a new agentic CLI (cursor-agent, gemini-cli, amp, ...) means building
+one `NativeProviderSpec` and calling `register_spec` — no other file needs to
+change. See `tests/test_provider_registry.py` for a worked example that
+registers a throwaway fifth provider and proves it flows through the
+dispatch chain, the permission-writer wiring, the preflight version probe,
+and the TUI chat provider list.
+
+**Copilot status**: `gh copilot` is registered but marked experimental —
+its `permission_writer` is `None` because the CLI exposes no non-interactive
+permission/config surface (no config file it reads, no flag to pre-approve
+tool use before a run, unlike claude's `settings.json`, codex's
+`config.yaml`, or opencode's `opencode.json`). It is also excluded from the
+TUI chat provider list (`tui_chat_support=False`): `gh copilot -p` is a
+one-shot suggestion command, not a session-oriented chat CLI, so it has no
+resumable session id or streaming output shape. Both facts are documented on
+its spec (`permission_writer_unavailable_reason`) and surfaced in the
+service catalog's `degraded_reason` for the desktop UI.
+
+## Slack Notifications
+
+Sarathi can post to a Slack channel when a run needs attention: task
+completed/failed, a phase paused for human input, budget exhausted, an
+approval requested, or a review rejected. Notifications are best-effort — a
+Slack outage never blocks a run — and secrets stay in the environment.
+
+Fastest path (incoming webhook):
+
+```bash
+export SARATHI_SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T000/B000/XXXX"
+sarathi run "Fix the failing checkout test" --policy-pack ./policy-pack
+```
+
+Bot-token mode (one token, any channel the bot is invited to):
+
+```bash
+export SARATHI_SLACK_BOT_TOKEN="xoxb-..."
+export SARATHI_SLACK_CHANNEL="#sarathi-runs"
+```
+
+Which events notify is policy: `policy-pack/notifications.md` declares the
+event list for engine runs (CLI/TUI/MCP), with fnmatch patterns such as
+`approval.*` or `phase.*`. The local service and work-queue worker fan out
+their `lifecycle_events` stream using environment-only configuration
+(`SARATHI_SLACK_EVENTS` narrows the event list, comma-separated). See
+`policy-pack/EXAMPLE/notifications.md` for the full reference.
+
+### Inbound Slash Commands
+
+Sarathi exposes `POST /api/workspaces/{id}/slack/commands/task` to create
+task drafts directly from Slack. HMAC signing is enforced when
+`SARATHI_SLACK_SIGNING_SECRET` is set. The endpoint returns a Slack-friendly
+JSON payload with `response_type`, `text`, `task_id`, and `approval_gate_id`.
 
 ## Verification Commands
 
@@ -503,6 +590,7 @@ Sarathi compiles a `HarnessConfig` during ROUTE. That artifact pre-declares:
 - permission scope
 - primary agent binding
 - assembly mode
+- role plan with policy-selected domain subroles
 - quality targets
 - cost/latency signals
 
@@ -516,8 +604,14 @@ hc = HarnessConfig.from_task_class(TaskClass.CODEGEN_PATCH, task_id="task-001")
 print(hc.context_scope)
 print(hc.permission_scope)
 print(hc.primary_agent.agent_id)
+print(hc.role_plan)
 print(hc.quality_signals)
 ```
+
+Role subroles are extensible overlays declared in `policy-pack/skills.md`.
+They preserve Sarathi's stable lifecycle roles while letting ROUTE mark the
+specialist lens a task needs, such as `security_review`, `data_migration`, or a
+project-defined domain review.
 
 Sarathi measures outcomes after execution:
 

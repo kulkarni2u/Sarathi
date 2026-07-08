@@ -23,11 +23,15 @@ try:
     from .harness import HarnessConfig, HarnessOutcome, derive_permission_mode
     from .permissions import PermissionScope, build_permission_scope
     from .trust_gate import TrustGate, TrustGateResult, arbitrate
+    from .notifications import budget_exhausted_event, build_slack_notifier, phase_event
+    from .engine_mirror import EngineRunRecorder
 except ImportError:
     from task_class import TaskClass, classify_task_class, from_legacy_type
     from harness import HarnessConfig, HarnessOutcome, derive_permission_mode
     from permissions import PermissionScope, build_permission_scope
     from trust_gate import TrustGate, TrustGateResult, arbitrate
+    from notifications import budget_exhausted_event, build_slack_notifier, phase_event
+    from engine_mirror import EngineRunRecorder
 
 try:
     from .dispatch import Dispatcher, LocalDispatcher, require_harness_id
@@ -58,6 +62,7 @@ try:
         PreflightPolicy,
         ProviderHealthStore,
         RecoveryRunner,
+        RoleSubrolePolicy,
         register_agent_role,
         TaskBudget,
         phase_agent_role_artifact,
@@ -93,6 +98,7 @@ except ImportError:
         PreflightPolicy,
         ProviderHealthStore,
         RecoveryRunner,
+        RoleSubrolePolicy,
         register_agent_role,
         TaskBudget,
         phase_agent_role_artifact,
@@ -177,6 +183,7 @@ class PolicyPack:
     task_tracking: dict[str, Any] = field(default_factory=dict)
     learning_feedback: dict[str, Any] = field(default_factory=dict)
     workflow_patterns: dict[str, Any] = field(default_factory=dict)
+    notifications: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -276,6 +283,11 @@ class RouteHandler(PhaseHandler):
                 if assembly_mode == "STANDARD":
                     self._harness_cache[task_class.value] = harness
 
+        role_plan = RoleSubrolePolicy.from_skills_section(self.policy_pack.skills).role_plan(
+            task_description=task.description,
+            file_paths=self._task_file_paths(task),
+        )
+        harness.role_plan = role_plan
         harness_dict = json.loads(harness.to_json())
 
         evidence = {
@@ -287,6 +299,7 @@ class RouteHandler(PhaseHandler):
             "requires_human_approval": harness.requires_human_approval,
             "assembly_mode": assembly_mode,
             "cache_hit": assembly_mode == "FAST",
+            "subroles_selected": role_plan["selected_count"],
         }
 
         artifacts = {
@@ -296,6 +309,7 @@ class RouteHandler(PhaseHandler):
             "permission_scope": harness.permission_scope,
             "permission_mode": derive_permission_mode(harness.permission_scope).value,
             "assembly_mode": assembly_mode,
+            "role_plan": role_plan,
         }
 
         if agent_spec is not None:
@@ -308,6 +322,17 @@ class RouteHandler(PhaseHandler):
             evidence=evidence,
             artifacts=artifacts,
         )
+
+    def _task_file_paths(self, task: TaskContext) -> list[str]:
+        """Extract optional file hints from task metadata for subrole routing."""
+        file_paths: list[str] = []
+        for key in ("files", "file_paths", "changed_files", "paths"):
+            value = task.complexity_evidence.get(key)
+            if isinstance(value, str):
+                file_paths.append(value)
+            elif isinstance(value, list):
+                file_paths.extend(str(item) for item in value if str(item).strip())
+        return file_paths
 
     def _classify_task_type(self, description: str) -> str:
         """Legacy ad-hoc task type string (preserved for backward compatibility)."""
@@ -571,6 +596,13 @@ class _HarnessAwareDispatcher:
             )
         if self.harness_id and not request.harness_id:
             request = _dc_replace(request, harness_id=self.harness_id)
+        # Health-ordered fallback providers for LocalDispatcher's transient-
+        # failure failover (see LocalDispatcher._attempt_provider_fallback).
+        if self.fallback_agents and not request.constraints.get("fallback_providers"):
+            request = _dc_replace(
+                request,
+                constraints={**request.constraints, "fallback_providers": list(self.fallback_agents)},
+            )
         # "Declare before dispatch": graph-node/child-task dispatches must
         # carry a harness_id proving a HarnessConfig was compiled before this
         # call. Scoped to purpose == "child_task_execution" (see
@@ -787,6 +819,13 @@ class Engine:
         if hasattr(self.dispatcher, "workspace_root"):
             self.dispatcher.workspace_root = self.workspace_root
 
+        # Outbound notifications (Slack) — policy-gated, env holds the secret.
+        self.notifier = build_slack_notifier(self.compiled_policy.get("notifications"))
+
+        # Best-effort mirror into the service SQLite DB (web cockpit
+        # visibility) — inactive unless .sarathi/sarathi.db already exists.
+        self.run_recorder = EngineRunRecorder.try_create()
+
         self.phase_handlers = self._create_phase_handlers()
         self.recovery_runner = RecoveryRunner(
             dispatcher=self.dispatcher,
@@ -813,6 +852,7 @@ class Engine:
             "learning_feedback",
             "workflow_patterns",
             "permissions",
+            "notifications",
         ):
             setattr(pack, attr, self.compiled_policy.get(attr))
 
@@ -1060,6 +1100,15 @@ class Engine:
                     budget.on_exhausted,
                 )
                 if budget.on_exhausted == "pause":
+                    if self.notifier is not None:
+                        self.notifier.notify(
+                            budget_exhausted_event(
+                                task.task_id,
+                                task.description,
+                                budget.consumed_tokens,
+                                budget.max_total_tokens,
+                            )
+                        )
                     self.persistence.save_task(task)
                     return task
 
@@ -1099,6 +1148,14 @@ class Engine:
 
         last_result = task.phase_results[-1]
         last_phase = last_result.phase
+        if self._pause_requires_approval(last_result):
+            approval = last_result.artifacts.get("approval")
+            approved = isinstance(approval, dict) and approval.get("approved") is True
+            if not approved:
+                rejected = isinstance(approval, dict) and approval.get("approved") is False
+                task.stop_reason = "rejected" if rejected else "approval_required"
+                self.persistence.save_task(task)
+                return task
         if self._should_pause_after_phase(last_result):
             next_phase = self._phase_override(last_result, last_phase)
         else:
@@ -1164,6 +1221,61 @@ class Engine:
     def _should_pause_after_phase(self, result: PhaseResult) -> bool:
         """Return True when a phase result requests resumable pause semantics."""
         return bool(result.artifacts.get("pause_execution"))
+
+    def _pause_requires_approval(self, result: PhaseResult) -> bool:
+        """Return True when a resumable pause is approval-flavored, not ordinary.
+
+        Most `pause_execution` pauses (see `src/phases/build.py`) are just
+        "more graph nodes remain, call resume again" — those must keep
+        resuming with a bare `resume_task` call, unchanged. A pause is
+        approval-flavored only when the pausing phase also flagged
+        `evidence["human_attention_required"]`: a graph node exhausted its
+        retry budget and was moved to `waiting_human` (see
+        `require_human_for_graph_node`), the same signal `sarathi log`
+        already keys off to render an escalation summary. Only that narrower
+        case is gated behind an explicit approval/rejection artifact.
+        """
+        return bool(result.artifacts.get("pause_execution")) and bool(
+            result.evidence.get("human_attention_required")
+        )
+
+    def record_approval(
+        self,
+        task: TaskContext,
+        *,
+        approved_by: str,
+        approve: bool = True,
+        note: str | None = None,
+    ) -> TaskContext:
+        """Record a human approval decision on a task paused for approval.
+
+        Attaches an `approval` artifact to the phase result that triggered
+        the approval-flavored pause (see `_pause_requires_approval`) and
+        persists the task via `self.persistence`. Approving clears the
+        transient `approval_required` stop marker so the next `resume_task`
+        call proceeds past the pause; rejecting sets
+        `task.stop_reason = "rejected"` and leaves the pause in place — a
+        rejected task never auto-advances, only a fresh approval unblocks it.
+
+        Raises `ValueError` if the task has no phase history, or if its most
+        recent phase result is not an approval-flavored pause.
+        """
+        if not task.phase_results:
+            raise ValueError(f"Task {task.task_id} has no phase history to approve.")
+        last_result = task.phase_results[-1]
+        if not self._pause_requires_approval(last_result):
+            raise ValueError(
+                f"Task {task.task_id} is not paused on an approval-flavored escalation."
+            )
+        last_result.artifacts["approval"] = {
+            "approved_by": approved_by,
+            "approved_at": datetime.now().isoformat(),
+            "approved": bool(approve),
+            "note": note,
+        }
+        task.stop_reason = None if approve else "rejected"
+        self.persistence.save_task(task)
+        return task
 
     def _phase_override(self, result: PhaseResult, current_phase: Phase) -> Phase:
         """Resolve the next phase override from a phase result."""
@@ -1407,6 +1519,23 @@ class Engine:
         """Log phase transition and persist task state."""
         # Save phase log entry
         self.persistence.save_phase_log(task, phase, status)
+        self._notify_phase(task, phase, status)
+        if self.run_recorder is not None:
+            self.run_recorder.record_phase(task, phase, status)
+
+    def _notify_phase(self, task: TaskContext, phase: Phase, status: str) -> None:
+        """Forward attention-worthy phase transitions to the notifier."""
+        if self.notifier is None:
+            return
+        event = phase_event(
+            task.task_id,
+            task.description,
+            phase.value,
+            status,
+            final_phase=phase is Phase.LEARN,
+        )
+        if event is not None:
+            self.notifier.notify(event)
 
     def _sync_task_state(self, task: TaskContext, result: PhaseResult) -> None:
         """Promote selected phase artifacts into task-level state."""

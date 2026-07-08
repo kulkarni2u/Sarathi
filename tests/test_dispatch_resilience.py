@@ -297,3 +297,263 @@ def test_provider_health_persists_across_instances(tmp_path):
 
     store2 = ProviderHealthStore(tmp_path)
     assert store2.score("claude") == pytest.approx(0.5)
+
+
+# ── ProviderHealthStore: decay, migration, latency EWMA ─────────────────────
+
+def test_provider_health_old_failure_washes_out_after_calendar_time(tmp_path, monkeypatch):
+    import src.runtime.provider_health as provider_health_mod
+
+    clock = [1_000_000.0]
+    monkeypatch.setattr(provider_health_mod.time, "time", lambda: clock[0])
+
+    store = ProviderHealthStore(tmp_path)
+    store.record("flaky", False)
+    assert store.score("flaky") == pytest.approx(0.1)  # floored: all-failure history
+
+    # Jump far into the future (many decay periods) with no activity in
+    # between, then start succeeding — the old failure should have decayed
+    # away almost entirely instead of depressing the score forever.
+    clock[0] += 200 * provider_health_mod._DECAY_PERIOD_SECONDS
+    store.record("flaky", True)
+
+    assert store.score("flaky") > 0.9
+
+
+def test_provider_health_rapid_calls_barely_decay(tmp_path, monkeypatch):
+    """Calls seconds apart (the common case within one task) shouldn't cause
+    visible decay — only real calendar time passing should."""
+    import src.runtime.provider_health as provider_health_mod
+
+    clock = [1_000_000.0]
+    monkeypatch.setattr(provider_health_mod.time, "time", lambda: clock[0])
+
+    store = ProviderHealthStore(tmp_path)
+    store.record("claude", True)
+    clock[0] += 0.01
+    store.record("claude", True)
+    clock[0] += 0.01
+    store.record("claude", False)
+
+    assert store.score("claude") == pytest.approx(2 / 3, rel=1e-6)
+
+
+def test_provider_health_migrates_old_on_disk_format(tmp_path):
+    health_file = tmp_path / "provider_health.json"
+    health_file.write_text(json.dumps({
+        "claude": {"successes": 8, "failures": 2, "health_score": 0.8},
+    }))
+
+    store = ProviderHealthStore(tmp_path)
+
+    assert store.score("claude") == pytest.approx(0.8)
+    snapshot = store.snapshot()["claude"]
+    assert snapshot["decayed_successes"] == pytest.approx(8.0)
+    assert snapshot["decayed_failures"] == pytest.approx(2.0)
+    assert snapshot["latency_ewma_ms"] is None
+
+    # And the migrated store keeps behaving normally afterward.
+    store.record("claude", True)
+    assert store.score("claude") == pytest.approx(9 / 11)
+
+
+def test_provider_health_latency_ewma_none_until_first_report(tmp_path):
+    store = ProviderHealthStore(tmp_path)
+    assert store.latency_ms("claude") is None
+
+    store.record("claude", True)  # old 2-arg call still works, no latency
+    assert store.latency_ms("claude") is None
+
+
+def test_provider_health_latency_ewma_tracks_reported_latency(tmp_path):
+    store = ProviderHealthStore(tmp_path)
+    store.record("claude", True, latency_ms=100.0)
+    assert store.latency_ms("claude") == pytest.approx(100.0)
+
+    store.record("claude", True, latency_ms=200.0)
+    # alpha = 0.2: 0.2 * 200 + 0.8 * 100 = 120
+    assert store.latency_ms("claude") == pytest.approx(120.0)
+
+
+def test_provider_health_latency_persists_across_instances(tmp_path):
+    store1 = ProviderHealthStore(tmp_path)
+    store1.record("claude", True, latency_ms=250.0)
+
+    store2 = ProviderHealthStore(tmp_path)
+    assert store2.latency_ms("claude") == pytest.approx(250.0)
+
+
+# ── LocalDispatcher: dispatch-level provider failover ───────────────────────
+
+class _RoutingProvider(ProviderAdapter):
+    """Provider stub whose result depends on constraints['provider']."""
+
+    def __init__(self, responses: dict):
+        self.responses = responses
+        self.calls: list[str | None] = []
+
+    @property
+    def name(self) -> str:
+        return "routing"
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(transport_kind="deterministic", supports_structured_output=True)
+
+    def dispatch(self, request: DispatchRequest) -> DispatchResponse:
+        provider = request.constraints.get("provider")
+        self.calls.append(provider)
+        item = self.responses[provider]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def test_dispatch_fails_over_to_fallback_provider_on_transient_exhaustion(monkeypatch):
+    monkeypatch.setattr("src.dispatch._sleep", lambda secs: None)
+    provider = _RoutingProvider({
+        "a": DispatchResponse(success=False, error="rate limit exceeded"),
+        "b": DispatchResponse(success=True, outputs={"ok": True}),
+    })
+    dispatcher = LocalDispatcher(provider=provider)
+    request = _make_request(
+        retry_budget=0,
+        constraints={"provider": "a", "fallback_providers": ["b"]},
+    )
+
+    response = dispatcher.dispatch(request)
+
+    assert response.success is True
+    assert response.artifacts["served_by_fallback"] == "b"
+    assert response.artifacts["fallback_attempted"]["original_provider"] == "a"
+    assert response.artifacts["fallback_attempted"]["fallback_used"] == "b"
+    assert provider.calls == ["a", "b"]
+
+
+def test_dispatch_retries_primary_before_failing_over(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("src.dispatch._sleep", lambda secs: sleeps.append(secs))
+    provider = _RoutingProvider({
+        "a": DispatchResponse(success=False, error="rate limit exceeded"),
+        "b": DispatchResponse(success=True, outputs={"ok": True}),
+    })
+    dispatcher = LocalDispatcher(provider=provider)
+    request = _make_request(
+        retry_budget=1,
+        constraints={"provider": "a", "fallback_providers": ["b"]},
+    )
+
+    response = dispatcher.dispatch(request)
+
+    assert response.success is True
+    assert response.artifacts["served_by_fallback"] == "b"
+    assert provider.calls == ["a", "a", "b"]
+    assert sleeps == [1]
+    assert response.artifacts["dispatch_retries"] == {
+        "attempts": 2,
+        "transient_failures": ["rate limit exceeded"],
+    }
+
+
+def test_dispatch_tries_fallback_providers_in_order_until_one_succeeds(monkeypatch):
+    monkeypatch.setattr("src.dispatch._sleep", lambda secs: None)
+    provider = _RoutingProvider({
+        "a": DispatchResponse(success=False, error="rate limit exceeded"),
+        "b": DispatchResponse(success=False, error="rate limit exceeded (b)"),
+        "c": DispatchResponse(success=True, outputs={"ok": True}),
+    })
+    dispatcher = LocalDispatcher(provider=provider)
+    request = _make_request(
+        retry_budget=0,
+        constraints={"provider": "a", "fallback_providers": ["b", "c"]},
+    )
+
+    response = dispatcher.dispatch(request)
+
+    assert response.success is True
+    assert response.artifacts["served_by_fallback"] == "c"
+    assert provider.calls == ["a", "b", "c"]
+
+
+def test_dispatch_all_fallbacks_fail_returns_original_failure(monkeypatch):
+    monkeypatch.setattr("src.dispatch._sleep", lambda secs: None)
+    provider = _RoutingProvider({
+        "a": DispatchResponse(success=False, error="rate limit exceeded"),
+        "b": DispatchResponse(success=False, error="rate limit exceeded (b)"),
+    })
+    dispatcher = LocalDispatcher(provider=provider)
+    request = _make_request(
+        retry_budget=0,
+        constraints={"provider": "a", "fallback_providers": ["b"]},
+    )
+
+    response = dispatcher.dispatch(request)
+
+    assert response.success is False
+    assert response.error == "rate limit exceeded"
+    assert "served_by_fallback" not in response.artifacts
+    assert provider.calls == ["a", "b"]
+
+
+def test_dispatch_no_failover_on_non_transient_failure(monkeypatch):
+    monkeypatch.setattr("src.dispatch._sleep", lambda secs: None)
+    provider = _RoutingProvider({
+        "a": DispatchResponse(success=False, error="invalid api key"),
+        "b": DispatchResponse(success=True, outputs={"ok": True}),
+    })
+    dispatcher = LocalDispatcher(provider=provider)
+    request = _make_request(
+        retry_budget=0,
+        constraints={"provider": "a", "fallback_providers": ["b"]},
+    )
+
+    response = dispatcher.dispatch(request)
+
+    assert response.success is False
+    assert response.error == "invalid api key"
+    assert provider.calls == ["a"]  # fallback never attempted
+
+
+def test_dispatch_no_fallback_candidates_behaves_as_before(monkeypatch):
+    monkeypatch.setattr("src.dispatch._sleep", lambda secs: None)
+    provider = _RoutingProvider({
+        "a": DispatchResponse(success=False, error="rate limit exceeded"),
+    })
+    dispatcher = LocalDispatcher(provider=provider)
+    request = _make_request(retry_budget=0, constraints={"provider": "a"})
+
+    response = dispatcher.dispatch(request)
+
+    assert response.success is False
+    assert response.error == "rate limit exceeded"
+    assert "dispatch_retries" not in response.artifacts
+    assert provider.calls == ["a"]
+
+
+def test_dispatch_fails_over_on_timeout_exhaustion(monkeypatch):
+    monkeypatch.setattr("src.dispatch._sleep", lambda secs: None)
+    provider = _RoutingProvider({
+        "a": DispatchTimeoutError("timed out"),
+        "b": DispatchResponse(success=True, outputs={"ok": True}),
+    })
+    dispatcher = LocalDispatcher(provider=provider)
+    request = _make_request(
+        retry_budget=0,
+        constraints={"provider": "a", "fallback_providers": ["b"]},
+    )
+
+    response = dispatcher.dispatch(request)
+
+    assert response.success is True
+    assert response.artifacts["served_by_fallback"] == "b"
+    assert provider.calls == ["a", "b"]
+
+
+def test_dispatch_timeout_exhaustion_with_no_fallback_still_raises(monkeypatch):
+    monkeypatch.setattr("src.dispatch._sleep", lambda secs: None)
+    provider = _RoutingProvider({"a": DispatchTimeoutError("timed out")})
+    dispatcher = LocalDispatcher(provider=provider)
+    request = _make_request(retry_budget=0, constraints={"provider": "a"})
+
+    with pytest.raises(DispatchTimeoutError):
+        dispatcher.dispatch(request)

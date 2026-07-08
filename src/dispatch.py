@@ -7,7 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Any
 
 _DISPATCH_TIMEOUT = int(os.environ.get("SARATHI_DISPATCH_TIMEOUT", "300"))
@@ -65,6 +65,26 @@ def require_harness_id(request: "DispatchRequest") -> None:
         )
 
 
+def _reported_cost_from_artifacts(artifacts: Mapping[str, Any] | None) -> float | None:
+    """Extract a provider's self-reported dollar cost from dispatch artifacts.
+
+    claude's CLI bridge surfaces `total_cost_usd` from its result envelope
+    into `DispatchResponse.artifacts`; other providers may report a plain
+    `cost_usd`. Either wins over a pricing-table computation.
+    """
+    if not isinstance(artifacts, Mapping):
+        return None
+    for key in ("total_cost_usd", "cost_usd"):
+        value = artifacts.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _is_transient_failure(
     response_or_none: "DispatchResponse | None",
     exc_or_none: Exception | None,
@@ -92,6 +112,7 @@ def _is_transient_failure(
 
 try:
     from .runtime import DispatchRequest, DispatchResponse
+    from .runtime.pricing import PricingTable, resolve_cost
     from .runtime.providers import (
         ConfiguredProviderAdapter,
         LocalProviderAdapter,
@@ -99,6 +120,7 @@ try:
     )
 except ImportError:
     from runtime import DispatchRequest, DispatchResponse
+    from runtime.pricing import PricingTable, resolve_cost
     from runtime.providers import (
         ConfiguredProviderAdapter,
         LocalProviderAdapter,
@@ -165,6 +187,12 @@ class LocalDispatcher(Dispatcher):
         provider_config: Mapping[str, Any] | None = None,
     ):
         self.provider = provider or self._provider_from_config(provider_config)
+        # Cost resolution is policy-driven: the model-routing section (which
+        # already reaches us as provider_config) may carry a `pricing:`
+        # mapping. We never hardcode a provider name or a dollar figure here
+        # — see src/runtime/pricing.py for parsing/lookup.
+        self._provider_config: Mapping[str, Any] = provider_config or {}
+        self._pricing_table = PricingTable.from_config(provider_config)
 
     def _provider_from_config(
         self, provider_config: Mapping[str, Any] | None
@@ -172,6 +200,44 @@ class LocalDispatcher(Dispatcher):
         if provider_config:
             return ConfiguredProviderAdapter(provider_config)
         return LocalProviderAdapter()
+
+    def _model_for_provider(self, provider_id: str | None) -> str | None:
+        """Best-effort model name for a provider, from its routing config.
+
+        Provider configs (see policy-pack/EXAMPLE/model-routing.md) declare a
+        fixed `model` per provider entry; this mirrors that lookup without
+        assuming any particular provider exists.
+        """
+        if not provider_id:
+            return None
+        providers_cfg = self._provider_config.get("providers")
+        if not isinstance(providers_cfg, Mapping):
+            return None
+        provider_cfg = providers_cfg.get(provider_id)
+        if not isinstance(provider_cfg, Mapping):
+            return None
+        model = provider_cfg.get("model")
+        return model if isinstance(model, str) and model else None
+
+    def _apply_cost(self, response: "DispatchResponse") -> None:
+        """Fill in `usage.cost_usd` when it isn't already known.
+
+        Precedence: a provider's self-reported cost (already present on the
+        usage record, or surfaced in response.artifacts as `total_cost_usd` /
+        `cost_usd`) always wins over a pricing-table computation, which wins
+        over leaving it unpriced (None).
+        """
+        usage = response.usage
+        if usage is None or usage.cost_usd is not None:
+            return
+        reported = _reported_cost_from_artifacts(response.artifacts)
+        if reported is not None:
+            usage.cost_usd = reported
+            return
+        if self._pricing_table.is_empty():
+            return
+        model = self._model_for_provider(usage.provider_id)
+        usage.cost_usd = resolve_cost(usage, usage.provider_id, model, self._pricing_table)
 
     def dispatch_explore(self, spec: TaskSpec) -> ExploreResult:
         response = self.dispatch(
@@ -221,7 +287,8 @@ class LocalDispatcher(Dispatcher):
                 exc = timeout_exc
 
             transient = _is_transient_failure(response, exc)
-            if not transient or attempt == retry_budget:
+
+            if not transient:
                 if exc is not None:
                     raise exc
                 if transient_failures:
@@ -231,17 +298,104 @@ class LocalDispatcher(Dispatcher):
                     }
                 return response
 
-            # Record what happened and back off before retrying.
-            if exc is not None:
-                transient_failures.append(str(exc))
-            else:
-                transient_failures.append(response.error or "transient failure")
+            if attempt < retry_budget:
+                # Still transient and retry budget remains — record what
+                # happened and back off before retrying the same provider.
+                if exc is not None:
+                    transient_failures.append(str(exc))
+                else:
+                    transient_failures.append(response.error or "transient failure")
 
-            backoff = min(2 ** attempt, 8)
-            _sleep(backoff)
+                backoff = min(2 ** attempt, 8)
+                _sleep(backoff)
+                continue
+
+            # Retry budget exhausted on a transient failure. Before giving up
+            # on this provider entirely, try any fallback providers the
+            # request carries (see _attempt_provider_fallback) — this never
+            # fires for non-transient failures, which return above.
+            fallback_response = self._attempt_provider_fallback(request, response, exc)
+            if fallback_response is not None:
+                if transient_failures:
+                    fallback_response.artifacts.setdefault(
+                        "dispatch_retries",
+                        {"attempts": attempt + 1, "transient_failures": list(transient_failures)},
+                    )
+                return fallback_response
+
+            if exc is not None:
+                raise exc
+            if transient_failures:
+                response.artifacts["dispatch_retries"] = {
+                    "attempts": attempt + 1,
+                    "transient_failures": transient_failures,
+                }
+            return response
 
         # Unreachable: the loop always returns or raises on its last iteration.
         raise AssertionError("LocalDispatcher.dispatch: retry loop exited without returning")
+
+    def _attempt_provider_fallback(
+        self,
+        request: DispatchRequest,
+        response: DispatchResponse | None,
+        exc: Exception | None,
+    ) -> DispatchResponse | None:
+        """Retry a transiently-exhausted dispatch against fallback providers.
+
+        Reads ``request.constraints["fallback_providers"]`` — an ordered list
+        of provider ids. This is the seam where a HarnessConfig's resolved
+        ``fallback_agents`` (see src/harness.py, health-ordered) are expected
+        to land on the request wherever the harness binding is applied to it
+        (e.g. alongside ``constraints["provider"]``); nothing upstream
+        populates it yet (see delivery notes), so today this is a no-op until
+        a caller sets it.
+
+        Tries each fallback once, in the given order, stopping at the first
+        success. Returns ``None`` (caller keeps the original failure/timeout)
+        when there are no fallback candidates or all of them also fail — this
+        method never raises on a fallback's own timeout, it just moves on to
+        the next candidate.
+        """
+        fallback_providers = request.constraints.get("fallback_providers")
+        if not isinstance(fallback_providers, (list, tuple)) or not fallback_providers:
+            return None
+
+        original_provider = request.constraints.get("provider")
+        prior_errors: list[str] = []
+        if exc is not None:
+            prior_errors.append(str(exc))
+        elif response is not None:
+            prior_errors.append(response.error or "transient failure")
+
+        for fallback_provider in fallback_providers:
+            if not isinstance(fallback_provider, str) or not fallback_provider:
+                continue
+            if fallback_provider == original_provider:
+                continue
+
+            fallback_request = _dc_replace(
+                request,
+                constraints={**request.constraints, "provider": fallback_provider},
+            )
+            try:
+                fallback_response = self._dispatch_once(fallback_request)
+            except DispatchTimeoutError as fallback_timeout:
+                prior_errors.append(str(fallback_timeout))
+                continue
+
+            if fallback_response.success:
+                fallback_response.artifacts["served_by_fallback"] = fallback_provider
+                fallback_response.artifacts["fallback_attempted"] = {
+                    "original_provider": original_provider,
+                    "fallback_used": fallback_provider,
+                    "prior_errors": prior_errors,
+                }
+                return fallback_response
+
+            prior_errors.append(fallback_response.error or "transient failure")
+
+        return None
 
     def _dispatch_once(self, request: DispatchRequest) -> DispatchResponse:
         # The provider's own subprocess timeout (request.timeout_seconds) is the
@@ -252,7 +406,9 @@ class LocalDispatcher(Dispatcher):
         pool = ThreadPoolExecutor(max_workers=1)
         future: Future[DispatchResponse] = pool.submit(self.provider.dispatch, request)
         try:
-            return future.result(timeout=timeout)
+            response = future.result(timeout=timeout)
+            self._apply_cost(response)
+            return response
         except FuturesTimeoutError:
             raise DispatchTimeoutError(
                 f"Provider dispatch timed out after {timeout}s "

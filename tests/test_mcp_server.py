@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from src import mcp_server as ms
-from src.engine import Complexity, PersistenceManager, Phase, PhaseResult, TaskContext
+from src.engine import Complexity, Engine, PersistenceManager, Phase, PhaseResult, TaskContext
 
 EXAMPLE_POLICY_PACK = str(Path(__file__).resolve().parents[1] / "policy-pack" / "EXAMPLE")
 
@@ -205,6 +205,116 @@ def test_task_log_nonexistent_task_returns_error(isolated_persistence):
 
 
 # ============================================================================
+# approve_task
+# ============================================================================
+
+def _write_waiting_human_policy_pack(policy_dir: Path) -> None:
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    files = {
+        "complexity.md": "classification_thresholds: present\nskip_rules: present\n",
+        "conventions.md": "conventions: present\nbrainstorming_protocol: present\n",
+        "commands.md": "```yaml\ntest:\n  command: \"echo test\"\n```\n",
+        "review.md": "max_rounds: 5\nmin_coverage: 80\n",
+        "escalation.md": "auto_fix: configured\nreview: configured\n",
+        "skills.md": "pattern_detection: enabled\nevolution_threshold: 0.8\n",
+        "task-tracking.md": """```yaml
+task: configured
+options: configured
+graph_execution:
+  step_limit: 1
+  max_retries: 1
+  require_human_after_retries: true
+```
+""",
+    }
+    for name, content in files.items():
+        (policy_dir / name).write_text(content)
+
+
+def _run_to_waiting_human_pause(tmp_path, isolated_persistence, monkeypatch, task_id):
+    policy_dir = tmp_path / "policy-pack"
+    _write_waiting_human_policy_pack(policy_dir)
+    monkeypatch.setenv("SARATHI_GRAPH_FAIL_NODE", "step-1")
+
+    engine = Engine(policy_pack_path=str(policy_dir))
+    engine.persistence = isolated_persistence
+    task = TaskContext(task_id=task_id, description="Fix bug", complexity=Complexity.LOW)
+    paused = engine.run_task(task)
+    assert paused.phase_results[-1].evidence["human_attention_required"] is True
+
+    monkeypatch.delenv("SARATHI_GRAPH_FAIL_NODE")
+    return str(policy_dir)
+
+
+def test_resume_task_blocked_pending_approval(tmp_path, isolated_persistence, monkeypatch):
+    policy_dir = _run_to_waiting_human_pause(tmp_path, isolated_persistence, monkeypatch, "task-mcp-blocked")
+
+    result = ms.resume_task("task-mcp-blocked", policy_pack=policy_dir)
+
+    assert result["ok"] is True
+    assert result["stop_reason"] == "approval_required"
+    assert result["final_status"] == "awaiting_approval"
+
+    reloaded = isolated_persistence.load_task("task-mcp-blocked")
+    assert not any(pr.artifacts.get("approval") for pr in reloaded.phase_results)
+
+
+def test_approve_task_approves_and_resumes(tmp_path, isolated_persistence, monkeypatch):
+    policy_dir = _run_to_waiting_human_pause(tmp_path, isolated_persistence, monkeypatch, "task-mcp-approve")
+
+    result = ms.approve_task("task-mcp-approve", note="looks safe", policy_pack=policy_dir)
+
+    assert result["ok"] is True
+    assert result["decision"] == "approved"
+    assert result["task_id"] == "task-mcp-approve"
+
+    reloaded = isolated_persistence.load_task("task-mcp-approve")
+    approvals = [pr.artifacts.get("approval") for pr in reloaded.phase_results if pr.artifacts.get("approval")]
+    assert approvals
+    assert approvals[0]["approved"] is True
+    assert approvals[0]["approved_by"] == "mcp"
+    assert approvals[0]["note"] == "looks safe"
+
+
+def test_approve_task_reject_leaves_task_paused(tmp_path, isolated_persistence, monkeypatch):
+    policy_dir = _run_to_waiting_human_pause(tmp_path, isolated_persistence, monkeypatch, "task-mcp-reject")
+
+    result = ms.approve_task("task-mcp-reject", note="not safe", reject=True, policy_pack=policy_dir)
+
+    assert result["ok"] is True
+    assert result["decision"] == "rejected"
+    assert result["final_status"] == "rejected"
+
+    reloaded = isolated_persistence.load_task("task-mcp-reject")
+    approvals = [pr.artifacts.get("approval") for pr in reloaded.phase_results if pr.artifacts.get("approval")]
+    assert approvals
+    assert approvals[0]["approved"] is False
+
+    # A rejected task stays blocked -- a bare resume must not proceed.
+    resumed = ms.resume_task("task-mcp-reject", policy_pack=policy_dir)
+    assert resumed["stop_reason"] == "rejected"
+    assert resumed["final_status"] == "rejected"
+
+
+def test_approve_task_nonexistent_task_returns_error(isolated_persistence):
+    result = ms.approve_task("does-not-exist")
+
+    assert result["ok"] is False
+    assert "error" in result
+
+
+def test_approve_task_non_paused_task_returns_error(isolated_persistence):
+    run_result = ms.run_task("Fix a small bug in the parser", policy_pack=EXAMPLE_POLICY_PACK, complexity="low")
+    assert run_result["ok"] is True
+    task_id = run_result["task_id"]
+
+    result = ms.approve_task(task_id, policy_pack=EXAMPLE_POLICY_PACK)
+
+    assert result["ok"] is False
+    assert "error" in result
+
+
+# ============================================================================
 # proposals
 # ============================================================================
 
@@ -375,6 +485,7 @@ def test_create_server_registers_expected_tools():
         "run_task",
         "task_status",
         "resume_task",
+        "approve_task",
         "list_tasks",
         "task_log",
         "list_proposals",

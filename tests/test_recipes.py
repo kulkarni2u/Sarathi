@@ -238,10 +238,10 @@ def test_recipe_to_artifact_roundtrips_fields():
 
 def test_shipped_recipes_discovered():
     recipes = load_recipes(RECIPES_DIR)
-    assert {"orchestrator", "debate"} <= set(recipes)
+    assert {"orchestrator", "debate", "bakeoff"} <= set(recipes)
 
 
-@pytest.mark.parametrize("key", ["orchestrator", "debate"])
+@pytest.mark.parametrize("key", ["orchestrator", "debate", "bakeoff"])
 def test_shipped_recipe_has_two_providers_and_builds(key: str):
     recipe = load_recipe(RECIPES_DIR / key)
     assert len(recipe.providers) >= 2
@@ -255,7 +255,7 @@ def test_shipped_recipe_has_two_providers_and_builds(key: str):
         assert len(providers) >= 2
 
 
-@pytest.mark.parametrize("key", ["orchestrator", "debate"])
+@pytest.mark.parametrize("key", ["orchestrator", "debate", "bakeoff"])
 def test_shipped_recipe_pack_compiles(key: str):
     compiled = compile_policy_pack(str(RECIPES_DIR / key))
     assert not compiled.parse_errors
@@ -264,3 +264,19 @@ def test_shipped_recipe_pack_compiles(key: str):
 def test_orchestrator_pack_ships_agents():
     specs = load_agent_specs(RECIPES_DIR / "orchestrator" / "agents")
     assert len(specs) >= 2
+
+
+def test_bakeoff_pack_ships_agents():
+    specs = load_agent_specs(RECIPES_DIR / "bakeoff" / "agents")
+    assert len(specs) >= 3  # codex-candidate, opencode-candidate, judge
+
+
+def test_bakeoff_recipe_declares_native_providers():
+    recipe = load_recipe(RECIPES_DIR / "bakeoff")
+    assert recipe.providers == ["codex", "opencode"]
+    graph = recipe.build_graph().to_artifact()
+    fanout_nodes = [n for n in graph["nodes"] if str(n.get("node_type")).endswith("fanout")]
+    assert fanout_nodes, "bakeoff recipe must declare a fanout node"
+    for fan in fanout_nodes:
+        providers = fan.get("pattern_config", {}).get("providers", [])
+        assert providers == ["codex", "opencode"], f"bakeoff fanout must declare codex and opencode, got {providers}"

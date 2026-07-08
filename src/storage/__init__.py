@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
+logger = logging.getLogger("sarathi.storage")
 
-LATEST_SCHEMA_VERSION = 10
+
+LATEST_SCHEMA_VERSION = 11
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -116,13 +119,30 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             (10, _utc_now()),
         )
         conn.commit()
+    if current_schema_version(conn) < 11:
+        conn.executescript(_MIGRATION_011)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (11, _utc_now()),
+        )
+        conn.commit()
 
 
 class Storage:
-    """Small repository facade for persisted Sarathi UI records."""
+    """Small repository facade for persisted Sarathi UI records.
 
-    def __init__(self, conn: sqlite3.Connection):
+    ``event_listener`` is an optional observer invoked (best-effort) with each
+    lifecycle event dict right after it is committed — used by the service to
+    fan events out to notification channels without coupling storage to them.
+    """
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        event_listener: Callable[[dict[str, Any]], None] | None = None,
+    ):
         self.conn = conn
+        self._event_listener = event_listener
 
     def create_workspace(
         self,
@@ -1261,6 +1281,11 @@ class Storage:
         self.conn.commit()
         event = self.get_lifecycle_event(event_id)
         assert event is not None
+        if self._event_listener is not None:
+            try:
+                self._event_listener(event)
+            except Exception:
+                logger.warning("Lifecycle event listener failed", exc_info=True)
         return event
 
     def get_lifecycle_event(self, event_id: str) -> dict[str, Any] | None:
@@ -1801,6 +1826,92 @@ class Storage:
         ).fetchall()
         return [_provider_from_row(row) for row in rows]
 
+    def upsert_proposal_decision(
+        self,
+        *,
+        workspace_id: str,
+        proposal_id: str,
+        status: str,
+        policy_file: str | None = None,
+        title: str | None = None,
+        source: str | None = None,
+        reason: str | None = None,
+        payload: dict[str, Any] | None = None,
+        reviewed_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or update a policy-proposal review decision.
+
+        Keyed by ``(workspace_id, proposal_id)`` so re-recording the same
+        decision (e.g. re-importing from the file store, or re-accepting an
+        already-accepted proposal) never duplicates a row -- it just updates
+        the existing one. ``payload`` stores the full decision dict produced
+        by ``evolve.ProposalReviewStore`` so no information is lost even for
+        fields not promoted to their own column.
+        """
+        now = _utc_now()
+        reviewed_at = reviewed_at or now
+        self.conn.execute(
+            """
+            INSERT INTO proposal_decisions (
+                id, workspace_id, proposal_id, status, policy_file, title,
+                source, reason, payload, reviewed_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_id, proposal_id) DO UPDATE SET
+                status = excluded.status,
+                policy_file = excluded.policy_file,
+                title = excluded.title,
+                source = excluded.source,
+                reason = excluded.reason,
+                payload = excluded.payload,
+                reviewed_at = excluded.reviewed_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                _new_id(),
+                workspace_id,
+                proposal_id,
+                status,
+                policy_file,
+                title,
+                source,
+                reason,
+                _dump_json(payload),
+                reviewed_at,
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        decision = self.get_proposal_decision(workspace_id, proposal_id)
+        assert decision is not None
+        return decision
+
+    def get_proposal_decision(self, workspace_id: str, proposal_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, workspace_id, proposal_id, status, policy_file, title,
+                   source, reason, payload, reviewed_at, created_at, updated_at
+            FROM proposal_decisions
+            WHERE workspace_id = ? AND proposal_id = ?
+            """,
+            (workspace_id, proposal_id),
+        ).fetchone()
+        return _proposal_decision_from_row(row) if row is not None else None
+
+    def list_proposal_decisions(self, workspace_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, proposal_id, status, policy_file, title,
+                   source, reason, payload, reviewed_at, created_at, updated_at
+            FROM proposal_decisions
+            WHERE workspace_id = ?
+            ORDER BY reviewed_at, id
+            """,
+            (workspace_id,),
+        ).fetchall()
+        return [_proposal_decision_from_row(row) for row in rows]
+
 
 def _workspace_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
@@ -2187,6 +2298,23 @@ def _provider_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "name": row["name"],
         "provider_type": row["provider_type"],
         "config": _load_json(row["config"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _proposal_decision_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "workspace_id": row["workspace_id"],
+        "proposal_id": row["proposal_id"],
+        "status": row["status"],
+        "policy_file": row["policy_file"],
+        "title": row["title"],
+        "source": row["source"],
+        "reason": row["reason"],
+        "payload": _load_json(row["payload"]),
+        "reviewed_at": row["reviewed_at"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -2614,4 +2742,25 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_token ON users(token);
+"""
+
+
+_MIGRATION_011 = """
+CREATE TABLE IF NOT EXISTS proposal_decisions (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    proposal_id TEXT NOT NULL,
+    status TEXT NOT NULL,                    -- 'accepted' | 'rejected'
+    policy_file TEXT,
+    title TEXT,
+    source TEXT,
+    reason TEXT,
+    payload TEXT NOT NULL DEFAULT '{}',
+    reviewed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_decisions_workspace_proposal
+    ON proposal_decisions(workspace_id, proposal_id);
 """

@@ -22,10 +22,13 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 try:
-    from . import tui_data
+    from . import review_data, tui_data
+    from .engine import Engine
 except ImportError:
     # Support direct execution via sarathi.py, which prepends src/ to sys.path.
+    import review_data
     import tui_data
+    from engine import Engine
 
 
 SARATHI_BANNER = r"""
@@ -74,7 +77,14 @@ _OUTCOME_STYLES = {
 
 _RISK_STYLES = {"low": "green", "medium": "yellow", "high": "bold red"}
 
-_DECISION_STYLES = {"accepted": "green", "rejected": "red"}
+_DECISION_STYLES = {"accepted": "green", "rejected": "red", "approved": "green"}
+
+_DIFF_STATUS_STYLES = {
+    "added": "green",
+    "modified": "yellow",
+    "deleted": "bold red",
+    "renamed": "cyan",
+}
 
 
 def _styled(text: object, styles: dict[str, str]) -> Text:
@@ -132,12 +142,49 @@ def _styled_log_line(line: str) -> Text:
     return text
 
 
+def _render_file_diff(file_diff: "review_data.FileDiff") -> Text:
+    """Render one `FileDiff` as Rich `Text` with +/- coloring."""
+    text = Text()
+    text.append(file_diff.path, style="bold")
+    if file_diff.old_path and file_diff.old_path != file_diff.path:
+        text.append(f"  (renamed from {file_diff.old_path})", style="dim italic")
+    text.append(f"  [{file_diff.status}]\n\n", style="dim")
+    if file_diff.binary:
+        text.append("Binary file — no textual diff available.\n", style="italic dim")
+        return text
+    if not file_diff.hunks:
+        text.append("No line-level changes (mode or pure rename).\n", style="dim")
+        return text
+    for hunk in file_diff.hunks:
+        text.append(f"{hunk.header}\n", style="bold cyan")
+        for line in hunk.lines:
+            if line.kind == "add":
+                text.append(f"{line.text}\n", style="green")
+            elif line.kind == "del":
+                text.append(f"{line.text}\n", style="red")
+            elif line.kind == "meta":
+                text.append(f"{line.text}\n", style="dim italic")
+            else:
+                text.append(f"{line.text}\n")
+    return text
+
+
 def _discover_policy_pack(start_path: str = ".") -> str | None:
     try:
         from .cli import discover_policy_pack
     except ImportError:
         from cli import discover_policy_pack
     return discover_policy_pack(start_path)
+
+
+def _current_username() -> str:
+    """Best-effort local username for approval attribution."""
+    import getpass
+
+    try:
+        return getpass.getuser()
+    except Exception:
+        return os.environ.get("USER") or "local"
 
 
 class NewTaskScreen(ModalScreen):
@@ -308,6 +355,139 @@ class ProposalsScreen(Screen):
             self.notify(f"Rejected {decision['id']}")
         self.action_reload()
         self._show_detail()
+
+
+class DiffReviewScreen(Screen):
+    """Review a task's build diff file-by-file.
+
+    Approve/reject decisions are recorded onto the task's phase history via
+    `review_data.record_review_decision` so a rejected file's path (and the
+    fact that it was rejected) is visible to the Review phase the next time
+    the task resumes — see `find_diff_review` in `src/phases/review.py`.
+    File-level granularity only: the diff parser tracks hunks, but deciding
+    per-hunk from the TUI is left for a follow-up rather than bloating this
+    screen — see docs/IMPLEMENTATION-PLAN.md item 3.2.
+    """
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+        Binding("q", "app.pop_screen", "Back"),
+        Binding("a", "approve_file", "Approve file"),
+        Binding("x", "reject_file", "Reject file"),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("down", "cursor_down", "Down", show=False),
+        Binding("up", "cursor_up", "Up", show=False),
+    ]
+
+    def __init__(self, persistence, task_id: str, workspace: str) -> None:
+        super().__init__()
+        self.persistence = persistence
+        self.task_id = task_id
+        self.workspace = workspace
+        self.files: list["review_data.FileDiff"] = []
+        self.decisions: dict[str, str] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal():
+            yield DataTable(id="diff-files")
+            with VerticalScroll(id="diff-pane-container"):
+                yield Static("Loading diff…", id="diff-pane")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#diff-files", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("File", "Status", "Decision")
+        self._load()
+
+    def _load(self) -> None:
+        task = self.persistence.load_task(self.task_id)
+        if task is None:
+            self.notify(f"Task {self.task_id} not found.", severity="error")
+            self.files = []
+            self.decisions = {}
+        else:
+            self.files = review_data.load_task_diff(task, workspace_root=self.workspace)
+            self.decisions = _file_decisions(review_data.find_diff_review(task))
+        self._render_table()
+
+    def _render_table(self) -> None:
+        table = self.query_one("#diff-files", DataTable)
+        previous = self._selected_path()
+        table.clear()
+        for file_diff in self.files:
+            table.add_row(
+                Text(file_diff.path, style="cyan"),
+                _styled(file_diff.status, _DIFF_STATUS_STYLES),
+                _styled(self.decisions.get(file_diff.path, ""), _DECISION_STYLES),
+                key=file_diff.path,
+            )
+        if not self.files:
+            self.query_one("#diff-pane", Static).update(
+                "No diff available for this task (no recorded review diff and no"
+                " git changes found in the workspace)."
+            )
+            return
+        target = previous if previous in {f.path for f in self.files} else self.files[0].path
+        table.move_cursor(row=table.get_row_index(target))
+        self._show_diff(target)
+
+    def _selected_path(self) -> str | None:
+        table = self.query_one("#diff-files", DataTable)
+        if table.row_count == 0:
+            return None
+        row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
+        return row_key.value if row_key is not None else None
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "diff-files" or event.row_key is None:
+            return
+        self._show_diff(event.row_key.value)
+
+    def _show_diff(self, path: str | None) -> None:
+        pane = self.query_one("#diff-pane", Static)
+        file_diff = next((f for f in self.files if f.path == path), None)
+        if file_diff is None:
+            pane.update("")
+            return
+        pane.update(_render_file_diff(file_diff))
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#diff-files", DataTable).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#diff-files", DataTable).action_cursor_up()
+
+    def action_approve_file(self) -> None:
+        self._decide("approved")
+
+    def action_reject_file(self) -> None:
+        self._decide("rejected")
+
+    def _decide(self, decision: str) -> None:
+        path = self._selected_path()
+        if path is None:
+            self.notify("No file selected.", severity="warning")
+            return
+        try:
+            review_data.record_review_decision(self.persistence, self.task_id, path, decision)
+        except ValueError as exc:
+            self.notify(f"Could not record decision: {exc}", severity="error")
+            return
+        self.decisions[path] = decision
+        self._render_table()
+        self.notify(f"{decision.capitalize()}: {path}")
+
+
+def _file_decisions(diff_review: dict) -> dict[str, str]:
+    """Latest file-level (`hunk_index is None`) decision per path, in write order."""
+    decisions: dict[str, str] = {}
+    for entry in diff_review.get("decisions", []) if isinstance(diff_review, dict) else []:
+        if isinstance(entry, dict) and entry.get("hunk_index") is None and entry.get("path"):
+            decisions[entry["path"]] = entry.get("decision", "")
+    return decisions
 
 
 class ChatScreen(Screen):
@@ -576,8 +756,10 @@ class TasksScreen(Screen):
         Binding("n", "new_task", "New task"),
         Binding("p", "proposals", "Proposals"),
         Binding("u", "resume", "Resume task"),
+        Binding("a", "approve", "Approve task"),
         Binding("i", "init_workspace", "Init pack"),
         Binding("c", "cancel_run", "Cancel run"),
+        Binding("d", "diff_review", "Diff review"),
     ]
 
     def __init__(self) -> None:
@@ -663,6 +845,15 @@ class TasksScreen(Screen):
     def action_proposals(self) -> None:
         self.app.push_screen(ProposalsScreen(self.app.persistence))
 
+    def action_diff_review(self) -> None:
+        task_id = self.selected_task_id
+        if task_id is None:
+            self.notify("No task selected.", severity="warning")
+            return
+        self.app.push_screen(
+            DiffReviewScreen(self.app.persistence, task_id, self.app.workspace)
+        )
+
     def action_new_task(self) -> None:
         def on_result(description: str | None) -> None:
             if description:
@@ -714,7 +905,59 @@ class TasksScreen(Screen):
             self.app.call_from_thread(self.app.post_chat_event, message)
             return
         phase = result.current_phase.value if result.current_phase else "Completed"
-        message = f"Resumed {task_id}: now at {phase}"
+        stop_reason = getattr(result, "stop_reason", None)
+        if stop_reason == "approval_required":
+            message = f"{task_id} is paused at {phase} pending approval — press `a` to approve."
+            self.app.call_from_thread(self.notify, message, severity="warning")
+        elif stop_reason == "rejected":
+            message = f"{task_id} was rejected at {phase} and stays paused."
+            self.app.call_from_thread(self.notify, message, severity="warning")
+        else:
+            message = f"Resumed {task_id}: now at {phase}"
+            self.app.call_from_thread(self.notify, message)
+        self.app.call_from_thread(self.app.post_chat_event, message)
+        self.app.call_from_thread(self.refresh_data)
+
+    def action_approve(self) -> None:
+        task_id = self.selected_task_id
+        if task_id is None:
+            self.notify("No task selected.", severity="warning")
+            return
+        policy_pack = _discover_policy_pack(self.app.workspace)
+        if not policy_pack:
+            self.notify(
+                "No policy pack found — run /init (or `sarathi init`) first.",
+                severity="error",
+            )
+            return
+        self.notify(f"Approving {task_id}…")
+        self.run_worker(
+            lambda: self._approve(task_id, policy_pack),
+            thread=True,
+            exclusive=True,
+            group="resume",
+        )
+
+    def _approve(self, task_id: str, policy_pack: str) -> None:
+        persistence = self.app.persistence
+        task = persistence.load_task(task_id)
+        if task is None:
+            message = f"Approve failed: task {task_id} not found."
+            self.app.call_from_thread(self.notify, message, severity="error")
+            return
+
+        engine = Engine(policy_pack_path=policy_pack, enforce_preflight=True)
+        engine.persistence = persistence
+        try:
+            task = engine.record_approval(task, approved_by=_current_username())
+        except ValueError as exc:
+            message = f"Approve failed: {exc}"
+            self.app.call_from_thread(self.notify, message, severity="error")
+            return
+
+        result = engine.resume_task(task, task_timeout=DEFAULT_TASK_TIMEOUT)
+        phase = result.current_phase.value if result.current_phase else "Completed"
+        message = f"Approved {task_id}: resumed, now at {phase}"
         self.app.call_from_thread(self.notify, message)
         self.app.call_from_thread(self.app.post_chat_event, message)
         self.app.call_from_thread(self.refresh_data)
@@ -810,6 +1053,19 @@ class SarathiApp(App):
         padding: 1;
         height: 1fr;
         overflow-y: auto;
+    }
+    #diff-files {
+        width: 36%;
+        border-right: solid $primary;
+    }
+    #diff-pane-container {
+        width: 1fr;
+        height: 1fr;
+    }
+    #diff-pane {
+        padding: 0 1;
+        height: auto;
+        width: auto;
     }
     NewTaskScreen {
         align: center middle;
@@ -908,7 +1164,7 @@ class SarathiApp(App):
             )
             return False
         policy_pack = _discover_policy_pack(self.workspace)
-        if not policy_pack:
+        if not policy_pack and not tui_data.can_start_task_via_service(self.workspace):
             self.notify(
                 "No policy pack found — run /init (or `sarathi init`) first.",
                 severity="error",
@@ -924,17 +1180,18 @@ class SarathiApp(App):
         )
         return True
 
-    def _start(self, description: str, policy_pack: str, context: str | None = None) -> None:
+    def _start(self, description: str, policy_pack: str | None, context: str | None = None) -> None:
         cancel_event = self._run_cancel
         try:
             try:
                 result = tui_data.start_task(
                     self.persistence,
                     description,
-                    policy_pack,
+                    policy_pack or "",
                     context=context,
                     cancel_check=cancel_event.is_set if cancel_event is not None else None,
                     task_timeout=DEFAULT_TASK_TIMEOUT,
+                    workspace=self.workspace,
                 )
             except Exception as exc:
                 self.call_from_thread(self.notify, f"Task failed: {exc}", severity="error")

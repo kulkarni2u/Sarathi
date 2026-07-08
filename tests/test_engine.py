@@ -298,6 +298,133 @@ graph_execution:
     assert result.task_graph_state["ready_nodes"] == []
 
 
+def _write_waiting_human_policy_pack(policy_dir: Path) -> None:
+    policy_dir.mkdir(parents=True, exist_ok=True)
+    for filename, content in {
+        "complexity.md": "classification_thresholds: present\nskip_rules: present\n",
+        "conventions.md": "conventions: present\nbrainstorming_protocol: present\n",
+        "commands.md": "```yaml\ntest:\n  command: \"echo test\"\n```\n",
+        "review.md": "max_rounds: 5\nmin_coverage: 80\n",
+        "escalation.md": "auto_fix: configured\nreview: configured\n",
+        "skills.md": "pattern_detection: enabled\nevolution_threshold: 0.8\n",
+        "task-tracking.md": """```yaml
+task: configured
+options: configured
+graph_execution:
+  step_limit: 1
+  max_retries: 1
+  require_human_after_retries: true
+```
+""",
+    }.items():
+        (policy_dir / filename).write_text(content)
+
+
+def _run_to_waiting_human_pause(tmp_path: Path, monkeypatch, task_id: str):
+    """Drive a task to an approval-flavored (waiting_human) BUILD pause."""
+    policy_dir = tmp_path / "policy-pack"
+    _write_waiting_human_policy_pack(policy_dir)
+    monkeypatch.setenv("SARATHI_GRAPH_FAIL_NODE", "step-1")
+    task = TaskContext(task_id=task_id, description="Fix bug", complexity=Complexity.LOW)
+    engine = Engine(policy_pack_path=str(policy_dir))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
+
+    result = engine.run_task(task)
+    assert result.current_phase == Phase.BUILD
+    assert result.phase_results[-1].evidence["human_attention_required"] is True
+    assert result.phase_results[-1].artifacts["pause_execution"] is True
+
+    # Remove the forced failure so a subsequent resume (once ungated) can
+    # actually make forward progress instead of failing the same way again.
+    monkeypatch.delenv("SARATHI_GRAPH_FAIL_NODE")
+    return engine, result
+
+
+def test_engine_blocks_bare_resume_on_approval_flavored_pause(tmp_path: Path, monkeypatch):
+    engine, result = _run_to_waiting_human_pause(tmp_path, monkeypatch, "approval-gate-block")
+    phase_count_before = len(result.phase_results)
+
+    blocked = engine.resume_task(result)
+
+    assert blocked.stop_reason == "approval_required"
+    assert blocked.current_phase == Phase.BUILD
+    assert len(blocked.phase_results) == phase_count_before
+
+
+def test_engine_approval_unblocks_resume(tmp_path: Path, monkeypatch):
+    engine, result = _run_to_waiting_human_pause(tmp_path, monkeypatch, "approval-gate-unblock")
+    phase_count_before = len(result.phase_results)
+
+    approved = engine.record_approval(result, approved_by="alice", note="looks safe")
+    assert approved.phase_results[-1].artifacts["approval"]["approved_by"] == "alice"
+    assert approved.phase_results[-1].artifacts["approval"]["approved"] is True
+    assert approved.phase_results[-1].artifacts["approval"]["note"] == "looks safe"
+    assert approved.stop_reason is None
+
+    resumed = engine.resume_task(approved)
+
+    assert resumed.stop_reason != "approval_required"
+    assert len(resumed.phase_results) > phase_count_before
+
+
+def test_engine_rejection_stops_task_and_keeps_blocking_resume(tmp_path: Path, monkeypatch):
+    engine, result = _run_to_waiting_human_pause(tmp_path, monkeypatch, "approval-gate-reject")
+    phase_count_before = len(result.phase_results)
+
+    rejected = engine.record_approval(result, approved_by="alice", approve=False, note="not safe")
+    assert rejected.phase_results[-1].artifacts["approval"]["approved"] is False
+    assert rejected.stop_reason == "rejected"
+
+    resumed = engine.resume_task(rejected)
+
+    assert resumed.stop_reason == "rejected"
+    assert len(resumed.phase_results) == phase_count_before
+
+
+def test_engine_record_approval_rejects_non_approval_pause(tmp_path: Path, monkeypatch):
+    # Reuse the ordinary (non-approval) incomplete-graph pause: it must not
+    # be approvable, since it was never gated in the first place.
+    policy_dir = tmp_path / "policy-pack"
+    policy_dir.mkdir()
+    for filename, content in {
+        "complexity.md": "classification_thresholds: present\nskip_rules: present\n",
+        "conventions.md": "conventions: present\nbrainstorming_protocol: present\n",
+        "commands.md": "```yaml\ntest:\n  command: \"echo test\"\n```\n",
+        "review.md": "max_rounds: 5\nmin_coverage: 80\n",
+        "escalation.md": "auto_fix: configured\nreview: configured\n",
+        "skills.md": "pattern_detection: enabled\nevolution_threshold: 0.8\n",
+        "task-tracking.md": "task: configured\noptions: configured\n",
+    }.items():
+        (policy_dir / filename).write_text(content)
+
+    monkeypatch.setenv("SARATHI_GRAPH_STEP_LIMIT", "1")
+    task = TaskContext(task_id="graph-ordinary-pause", description="Fix bug", complexity=Complexity.LOW)
+    engine = Engine(policy_pack_path=str(policy_dir))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
+
+    result = engine.run_task(task)
+    assert result.current_phase == Phase.BUILD
+    assert "human_attention_required" not in result.phase_results[-1].evidence
+    phase_count_before = len(result.phase_results)
+
+    with pytest.raises(ValueError):
+        engine.record_approval(result, approved_by="alice")
+
+    # Ordinary pauses stay fully resumable without any approval artifact.
+    resumed = engine.resume_task(result)
+    assert resumed.stop_reason != "approval_required"
+    assert len(resumed.phase_results) > phase_count_before
+
+
+def test_engine_record_approval_requires_phase_history(tmp_path: Path):
+    engine = Engine(policy_pack_path=str(tmp_path / "policy-pack"))
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
+    task = TaskContext(task_id="graph-no-history", description="Fix bug", complexity=Complexity.LOW)
+
+    with pytest.raises(ValueError):
+        engine.record_approval(task, approved_by="alice")
+
+
 def test_engine_executes_bounded_verify_recovery_loop(tmp_path: Path, monkeypatch):
     policy_dir = tmp_path / "policy-pack"
     policy_dir.mkdir()

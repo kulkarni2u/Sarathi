@@ -21,10 +21,79 @@ from typing import Any, Callable
 try:
     from .engine import Engine, PersistenceManager, TaskContext
     from .evolve import Evolver, PolicyProposal, ProposalReviewStore
+    from .runtime.providers.registry import specs_by_fallback_priority
 except ImportError:
     # Support direct execution via sarathi.py, which prepends src/ to sys.path.
     from engine import Engine, PersistenceManager, TaskContext
     from evolve import Evolver, PolicyProposal, ProposalReviewStore
+    from runtime.providers.registry import specs_by_fallback_priority
+
+
+class _DynamicChatProviders:
+    """Descriptor recomputing the ordered TUI-chat-capable provider tuple
+    from the native provider registry on each access (class or instance),
+    instead of a tuple frozen at import time — so a provider registered
+    after this module first loaded (e.g. a test adding a fifth provider)
+    still appears. See `NativeProviderSpec.tui_chat_support`/`fallback_priority`."""
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> tuple[str, ...]:
+        return tuple(
+            spec.name for spec in specs_by_fallback_priority() if spec.tui_chat_support
+        )
+
+
+class _DynamicStreamingHandlers:
+    """Descriptor recomputing the provider-name -> streaming-method-name table
+    from the registry on each access. See `NativeProviderSpec.tui_streaming_handler`."""
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> dict[str, str]:
+        return {
+            spec.name: spec.tui_streaming_handler
+            for spec in specs_by_fallback_priority()
+            if spec.tui_chat_support and spec.tui_streaming_handler is not None
+        }
+
+
+def _try_service_client():
+    """Return a service client if the local service is reachable, else None."""
+    try:
+        from .service_client import ServiceClient
+
+        client = ServiceClient()
+        if client.available:
+            client.list_workspaces()  # verify reachability
+            return client
+    except Exception:
+        pass
+    return None
+
+
+def can_start_task_via_service(workspace: str | None = None) -> bool:
+    """True if the local service is reachable and a workspace can be selected
+    for service draft creation."""
+    client = _try_service_client()
+    if client is None:
+        return False
+    ws = client.select_workspace(cwd=workspace or os.getcwd())
+    return ws is not None
+
+
+class _ServiceTaskPhase:
+    """Lightweight phase-like object exposing a ``.value`` attribute so
+    existing TUI ``current_phase.value`` access works without None."""
+
+    def __init__(self, value: str):
+        self.value = value
+
+
+class _ServiceTaskResult:
+    """Lightweight object compatible with ``TaskContext`` for service-created
+    tasks returned by ``start_task`` when running via the service."""
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        self.current_phase = _ServiceTaskPhase("prd_pending")
+        self.stop_reason = "approval_required/service_draft"
 
 
 def default_persistence(storage_path: str | None = None) -> PersistenceManager:
@@ -39,12 +108,35 @@ def _cli():
     return cli
 
 
-def task_summaries(persistence: PersistenceManager) -> list[dict[str, Any]]:
-    """List persisted tasks, newest first, reading the raw JSON files.
+def _service_task_summary(task: dict[str, Any]) -> dict[str, Any]:
+    metadata = task.get("metadata") or {}
+    return {
+        "task_id": task.get("id", ""),
+        "description": task.get("title") or task.get("description", ""),
+        "complexity": metadata.get("complexity", ""),
+        "current_phase": task.get("status", "prd_pending"),
+        "phases": 0,
+        "last_phase": "",
+        "last_outcome": "",
+        "last_updated": task.get("updated_at") or task.get("created_at", ""),
+    }
 
-    Reads the files directly instead of `load_task` so the list view stays
-    cheap and tolerant of records written by newer/older engine versions.
-    """
+
+def task_summaries(persistence: PersistenceManager) -> list[dict[str, Any]]:
+    """List tasks — from the local service when reachable, else JSON files."""
+    client = _try_service_client()
+    if client is not None:
+        ws = client.select_workspace(cwd=os.getcwd())
+        if ws is not None:
+            try:
+                tasks = client.list_tasks(ws["id"])
+            except RuntimeError:
+                pass
+            else:
+                summaries = [_service_task_summary(t) for t in tasks]
+                summaries.sort(key=lambda item: item["last_updated"], reverse=True)
+                return summaries
+
     summaries: list[dict[str, Any]] = []
     for task_id in persistence.list_tasks():
         path = persistence.storage_path / f"{task_id}.json"
@@ -73,7 +165,26 @@ def task_summaries(persistence: PersistenceManager) -> list[dict[str, Any]]:
 
 
 def status_snapshot(persistence: PersistenceManager, task_id: str) -> str | None:
-    """Compact supervision snapshot, identical to `sarathi status <task_id>`."""
+    """Compact supervision snapshot — from the service when available, else local."""
+    client = _try_service_client()
+    if client is not None:
+        task = client.get_task(task_id)
+        if task is not None:
+            title = task.get("title") or task.get("description", "")
+            status = task.get("status", "")
+            metadata = task.get("metadata") or {}
+            created = str(task.get("created_at", ""))[:19].replace("T", " ")
+            updated = str(task.get("updated_at", ""))[:19].replace("T", " ")
+            lines = [
+                f"Task: {task_id}",
+                f"Description: {title}",
+                f"Complexity: {metadata.get('complexity', '-')}",
+                f"Status: {status}",
+                f"Created: {created}",
+                f"Updated: {updated}",
+            ]
+            return "\n".join(lines)
+
     task = persistence.load_task(task_id)
     if task is None:
         return None
@@ -84,7 +195,13 @@ def status_snapshot(persistence: PersistenceManager, task_id: str) -> str | None
 
 
 def phase_rows(persistence: PersistenceManager, task_id: str) -> list[dict[str, Any]]:
-    """Per-phase result rows for a persisted task."""
+    """Per-phase result rows — from the service when available, else local."""
+    client = _try_service_client()
+    if client is not None:
+        task = client.get_task(task_id)
+        if task is not None:
+            return []  # service tasks have engine phases only after graph execution
+
     task = persistence.load_task(task_id)
     if task is None:
         return []
@@ -104,7 +221,26 @@ def phase_rows(persistence: PersistenceManager, task_id: str) -> list[dict[str, 
 def phase_log_tail(
     persistence: PersistenceManager, task_id: str, max_lines: int = 200
 ) -> list[str]:
-    """Tail of the phase transition log written by the engine."""
+    """Tail of the phase transition log — from service events when available,
+    else from the engine log file."""
+    client = _try_service_client()
+    if client is not None:
+        task = client.get_task(task_id)
+        if task is not None:
+            events = client.get_events(task_id)
+            lines = []
+            for ev in events[-max_lines:]:
+                lines.append(
+                    json.dumps(
+                        {
+                            "timestamp": ev.get("created_at", ""),
+                            "task_id": task_id,
+                            "event_type": ev.get("event_type", ""),
+                        }
+                    )
+                )
+            return lines
+
     log_file = persistence.storage_path / f"{task_id}_phases.log"
     if not log_file.exists():
         return []
@@ -168,20 +304,42 @@ def start_task(
     context: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
     task_timeout: float | None = None,
+    workspace: str | None = None,
 ) -> TaskContext:
-    """Create a new task from a description and run it through the lifecycle.
+    """Create a new task — via the service when reachable, otherwise via the
+    engine lifecycle.
 
-    Mirrors `sarathi run` with auto-detected complexity; raises RuntimeError
-    when preflight validation blocks execution.
+    When the local service is reachable and a workspace can be selected,
+    creates a service task draft (PRD/AC shell) and returns a lightweight
+    result object (``_ServiceTaskResult``) with ``task_id`` and
+    ``current_phase = None``.  The TUI treats this as "completed" from the
+    engine perspective; the actual task awaits PRD/AC approval on the
+    service.
 
-    When `context` is given (and non-empty), it is appended to the task
-    description as recent chat context, but `task_id` and `complexity` are
-    still derived from the bare `description` so the transcript doesn't
-    pollute task identity.
+    ``workspace`` is passed to ``ServiceClient.select_workspace`` as the
+    ``cwd`` for matching against service workspace root paths.  Defaults to
+    ``os.getcwd()`` when omitted.
 
-    `cancel_check` and `task_timeout` are forwarded to `Engine.run_task` for
-    cooperative cancellation and a wall-clock cap (see `task.stop_reason`).
+    In all other cases, delegates to the engine (same as ``sarathi run``).
     """
+    client = _try_service_client()
+    if client is not None:
+        ws = client.select_workspace(cwd=workspace or os.getcwd())
+        if ws is not None:
+            ws_id = ws.get("id")
+            if isinstance(ws_id, str) and ws_id:
+                prompt = description
+                if context:
+                    prompt = f"{description}\n\nContext from chat conversation:\n{context}"
+                try:
+                    result = client.create_task_draft(ws_id, prompt)
+                    task = result.get("task") or {}
+                    task_id = task.get("id", "")
+                    if task_id:
+                        return _ServiceTaskResult(task_id=task_id)
+                except RuntimeError:
+                    pass  # fall through to engine
+
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         engine = Engine(policy_pack_path=str(policy_pack), enforce_preflight=True)
         engine.persistence = persistence
@@ -217,6 +375,85 @@ def is_error_reply(reply: str) -> bool:
     return bool(_ERROR_REPLY_RE.match(reply))
 
 
+_SESSION_ID_KEYS = (
+    "session_id", "sessionId",
+    "thread_id", "threadId",
+    "conversation_id", "conversationId",
+)
+
+_SESSION_ID_LINE_RE = re.compile(
+    r"(?i)\b(?:session|thread|conversation)[ _-]?id\b\s*[:=]\s*\"?([A-Za-z0-9][A-Za-z0-9._-]{5,})\"?"
+)
+
+
+def _codex_event_payloads(event: dict) -> list[dict]:
+    """Candidate dicts to scan for assistant text within one decoded codex
+    `--json` line.
+
+    Codex's JSONL event shape isn't stable across CLI versions — some wrap
+    the real event under a `msg` key, others emit `item`/`message` objects
+    at the top level — so this scans all of them rather than committing to
+    one schema, per the "be liberal about unknown shapes" contract.
+    """
+    payloads = [event]
+    for key in ("msg", "item", "message"):
+        nested = event.get(key)
+        if isinstance(nested, dict):
+            payloads.append(nested)
+    return payloads
+
+
+def _codex_text_from_payload(payload: dict) -> tuple[str, bool] | None:
+    """Pull `(text, is_delta)` out of one candidate payload, or None.
+
+    `is_delta` is True when the text came from a `delta` key, or the
+    payload's `type` mentions "delta" — an incremental chunk to append.
+    Otherwise the text is a full/completed message, used to seed the reply
+    only if no delta has arrived yet (mirrors how the claude streaming path
+    ignores a redelivered full message once deltas already built the text).
+    """
+    type_str = str(payload.get("type") or "").lower()
+    for key in ("delta", "text", "content"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value, (key == "delta" or "delta" in type_str)
+    return None
+
+
+def _extract_session_id(*chunks: str | None) -> str | None:
+    """Best-effort extraction of a resumable session id from codex/opencode output.
+
+    Neither CLI is guaranteed to emit a machine-readable session id in any
+    one shape, so this is telemetry rather than a hard requirement: any
+    parse failure or absence of an id-looking value returns None instead of
+    raising, so a chat turn never fails because session capture failed.
+    """
+    for chunk in chunks:
+        if not chunk or not chunk.strip():
+            continue
+        try:
+            for line in chunk.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    for key in _SESSION_ID_KEYS:
+                        value = parsed.get(key)
+                        if isinstance(value, str) and value.strip():
+                            return value.strip()
+                    continue
+                match = _SESSION_ID_LINE_RE.search(line)
+                if match:
+                    return match.group(1)
+        except Exception:  # noqa: BLE001 — telemetry only, never fail a chat turn
+            continue
+    return None
+
+
 class ChatSession:
     """Multi-turn chat backed by an agent CLI on PATH.
 
@@ -226,29 +463,51 @@ class ChatSession:
     for lifecycle dispatches.
     """
 
-    PROVIDERS = ("claude", "opencode", "codex")
+    # Both are registry-backed descriptors (see _DynamicChatProviders /
+    # _DynamicStreamingHandlers above) rather than frozen literals, so a
+    # provider registered via `registry.register_spec` shows up here too.
+    # Order matches each spec's `fallback_priority` (today: claude, codex,
+    # opencode); providers absent from `_STREAMING_HANDLERS` (or with no CLI
+    # on PATH) fall back to the blocking `send` in `send_streaming` below.
+    PROVIDERS = _DynamicChatProviders()
     HISTORY_TURNS = 6
+
+    _STREAMING_HANDLERS = _DynamicStreamingHandlers()
 
     def __init__(self, workspace_root: str | None = None, timeout: int = 180):
         self.workspace_root = workspace_root or os.getcwd()
         self.timeout = timeout
         self.provider: tuple[str, str] | None = None
-        self.claude_session_id: str | None = None
+        # Per-provider resumable session ids (e.g. {"claude": "sess-1"}).
+        # `claude_session_id` below is a compatibility view onto this dict —
+        # other code and tests still read/write it as a plain attribute.
+        self.session_ids: dict[str, str] = {}
         self.history: list[tuple[str, str]] = []
         self.pending_context: list[str] = []
         self.cancelled = False
         self._active_proc: subprocess.Popen | None = None
         self._proc_lock = threading.Lock()
 
+    @property
+    def claude_session_id(self) -> str | None:
+        return self.session_ids.get("claude")
+
+    @claude_session_id.setter
+    def claude_session_id(self, value: str | None) -> None:
+        if value:
+            self.session_ids["claude"] = value
+        else:
+            self.session_ids.pop("claude", None)
+
     def clear(self) -> None:
-        """Forget the conversation: history, pending context, and CLI session."""
+        """Forget the conversation: history, pending context, and CLI session(s)."""
         self.history = []
         self.pending_context = []
-        self.claude_session_id = None
+        self.session_ids = {}
 
     def reset_session(self) -> None:
-        """Drop the resumable claude session, keeping history and pending context."""
-        self.claude_session_id = None
+        """Drop the resumable provider session(s), keeping history and pending context."""
+        self.session_ids = {}
 
     def cancel(self) -> bool:
         """Kill the in-flight CLI subprocess, if any.
@@ -309,7 +568,7 @@ class ChatSession:
         if not path:
             return False
         self.provider = (name, path)
-        self.claude_session_id = None
+        self.session_ids = {}
         return True
 
     def send(self, message: str) -> str:
@@ -336,25 +595,256 @@ class ChatSession:
     ) -> str:
         """Send `message`, optionally streaming partial replies via `on_text`.
 
-        For `claude`, reads `stream-json` events from the CLI and invokes
-        `on_text` with the growing accumulated text as assistant message
-        chunks arrive. For other providers (or when no provider is
+        Each provider with a streaming implementation (`claude`, `codex`,
+        `opencode` — see `_STREAMING_HANDLERS`) reads its CLI's incremental
+        output and invokes `on_text` with the growing accumulated text as
+        chunks arrive. For providers without one (or when no provider is
         available), falls back to the blocking `send` and calls `on_text`
         once with the full reply.
         """
         self.cancelled = False
         provider = self.resolve_provider()
-        if provider is None or provider[0] != "claude":
+        if provider is None:
+            reply = self.send(message)
+            if on_text is not None and reply:
+                on_text(reply)
+            return reply
+        name, path = provider
+        handler_name = self._STREAMING_HANDLERS.get(name)
+        if handler_name is None:
             reply = self.send(message)
             if on_text is not None and reply:
                 on_text(reply)
             return reply
         resolved = self._consume_context(message)
-        name, path = provider
         try:
-            return self._send_claude_streaming(path, message, resolved, on_text)
+            return getattr(self, handler_name)(path, message, resolved, on_text)
         except OSError as exc:
             return f"Could not start {name}: {exc}"
+
+    def _run_streaming_subprocess(
+        self,
+        command: list[str],
+        stdin_text: str,
+        on_stdout_line: Callable[[str], None],
+    ) -> tuple[str, bool, int | None]:
+        """Spawn `command`, feed `stdin_text` on stdin, and call
+        `on_stdout_line` for each non-empty stdout line as it arrives.
+
+        Shares the reader-thread/queue/deadline plumbing the `claude`
+        streaming path pioneered (see `_send_claude_streaming`) so `codex`
+        and `opencode` streaming get the same non-blocking incremental
+        reads, cooperative cancellation via `cancel()`, and timeout
+        handling without duplicating that logic per provider. Always kills
+        and reaps the process before returning. Returns
+        `(stderr_text, timed_out, returncode)`.
+        """
+        deadline = time.monotonic() + self.timeout
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=self.workspace_root,
+        )
+        with self._proc_lock:
+            self._active_proc = proc
+
+        if proc.stdin is not None:
+            try:
+                proc.stdin.write(stdin_text)
+            except (BrokenPipeError, OSError):
+                pass
+            try:
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+        line_queue: queue.Queue[str | None] = queue.Queue()
+        stderr_chunks: list[str] = []
+
+        def _read_stdout() -> None:
+            try:
+                if proc.stdout is not None:
+                    for raw_line in proc.stdout:
+                        line_queue.put(raw_line)
+            finally:
+                line_queue.put(None)
+
+        def _read_stderr() -> None:
+            try:
+                if proc.stderr is not None:
+                    for raw_line in proc.stderr:
+                        stderr_chunks.append(raw_line)
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+        stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        timed_out = False
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    line = line_queue.get(timeout=min(remaining, 0.5))
+                except queue.Empty:
+                    continue
+                if line is None:  # EOF sentinel
+                    break
+                stripped = line.strip()
+                if stripped:
+                    on_stdout_line(stripped)
+
+            if not timed_out:
+                remaining = deadline - time.monotonic()
+                try:
+                    proc.wait(timeout=max(remaining, 0))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            stderr_thread.join(timeout=1)
+            with self._proc_lock:
+                self._active_proc = None
+
+        return "".join(stderr_chunks), timed_out, proc.returncode
+
+    def _send_codex_streaming(
+        self,
+        path: str,
+        original_message: str,
+        message: str,
+        on_text: Callable[[str], None] | None,
+    ) -> str:
+        """Stream `codex exec --json`, parsing JSONL events incrementally.
+
+        Malformed or unrecognized lines/events are skipped silently (never
+        raise) — codex's JSONL shape isn't guaranteed, so this is
+        best-effort text extraction, not a strict schema. See
+        `_codex_event_payloads`/`_codex_text_from_payload`.
+        """
+        session_id = self.session_ids.get("codex")
+        if session_id:
+            command = [path, "exec", "resume", session_id, "--json", message]
+        else:
+            command = [path, "exec", "--json", self._prompt_with_history(message)]
+
+        accumulated = ""
+        saw_delta = False
+        raw_lines: list[str] = []
+
+        def _on_line(line: str) -> None:
+            nonlocal accumulated, saw_delta
+            raw_lines.append(line)
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                return  # malformed JSONL line: skip silently
+            if not isinstance(event, dict):
+                return
+            for payload in _codex_event_payloads(event):
+                found = _codex_text_from_payload(payload)
+                if found is None:
+                    continue
+                text, is_delta = found
+                if is_delta:
+                    accumulated += text
+                    saw_delta = True
+                elif not saw_delta:
+                    accumulated += text
+                else:
+                    continue  # a redelivered full message once deltas exist
+                if on_text is not None:
+                    on_text(accumulated)
+                break
+
+        stderr_text, timed_out, returncode = self._run_streaming_subprocess(
+            command, "", _on_line
+        )
+
+        if self.cancelled:
+            return "(cancelled)"
+        if timed_out:
+            return f"codex timed out after {self.timeout}s."
+
+        found_session_id = _extract_session_id(*raw_lines, stderr_text)
+        if found_session_id:
+            self.session_ids["codex"] = found_session_id
+
+        reply = accumulated.strip()
+        if returncode not in (0, None):
+            if reply:
+                self.history.append((original_message, reply))
+                return reply
+            detail = stderr_text.strip()[:400]
+            return f"codex exited with {returncode}: {detail}"
+
+        if reply:
+            self.history.append((original_message, reply))
+            return reply
+        return "(empty response)"
+
+    def _send_opencode_streaming(
+        self,
+        path: str,
+        original_message: str,
+        message: str,
+        on_text: Callable[[str], None] | None,
+    ) -> str:
+        """Stream `opencode run`, forwarding stdout lines as they arrive.
+
+        OpenCode has no partial-message JSON protocol like claude/codex; it
+        just prints progressively, so each stdout line is appended to the
+        growing reply as soon as it's read.
+        """
+        session_id = self.session_ids.get("opencode")
+        if session_id:
+            command = [path, "run", "--session", session_id, "--", message]
+        else:
+            command = [path, "run", "--", self._prompt_with_history(message)]
+
+        accumulated = ""
+
+        def _on_line(line: str) -> None:
+            nonlocal accumulated
+            accumulated = f"{accumulated}\n{line}" if accumulated else line
+            if on_text is not None:
+                on_text(accumulated)
+
+        stderr_text, timed_out, returncode = self._run_streaming_subprocess(
+            command, "", _on_line
+        )
+
+        if self.cancelled:
+            return "(cancelled)"
+        if timed_out:
+            return f"opencode timed out after {self.timeout}s."
+
+        found_session_id = _extract_session_id(accumulated, stderr_text)
+        if found_session_id:
+            self.session_ids["opencode"] = found_session_id
+
+        reply = accumulated.strip()
+        if returncode not in (0, None):
+            if reply:
+                self.history.append((original_message, reply))
+                return reply
+            detail = stderr_text.strip()[:400]
+            return f"opencode exited with {returncode}: {detail}"
+
+        if reply:
+            self.history.append((original_message, reply))
+            return reply
+        return "(empty response)"
 
     def _send_claude_streaming(
         self,
@@ -571,8 +1061,16 @@ class ChatSession:
         return (completed.stdout or "").strip() or "(empty response)"
 
     def _send_one_shot(self, name: str, path: str, message: str) -> str:
+        session_id = self.session_ids.get(name)
         if name == "opencode":
-            command = [path, "run", "--", self._prompt_with_history(message)]
+            if session_id:
+                # Resuming: the CLI already has the prior turns, so send the
+                # raw message rather than re-folding history into the prompt.
+                command = [path, "run", "--session", session_id, "--", message]
+            else:
+                command = [path, "run", "--", self._prompt_with_history(message)]
+        elif session_id:
+            command = [path, "exec", "resume", session_id, message]
         else:
             command = [path, "exec", self._prompt_with_history(message)]
         completed = subprocess.run(
@@ -582,6 +1080,9 @@ class ChatSession:
             timeout=self.timeout,
             cwd=self.workspace_root,
         )
+        found_session_id = _extract_session_id(completed.stdout, completed.stderr)
+        if found_session_id:
+            self.session_ids[name] = found_session_id
         if completed.returncode != 0:
             detail = (completed.stderr or "").strip()[:400]
             return f"{name} exited with {completed.returncode}: {detail}"

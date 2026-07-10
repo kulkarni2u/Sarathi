@@ -507,6 +507,43 @@ their `lifecycle_events` stream using environment-only configuration
 (`SARATHI_SLACK_EVENTS` narrows the event list, comma-separated). See
 `policy-pack/EXAMPLE/notifications.md` for the full reference.
 
+### Slack commands (inbound)
+
+The local service also accepts inbound Slack slash commands, completing the
+loop with the outbound notifications above: `/sarathi run <description>`
+drafts a PRD/AC-gated task, and `/sarathi status <task-id>` reports a
+task's current state. Because a draft's `task.draft_created` /
+`approval.requested` lifecycle events are the same ones every other intake
+path emits, an outbound Slack notification fires automatically for the new
+draft when the events above are configured.
+
+Setup:
+
+1. Create a Slack app with a slash command named `/sarathi` (or any name —
+   Slack sends whatever the user typed as the `command` field) whose
+   request URL points at your service: `https://<your-host>/slack/commands`.
+2. Copy the app's **Signing Secret** (Slack app settings → Basic
+   Information) and export it where the service runs:
+
+   ```bash
+   export SARATHI_SLACK_SIGNING_SECRET="..."
+   ```
+
+   The route is disabled (404) whenever this variable is unset — inbound
+   Slack intake is off by default. Every request is verified against
+   Slack's `X-Slack-Signature` / `X-Slack-Request-Timestamp` headers (HMAC
+   over the raw request body, replay-rejected after 5 minutes); a request
+   that fails verification gets a 401 with no side effects.
+
+Commands:
+
+- `/sarathi run <description>` — drafts a task in the workspace, if there
+  is exactly one. With multiple workspaces, name one explicitly:
+  `/sarathi run in <workspace-name-or-id>: <description>`.
+- `/sarathi status <task-id>` — replies with the task's title, status,
+  workspace, and most recent lifecycle event.
+- `/sarathi help` (or no arguments) — usage text for both commands.
+
 ## Verification Commands
 
 By default, Verify does not execute shell commands and reports the phase as

@@ -72,17 +72,37 @@ def create_http_server(
                 self._handle_sse()
                 return
 
-            body, error = self._read_json_body()
-            if error is not None:
+            raw_body, length_error = self._read_raw_body()
+            if length_error is not None:
                 correlation_id = _correlation_id(self.headers)
-                self._write_json(error.status, _error(error, correlation_id))
+                self._write_json(length_error.status, _error(length_error, correlation_id))
                 return
+
+            # Slack's `/slack/commands` POST body is
+            # `application/x-www-form-urlencoded`, not JSON, and Slack's
+            # request signature is computed over the *exact raw bytes* of
+            # that body — so this one route skips JSON parsing and passes
+            # the raw body through to ServiceApp untouched. Every other
+            # route keeps parsing JSON out of the same raw bytes as before.
+            is_slack_commands = self.command == "POST" and _path_parts(self.path) in (
+                ["slack", "commands"],
+                ["api", "slack", "commands"],
+            )
+            if is_slack_commands:
+                body: dict[str, Any] | None = None
+            else:
+                body, parse_error = self._parse_json_body(raw_body)
+                if parse_error is not None:
+                    correlation_id = _correlation_id(self.headers)
+                    self._write_json(parse_error.status, _error(parse_error, correlation_id))
+                    return
 
             result = app.handle(
                 self.command,
                 self.path,
                 body=body,
                 headers=dict(self.headers.items()),
+                raw_body=raw_body if is_slack_commands else None,
             )
             if isinstance(result, RawResponse):
                 self._write_raw(result)
@@ -129,17 +149,24 @@ def create_http_server(
             self.wfile.write(encoded)
             self.wfile.flush()
 
-        def _read_json_body(self) -> tuple[dict[str, Any] | None, ServiceError | None]:
+        def _read_raw_body(self) -> tuple[bytes, ServiceError | None]:
             try:
                 length = int(self.headers.get("content-length") or "0")
             except ValueError:
-                return None, ServiceError("invalid_request", "Content-Length must be numeric.", 400)
+                return b"", ServiceError("invalid_request", "Content-Length must be numeric.", 400)
             if length > MAX_BODY_BYTES:
-                return None, ServiceError("request_too_large", "Request body is too large.", 413)
+                return b"", ServiceError("request_too_large", "Request body is too large.", 413)
             if length == 0:
+                return b"", None
+            return self.rfile.read(length), None
+
+        def _parse_json_body(
+            self, raw: bytes
+        ) -> tuple[dict[str, Any] | None, ServiceError | None]:
+            if not raw:
                 return None, None
             try:
-                decoded = self.rfile.read(length).decode("utf-8")
+                decoded = raw.decode("utf-8")
                 payload = json.loads(decoded)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 return None, ServiceError("invalid_json", "Request body must be valid JSON.", 400)

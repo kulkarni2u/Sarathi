@@ -286,6 +286,86 @@ def _create_github_issue_task_draft(
     }
 
 
+def _create_slack_task_draft(
+    storage: Storage,
+    workspace_id: str,
+    prompt: str,
+    *,
+    user: str | None = None,
+    channel: str | None = None,
+    team: str | None = None,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Draft a PRD/AC-gated task from a Slack ``/sarathi run`` command.
+
+    Mirrors ``_create_github_issue_task_draft``: same task/message/gate/
+    lifecycle-event shape, sourced from a Slack slash command instead of a
+    GitHub issue reference. Metadata carries ``{source: "slack", user,
+    channel, team}`` so the task's origin is auditable, and (like the other
+    intake paths) the ``task.draft_created`` / ``approval.requested``
+    lifecycle events fire the same outbound Slack notification loop wired in
+    ``src/notifications.py`` when configured.
+    """
+    title = _derive_task_title(prompt)
+    task_metadata = _task_draft_metadata(prompt, project_id=project_id)
+    task_metadata["source"] = "slack"
+    task_metadata["slack"] = {"user": user, "channel": channel, "team": team}
+
+    task = storage.create_task(
+        workspace_id=workspace_id,
+        title=title,
+        status="prd_pending",
+        description=prompt,
+        metadata=task_metadata,
+        project_id=task_metadata.get("project_id"),
+    )
+    user_message = storage.create_message(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        role="user",
+        content=prompt,
+        metadata={"target": "Sarathi", "source": "slack_command", "slack_user": user},
+    )
+    sarathi_message = storage.create_message(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        role="sarathi",
+        content=(
+            "I drafted the PRD/AC shell from the Slack /sarathi run command and "
+            "opened the PRD/AC approval gate before graph generation."
+        ),
+        metadata={"draft_task_id": task["id"], "gate": "PRD/AC", "source": "slack_command"},
+    )
+    gate = storage.create_approval_gate(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        name="PRD/AC",
+        status="pending",
+        metadata={
+            "requires_human": True,
+            "source_prompt": prompt,
+            "acceptance_criteria": task_metadata["acceptance_criteria"],
+        },
+    )
+    storage.create_lifecycle_event(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        event_type="task.draft_created",
+        payload={"object_id": task["id"], "gate": gate["id"]},
+    )
+    storage.create_lifecycle_event(
+        workspace_id=workspace_id,
+        task_id=task["id"],
+        event_type="approval.requested",
+        payload={"object_id": gate["id"], "name": gate["name"]},
+    )
+    return {
+        "task": task,
+        "approval_gate": gate,
+        "messages": [user_message, sarathi_message],
+    }
+
+
 def _parse_github_remote(remote_url: str | None) -> tuple[str, str] | None:
     """Best-effort ``owner/repo`` extraction from a git remote URL.
 

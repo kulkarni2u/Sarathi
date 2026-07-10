@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import os
 import shutil
 import threading
 from dataclasses import dataclass, field
@@ -43,6 +44,7 @@ from .intake import (
     _write_brainstorm_spec,
 )
 from .openapi import build_openapi_spec
+from . import slack_intake
 from .policy_layers import (
     get_session_policy,
     get_workspace_policy,
@@ -223,8 +225,9 @@ class ServiceApp:
         *,
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        raw_body: bytes | None = None,
     ) -> tuple[int, dict[str, Any]] | RawResponse:
-        return self.handle(method, path, body=body, headers=headers)
+        return self.handle(method, path, body=body, headers=headers, raw_body=raw_body)
 
     # First path segments that are served by the JSON API router (`_route`).
     # A GET to any other top-level path falls back to the static web bundle.
@@ -239,6 +242,7 @@ class ServiceApp:
         "brainstorm",
         "sessions",
         "users",
+        "slack",
     }
 
     def handle(
@@ -249,6 +253,7 @@ class ServiceApp:
         body: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
         skip_auth: bool = False,
+        raw_body: bytes | None = None,
     ) -> tuple[int, dict[str, Any]] | RawResponse:
         correlation_id = _correlation_id(headers)
         try:
@@ -269,6 +274,16 @@ class ServiceApp:
                 public_response = self._public_get_response(raw_parts, correlation_id)
                 if public_response is not None:
                     return public_response
+
+            # Slack slash-command intake bypasses bearer auth entirely:
+            # Slack cannot send our service's bearer token, so authenticity
+            # relies solely on the `X-Slack-Signature` request signature,
+            # verified inside `_handle_slack_command` against the raw
+            # (pre-JSON-parsing) request body. This check must run before
+            # `_authorize` below and before any body-parsing side effects.
+            command_parts = raw_parts[1:] if is_api_request else raw_parts
+            if method == "POST" and command_parts == ["slack", "commands"]:
+                return self._handle_slack_command(headers, raw_body or b"")
 
             principal = None if skip_auth else self._authorize(headers)
             parts = raw_parts[1:] if is_api_request else raw_parts
@@ -389,6 +404,49 @@ class ServiceApp:
             for event in events
         )
         return _sse_response(200, body)
+
+    def _handle_slack_command(
+        self,
+        headers: Mapping[str, str] | None,
+        raw_body: bytes,
+    ) -> tuple[int, dict[str, Any]]:
+        """Verify and dispatch an inbound Slack `/sarathi` slash command.
+
+        Returns Slack's expected ``{response_type, text}`` shape directly
+        (bypassing the ``{ok, data}`` envelope, like the OpenAPI document
+        below), with HTTP 200 for any successfully-authenticated command —
+        including user-facing errors such as an unknown subcommand or a
+        missing task id, which Slack renders as the response text rather
+        than a generic webhook failure.
+
+        Disabled-by-default, 404 when off: if
+        ``SARATHI_SLACK_SIGNING_SECRET`` is unset, this route 404s (looks
+        absent) rather than 401ing, so a prober cannot distinguish "feature
+        disabled" from "endpoint does not exist". Once the feature is
+        enabled, an invalid, stale, or tampered signature 401s instead,
+        since at that point the caller can already see the route exists.
+        """
+        signing_secret = os.environ.get(slack_intake.SLACK_SIGNING_SECRET_ENV)
+        if not signing_secret:
+            raise ServiceError("not_found", "Slack commands are not configured.", 404)
+
+        signature: str | None = None
+        timestamp: str | None = None
+        for key, value in (headers or {}).items():
+            lowered = key.lower()
+            if lowered == "x-slack-signature":
+                signature = value
+            elif lowered == "x-slack-request-timestamp":
+                timestamp = value
+
+        if not slack_intake.verify_slack_signature(
+            signing_secret, timestamp, raw_body, signature
+        ):
+            raise ServiceError("unauthorized", "Invalid Slack request signature.", 401)
+
+        form = slack_intake.parse_slack_form_body(raw_body)
+        _conn, storage = self._storage()
+        return 200, slack_intake.handle_slack_command(storage, form)
 
     def _serve_static(self, parts: list[str]) -> RawResponse | None:
         """Serve a file from the built web bundle (`self.dist_root`).

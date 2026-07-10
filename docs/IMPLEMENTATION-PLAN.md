@@ -72,6 +72,19 @@ criteria, and a size (S ≈ hours, M ≈ 1–3 days, L ≈ 1–2 weeks).
   optional `gh pr create` helper (`src/pr_body.py`)
 - ☑ 3.6 `sarathi chat` is now a real inline terminal REPL (streaming,
   /model switching, Ctrl-C cancels the reply, not the session)
+- ☑ 1.4-C (first slice) CLI service-client mode: `list --all` (deduped
+  against engine-mirrored runs), `status`/`log` service fallthrough,
+  `run --remote`, and `sarathi pr-body <id> [--out]`
+- ☑ 3.8 Inbound Slack (`src/service/slack_intake.py`): signed
+  `POST /slack/commands` (HMAC over raw body, replay window, 404 when
+  `SARATHI_SLACK_SIGNING_SECRET` unset); `/sarathi run <desc>` drafts a
+  task, `/sarathi status <id>` answers inline; drafts emit the standard
+  lifecycle events, so outbound Slack notifications fire on them
+- 3.7 (part 2, hosted pack registry/publishing) — deferred; `--from`
+  covers local dirs, shipped recipes, and git URLs today.
+
+**All planned phases (0, 1, 2, 3) are complete** except the deferred
+hosted-registry follow-up above. Delivered via PR #15.
 
 ---
 

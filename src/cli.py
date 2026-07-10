@@ -725,6 +725,16 @@ def main() -> None:
         default=None,
         help="Path to a recipe dir/file to execute as a FANOUT/JUDGE workflow graph (instead of the standard lifecycle)",
     )
+    run_parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Submit the task to the running Sarathi service instead of executing the engine in-process",
+    )
+    run_parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace id to submit to with --remote (default: workspace matching cwd, or the only workspace)",
+    )
 
     # NCP Integration
     run_parser.add_argument(
@@ -819,7 +829,12 @@ def main() -> None:
         help="Reject the escalation instead of approving it",
     )
 
-    subparsers.add_parser("list", help="List saved task IDs under .sarathi/tasks")
+    list_parser = subparsers.add_parser("list", help="List saved task IDs under .sarathi/tasks")
+    list_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Also show tasks tracked by the running Sarathi service (deduplicated against engine-mirrored runs)",
+    )
     proposals_parser = subparsers.add_parser("proposals", help="Show or review policy proposals from persisted learnings")
     proposals_parser.add_argument(
         "--policy-pack",
@@ -931,6 +946,17 @@ def main() -> None:
         "--owner", default=None, help="Owner for the forked session (default: source owner)"
     )
 
+    # PR body command (render the audit-trail PR body for a service task)
+    pr_body_parser = subparsers.add_parser(
+        "pr-body", help="Print the audit-trail PR body for a service task"
+    )
+    pr_body_parser.add_argument("task_id", help="Service task ID")
+    pr_body_parser.add_argument(
+        "--out",
+        default=None,
+        help="Also write the PR body to this file (e.g. for use with `gh pr create --body-file`)",
+    )
+
     if len(sys.argv) > 1 and sys.argv[1] == "desktop":
         args, _desktop_passthrough = parser.parse_known_args()
         setattr(args, "desktop_args", sys.argv[2:])
@@ -969,7 +995,7 @@ def main() -> None:
     elif args.command == "approve":
         handle_approve(args)
     elif args.command == "list":
-        handle_list_tasks()
+        handle_list_tasks(args)
     elif args.command == "proposals":
         handle_proposals(args)
     elif args.command == "reuse":
@@ -980,6 +1006,8 @@ def main() -> None:
         handle_attach(args)
     elif args.command == "fork":
         handle_fork(args)
+    elif args.command == "pr-body":
+        handle_pr_body(args)
     elif args.command == "agents":
         handle_agents()
     elif args.command == "recipes":
@@ -1347,8 +1375,85 @@ def _run_recipe(args: argparse.Namespace, policy_pack: str) -> None:
     print(f"  Measured token cost: {total_tokens}")
 
 
+def _resolve_remote_workspace(workspaces: list[dict[str, Any]], requested_id: str | None) -> dict[str, Any]:
+    """Resolve which service workspace a `run --remote` submission targets.
+
+    Resolution order: an explicit ``--workspace <id>`` flag, then the
+    workspace whose ``root_path`` matches the current working directory,
+    then (if there is exactly one workspace) that workspace. Raises
+    SystemExit with a listing of workspaces when none of those resolve.
+    """
+    if requested_id:
+        selected = next((w for w in workspaces if w.get("id") == requested_id), None)
+        if selected is None:
+            print(f"Workspace not found: {requested_id}")
+            raise SystemExit(1)
+        return selected
+
+    cwd = os.getcwd()
+    by_cwd = next((w for w in workspaces if w.get("root_path") == cwd), None)
+    if by_cwd is not None:
+        return by_cwd
+
+    if len(workspaces) == 1:
+        return workspaces[0]
+
+    print("Multiple workspaces found. Re-run with --workspace <id>.")
+    for workspace in workspaces:
+        print(f"  - {workspace.get('name')} ({workspace.get('id')}) {workspace.get('root_path', '')}")
+    raise SystemExit(1)
+
+
+def _run_remote(args: argparse.Namespace) -> None:
+    """Submit a task to the running Sarathi service instead of running the engine in-process."""
+    info = _read_service_discovery()
+    service_url = info.get("url") if isinstance(info, dict) else None
+    if not service_url:
+        print("Sarathi desktop service not running — start it with: sarathi desktop")
+        raise SystemExit(1)
+    service_token = _service_auth_token(info)
+
+    try:
+        workspaces = _service_get_json(service_url, "/api/workspaces", token=service_token).get("workspaces", [])
+    except Exception as error:
+        print(f"Failed to reach Sarathi service: {error}")
+        raise SystemExit(1)
+
+    if not isinstance(workspaces, list) or not workspaces:
+        print("No workspaces available yet. Create one in the desktop first.")
+        raise SystemExit(1)
+
+    workspace = _resolve_remote_workspace(workspaces, getattr(args, "workspace", None))
+    workspace_id = workspace.get("id")
+
+    body = {
+        "title": args.task_description,
+        "description": args.task_description,
+    }
+    try:
+        data = _service_post_json(
+            service_url,
+            f"/api/workspaces/{workspace_id}/tasks",
+            body,
+            token=service_token,
+        )
+    except RuntimeError as exc:
+        print(f"Could not submit task to Sarathi service: {exc}")
+        raise SystemExit(1)
+
+    task = data.get("task") or {}
+    task_id = task.get("id")
+    print(f"Submitted task to Sarathi service: {task_id}")
+    print(f"  workspace: {workspace.get('name') or workspace_id}")
+    print(f"  hint: sarathi watch {task_id} --follow")
+
+
 def handle_run(args: argparse.Namespace) -> None:
     """Handle the run command."""
+    if getattr(args, "remote", False):
+        _run_remote(args)
+        return
+
     # Auto-discover policy pack
     policy_pack = args.policy_pack
     if not policy_pack:
@@ -1597,8 +1702,8 @@ def handle_tui(args: argparse.Namespace) -> None:
     )
 
 
-def handle_list_tasks() -> None:
-    """List task IDs persisted by the engine."""
+def handle_list_tasks(args: argparse.Namespace | None = None) -> None:
+    """List task IDs persisted by the engine, optionally merged with service tasks."""
     persistence_cls = globals().get("PersistenceManager")
     if persistence_cls is None:
         try:
@@ -1610,10 +1715,68 @@ def handle_list_tasks() -> None:
     ids = persistence.list_tasks()
     if not ids:
         print("No saved tasks. Run `sarathi run \"…\"` first.")
+    else:
+        print(f"Saved tasks ({persistence.storage_path}):")
+        for tid in sorted(ids):
+            print(f"  {tid}")
+
+    if not getattr(args, "all", False):
         return
-    print(f"Saved tasks ({persistence.storage_path}):")
-    for tid in sorted(ids):
-        print(f"  {tid}")
+
+    print()
+    _print_service_task_section(set(ids))
+
+
+def _print_service_task_section(known_engine_task_ids: set[str]) -> None:
+    """Print the "Service tasks" section for `sarathi list --all`.
+
+    Fetches every workspace/task pair from the running Sarathi service (if
+    any) and prints them, skipping tasks whose ``metadata.engine_task_id``
+    matches a task already shown in the file-store section above (those are
+    engine-mirrored copies of the same run, not a distinct service task).
+    """
+    info = _read_service_discovery()
+    service_url = info.get("url") if isinstance(info, dict) else None
+    if not service_url:
+        print("Service tasks: Sarathi desktop service not running — start it with: sarathi desktop")
+        return
+
+    service_token = _service_auth_token(info)
+    try:
+        workspaces = _service_get_json(service_url, "/api/workspaces", token=service_token).get("workspaces", [])
+    except Exception as error:
+        print(f"Service tasks: failed to reach Sarathi service ({error})")
+        return
+
+    rows: list[tuple[dict[str, Any], str]] = []
+    for workspace in workspaces:
+        workspace_id = workspace.get("id")
+        workspace_name = workspace.get("name") or workspace_id
+        try:
+            tasks = _service_get_json(
+                service_url, f"/api/workspaces/{workspace_id}/tasks", token=service_token
+            ).get("tasks", [])
+        except Exception:
+            continue
+        for task in tasks:
+            metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+            engine_task_id = metadata.get("engine_task_id")
+            if engine_task_id and engine_task_id in known_engine_task_ids:
+                continue  # already listed in the file-store section above
+            rows.append((task, workspace_name))
+
+    print("Service tasks:")
+    if not rows:
+        print("  (none)")
+        return
+    for task, workspace_name in rows:
+        title = task.get("title") or task.get("id")
+        status = task.get("status", "unknown")
+        print(f"  - {task.get('id')}: {title} [{status}] workspace={workspace_name}")
+        description = (task.get("description") or "").strip()
+        if description and description != title:
+            snippet = description if len(description) <= 70 else description[:67] + "..."
+            print(f"      {snippet}")
 
 
 def handle_agents() -> None:
@@ -2030,6 +2193,30 @@ def handle_fork(args: argparse.Namespace) -> None:
         )
 
 
+def handle_pr_body(args: argparse.Namespace) -> None:
+    """Fetch and print a task's audit-trail PR body from the running Sarathi service."""
+    info = _read_service_discovery()
+    service_url = info.get("url") if isinstance(info, dict) else None
+    if not service_url:
+        print("Sarathi desktop service not running — start it with: sarathi desktop")
+        raise SystemExit(1)
+    token = _service_auth_token(info)
+
+    try:
+        data = _service_get_json(service_url, f"/api/tasks/{args.task_id}/pr-body", token=token)
+    except Exception as exc:
+        print(f"Could not fetch PR body: {exc}")
+        raise SystemExit(1)
+
+    body = data.get("body", "")
+    out_path = getattr(args, "out", None)
+    if out_path:
+        Path(out_path).write_text(body)
+        print(f"Wrote PR body to {out_path}")
+    else:
+        print(body)
+
+
 def handle_proposals(args: argparse.Namespace | None = None) -> None:
     """Show policy proposals generated from persisted Learn artifacts."""
     persistence_cls = globals().get("PersistenceManager")
@@ -2100,6 +2287,74 @@ def _find_proposal(proposals, proposal_id: str):
     return None
 
 
+def _service_task_lookup(service_url: str, token: str | None, task_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """Fetch a service task and its lifecycle events. Returns None if not found/unreachable."""
+    try:
+        detail = _service_get_json(service_url, f"/api/tasks/{task_id}", token=token)
+    except (RuntimeError, urllib.error.HTTPError, urllib.error.URLError):
+        return None
+    task = detail.get("task")
+    if not isinstance(task, dict):
+        return None
+    try:
+        events = _service_get_json(service_url, f"/api/events?task_id={task_id}", token=token).get("events", [])
+    except (RuntimeError, urllib.error.HTTPError, urllib.error.URLError):
+        events = []
+    if not isinstance(events, list):
+        events = []
+    return task, events
+
+
+def _try_service_task_fallthrough(task_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """Look up `task_id` as a service task when it isn't a known file-store task."""
+    info = _read_service_discovery()
+    service_url = info.get("url") if isinstance(info, dict) else None
+    if not service_url:
+        return None
+    token = _service_auth_token(info)
+    return _service_task_lookup(service_url, token, task_id)
+
+
+def _print_service_task_status(task: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    """Render a service task in a style consistent with `_print_task_status`."""
+    print(f"Task: {task.get('id')} (service)")
+    print(f"Title: {task.get('title') or '(untitled)'}")
+    description = task.get("description")
+    if description:
+        print(f"Description: {description}")
+    print(f"Status: {task.get('status', 'unknown')}")
+    print(f"Workspace: {task.get('workspace_id', 'unknown')}")
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    engine_task_id = metadata.get("engine_task_id")
+    if engine_task_id:
+        print(f"Engine task id: {engine_task_id}")
+    print(f"Lifecycle Events: {len(events)}")
+    if events:
+        last = events[-1]
+        print(f"Last Event: {last.get('event_type')} at {last.get('created_at', 'unknown time')}")
+
+
+def _print_service_task_log(task: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    """Render a service task's lifecycle event log in a style consistent with `handle_log`."""
+    print(f"Task: {task.get('id')} (service)")
+    print(f"Title: {task.get('title') or '(untitled)'}")
+    description = task.get("description")
+    if description:
+        print(f"Description: {description}")
+    print(f"Status: {task.get('status', 'unknown')}")
+    print()
+
+    if events:
+        print(f"Lifecycle Events ({len(events)}):")
+        print("-" * 94)
+        for event in events:
+            timestamp = event.get("created_at", "")
+            payload = event.get("payload")
+            print(f"  {timestamp} [{event.get('event_type', 'unknown')}] {payload}")
+    else:
+        print("No lifecycle events recorded yet.")
+
+
 def handle_log(args: argparse.Namespace) -> None:
     """Handle the log command."""
     persistence_cls = globals().get("PersistenceManager")
@@ -2115,6 +2370,11 @@ def handle_log(args: argparse.Namespace) -> None:
     task = persistence.load_task(args.task_id)
 
     if task is None:
+        service_result = _try_service_task_fallthrough(args.task_id)
+        if service_result is not None:
+            service_task, events = service_result
+            _print_service_task_log(service_task, events)
+            return
         print(f"Task {args.task_id} not found. Available tasks: {persistence.list_tasks()}")
         return
 
@@ -2172,6 +2432,11 @@ def handle_status(args: argparse.Namespace) -> None:
     task = persistence.load_task(args.task_id)
 
     if task is None:
+        service_result = _try_service_task_fallthrough(args.task_id)
+        if service_result is not None:
+            service_task, events = service_result
+            _print_service_task_status(service_task, events)
+            return
         print(f"Task {args.task_id} not found. Available tasks: {persistence.list_tasks()}")
         return
 

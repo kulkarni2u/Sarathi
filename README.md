@@ -168,12 +168,17 @@ sarathi run "Add search filters"       # auto-discover policy-pack when possible
 sarathi run "Add search filters" --dry-run
 sarathi run "Refactor auth" --complexity high
 sarathi run "Compare providers" --recipe policy-pack/RECIPES/debate
+sarathi run "Add search filters" --remote                # submit to the running service instead of the in-process engine
+sarathi run "Add search filters" --remote --workspace <id>  # target a specific service workspace
 
 sarathi status <task_id>
 sarathi watch <task_id>
 sarathi resume <task_id>
 sarathi list
+sarathi list --all                     # also show service-tracked tasks (deduped against engine-mirrored runs)
 sarathi log <task_id>
+sarathi pr-body <task_id>              # print a service task's audit-trail PR body
+sarathi pr-body <task_id> --out body.md  # e.g. for `gh pr create --body-file body.md`
 
 sarathi proposals
 sarathi proposals --accept <proposal_id> --policy-pack ./policy-pack
@@ -193,7 +198,9 @@ sarathi autoresearch list
 ```
 
 Running `sarathi` with no subcommand prints the local home screen, including
-service discovery status when a Sarathi service is already running.
+service discovery status when a Sarathi service is already running. When the
+service is discoverable, `sarathi status <id>` and `sarathi log <id>` also
+fall through to a service task lookup if the id isn't a known local task.
 
 ## Terminal UI
 

@@ -51,11 +51,16 @@ fi
 skill_content="$(cat "$skill_path")"
 context="<SARATHI_SESSION_START>
 Sarathi workspace detected at: ${workspace_root}
+Sarathi skill files live at: ${PLUGIN_ROOT}
 
 You are starting inside a Sarathi-ready workspace. Use Sarathi's policy-backed lifecycle when the work benefits from structured route, brainstorm, plan, build, verify, review, task tracking, and learn phases.
 
 Use the workspace policy pack as the source of truth when it exists:
 - ${workspace_root}/policy-pack
+
+Any relative path this skill references (e.g. \`skills/build-tdd.md\`) resolves
+under ${PLUGIN_ROOT}, not under the workspace — read it from there on demand
+rather than assuming it was inlined below.
 
 Do not mutate files or start services only because this hook fired. Treat this as operating context for the session.
 

@@ -69,6 +69,15 @@ include-package-data = true
     "skill/reference/required-list.md",
     "skill/reference/workflow.md",
 ]
+"share/sarathi/skill/skills" = [
+    "skill/skills/brainstorm.md",
+    "skill/skills/plan.md",
+    "skill/skills/build-tdd.md",
+    "skill/skills/verify.md",
+    "skill/skills/review-phase.md",
+    "skill/skills/provider-contracts.md",
+    "skill/skills/ncp-handoff.md",
+]
 "share/sarathi/skill/policy-pack/EXAMPLE" = [
     "skill/policy-pack/EXAMPLE/commands.md",
     "skill/policy-pack/EXAMPLE/complexity.md",

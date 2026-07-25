@@ -726,7 +726,8 @@ Sarathi/
 
 The repo includes a portable skill pack for agent hosts:
 
-- `skill/SKILL.md`
+- `skill/SKILL.md` — entrypoint; router to the phase detail files below
+- `skill/skills/` — per-phase detail (brainstorm, plan, build-tdd, verify, review-phase, provider-contracts, ncp-handoff), loaded on demand
 - `skill/sarathi-init.md`
 - `skill/sarathi-implementer-prompt.md`
 - `skill/reference/`

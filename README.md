@@ -516,7 +516,8 @@ task drafts directly from Slack. HMAC signing is enforced when
 JSON payload with `response_type`, `text`, `task_id`, and `approval_gate_id`.
 
 When bot-token mode is configured, the drafted task's PRD/AC gate is also
-posted as an interactive Slack message with Approve/Reject buttons.
+posted as an interactive Slack message with Approve/Reject buttons, and the
+task itself is anchored to that message's thread (see Threaded Replies below).
 
 ### Inbound Interactive Components (Approve/Reject)
 
@@ -528,6 +529,25 @@ rejecting sets the task's status to `rejected` and emits a `task.cancelled`
 lifecycle event), and best-effort updates the original Slack message via
 `response_url`. HMAC signing is enforced the same way as the slash-command
 route. Repeat clicks on an already-decided gate are a no-op.
+
+### Threaded Replies
+
+Every outbound notification for a Slack-originated task (phase paused,
+completed, budget exhausted, etc.) posts as a reply in the task's original
+thread — the thread anchor (`channel_id` + `thread_ts`) is recorded on the
+task when its PRD/AC gate card is first posted. Tasks with no Slack origin
+are unaffected and post as top-level messages as before.
+
+### Inbound Conversational Replies
+
+Sarathi exposes `POST /api/workspaces/{id}/slack/events` as the Slack app's
+Events API Request URL (subscribe to the `message.channels` bot event and
+answer the one-time `url_verification` handshake automatically). A reply
+posted in a task's thread is appended to the task as a user message
+(`metadata.source: "slack_message"`) and emits a `task.human_reply`
+lifecycle event; bot messages and edits/deletions are ignored. This is
+intake-only for now — no phase currently pauses to consume these replies,
+so the engine-side resume hook is future work.
 
 ## Verification Commands
 

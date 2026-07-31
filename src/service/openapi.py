@@ -827,6 +827,17 @@ ROUTES: list[dict[str, Any]] = [
         "not_found": True,
         "raw_content_type": "application/json",
     },
+    {
+        "method": "POST",
+        "path": "/workspaces/{id}/slack/events",
+        "summary": "Handle a Slack Events API callback (URL verification + threaded replies).",
+        "tags": ["slack"],
+        "params": ["id"],
+        "request": OBJECT_SCHEMA,
+        "success": ("200", "Empty JSON ack, or {\"challenge\": ...} for url_verification."),
+        "not_found": True,
+        "raw_content_type": "application/json",
+    },
     # ── Tasks (by ID) ─────────────────────────────────────────────────────
     {
         "method": "GET",

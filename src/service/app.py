@@ -207,7 +207,7 @@ class ServiceApp:
         self.auth_enabled = _auth_enabled() if auth_enabled is None else auth_enabled
         self._local = threading.local()
         # Optional Slack fan-out for lifecycle events (env-configured).
-        self._event_listener = lifecycle_event_listener()
+        self._event_listener = lifecycle_event_listener(get_task=self._lookup_task)
         # Run migrations once at startup on the main thread
         with connect(self.db_path) as _conn:
             run_migrations(_conn)
@@ -219,6 +219,13 @@ class ServiceApp:
             conn = connect(self.db_path).__enter__()  # keep connection open
             self._local.conn = conn
         return conn, Storage(conn, event_listener=self._event_listener)
+
+    def _lookup_task(self, task_id: str) -> Mapping[str, Any] | None:
+        try:
+            _conn, storage = self._storage()
+            return storage.get_task(task_id)
+        except Exception:
+            return None
 
     def __call__(
         self,

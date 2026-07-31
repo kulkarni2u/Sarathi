@@ -1013,6 +1013,12 @@ def _create_slack_task_draft(
                             "channel_id": posted["channel"], "message_ts": posted["ts"],
                         }},
                     )
+                    task = storage.update_task(
+                        task["id"],
+                        metadata={**task["metadata"], "slack": {
+                            "channel_id": posted["channel"], "thread_ts": posted["ts"],
+                        }},
+                    )
         except Exception:
             pass  # best-effort; never break task-draft creation
 

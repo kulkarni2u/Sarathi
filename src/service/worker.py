@@ -167,7 +167,8 @@ def run_worker(
 
     with connect(db_path) as conn:
         run_migrations(conn)
-        storage = Storage(conn, event_listener=lifecycle_event_listener())
+        _lookup = Storage(conn)
+        storage = Storage(conn, event_listener=lifecycle_event_listener(get_task=_lookup.get_task))
 
         while True:
             if should_stop is not None and should_stop():

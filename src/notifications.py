@@ -199,11 +199,13 @@ class SlackNotifier:
     def matches(self, event_type: str) -> bool:
         return any(fnmatch(event_type, pattern) for pattern in self.config.events)
 
-    def notify(self, event: NotificationEvent) -> bool:
+    def notify(self, event: NotificationEvent, *, thread_ts: str | None = None) -> bool:
         """Post the event to Slack. Returns True only on confirmed delivery."""
         if not self.is_configured() or not self.matches(event.event_type):
             return False
         message = build_slack_message(event)
+        if thread_ts:
+            message["thread_ts"] = thread_ts
         try:
             if self.webhook_url:
                 return self._post_json(self.webhook_url, message, headers={})
@@ -485,6 +487,7 @@ def lifecycle_notification(event: Mapping[str, Any]) -> NotificationEvent | None
 def lifecycle_event_listener(
     env: Mapping[str, str] | None = None,
     opener: Callable[..., Any] | None = None,
+    get_task: Callable[[str], Mapping[str, Any] | None] | None = None,
 ) -> Callable[[Mapping[str, Any]], None] | None:
     """Storage listener that forwards lifecycle events to Slack, or None.
 
@@ -498,8 +501,20 @@ def lifecycle_event_listener(
 
     def _listen(event: Mapping[str, Any]) -> None:
         notification = lifecycle_notification(event)
-        if notification is not None:
-            notifier.notify(notification)
+        if notification is None:
+            return
+        thread_ts = None
+        if get_task is not None and notification.task_id and notifier.matches(notification.event_type):
+            try:
+                task = get_task(notification.task_id)
+                meta = (task or {}).get("metadata")
+                slack = meta.get("slack") if isinstance(meta, Mapping) else None
+                if isinstance(slack, Mapping):
+                    ts = slack.get("thread_ts")
+                    thread_ts = str(ts) if ts else None
+            except Exception:
+                thread_ts = None
+        notifier.notify(notification, thread_ts=thread_ts)
 
     return _listen
 

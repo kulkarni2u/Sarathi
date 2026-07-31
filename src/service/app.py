@@ -119,6 +119,7 @@ from .scheduling import (
     _schedule_ready_subtasks,
     _service_now,
     _transition_subtask,
+    record_gate_decision,
 )
 from .views import (
     _latest_or_none,
@@ -1265,26 +1266,13 @@ class ServiceApp:
             task = storage.get_task(parts[1])
             if task is None:
                 raise ServiceError("not_found", "Task not found.", 404)
-            gate = storage.create_approval_gate(
-                workspace_id=task["workspace_id"],
-                task_id=task["id"],
+            result = record_gate_decision(
+                storage,
+                task,
                 name=_required_text(body, "name"),
                 status=_required_text(body, "status"),
                 metadata=_optional_dict(body, "metadata"),
             )
-            storage.create_lifecycle_event(
-                workspace_id=task["workspace_id"],
-                task_id=task["id"],
-                event_type="approval.recorded",
-                payload={"object_id": gate["id"], "status": gate["status"]},
-            )
-            result: dict[str, Any] = {"approval_gate": gate}
-            if gate["name"] == "Task graph" and gate["status"] == "approved":
-                result["auto_schedule"] = _maybe_auto_schedule_ready_subtasks(
-                    storage,
-                    task,
-                    reason="task_graph_approved",
-                )
             return 201, result
 
         if (

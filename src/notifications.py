@@ -220,9 +220,10 @@ class SlackNotifier:
             )
             return False
 
-    def _post_json(
+    def _post_raw(
         self, url: str, payload: dict[str, Any], *, headers: dict[str, str]
-    ) -> bool:
+    ) -> tuple[int, bytes]:
+        """Post a JSON payload and return (status, raw_bytes)."""
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -233,6 +234,12 @@ class SlackNotifier:
         with self._opener(request, timeout=self.config.timeout_seconds) as response:
             status = getattr(response, "status", 200)
             raw = response.read()
+        return status, raw
+
+    def _post_json(
+        self, url: str, payload: dict[str, Any], *, headers: dict[str, str]
+    ) -> bool:
+        status, raw = self._post_raw(url, payload, headers=headers)
         if status >= 300:
             logger.warning("Slack returned HTTP %s", status)
             return False
@@ -246,6 +253,36 @@ class SlackNotifier:
                 logger.warning("Slack API error: %s", parsed.get("error", "unknown"))
                 return False
         return True
+
+    def post_message(self, channel: str, message: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Post via chat.postMessage (bot-token mode only). Returns {"channel","ts"} from
+        the parsed Slack response on success, or None (webhook-only mode, missing bot
+        token/channel, HTTP error, or Slack ok:false). Never raises — same best-effort
+        contract as notify()."""
+        if not self.bot_token:
+            return None
+
+        payload = dict(message)
+        payload["channel"] = channel
+
+        try:
+            status, raw = self._post_raw(
+                SLACK_POST_MESSAGE_URL,
+                payload,
+                headers={"Authorization": f"Bearer {self.bot_token}"},
+            )
+
+            if status >= 300:
+                return None
+
+            parsed = json.loads(raw.decode("utf-8"))
+            if not parsed.get("ok"):
+                return None
+
+            return {"channel": parsed.get("channel"), "ts": parsed.get("ts")}
+        except Exception as exc:
+            logger.warning("post_message failed: %s", exc)
+            return None
 
 
 def build_slack_message(event: NotificationEvent) -> dict[str, Any]:
@@ -280,6 +317,54 @@ def build_slack_message(event: NotificationEvent) -> dict[str, Any]:
     return {"text": headline, "blocks": blocks}
 
 
+def build_gate_approval_message(
+    *, task_id: str, gate_id: str, title: str,
+    acceptance_criteria: list[str] | None = None,
+) -> dict[str, Any]:
+    """Block Kit payload with an approve/reject action block for a pending gate."""
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{title}*"},
+        },
+    ]
+    if acceptance_criteria:
+        criteria_text = "\n".join(f"• {item}" for item in acceptance_criteria[:10])
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": criteria_text},
+        })
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Approve"},
+                "style": "primary",
+                "action_id": "approve_gate",
+                "value": f"{task_id}:{gate_id}",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Reject"},
+                "style": "danger",
+                "action_id": "reject_gate",
+                "value": f"{task_id}:{gate_id}",
+            },
+        ],
+    })
+    return {"text": title, "blocks": blocks}
+
+
+def build_gate_decision_text(*, status: str, gate_id: str, user: str | None) -> str:
+    """Plain text summarizing a resolved decision, e.g. for replace_original updates."""
+    user_name = user or "someone"
+    if status == "approved":
+        return f"✅ Approved by {user_name}"
+    else:
+        return f"❌ Rejected by {user_name}"
+
+
 def build_slack_notifier(
     policy_section: Mapping[str, Any] | None = None,
     env: Mapping[str, str] | None = None,
@@ -302,6 +387,28 @@ def build_slack_notifier(
     if not notifier.is_configured():
         return None
     return notifier
+
+
+def post_response_url(
+    response_url: str, payload: Mapping[str, Any], *,
+    timeout_seconds: float = 5.0, opener: Callable[..., Any] | None = None,
+) -> bool:
+    """Bare-urllib POST to a Slack response_url (e.g. {"replace_original": True, "text": ...}).
+    Never raises; returns True only on HTTP < 300."""
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            response_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        http_opener = opener or urllib.request.urlopen
+        with http_opener(request, timeout=timeout_seconds) as response:
+            status = getattr(response, "status", 200)
+        return status < 300
+    except Exception:
+        return False
 
 
 def phase_event(

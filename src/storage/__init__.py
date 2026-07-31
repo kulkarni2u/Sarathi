@@ -911,6 +911,28 @@ class Storage:
         ).fetchone()
         return _approval_gate_from_row(row) if row is not None else None
 
+    def update_approval_gate(
+        self, gate_id: str, *, status: str | None = None, metadata: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        existing = self.get_approval_gate(gate_id)
+        if existing is None:
+            raise KeyError(gate_id)
+        next_status = status if status is not None else existing["status"]
+        next_metadata = metadata if metadata is not None else existing["metadata"]
+        now = _utc_now()
+        self.conn.execute(
+            """
+            UPDATE approval_gates
+            SET status = ?, metadata = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (next_status, _dump_json(next_metadata), now, gate_id),
+        )
+        self.conn.commit()
+        gate = self.get_approval_gate(gate_id)
+        assert gate is not None
+        return gate
+
     def list_approval_gates_for_task(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             """

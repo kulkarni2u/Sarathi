@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, quote, urlparse
 
 from src.init import InitWorkflow
+from src.notifications import build_slack_notifier, build_gate_approval_message
 from src.storage import Storage
 
 from .errors import ServiceError
@@ -992,6 +993,28 @@ def _create_slack_task_draft(
             "acceptance_criteria": metadata["acceptance_criteria"],
         },
     )
+
+    channel_id = slack_meta.get("channel_id")
+    if channel_id:
+        try:
+            notifier = build_slack_notifier(None)
+            if notifier is not None:
+                posted = notifier.post_message(
+                    channel_id,
+                    build_gate_approval_message(
+                        task_id=task["id"], gate_id=gate["id"], title=title,
+                        acceptance_criteria=metadata["acceptance_criteria"],
+                    ),
+                )
+                if posted:
+                    gate = storage.update_approval_gate(
+                        gate["id"],
+                        metadata={**gate["metadata"], "slack": {
+                            "channel_id": posted["channel"], "message_ts": posted["ts"],
+                        }},
+                    )
+        except Exception:
+            pass  # best-effort; never break task-draft creation
 
     storage.create_lifecycle_event(
         workspace_id=workspace_id,

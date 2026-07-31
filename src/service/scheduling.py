@@ -328,6 +328,41 @@ def _maybe_auto_schedule_ready_subtasks(
     return result
 
 
+def record_gate_decision(
+    storage: Storage,
+    task: dict[str, Any],
+    *,
+    name: str,
+    status: str,
+    metadata: dict[str, Any] | None = None,
+    gate_id: str | None = None,
+) -> dict[str, Any]:
+    """Record an approval-gate decision and return {"approval_gate": gate} plus
+    "auto_schedule" when the Task-graph auto-schedule side effect ran."""
+    if gate_id is not None:
+        gate = storage.update_approval_gate(gate_id, status=status, metadata=metadata)
+    else:
+        gate = storage.create_approval_gate(
+            workspace_id=task["workspace_id"],
+            task_id=task["id"],
+            name=name,
+            status=status,
+            metadata=metadata,
+        )
+    storage.create_lifecycle_event(
+        workspace_id=task["workspace_id"],
+        task_id=task["id"],
+        event_type="approval.recorded",
+        payload={"object_id": gate["id"], "status": gate["status"]},
+    )
+    result: dict[str, Any] = {"approval_gate": gate}
+    if gate["name"] == "Task graph" and gate["status"] == "approved":
+        result["auto_schedule"] = _maybe_auto_schedule_ready_subtasks(
+            storage, task, reason="task_graph_approved"
+        )
+    return result
+
+
 def _workspace_graph_execution_policy(
     storage: Storage,
     workspace_id: str,

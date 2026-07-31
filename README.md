@@ -515,6 +515,20 @@ task drafts directly from Slack. HMAC signing is enforced when
 `SARATHI_SLACK_SIGNING_SECRET` is set. The endpoint returns a Slack-friendly
 JSON payload with `response_type`, `text`, `task_id`, and `approval_gate_id`.
 
+When bot-token mode is configured, the drafted task's PRD/AC gate is also
+posted as an interactive Slack message with Approve/Reject buttons.
+
+### Inbound Interactive Components (Approve/Reject)
+
+Sarathi exposes `POST /api/workspaces/{id}/slack/interactions` as the Slack
+app's Interactivity Request URL. Clicking Approve or Reject on a gate's
+message resolves the task/gate encoded in the button's value, records the
+decision (approving a `Task graph` gate auto-schedules its ready subtasks;
+rejecting sets the task's status to `rejected` and emits a `task.cancelled`
+lifecycle event), and best-effort updates the original Slack message via
+`response_url`. HMAC signing is enforced the same way as the slash-command
+route. Repeat clicks on an already-decided gate are a no-op.
+
 ## Verification Commands
 
 By default, Verify does not execute shell commands and reports the phase as

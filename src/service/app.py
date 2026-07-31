@@ -12,7 +12,7 @@ from typing import Any, Mapping
 from urllib.parse import unquote
 
 from src.init import bootstrap_workspace
-from src.notifications import lifecycle_event_listener
+from src.notifications import build_gate_decision_text, lifecycle_event_listener, post_response_url
 from src.pr_body import build_pr_body
 from src.storage import Storage, connect, run_migrations
 
@@ -288,6 +288,21 @@ class ServiceApp:
                 and raw_parts[5] == "task"
             ):
                 return self._handle_slack_command(
+                    raw_parts[2], body or {}, headers, raw_body
+                )
+
+            # Slack interactive component (block_actions) intake — same
+            # self-authenticating HMAC bypass as the slash-command route
+            # above.
+            if (
+                is_api_request
+                and method == "POST"
+                and len(raw_parts) == 5
+                and raw_parts[1] == "workspaces"
+                and raw_parts[3] == "slack"
+                and raw_parts[4] == "interactions"
+            ):
+                return self._handle_slack_interaction(
                     raw_parts[2], body or {}, headers, raw_body
                 )
 
@@ -1833,6 +1848,96 @@ class ServiceApp:
             "application/json",
             slack_reply.encode("utf-8"),
         )
+
+    def _handle_slack_interaction(
+        self,
+        workspace_id: str,
+        body: Mapping[str, Any],
+        headers: Mapping[str, str] | None,
+        raw_body: str | None,
+    ) -> RawResponse | tuple[int, dict[str, Any]]:
+        """Handle a Slack interactive-component (block_actions) callback.
+
+        Verifies the Slack HMAC signature (if ``SARATHI_SLACK_SIGNING_SECRET``
+        is set), parses the ``payload`` form field, records an approve/reject
+        gate decision, and best-effort updates the original Slack message via
+        ``response_url``. Always replies 200 within Slack's window.
+        """
+        form = _parse_slack_body(body)
+        _verify_slack_request(headers, raw_body)
+
+        payload = json.loads(form.get("payload") or "{}")
+        if payload.get("type") != "block_actions":
+            return RawResponse(200, "application/json", b"{}")
+
+        action = (payload.get("actions") or [{}])[0]
+        action_id = action.get("action_id")
+        if action_id not in ("approve_gate", "reject_gate"):
+            return RawResponse(200, "application/json", b"{}")
+
+        raw_value = str(action.get("value", ""))
+        task_id, _, gate_id = raw_value.partition(":")
+        user_obj = payload.get("user") or {}
+        user = user_obj.get("username") or user_obj.get("id")
+        response_url = payload.get("response_url")
+
+        conn, storage = self._storage()
+        if storage.get_workspace(workspace_id) is None:
+            raise ServiceError("not_found", "Workspace not found.", 404)
+
+        task = storage.get_task(task_id)
+        if task is None or task["workspace_id"] != workspace_id:
+            raise ServiceError("not_found", "Task not found.", 404)
+
+        gate = storage.get_approval_gate(gate_id)
+        if gate is None or gate["task_id"] != task_id:
+            raise ServiceError("not_found", "Approval gate not found.", 404)
+
+        if gate["status"] != "pending":
+            final_status = gate["status"]
+        else:
+            final_status = "approved" if action_id == "approve_gate" else "rejected"
+            record_gate_decision(
+                storage,
+                task,
+                name=gate["name"],
+                status=final_status,
+                gate_id=gate["id"],
+                metadata={**gate["metadata"], "decided_by": user, "decided_via": "slack"},
+            )
+            if final_status == "rejected":
+                storage.update_task(
+                    task_id,
+                    status="rejected",
+                    metadata={**task["metadata"], "rejection_reason": "prd_ac_rejected"},
+                )
+                storage.create_lifecycle_event(
+                    workspace_id=workspace_id,
+                    task_id=task_id,
+                    event_type="task.cancelled",
+                    payload={
+                        "object_id": task_id,
+                        "reason": "prd_ac_rejected",
+                        "gate": gate_id,
+                        "by": user,
+                    },
+                )
+
+        if response_url:
+            try:
+                post_response_url(
+                    response_url,
+                    {
+                        "replace_original": True,
+                        "text": build_gate_decision_text(
+                            status=final_status, gate_id=gate_id, user=user
+                        ),
+                    },
+                )
+            except Exception:
+                pass
+
+        return RawResponse(200, "application/json", b"{}")
 
     def _authorize(self, headers: Mapping[str, str] | None) -> Principal | None:
         # Opt-in multi-user mode: the bearer must be the admin token or an

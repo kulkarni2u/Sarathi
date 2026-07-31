@@ -390,3 +390,325 @@ def test_engine_run_emits_task_completed():
     )
     engine.run_task(task)
     assert "task.completed" in [e.event_type for e in stub.events]
+
+
+# ---------------------------------------------------------------- thread linking
+
+
+def test_notify_with_thread_ts_webhook():
+    """Posting to webhook with thread_ts includes it in the JSON payload."""
+    opener = FakeOpener()
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/T/B/x"}
+    notifier = SlackNotifier(SlackConfig(enabled=True), env=env, opener=opener)
+    event = NotificationEvent(
+        event_type="task.failed",
+        title="Task t-1: fix checkout",
+        task_id="t-1",
+    )
+
+    assert notifier.notify(event, thread_ts="1700000000.123456") is True
+    payload = opener.last_payload()
+    assert payload["thread_ts"] == "1700000000.123456"
+
+
+def test_notify_with_thread_ts_bot_token():
+    """Posting via bot token with thread_ts includes it in the JSON payload."""
+    opener = FakeOpener(responses=[FakeResponse(body=b'{"ok": true}')])
+    env = {"SARATHI_SLACK_BOT_TOKEN": "xoxb-secret"}
+    config = SlackConfig(enabled=True, channel="#runs")
+    notifier = SlackNotifier(config, env=env, opener=opener)
+    event = NotificationEvent("task.completed", "Task done", task_id="t-1")
+
+    assert notifier.notify(event, thread_ts="1700000000.999") is True
+    payload = opener.last_payload()
+    assert payload["thread_ts"] == "1700000000.999"
+    assert payload["channel"] == "#runs"
+
+
+def test_notify_without_thread_ts_no_key_in_payload():
+    """Posting without thread_ts (default behavior) does not include the key."""
+    opener = FakeOpener()
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/T/B/x"}
+    notifier = SlackNotifier(SlackConfig(enabled=True), env=env, opener=opener)
+    event = NotificationEvent("task.completed", "Task done", task_id="t-1")
+
+    assert notifier.notify(event) is True
+    payload = opener.last_payload()
+    assert "thread_ts" not in payload
+
+
+def test_notify_with_none_thread_ts_no_key_in_payload():
+    """Explicitly passing thread_ts=None does not include the key."""
+    opener = FakeOpener()
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/T/B/x"}
+    notifier = SlackNotifier(SlackConfig(enabled=True), env=env, opener=opener)
+    event = NotificationEvent("task.completed", "Task done", task_id="t-1")
+
+    assert notifier.notify(event, thread_ts=None) is True
+    payload = opener.last_payload()
+    assert "thread_ts" not in payload
+
+
+def test_lifecycle_event_listener_with_get_task_thread_ts(tmp_path):
+    """Listener with get_task forwards thread_ts from task metadata to notifier."""
+    opener = FakeOpener()
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+
+    def fake_get_task(task_id):
+        return {
+            "id": task_id,
+            "metadata": {
+                "slack": {
+                    "thread_ts": "1700000000.555",
+                    "channel_id": "C-ABC",
+                }
+            },
+        }
+
+    listener = lifecycle_event_listener(env=env, opener=opener, get_task=fake_get_task)
+    assert listener is not None
+
+    with connect(tmp_path / "test.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn, event_listener=listener)
+        workspace = storage.create_workspace(name="w", root_path=str(tmp_path))
+        task = storage.create_task(
+            workspace_id=workspace["id"],
+            title="Test task",
+            status="running",
+            description="Test",
+            metadata={},
+        )
+        storage.create_lifecycle_event(
+            workspace_id=workspace["id"],
+            task_id=task["id"],
+            event_type="task.completed",
+            payload={"summary": "success"},
+        )
+
+    # Verify notifier was called with thread_ts
+    assert len(opener.requests) == 1
+    payload = opener.last_payload()
+    assert payload["thread_ts"] == "1700000000.555"
+
+
+def test_lifecycle_event_listener_get_task_returns_none(tmp_path):
+    """When get_task returns None, listener still posts without thread_ts."""
+    opener = FakeOpener()
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+
+    def fake_get_task(task_id):
+        return None  # task not found
+
+    listener = lifecycle_event_listener(env=env, opener=opener, get_task=fake_get_task)
+    assert listener is not None
+
+    with connect(tmp_path / "test.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn, event_listener=listener)
+        workspace = storage.create_workspace(name="w", root_path=str(tmp_path))
+        task = storage.create_task(
+            workspace_id=workspace["id"],
+            title="Test task",
+            status="running",
+            description="Test",
+            metadata={},
+        )
+        storage.create_lifecycle_event(
+            workspace_id=workspace["id"],
+            task_id=task["id"],
+            event_type="task.failed",
+            payload={"summary": "error"},
+        )
+
+    # Post happens without thread_ts
+    assert len(opener.requests) == 1
+    payload = opener.last_payload()
+    assert "thread_ts" not in payload
+
+
+def test_lifecycle_event_listener_get_task_missing_slack_metadata(tmp_path):
+    """When task metadata lacks 'slack' key, listener posts without thread_ts."""
+    opener = FakeOpener()
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+
+    def fake_get_task(task_id):
+        return {
+            "id": task_id,
+            "metadata": {
+                "source": "github_issue",
+                # no 'slack' key
+            },
+        }
+
+    listener = lifecycle_event_listener(env=env, opener=opener, get_task=fake_get_task)
+    assert listener is not None
+
+    with connect(tmp_path / "test.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn, event_listener=listener)
+        workspace = storage.create_workspace(name="w", root_path=str(tmp_path))
+        task = storage.create_task(
+            workspace_id=workspace["id"],
+            title="Test task",
+            status="running",
+            description="Test",
+            metadata={},
+        )
+        storage.create_lifecycle_event(
+            workspace_id=workspace["id"],
+            task_id=task["id"],
+            event_type="task.paused",
+            payload={},
+        )
+
+    # Post happens without thread_ts
+    assert len(opener.requests) == 1
+    payload = opener.last_payload()
+    assert "thread_ts" not in payload
+
+
+def test_lifecycle_event_listener_get_task_metadata_none(tmp_path):
+    """When task.metadata is None, listener posts without thread_ts."""
+    opener = FakeOpener()
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+
+    def fake_get_task(task_id):
+        return {
+            "id": task_id,
+            "metadata": None,  # No metadata at all
+        }
+
+    listener = lifecycle_event_listener(env=env, opener=opener, get_task=fake_get_task)
+    assert listener is not None
+
+    with connect(tmp_path / "test.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn, event_listener=listener)
+        workspace = storage.create_workspace(name="w", root_path=str(tmp_path))
+        task = storage.create_task(
+            workspace_id=workspace["id"],
+            title="Test task",
+            status="running",
+            description="Test",
+            metadata={},
+        )
+        storage.create_lifecycle_event(
+            workspace_id=workspace["id"],
+            task_id=task["id"],
+            event_type="task.escalated",
+            payload={},
+        )
+
+    # Post happens without thread_ts
+    assert len(opener.requests) == 1
+    payload = opener.last_payload()
+    assert "thread_ts" not in payload
+
+
+def test_lifecycle_event_listener_get_task_raises_exception(tmp_path):
+    """When get_task raises an exception, listener still posts without thread_ts."""
+    opener = FakeOpener()
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+
+    def fake_get_task(task_id):
+        raise RuntimeError("database error")
+
+    listener = lifecycle_event_listener(env=env, opener=opener, get_task=fake_get_task)
+    assert listener is not None
+
+    with connect(tmp_path / "test.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn, event_listener=listener)
+        workspace = storage.create_workspace(name="w", root_path=str(tmp_path))
+        task = storage.create_task(
+            workspace_id=workspace["id"],
+            title="Test task",
+            status="running",
+            description="Test",
+            metadata={},
+        )
+        storage.create_lifecycle_event(
+            workspace_id=workspace["id"],
+            task_id=task["id"],
+            event_type="task.timed_out",
+            payload={},
+        )
+
+    # Post happens without thread_ts, no exception raised
+    assert len(opener.requests) == 1
+    payload = opener.last_payload()
+    assert "thread_ts" not in payload
+
+
+def test_lifecycle_event_listener_unmatched_event_skips_get_task_call(tmp_path):
+    """When event type doesn't match notifier config, get_task is not called."""
+    opener = FakeOpener()
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+
+    call_count = 0
+
+    def fake_get_task(task_id):
+        nonlocal call_count
+        call_count += 1
+        return {"id": task_id, "metadata": {"slack": {"thread_ts": "123.456"}}}
+
+    listener = lifecycle_event_listener(env=env, opener=opener, get_task=fake_get_task)
+    assert listener is not None
+
+    with connect(tmp_path / "test.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn, event_listener=listener)
+        workspace = storage.create_workspace(name="w", root_path=str(tmp_path))
+        task = storage.create_task(
+            workspace_id=workspace["id"],
+            title="Test task",
+            status="running",
+            description="Test",
+            metadata={},
+        )
+        # Post a non-matching event (message.created is not in DEFAULT_EVENTS)
+        storage.create_lifecycle_event(
+            workspace_id=workspace["id"],
+            task_id=task["id"],
+            event_type="message.created",
+            payload={},
+        )
+
+    # get_task should never have been called
+    assert call_count == 0
+    # No Slack request should have been made
+    assert len(opener.requests) == 0
+
+
+def test_lifecycle_event_listener_default_get_task_none(tmp_path):
+    """Listener without get_task still works (existing behavior regression test)."""
+    opener = FakeOpener()
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+
+    # No get_task provided (None/default)
+    listener = lifecycle_event_listener(env=env, opener=opener)
+    assert listener is not None
+
+    with connect(tmp_path / "test.db") as conn:
+        run_migrations(conn)
+        storage = Storage(conn, event_listener=listener)
+        workspace = storage.create_workspace(name="w", root_path=str(tmp_path))
+        task = storage.create_task(
+            workspace_id=workspace["id"],
+            title="Test task",
+            status="running",
+            description="Test",
+            metadata={},
+        )
+        storage.create_lifecycle_event(
+            workspace_id=workspace["id"],
+            task_id=task["id"],
+            event_type="task.completed",
+            payload={},
+        )
+
+    # Post happens normally without thread_ts (unchanged behavior)
+    assert len(opener.requests) == 1
+    payload = opener.last_payload()
+    assert "thread_ts" not in payload

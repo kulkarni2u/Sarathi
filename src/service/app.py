@@ -34,6 +34,7 @@ from .intake import (
     _create_slack_task_draft,
     _derive_task_title,
     _emit_brainstorm_event,
+    _find_task_by_slack_thread,
     _get_policy_pack,
     _initialize_workspace_repository,
     _parse_slack_body,
@@ -310,6 +311,19 @@ class ServiceApp:
                 and raw_parts[4] == "interactions"
             ):
                 return self._handle_slack_interaction(
+                    raw_parts[2], body or {}, headers, raw_body
+                )
+
+            # Slack Events API intake — same self-authenticating HMAC bypass.
+            if (
+                is_api_request
+                and method == "POST"
+                and len(raw_parts) == 5
+                and raw_parts[1] == "workspaces"
+                and raw_parts[3] == "slack"
+                and raw_parts[4] == "events"
+            ):
+                return self._handle_slack_events(
                     raw_parts[2], body or {}, headers, raw_body
                 )
 
@@ -1944,6 +1958,65 @@ class ServiceApp:
             except Exception:
                 pass
 
+        return RawResponse(200, "application/json", b"{}")
+
+    def _handle_slack_events(
+        self,
+        workspace_id: str,
+        body: Mapping[str, Any],
+        headers: Mapping[str, str] | None,
+        raw_body: str | None,
+    ) -> RawResponse:
+        """Handle a Slack Events API callback (URL verification + threaded replies).
+
+        Verifies the Slack HMAC signature (if SARATHI_SLACK_SIGNING_SECRET is
+        set), answers the one-time url_verification handshake, and appends
+        threaded channel replies as user messages on the matching task. Always
+        acks 200 quickly -- Slack retries aggressively on non-200/timeout.
+        """
+        payload = _parse_slack_body(body)
+        _verify_slack_request(headers, raw_body)
+
+        if payload.get("type") == "url_verification":
+            return RawResponse(
+                200,
+                "application/json",
+                json.dumps({"challenge": payload.get("challenge", "")}).encode("utf-8"),
+            )
+        if payload.get("type") != "event_callback":
+            return RawResponse(200, "application/json", b"{}")
+
+        event = payload.get("event") or {}
+        if event.get("type") != "message" or event.get("bot_id") or event.get("subtype"):
+            return RawResponse(200, "application/json", b"{}")
+
+        channel = event.get("channel")
+        thread_ts = event.get("thread_ts") or event.get("ts")
+        text = (event.get("text") or "").strip()
+        if not (channel and thread_ts and text):
+            return RawResponse(200, "application/json", b"{}")
+
+        conn, storage = self._storage()
+        if storage.get_workspace(workspace_id) is None:
+            raise ServiceError("not_found", "Workspace not found.", 404)
+
+        task = _find_task_by_slack_thread(storage, workspace_id, channel, thread_ts)
+        if task is None:
+            return RawResponse(200, "application/json", b"{}")
+
+        message = storage.create_message(
+            workspace_id=workspace_id,
+            task_id=task["id"],
+            role="user",
+            content=text,
+            metadata={"source": "slack_message", "slack_user_id": event.get("user")},
+        )
+        storage.create_lifecycle_event(
+            workspace_id=workspace_id,
+            task_id=task["id"],
+            event_type="task.human_reply",
+            payload={"object_id": message["id"], "slack_user_id": event.get("user")},
+        )
         return RawResponse(200, "application/json", b"{}")
 
     def _authorize(self, headers: Mapping[str, str] | None) -> Principal | None:

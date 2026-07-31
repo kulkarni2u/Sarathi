@@ -381,3 +381,149 @@ def test_slack_command_rejects_missing_workspace(tmp_path):
     )
 
     assert status == 404
+
+
+# ---------------------------------------------------------------------------
+# Thread linking: gate posting with task metadata recording
+# ---------------------------------------------------------------------------
+
+
+def test_slack_command_records_gate_message_in_task_metadata(tmp_path, monkeypatch):
+    """When gate approval message posts successfully, task.metadata.slack.thread_ts is set."""
+    from unittest.mock import MagicMock
+    from src.notifications import build_slack_notifier as original_builder
+
+    app, workspace_id = _make_workspace(tmp_path)
+
+    # Mock notifier to return a posted message
+    mock_notifier = MagicMock()
+    mock_notifier.post_message.return_value = {
+        "channel": "C-gate-123",
+        "ts": "1700000000.555666",
+    }
+
+    def mock_build_slack_notifier(policy_section, env=None, opener=None):
+        return mock_notifier
+
+    monkeypatch.setattr(
+        "src.service.intake.build_slack_notifier", mock_build_slack_notifier
+    )
+
+    body = {
+        "text": "Implement new feature",
+        "team_id": "T001",
+        "team_domain": "acme",
+        "channel_id": "C-cmd-789",
+        "channel_name": "dev",
+        "user_id": "U001",
+        "user_name": "alice",
+        "command": "/task",
+        "response_url": "https://hooks.slack.com/commands/T001/123",
+    }
+
+    status, slack_reply = slack_request(
+        app, "POST", f"/api/workspaces/{workspace_id}/slack/commands/task",
+        body=body,
+    )
+
+    assert status == 200
+    task_id = slack_reply["task_id"]
+
+    # Fetch task and verify slack metadata includes thread_ts
+    _, task_data = json_request(app, "GET", f"/api/tasks/{task_id}")
+    task = task_data["task"]
+    assert "slack" in task["metadata"]
+    assert task["metadata"]["slack"]["channel_id"] == "C-gate-123"
+    assert task["metadata"]["slack"]["thread_ts"] == "1700000000.555666"
+
+    # Verify the gate also has the posted message metadata
+    _, gates_data = json_request(app, "GET", f"/api/tasks/{task_id}/approvals")
+    gate = gates_data["approval_gates"][0]
+    assert "slack" in gate["metadata"]
+    assert gate["metadata"]["slack"]["channel_id"] == "C-gate-123"
+    assert gate["metadata"]["slack"]["message_ts"] == "1700000000.555666"
+
+
+def test_slack_command_without_bot_token_no_slack_metadata(tmp_path, monkeypatch):
+    """When notifier.post_message returns None (no bot token), no slack metadata is added."""
+    from unittest.mock import MagicMock
+
+    app, workspace_id = _make_workspace(tmp_path)
+
+    # Mock notifier that returns None (webhook-only or missing bot token)
+    mock_notifier = MagicMock()
+    mock_notifier.post_message.return_value = None
+
+    def mock_build_slack_notifier(policy_section, env=None, opener=None):
+        return mock_notifier
+
+    monkeypatch.setattr(
+        "src.service.intake.build_slack_notifier", mock_build_slack_notifier
+    )
+
+    body = {
+        "text": "Another task",
+        "team_id": "T002",
+        "channel_id": "C-cmd-456",
+        "user_id": "U002",
+        "user_name": "bob",
+        "command": "/task",
+    }
+
+    status, slack_reply = slack_request(
+        app, "POST", f"/api/workspaces/{workspace_id}/slack/commands/task",
+        body=body,
+    )
+
+    assert status == 200
+    task_id = slack_reply["task_id"]
+
+    # Fetch task and verify NO slack metadata is added (only slack_command should exist)
+    _, task_data = json_request(app, "GET", f"/api/tasks/{task_id}")
+    task = task_data["task"]
+    # slack_command should still be present (from slack payload extraction)
+    assert "slack_command" in task["metadata"]
+    # but not the gate-posting slack metadata
+    assert "slack" not in task["metadata"] or task["metadata"].get("slack") is None
+
+
+def test_slack_command_gate_posting_error_does_not_break_task_creation(tmp_path, monkeypatch):
+    """If post_message raises an exception, task creation still succeeds."""
+    from unittest.mock import MagicMock
+
+    app, workspace_id = _make_workspace(tmp_path)
+
+    # Mock notifier that raises when posting
+    mock_notifier = MagicMock()
+    mock_notifier.post_message.side_effect = RuntimeError("Slack API error")
+
+    def mock_build_slack_notifier(policy_section, env=None, opener=None):
+        return mock_notifier
+
+    monkeypatch.setattr(
+        "src.service.intake.build_slack_notifier", mock_build_slack_notifier
+    )
+
+    body = {
+        "text": "Resilient task",
+        "team_id": "T003",
+        "channel_id": "C-cmd-999",
+        "user_id": "U003",
+        "user_name": "charlie",
+        "command": "/task",
+    }
+
+    status, slack_reply = slack_request(
+        app, "POST", f"/api/workspaces/{workspace_id}/slack/commands/task",
+        body=body,
+    )
+
+    # Task creation succeeds despite post_message error
+    assert status == 200
+    task_id = slack_reply["task_id"]
+
+    # Fetch task and verify it was created without slack gate metadata
+    _, task_data = json_request(app, "GET", f"/api/tasks/{task_id}")
+    task = task_data["task"]
+    assert task["status"] == "prd_pending"
+    assert "slack" not in task["metadata"] or task["metadata"].get("slack") is None

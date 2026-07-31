@@ -452,6 +452,28 @@ def _find_existing_github_issue_draft(
     return None
 
 
+def _find_task_by_slack_thread(
+    storage: Storage,
+    workspace_id: str,
+    channel_id: str,
+    thread_ts: str,
+) -> dict[str, Any] | None:
+    """Find the task whose Slack thread anchor matches (channel_id, thread_ts).
+
+    Mirrors _find_existing_github_issue_draft's scan-and-match shape.
+    """
+    for task in storage.list_tasks_for_workspace(workspace_id):
+        metadata = task.get("metadata")
+        if not isinstance(metadata, Mapping):
+            continue
+        slack = metadata.get("slack")
+        if not isinstance(slack, Mapping):
+            continue
+        if slack.get("channel_id") == channel_id and str(slack.get("thread_ts")) == str(thread_ts):
+            return task
+    return None
+
+
 def _sync_github_issues_by_label(
     storage: Storage,
     workspace_id: str,

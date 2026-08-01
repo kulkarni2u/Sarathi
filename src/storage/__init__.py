@@ -21,6 +21,7 @@ LATEST_SCHEMA_VERSION = 14
 # compiler treat only entries carrying these identities as typed external data.
 SLACK_EXTERNAL_INPUT_SOURCE = "slack"
 SLACK_EXTERNAL_INPUT_TRUST = "untrusted_external"
+SLACK_PROVISIONAL_THREAD_PREFIX = "provisional:"
 
 
 class _AssignResumeAborted(Exception):
@@ -2444,7 +2445,13 @@ class Storage:
             ).fetchall()
         return [_slack_outbox_from_row(row) for row in rows]
 
-    def finish_slack_outbox(self, operation_key: str, *, slack_message_ts: str) -> dict[str, Any]:
+    def finish_slack_outbox(
+        self,
+        operation_key: str,
+        *,
+        slack_message_ts: str,
+        delivered_channel_id: str | None = None,
+    ) -> dict[str, Any]:
         """Record successful delivery of an outbox row as ``sent``.
 
         Transitions only from ``pending`` or ``processing``; an already-terminal
@@ -2453,7 +2460,8 @@ class Storage:
         """
         now = _utc_now()
         with self.conn:
-            self.conn.execute(
+            self.conn.execute("BEGIN IMMEDIATE")
+            transitioned = self.conn.execute(
                 """
                 UPDATE slack_outbox
                 SET status = 'sent', slack_message_ts = ?, error_code = NULL,
@@ -2462,6 +2470,54 @@ class Storage:
                 """,
                 (slack_message_ts, now, now, operation_key),
             )
+            if transitioned.rowcount == 1 and delivered_channel_id is not None:
+                delivery = self.conn.execute(
+                    """
+                    SELECT task_id, workspace_id, channel_id
+                    FROM slack_outbox WHERE operation_key = ?
+                    """,
+                    (operation_key,),
+                ).fetchone()
+                if delivery is None or delivery["channel_id"] != delivered_channel_id:
+                    raise ValueError("Slack delivery channel does not match durable outbox")
+                binding = self.conn.execute(
+                    """
+                    SELECT id, thread_ts FROM slack_task_bindings
+                    WHERE task_id = ? AND workspace_id = ? AND channel_id = ?
+                    """,
+                    (
+                        delivery["task_id"],
+                        delivery["workspace_id"],
+                        delivered_channel_id,
+                    ),
+                ).fetchone()
+                if (
+                    binding is not None
+                    and binding["thread_ts"].startswith(SLACK_PROVISIONAL_THREAD_PREFIX)
+                ):
+                    self.conn.execute(
+                        """
+                        UPDATE slack_task_bindings SET thread_ts = ?, updated_at = ?
+                        WHERE id = ? AND thread_ts = ?
+                        """,
+                        (slack_message_ts, now, binding["id"], binding["thread_ts"]),
+                    )
+                    task_row = self.conn.execute(
+                        "SELECT metadata FROM tasks WHERE id = ?",
+                        (delivery["task_id"],),
+                    ).fetchone()
+                    if task_row is not None:
+                        metadata = _load_json(task_row["metadata"])
+                        slack_meta = metadata.get("slack")
+                        if isinstance(slack_meta, Mapping):
+                            slack_meta = dict(slack_meta)
+                            slack_meta["thread_ts"] = slack_message_ts
+                            slack_meta["thread_ts_provisional"] = False
+                            metadata["slack"] = slack_meta
+                            self.conn.execute(
+                                "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                                (_dump_json(metadata), now, delivery["task_id"]),
+                            )
             row = self.conn.execute(
                 """
                 SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,

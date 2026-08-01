@@ -164,3 +164,24 @@ def test_outbox_accepts_slack_sdk_response_wrapper(config, storage):
         channel_id="C1", thread_ts=None, operation="message", payload={"text": "Status"},
     )
     assert runner.process_outbox_once()[0]["status"] == "sent"
+
+
+def test_command_delivery_atomically_finalizes_real_thread_binding(config, storage):
+    client = FakeClient()
+    runner = SocketModeRunner(config=config, storage=storage, app_factory=lambda _: FakeApp(client))
+    runner.handle_envelope(command_payload(), lambda: None)
+    created = runner.process_inbox_once()[0]
+    task_id = created["task_id"]
+    provisional = storage.conn.execute(
+        "SELECT thread_ts FROM slack_task_bindings WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    assert provisional["thread_ts"].startswith("provisional:")
+
+    assert runner.process_outbox_once()[0]["status"] == "sent"
+    binding = storage.conn.execute(
+        "SELECT channel_id, thread_ts FROM slack_task_bindings WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    assert dict(binding) == {"channel_id": "C1", "thread_ts": "123.4"}
+    slack_meta = storage.get_task(task_id)["metadata"]["slack"]
+    assert slack_meta["thread_ts"] == "123.4"
+    assert slack_meta["thread_ts_provisional"] is False

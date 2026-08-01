@@ -79,7 +79,9 @@ class SocketModeRunner:
                     raise RuntimeError("slack-delivery-mismatch")
                 results.append(
                     self.storage.finish_slack_outbox(
-                        row["operation_key"], slack_message_ts=str(response_data["ts"])
+                        row["operation_key"],
+                        slack_message_ts=str(response_data["ts"]),
+                        delivered_channel_id=str(response_data["channel"]),
                     )
                 )
             except Exception as exc:  # Slack SDK errors may vary by version

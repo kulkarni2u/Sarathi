@@ -22,9 +22,28 @@ class FakeClient:
         return {"ok": self.ok, "channel": kwargs["channel"], "ts": kwargs["ts"]}
 
 
+class FakeSlackResponse:
+    def __init__(self, data):
+        self.data = data
+
+
 class FakeApp:
     def __init__(self, client=None):
         self.client = client or FakeClient()
+
+
+class FakeSocketRequest:
+    type = "slash_commands"
+    envelope_id = "socket-env-1"
+    payload = command_payload = None
+
+
+class FakeSocketClient:
+    def __init__(self):
+        self.responses = []
+
+    def send_socket_mode_response(self, response):
+        self.responses.append(response)
 
 
 @pytest.fixture
@@ -58,6 +77,35 @@ def command_payload(text="Build the release checklist"):
             "command": "/sarathi-task", "text": text,
         },
     }
+
+
+def test_raw_socket_request_preserves_envelope_id_before_ack(config, storage):
+    runner = SocketModeRunner(config=config, storage=storage, app_factory=lambda _: FakeApp())
+    request = FakeSocketRequest()
+    request.payload = command_payload()["payload"]
+    client = FakeSocketClient()
+    runner.handle_socket_request(
+        client, request, lambda **kwargs: kwargs,
+    )
+    row = storage.conn.execute("SELECT envelope_id FROM slack_inbox").fetchone()
+    assert row["envelope_id"] == "socket-env-1"
+    assert client.responses == [{"envelope_id": "socket-env-1"}]
+
+
+def test_interactive_socket_type_uses_inner_block_action_type(config, storage):
+    runner = SocketModeRunner(config=config, storage=storage, app_factory=lambda _: FakeApp())
+    raw = {
+        "type": "interactive", "envelope_id": "env-action",
+        "payload": {
+            "type": "block_actions", "team": {"id": "T1"},
+            "channel": {"id": "C1"}, "user": {"id": "U1"},
+            "message": {"ts": "10.2"},
+            "actions": [{"action_id": "unknown", "value": "opaque"}],
+        },
+    }
+    envelope = runner._to_envelope(raw)
+    assert envelope.kind == "interaction"
+    assert envelope.envelope_id == "env-action"
 
 
 def test_runner_persists_before_ack(config, storage):
@@ -103,3 +151,16 @@ def test_outbox_failure_is_redacted_and_requeued(config, storage):
     assert result[0]["status"] == "pending"
     assert result[0]["error_code"] == "delivery-failed"
     assert "secret" not in str(result)
+
+
+def test_outbox_accepts_slack_sdk_response_wrapper(config, storage):
+    client = FakeClient()
+    client.chat_postMessage = lambda **kwargs: FakeSlackResponse(
+        {"ok": True, "channel": kwargs["channel"], "ts": "55.2"}
+    )
+    runner = SocketModeRunner(config=config, storage=storage, app_factory=lambda _: FakeApp(client))
+    storage.enqueue_slack_outbox(
+        operation_key="op-sdk", workspace_id="ws-1", task_id="task-1",
+        channel_id="C1", thread_ts=None, operation="message", payload={"text": "Status"},
+    )
+    assert runner.process_outbox_once()[0]["status"] == "sent"

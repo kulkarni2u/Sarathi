@@ -7,12 +7,11 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
+from threading import Event
 from typing import Any
 
 from src.service.slack.config import SlackSocketConfig
 from src.service.slack.workflow import (
-    COMMAND_NAME,
-    DECISION_ACTION_ID,
     SELECTION_ACTION_ID,
     SlackEnvelope,
     SlackWorkflow,
@@ -61,17 +60,26 @@ class SocketModeRunner:
                 if payload.get("selection_actions"):
                     kwargs["blocks"] = _selection_blocks(payload["selection_actions"])
                 if row["operation"] == "update":
+                    kwargs.pop("thread_ts", None)
                     kwargs["ts"] = payload["ts"]
                     response = client.chat_update(**kwargs)
                 else:
                     response = client.chat_postMessage(**kwargs)
-                if not isinstance(response, Mapping) or response.get("ok") is not True:
+                response_data = (
+                    response
+                    if isinstance(response, Mapping)
+                    else getattr(response, "data", None)
+                )
+                if not isinstance(response_data, Mapping) or response_data.get("ok") is not True:
                     raise RuntimeError("slack-delivery-failed")
-                if response.get("channel") != row["channel_id"] or not response.get("ts"):
+                if (
+                    response_data.get("channel") != row["channel_id"]
+                    or not response_data.get("ts")
+                ):
                     raise RuntimeError("slack-delivery-mismatch")
                 results.append(
                     self.storage.finish_slack_outbox(
-                        row["operation_key"], slack_message_ts=str(response["ts"])
+                        row["operation_key"], slack_message_ts=str(response_data["ts"])
                     )
                 )
             except Exception as exc:  # Slack SDK errors may vary by version
@@ -81,31 +89,41 @@ class SocketModeRunner:
                 )
         return results
 
-    def register_listeners(self) -> None:
-        """Register Bolt listeners without starting a connection."""
-        app = self.app
+    def handle_socket_request(
+        self,
+        client: object,
+        request: object,
+        response_factory: Callable[..., object],
+    ) -> None:
+        """Preserve the Socket Mode envelope identity through persistence/ack."""
+        payload = getattr(request, "payload", None)
+        if not isinstance(payload, Mapping):
+            raise ValueError("invalid-socket-payload")
+        envelope_id = str(getattr(request, "envelope_id", "") or "")
+        if not envelope_id:
+            raise ValueError("missing-envelope-id")
+        raw = {
+            "type": str(getattr(request, "type", "") or ""),
+            "envelope_id": envelope_id,
+            "event_id": payload.get("event_id"),
+            "payload": payload,
+        }
 
-        @app.command(COMMAND_NAME)
-        def command_listener(ack, body):
-            self.handle_envelope({"type": "slash_commands", **body}, ack)
+        def ack() -> None:
+            client.send_socket_mode_response(response_factory(envelope_id=envelope_id))
 
-        @app.action(DECISION_ACTION_ID)
-        def decision_listener(ack, body):
-            self.handle_envelope({"type": "block_actions", **body}, ack)
-
-        @app.action(SELECTION_ACTION_ID)
-        def selection_listener(ack, body):
-            self.handle_envelope({"type": "block_actions", **body}, ack)
-
-        @app.event("message")
-        def message_listener(body, ack):
-            self.handle_envelope({"type": "events_api", **body}, ack)
+        self.handle_envelope(raw, ack)
 
     @staticmethod
     def _to_envelope(raw: Mapping[str, Any]) -> SlackEnvelope:
         envelope_id = str(raw.get("envelope_id") or raw.get("event_id") or "")
         body = raw.get("payload") if isinstance(raw.get("payload"), Mapping) else raw
-        kind = str(raw.get("type") or body.get("type") or "")
+        socket_kind = str(raw.get("type") or "")
+        kind = (
+            str(body.get("type") or "")
+            if socket_kind == "interactive"
+            else socket_kind or str(body.get("type") or "")
+        )
         team = body.get("team") if isinstance(body.get("team"), Mapping) else {}
         user = body.get("user") if isinstance(body.get("user"), Mapping) else {}
         if kind == "slash_commands":
@@ -162,14 +180,6 @@ def _selection_blocks(actions: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [{"type": "actions", "elements": elements}]
 
 
-def _bolt_app_factory(config: SlackSocketConfig) -> object:
-    try:
-        from slack_bolt import App
-    except ImportError as exc:
-        raise RuntimeError("Slack support is optional; install with: pip install 'sarathi-ai[slack]'") from exc
-    return App(token=config.bot_token)
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Sarathi Slack Socket Mode")
     parser.add_argument("--db", default=".sarathi/sarathi.db")
@@ -177,13 +187,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = SlackSocketConfig.from_env()
     conn = connect(args.db)
     run_migrations(conn)
-    runner = SocketModeRunner(config=config, storage=Storage(conn), app_factory=_bolt_app_factory)
-    runner.register_listeners()
     try:
-        from slack_bolt.adapter.socket_mode import SocketModeHandler
+        from slack_sdk.socket_mode import SocketModeClient
+        from slack_sdk.socket_mode.response import SocketModeResponse
+        from slack_sdk.web import WebClient
     except ImportError as exc:
         raise RuntimeError("Slack support is optional; install with: pip install 'sarathi-ai[slack]'") from exc
-    SocketModeHandler(runner.app, config.app_token).start()
+    web_client = WebClient(token=config.bot_token)
+    socket_client = SocketModeClient(app_token=config.app_token, web_client=web_client)
+
+    class _ClientHolder:
+        client = web_client
+
+    runner = SocketModeRunner(
+        config=config, storage=Storage(conn), app_factory=lambda _: _ClientHolder()
+    )
+    socket_client.socket_mode_request_listeners.append(
+        lambda client, request: runner.handle_socket_request(
+            client, request, SocketModeResponse
+        )
+    )
+    socket_client.connect()
+    Event().wait()
     return 0
 
 

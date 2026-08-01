@@ -1,6 +1,5 @@
 """Tests for Slack notification channel (src/notifications.py)."""
 
-import io
 import json
 
 from src.notifications import (
@@ -83,7 +82,7 @@ def test_config_from_policy_defaults_disabled():
 
 
 def test_config_from_env_auto_enables_on_webhook():
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
     config = SlackConfig.from_env(env)
     assert config.enabled is True
     assert config.events == DEFAULT_EVENTS
@@ -112,15 +111,14 @@ def test_build_notifier_none_without_secret():
 
 def test_build_notifier_policy_disabled_wins_over_env():
     section = {"slack": {"enabled": False}}
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
     assert build_slack_notifier(section, env=env) is None
 
 
-def test_build_notifier_env_fallback_without_policy():
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+def test_build_notifier_never_creates_legacy_http_transport_implicitly():
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
     notifier = build_slack_notifier(None, env=env)
-    assert notifier is not None
-    assert notifier.is_configured()
+    assert notifier is None
 
 
 # ---------------------------------------------------------------- filtering
@@ -140,7 +138,7 @@ def test_event_filter_supports_globs():
 
 def test_webhook_post_sends_blocks():
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/T/B/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/services/T/B/x"}
     notifier = SlackNotifier(SlackConfig(enabled=True), env=env, opener=opener)
     event = NotificationEvent(
         event_type="task.failed",
@@ -151,7 +149,7 @@ def test_webhook_post_sends_blocks():
 
     assert notifier.notify(event) is True
     request, timeout = opener.requests[0]
-    assert request.full_url == "https://hooks.slack.com/services/T/B/x"
+    assert request.full_url == "https://slack.invalid/services/T/B/x"
     assert timeout == 5.0
     payload = opener.last_payload()
     assert payload["text"].endswith("Task t-1: fix checkout")
@@ -162,14 +160,14 @@ def test_webhook_post_sends_blocks():
 
 def test_bot_token_posts_to_chat_post_message():
     opener = FakeOpener(responses=[FakeResponse(body=b'{"ok": true}')])
-    env = {"SARATHI_SLACK_BOT_TOKEN": "xoxb-secret"}
+    env = {"SARATHI_SLACK_BOT_TOKEN": "bot-test-token"}
     config = SlackConfig(enabled=True, channel="#runs")
     notifier = SlackNotifier(config, env=env, opener=opener)
 
     assert notifier.notify(NotificationEvent("task.completed", "Task done")) is True
     request, _ = opener.requests[0]
     assert request.full_url == SLACK_POST_MESSAGE_URL
-    assert request.get_header("Authorization") == "Bearer xoxb-secret"
+    assert request.get_header("Authorization") == "Bearer bot-test-token"
     assert opener.last_payload()["channel"] == "#runs"
 
 
@@ -192,14 +190,14 @@ def test_bot_token_without_channel_not_configured():
 
 def test_notify_swallows_network_errors():
     opener = FakeOpener(error=OSError("connection refused"))
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
     notifier = SlackNotifier(SlackConfig(enabled=True), env=env, opener=opener)
     assert notifier.notify(NotificationEvent("task.failed", "boom")) is False
 
 
 def test_notify_skips_unmatched_event_without_request():
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
     config = SlackConfig(enabled=True, events=("task.failed",))
     notifier = SlackNotifier(config, env=env, opener=opener)
     assert notifier.notify(NotificationEvent("task.completed", "done")) is False
@@ -307,7 +305,7 @@ def test_storage_listener_errors_do_not_break_writes(tmp_path):
 
 def test_lifecycle_event_listener_end_to_end(tmp_path):
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
     listener = lifecycle_event_listener(env=env, opener=opener)
     assert listener is not None
 
@@ -398,7 +396,7 @@ def test_engine_run_emits_task_completed():
 def test_notify_with_thread_ts_webhook():
     """Posting to webhook with thread_ts includes it in the JSON payload."""
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/T/B/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/services/T/B/x"}
     notifier = SlackNotifier(SlackConfig(enabled=True), env=env, opener=opener)
     event = NotificationEvent(
         event_type="task.failed",
@@ -414,7 +412,7 @@ def test_notify_with_thread_ts_webhook():
 def test_notify_with_thread_ts_bot_token():
     """Posting via bot token with thread_ts includes it in the JSON payload."""
     opener = FakeOpener(responses=[FakeResponse(body=b'{"ok": true}')])
-    env = {"SARATHI_SLACK_BOT_TOKEN": "xoxb-secret"}
+    env = {"SARATHI_SLACK_BOT_TOKEN": "bot-test-token"}
     config = SlackConfig(enabled=True, channel="#runs")
     notifier = SlackNotifier(config, env=env, opener=opener)
     event = NotificationEvent("task.completed", "Task done", task_id="t-1")
@@ -428,7 +426,7 @@ def test_notify_with_thread_ts_bot_token():
 def test_notify_without_thread_ts_no_key_in_payload():
     """Posting without thread_ts (default behavior) does not include the key."""
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/T/B/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/services/T/B/x"}
     notifier = SlackNotifier(SlackConfig(enabled=True), env=env, opener=opener)
     event = NotificationEvent("task.completed", "Task done", task_id="t-1")
 
@@ -440,7 +438,7 @@ def test_notify_without_thread_ts_no_key_in_payload():
 def test_notify_with_none_thread_ts_no_key_in_payload():
     """Explicitly passing thread_ts=None does not include the key."""
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/services/T/B/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/services/T/B/x"}
     notifier = SlackNotifier(SlackConfig(enabled=True), env=env, opener=opener)
     event = NotificationEvent("task.completed", "Task done", task_id="t-1")
 
@@ -452,7 +450,7 @@ def test_notify_with_none_thread_ts_no_key_in_payload():
 def test_lifecycle_event_listener_with_get_task_thread_ts(tmp_path):
     """Listener with get_task forwards thread_ts from task metadata to notifier."""
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
 
     def fake_get_task(task_id):
         return {
@@ -495,7 +493,7 @@ def test_lifecycle_event_listener_with_get_task_thread_ts(tmp_path):
 def test_lifecycle_event_listener_get_task_returns_none(tmp_path):
     """When get_task returns None, listener still posts without thread_ts."""
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
 
     def fake_get_task(task_id):
         return None  # task not found
@@ -530,7 +528,7 @@ def test_lifecycle_event_listener_get_task_returns_none(tmp_path):
 def test_lifecycle_event_listener_get_task_missing_slack_metadata(tmp_path):
     """When task metadata lacks 'slack' key, listener posts without thread_ts."""
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
 
     def fake_get_task(task_id):
         return {
@@ -571,7 +569,7 @@ def test_lifecycle_event_listener_get_task_missing_slack_metadata(tmp_path):
 def test_lifecycle_event_listener_get_task_metadata_none(tmp_path):
     """When task.metadata is None, listener posts without thread_ts."""
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
 
     def fake_get_task(task_id):
         return {
@@ -609,7 +607,7 @@ def test_lifecycle_event_listener_get_task_metadata_none(tmp_path):
 def test_lifecycle_event_listener_get_task_raises_exception(tmp_path):
     """When get_task raises an exception, listener still posts without thread_ts."""
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
 
     def fake_get_task(task_id):
         raise RuntimeError("database error")
@@ -644,7 +642,7 @@ def test_lifecycle_event_listener_get_task_raises_exception(tmp_path):
 def test_lifecycle_event_listener_unmatched_event_skips_get_task_call(tmp_path):
     """When event type doesn't match notifier config, get_task is not called."""
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
 
     call_count = 0
 
@@ -684,7 +682,7 @@ def test_lifecycle_event_listener_unmatched_event_skips_get_task_call(tmp_path):
 def test_lifecycle_event_listener_default_get_task_none(tmp_path):
     """Listener without get_task still works (existing behavior regression test)."""
     opener = FakeOpener()
-    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://hooks.slack.com/x"}
+    env = {"SARATHI_SLACK_WEBHOOK_URL": "https://slack.invalid/x"}
 
     # No get_task provided (None/default)
     listener = lifecycle_event_listener(env=env, opener=opener)

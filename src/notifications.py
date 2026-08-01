@@ -179,7 +179,10 @@ class SlackNotifier:
     ):
         self.config = config
         self._env = os.environ if env is None else env
-        self._opener = opener or urllib.request.urlopen
+        # Legacy HTTP delivery is test/embedding-only. Production Slack
+        # delivery is owned by the durable Socket Mode outbox worker; never
+        # create a network-capable urllib transport implicitly.
+        self._opener = opener
 
     @property
     def webhook_url(self) -> str | None:
@@ -190,6 +193,8 @@ class SlackNotifier:
         return self._env.get(self.config.bot_token_env) or None
 
     def is_configured(self) -> bool:
+        if self._opener is None:
+            return False
         if not self.config.enabled:
             return False
         if self.webhook_url:
@@ -233,6 +238,7 @@ class SlackNotifier:
             headers={"Content-Type": "application/json", **headers},
             method="POST",
         )
+        assert self._opener is not None
         with self._opener(request, timeout=self.config.timeout_seconds) as response:
             status = getattr(response, "status", 200)
             raw = response.read()
@@ -376,8 +382,9 @@ def build_slack_notifier(
 
     When a ``notifications`` policy section is present its ``enabled`` flag
     governs. When the policy pack has no notifications section at all, the
-    environment auto-enables (exporting ``SARATHI_SLACK_WEBHOOK_URL`` is
-    enough for CLI users without a policy edit).
+    Legacy delivery is available only to callers that explicitly inject an
+    opener. Runtime code never creates this HTTP transport; Slack delivery is
+    owned by the durable Socket Mode outbox.
     """
     has_policy = isinstance(policy_section, Mapping) and bool(policy_section)
     config = (

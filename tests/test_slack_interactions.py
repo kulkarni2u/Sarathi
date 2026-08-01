@@ -1,558 +1,279 @@
-"""Tests for Slack interactive approve/reject gate decisions.
+"""Transport-independent Slack approve/reject gate decision tests.
 
-Covers:
-- POST /api/workspaces/{workspace_id}/slack/interactions
-- Block actions payload (type: "block_actions")
-- Approve/reject button click handling (approve_gate / reject_gate actions)
-- Gate status updates and lifecycle events
-- HMAC signature verification
-- Idempotency of repeated clicks
-- Error handling (unknown gate/task, non-block-actions payloads)
+These tests drive ``SlackWorkflow`` directly with typed ``SlackEnvelope``
+objects and a local SQLite ``Storage``. They never connect to Slack, access
+the network, or use real-looking tokens, webhook URLs, response URLs, or raw
+Socket Mode envelopes. The old HMAC/HTTP interaction behavior is intentionally
+gone; Task 5 removes the public routes from the main service.
 """
 
 from __future__ import annotations
 
-import hmac
-import json
-import time
+from typing import Any
 
 import pytest
 
-from src.service import create_app
-from src.service.app import RawResponse
+from src.service.slack.config import SlackSocketConfig
+from src.service.slack.workflow import SlackEnvelope, SlackWorkflow
 from src.storage import Storage, connect, run_migrations
 
+TEST_TEAM_ID = "T00000000"
+TEST_CHANNEL_ID = "C11111111"
+TEST_ACTOR_ID = "U33333333"
+TEST_APPROVER_ID = "U44444444"
+TEST_WS_ID = "ws-0123456789abcdef"
+TEST_THREAD_TS = "1700000000.000000"
+TEST_APPROVE_ACTION = "v9k2m1q7w4"
+TEST_REJECT_ACTION = "n3p8z5r2t6"
 
-def slack_request(app, method, path, body=None, raw_body=None,
-                  correlation_id="corr-slack", headers=None):
-    """Call ``app.handle`` and return ``(status, payload)``.
-
-    Normalises ``RawResponse`` (returned on success for Slack endpoints)
-    to ``(status, json_dict)`` so callers get a uniform interface.
-    """
-    base_headers = {"x-correlation-id": correlation_id}
-    if headers:
-        base_headers.update(headers)
-    result = app.handle(method, path, body=body, raw_body=raw_body, headers=base_headers)
-    if isinstance(result, RawResponse):
-        return result.status, json.loads(result.body.decode("utf-8"))
-    return result
+SLACK_SECURITY_EVENT = "slack.security_rejected"
 
 
-def json_request(app, method, path, body=None, correlation_id="corr-slack"):
-    """Call a normal JSON-API endpoint (returns the ok envelope)."""
-    status, payload = app.handle(
-        method, path, body=body, headers={"x-correlation-id": correlation_id},
+def approval_envelope(**overrides: Any) -> SlackEnvelope:
+    """Build an approval block-action envelope for the seeded gate."""
+    action = overrides.pop("action", "approve")
+    data: dict[str, Any] = {
+        "kind": "interaction",
+        "envelope_id": "env-interaction-1",
+        "event_id": None,
+        "team_id": TEST_TEAM_ID,
+        "channel_id": TEST_CHANNEL_ID,
+        "actor_id": TEST_APPROVER_ID,
+        "payload": {
+            "action_id": "sarathi_gate_decision",
+            "value": TEST_APPROVE_ACTION if action == "approve" else TEST_REJECT_ACTION,
+            "thread_ts": TEST_THREAD_TS,
+            "channel_id": TEST_CHANNEL_ID,
+            "team_id": TEST_TEAM_ID,
+        },
+    }
+    data.update(overrides)
+    return SlackEnvelope(**data)
+
+
+class GateProbe:
+    def __init__(self, storage: Storage, gate_id: str) -> None:
+        self._storage = storage
+        self._gate_id = gate_id
+
+    def refresh(self) -> dict:
+        gate = self._storage.get_approval_gate(self._gate_id)
+        assert gate is not None
+        return gate
+
+
+@pytest.fixture
+def storage(tmp_path):
+    conn = connect(tmp_path / "sarathi.db")
+    run_migrations(conn)
+    storage = Storage(conn)
+    yield storage
+    conn.close()
+
+
+@pytest.fixture
+def config() -> SlackSocketConfig:
+    return SlackSocketConfig(
+        app_token="sarathi-app-level-a1",
+        bot_token="sarathi-bot-level-b2",
+        team_id=TEST_TEAM_ID,
+        channel_ids=frozenset({TEST_CHANNEL_ID}),
+        approver_ids=frozenset({TEST_ACTOR_ID, TEST_APPROVER_ID}),
+        workspace_id=TEST_WS_ID,
     )
-    assert payload["ok"] is True
-    return status, payload["data"]
 
 
-def _make_workspace(tmp_path):
-    """Create a workspace and return (app, workspace_id)."""
-    app = create_app(tmp_path / "sarathi.db")
-    _, data = json_request(
-        app,
-        "POST",
-        "/api/workspaces",
-        {"name": "Slack Workspace", "root_path": str(tmp_path)},
+@pytest.fixture
+def workspace(storage):
+    storage.conn.execute(
+        """
+        INSERT INTO workspaces (id, name, root_path, metadata, created_at, updated_at)
+        VALUES (?, ?, ?, '{}', ?, ?)
+        """,
+        (
+            TEST_WS_ID,
+            "Slack interactions",
+            "/work/slack",
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:00+00:00",
+        ),
     )
-    return app, data["workspace"]["id"]
+    storage.conn.commit()
+    return storage.get_workspace(TEST_WS_ID)
 
 
-def _create_task_with_pending_gate(storage, workspace_id):
-    """Create a task with a pending PRD/AC approval gate. Returns (task, gate)."""
+@pytest.fixture
+def workflow(storage, config) -> SlackWorkflow:
+    return SlackWorkflow(storage=storage, config=config)
+
+
+@pytest.fixture
+def pending_gate(storage, workspace) -> GateProbe:
     task = storage.create_task(
-        workspace_id=workspace_id,
-        title="Test task for approval",
+        workspace_id=TEST_WS_ID,
+        title="Approval task",
         status="prd_pending",
+        metadata={"source": "slack_command"},
     )
     gate = storage.create_approval_gate(
-        workspace_id=workspace_id,
+        workspace_id=TEST_WS_ID,
         task_id=task["id"],
         name="PRD/AC",
         status="pending",
-        metadata={"requires_human": True},
+        metadata={
+            "requires_human": True,
+            "slack_decision_actions": {
+                "approve": TEST_APPROVE_ACTION,
+                "reject": TEST_REJECT_ACTION,
+            },
+        },
     )
-    return task, gate
+    storage.bind_slack_task(
+        task_id=task["id"],
+        workspace_id=TEST_WS_ID,
+        team_id=TEST_TEAM_ID,
+        channel_id=TEST_CHANNEL_ID,
+        thread_ts=TEST_THREAD_TS,
+        requester_user_id=TEST_ACTOR_ID,
+    )
+    return GateProbe(storage, gate["id"])
+
+
+def _security_events(storage) -> list[dict]:
+    return [
+        event
+        for event in storage.list_events(workspace_id=TEST_WS_ID)
+        if event["event_type"] == SLACK_SECURITY_EVENT
+    ]
 
 
 # ---------------------------------------------------------------------------
-# Happy path tests
+# Approve / reject transitions
 # ---------------------------------------------------------------------------
 
 
-def test_slack_interaction_approve_happy_path(tmp_path):
-    """POST a block_actions payload with approve_gate action updates gate status."""
-    app, workspace_id = _make_workspace(tmp_path)
+def test_approved_gate_transition_is_processed(workflow, storage, pending_gate):
+    workflow.accept(approval_envelope(envelope_id="env-interaction-1"))
+    results = workflow.process_next()
+    assert len(results) == 1
+    assert results[0]["kind"] == "interaction"
+    assert results[0]["status"] == "processed"
+    assert results[0]["applied"] is True
+    assert results[0]["gate_status"] == "approved"
 
-    db_path = tmp_path / "sarathi.db"
-    with connect(db_path) as conn:
-        run_migrations(conn)
-        storage = Storage(conn)
-        task, gate = _create_task_with_pending_gate(storage, workspace_id)
+    assert pending_gate.refresh()["status"] == "approved"
 
-    # Build the Slack payload for an approve action
-    payload = {
-        "type": "block_actions",
-        "user": {"id": "U123", "username": "alice"},
-        "actions": [
-            {
-                "action_id": "approve_gate",
-                "value": f"{task['id']}:{gate['id']}",
-            }
-        ],
-        "response_url": "https://hooks.slack.com/actions/T123/456",
-    }
+    outbox = storage.claim_slack_outbox()
+    assert len(outbox) == 1
+    assert outbox[0]["operation_key"].startswith("gate-decision:")
+    assert outbox[0]["operation_key"].endswith(":env-interaction-1")
+    assert outbox[0]["thread_ts"] == TEST_THREAD_TS
 
-    status, response = slack_request(
-        app,
-        "POST",
-        f"/api/workspaces/{workspace_id}/slack/interactions",
-        body={"payload": json.dumps(payload)},
-    )
+    assert storage.claim_slack_events() == []
 
-    assert status == 200
-
-    # Verify gate status was updated
-    with connect(db_path) as conn:
-        storage = Storage(conn)
-        updated_gate = storage.get_approval_gate(gate["id"])
-        assert updated_gate["status"] == "approved"
-
-    # Verify lifecycle event was created
-    _, events_data = json_request(app, "GET", f"/api/events?workspace_id={workspace_id}")
-    events = events_data["events"]
-    approval_events = [e for e in events if e["event_type"] == "approval.recorded"]
-    assert len(approval_events) > 0
-    latest_event = approval_events[-1]
-    assert latest_event["task_id"] == task["id"]
-    assert latest_event["payload"]["object_id"] == gate["id"]
-    assert latest_event["payload"]["status"] == "approved"
+    events = _security_events(storage)
+    assert events == []
 
 
-def test_slack_interaction_reject_happy_path(tmp_path):
-    """POST a block_actions payload with reject_gate action updates gate and task status."""
-    app, workspace_id = _make_workspace(tmp_path)
+def test_rejected_gate_transition_is_processed(workflow, storage, pending_gate):
+    workflow.accept(approval_envelope(action="reject", envelope_id="env-interaction-1"))
+    results = workflow.process_next()
+    assert len(results) == 1
+    assert results[0]["status"] == "processed"
+    assert results[0]["applied"] is True
+    assert results[0]["gate_status"] == "rejected"
 
-    db_path = tmp_path / "sarathi.db"
-    with connect(db_path) as conn:
-        run_migrations(conn)
-        storage = Storage(conn)
-        task, gate = _create_task_with_pending_gate(storage, workspace_id)
+    assert pending_gate.refresh()["status"] == "rejected"
 
-    # Build the Slack payload for a reject action
-    payload = {
-        "type": "block_actions",
-        "user": {"id": "U456", "username": "bob"},
-        "actions": [
-            {
-                "action_id": "reject_gate",
-                "value": f"{task['id']}:{gate['id']}",
-            }
-        ],
-        "response_url": "https://hooks.slack.com/actions/T123/789",
-    }
 
-    status, response = slack_request(
-        app,
-        "POST",
-        f"/api/workspaces/{workspace_id}/slack/interactions",
-        body={"payload": json.dumps(payload)},
-    )
+def test_duplicate_envelope_is_applied_at_most_once(workflow, storage, pending_gate):
+    workflow.accept(approval_envelope(envelope_id="env-interaction-1"))
+    workflow.process_next()
+    workflow.accept(approval_envelope(envelope_id="env-interaction-1"))
+    workflow.process_next()
 
-    assert status == 200
+    assert pending_gate.refresh()["status"] == "approved"
+    outbox = storage.claim_slack_outbox()
+    assert len(outbox) == 1
+    assert storage.claim_slack_outbox() == []
+    assert storage.claim_slack_events() == []
 
-    # Verify gate status was updated to rejected
-    with connect(db_path) as conn:
-        storage = Storage(conn)
-        updated_gate = storage.get_approval_gate(gate["id"])
-        assert updated_gate["status"] == "rejected"
 
-        # Verify task status changed to rejected
-        updated_task = storage.get_task(task["id"])
-        assert updated_task["status"] == "rejected"
+def test_repeat_decision_on_terminal_gate_does_not_second_transition(workflow, storage, pending_gate):
+    workflow.accept(approval_envelope(envelope_id="env-interaction-1"))
+    workflow.process_next()
+    workflow.accept(approval_envelope(envelope_id="env-interaction-2"))
+    results = workflow.process_next()
+    assert len(results) == 1
+    assert results[0]["status"] == "processed"
+    assert results[0]["applied"] is False
+    assert results[0]["gate_status"] == "approved"
 
-    # Verify lifecycle events were created
-    _, events_data = json_request(app, "GET", f"/api/events?workspace_id={workspace_id}")
-    events = events_data["events"]
-
-    # Should have both approval.recorded and task.cancelled events
-    approval_events = [e for e in events if e["event_type"] == "approval.recorded"]
-    cancelled_events = [e for e in events if e["event_type"] == "task.cancelled"]
-
-    assert len(approval_events) > 0
-    assert len(cancelled_events) > 0
-
-    # Verify task.cancelled event has correct payload
-    cancel_event = cancelled_events[-1]
-    assert cancel_event["task_id"] == task["id"]
-    assert cancel_event["payload"]["reason"] == "prd_ac_rejected"
-    assert cancel_event["payload"]["gate"] == gate["id"]
-    assert cancel_event["payload"]["by"] == "bob"
+    assert pending_gate.refresh()["status"] == "approved"
+    assert len(storage.claim_slack_outbox()) == 1
 
 
 # ---------------------------------------------------------------------------
-# Idempotency tests
+# Rejected before any state change
 # ---------------------------------------------------------------------------
 
 
-def test_slack_interaction_idempotent_double_approve(tmp_path):
-    """POST the same approve action twice; second call is idempotent."""
-    app, workspace_id = _make_workspace(tmp_path)
-
-    db_path = tmp_path / "sarathi.db"
-    with connect(db_path) as conn:
-        run_migrations(conn)
-        storage = Storage(conn)
-        task, gate = _create_task_with_pending_gate(storage, workspace_id)
-
-    payload = {
-        "type": "block_actions",
-        "user": {"id": "U123", "username": "alice"},
-        "actions": [
-            {
-                "action_id": "approve_gate",
-                "value": f"{task['id']}:{gate['id']}",
-            }
-        ],
-        "response_url": "https://hooks.slack.com/actions/T123/456",
-    }
-
-    # First click
-    status1, _ = slack_request(
-        app,
-        "POST",
-        f"/api/workspaces/{workspace_id}/slack/interactions",
-        body={"payload": json.dumps(payload)},
+def test_unknown_action_value_is_rejected(workflow, storage, pending_gate):
+    workflow.accept(
+        approval_envelope(envelope_id="env-interaction-1", payload={
+            "action_id": "sarathi_gate_decision",
+            "value": "totally-random-value",
+            "thread_ts": TEST_THREAD_TS,
+            "channel_id": TEST_CHANNEL_ID,
+            "team_id": TEST_TEAM_ID,
+        })
     )
-    assert status1 == 200
+    results = workflow.process_next()
+    assert results[0]["status"] == "rejected"
+    assert results[0]["error_code"] == "unknown-action"
 
-    # Get the gate state after first click
-    _, events_data1 = json_request(app, "GET", f"/api/events?workspace_id={workspace_id}")
-    approval_events1 = [e for e in events_data1["events"] if e["event_type"] == "approval.recorded"]
-    event_count_1 = len(approval_events1)
+    assert pending_gate.refresh()["status"] == "pending"
+    assert storage.claim_slack_outbox() == []
+    events = _security_events(storage)
+    assert [event["payload"]["reason"] for event in events] == ["unknown-action"]
 
-    # Second click (same payload)
-    status2, _ = slack_request(
-        app,
-        "POST",
-        f"/api/workspaces/{workspace_id}/slack/interactions",
-        body={"payload": json.dumps(payload)},
+
+def test_binding_mismatch_is_rejected(workflow, storage, pending_gate):
+    workflow.accept(
+        approval_envelope(envelope_id="env-interaction-1", payload={
+            "action_id": "sarathi_gate_decision",
+            "value": TEST_APPROVE_ACTION,
+            "thread_ts": "1700000000.999999",
+            "channel_id": TEST_CHANNEL_ID,
+            "team_id": TEST_TEAM_ID,
+        })
     )
-    assert status2 == 200
+    results = workflow.process_next()
+    assert results[0]["status"] == "rejected"
+    assert results[0]["error_code"] == "binding-mismatch"
 
-    # Verify gate still approved and no new event was created
-    with connect(db_path) as conn:
-        storage = Storage(conn)
-        gate_state = storage.get_approval_gate(gate["id"])
-        assert gate_state["status"] == "approved"
-
-    # Verify only one approval.recorded event (idempotent)
-    _, events_data2 = json_request(app, "GET", f"/api/events?workspace_id={workspace_id}")
-    approval_events2 = [e for e in events_data2["events"] if e["event_type"] == "approval.recorded"]
-    assert len(approval_events2) == event_count_1
+    assert pending_gate.refresh()["status"] == "pending"
+    assert storage.claim_slack_outbox() == []
+    events = _security_events(storage)
+    assert [event["payload"]["reason"] for event in events] == ["binding-mismatch"]
 
 
-# ---------------------------------------------------------------------------
-# Signature verification tests
-# ---------------------------------------------------------------------------
+def test_unauthorized_actor_fails_before_persistence(workflow, storage, pending_gate):
+    with pytest.raises(Exception):
+        workflow.accept(approval_envelope(actor_id="U-nope", envelope_id="env-interaction-1"))
+    assert storage.claim_slack_events() == []
+    assert storage.claim_slack_outbox() == []
+    assert pending_gate.refresh()["status"] == "pending"
 
 
-def test_slack_interaction_rejects_bad_signature(tmp_path, monkeypatch):
-    """When SARATHI_SLACK_SIGNING_SECRET is set, reject request with bad signature."""
-    secret = "test_signing_secret"
-    monkeypatch.setenv("SARATHI_SLACK_SIGNING_SECRET", secret)
-    app, workspace_id = _make_workspace(tmp_path)
-
-    db_path = tmp_path / "sarathi.db"
-    with connect(db_path) as conn:
-        run_migrations(conn)
-        storage = Storage(conn)
-        task, gate = _create_task_with_pending_gate(storage, workspace_id)
-
-    payload = {
-        "type": "block_actions",
-        "user": {"id": "U123", "username": "alice"},
-        "actions": [
-            {
-                "action_id": "approve_gate",
-                "value": f"{task['id']}:{gate['id']}",
-            }
-        ],
-    }
-
-    ts = str(int(time.time()))
-    headers = {
-        "x-slack-request-timestamp": ts,
-        "x-slack-signature": "v0=definitely_wrong",
-    }
-
-    status, _ = slack_request(
-        app,
-        "POST",
-        f"/api/workspaces/{workspace_id}/slack/interactions",
-        body={"payload": json.dumps(payload)},
-        raw_body=f"payload={json.dumps(payload)}",
-        headers=headers,
+def test_only_approver_can_decide_and_first_decision_wins(workflow, pending_gate):
+    with pytest.raises(Exception):
+        workflow.accept(approval_envelope(actor_id="U-requester", envelope_id="env-interaction-1"))
+    workflow.accept(approval_envelope(actor_id=TEST_APPROVER_ID, action="approve"))
+    workflow.accept(
+        approval_envelope(
+            actor_id=TEST_APPROVER_ID, action="reject", envelope_id="env-interaction-2"
+        )
     )
-
-    assert status == 401
-
-
-def test_slack_interaction_accepts_valid_signature(tmp_path, monkeypatch):
-    """When SARATHI_SLACK_SIGNING_SECRET is set, accept request with valid signature."""
-    secret = "test_signing_secret"
-    monkeypatch.setenv("SARATHI_SLACK_SIGNING_SECRET", secret)
-    app, workspace_id = _make_workspace(tmp_path)
-
-    db_path = tmp_path / "sarathi.db"
-    with connect(db_path) as conn:
-        run_migrations(conn)
-        storage = Storage(conn)
-        task, gate = _create_task_with_pending_gate(storage, workspace_id)
-
-    payload = {
-        "type": "block_actions",
-        "user": {"id": "U123", "username": "alice"},
-        "actions": [
-            {
-                "action_id": "approve_gate",
-                "value": f"{task['id']}:{gate['id']}",
-            }
-        ],
-    }
-
-    raw_body = f"payload={json.dumps(payload)}"
-    ts = str(int(time.time()))
-    sig_basestring = f"v0:{ts}:{raw_body}"
-    expected_sig = "v0=" + hmac.new(
-        secret.encode("utf-8"), sig_basestring.encode("utf-8"), "sha256",
-    ).hexdigest()
-
-    headers = {
-        "x-slack-request-timestamp": ts,
-        "x-slack-signature": expected_sig,
-    }
-
-    status, _ = slack_request(
-        app,
-        "POST",
-        f"/api/workspaces/{workspace_id}/slack/interactions",
-        body={"payload": json.dumps(payload)},
-        raw_body=raw_body,
-        headers=headers,
-    )
-
-    assert status == 200
-
-    # Verify gate was actually updated
-    with connect(db_path) as conn:
-        storage = Storage(conn)
-        updated_gate = storage.get_approval_gate(gate["id"])
-        assert updated_gate["status"] == "approved"
-
-
-# ---------------------------------------------------------------------------
-# Error handling tests
-# ---------------------------------------------------------------------------
-
-
-def test_slack_interaction_unknown_gate_returns_404(tmp_path):
-    """POST with unknown gate_id returns 404."""
-    app, workspace_id = _make_workspace(tmp_path)
-
-    db_path = tmp_path / "sarathi.db"
-    with connect(db_path) as conn:
-        run_migrations(conn)
-        storage = Storage(conn)
-        task, gate = _create_task_with_pending_gate(storage, workspace_id)
-
-    payload = {
-        "type": "block_actions",
-        "user": {"id": "U123", "username": "alice"},
-        "actions": [
-            {
-                "action_id": "approve_gate",
-                "value": f"{task['id']}:nonexistent-gate-id",
-            }
-        ],
-    }
-
-    status, _ = slack_request(
-        app,
-        "POST",
-        f"/api/workspaces/{workspace_id}/slack/interactions",
-        body={"payload": json.dumps(payload)},
-    )
-
-    assert status == 404
-
-
-def test_slack_interaction_unknown_task_returns_404(tmp_path):
-    """POST with unknown task_id returns 404."""
-    app, workspace_id = _make_workspace(tmp_path)
-
-    db_path = tmp_path / "sarathi.db"
-    with connect(db_path) as conn:
-        run_migrations(conn)
-        storage = Storage(conn)
-        task, gate = _create_task_with_pending_gate(storage, workspace_id)
-
-    payload = {
-        "type": "block_actions",
-        "user": {"id": "U123", "username": "alice"},
-        "actions": [
-            {
-                "action_id": "approve_gate",
-                "value": f"nonexistent-task-id:{gate['id']}",
-            }
-        ],
-    }
-
-    status, _ = slack_request(
-        app,
-        "POST",
-        f"/api/workspaces/{workspace_id}/slack/interactions",
-        body={"payload": json.dumps(payload)},
-    )
-
-    assert status == 404
-
-
-def test_slack_interaction_unknown_workspace_returns_404(tmp_path):
-    """POST to unknown workspace returns 404."""
-    app = create_app(tmp_path / "sarathi.db")
-
-    payload = {
-        "type": "block_actions",
-        "user": {"id": "U123", "username": "alice"},
-        "actions": [
-            {
-                "action_id": "approve_gate",
-                "value": "task-id:gate-id",
-            }
-        ],
-    }
-
-    status, _ = slack_request(
-        app,
-        "POST",
-        "/api/workspaces/nonexistent-workspace/slack/interactions",
-        body={"payload": json.dumps(payload)},
-    )
-
-    assert status == 404
-
-
-def test_slack_interaction_non_block_actions_payload_is_no_op(tmp_path):
-    """POST with type != 'block_actions' returns 200 without updating anything."""
-    app, workspace_id = _make_workspace(tmp_path)
-
-    db_path = tmp_path / "sarathi.db"
-    with connect(db_path) as conn:
-        run_migrations(conn)
-        storage = Storage(conn)
-        task, gate = _create_task_with_pending_gate(storage, workspace_id)
-
-    # Send a "view_submission" payload instead of "block_actions"
-    payload = {
-        "type": "view_submission",
-        "user": {"id": "U123", "username": "alice"},
-        "trigger_id": "some-trigger-id",
-        "view": {"id": "V123"},
-    }
-
-    status, _ = slack_request(
-        app,
-        "POST",
-        f"/api/workspaces/{workspace_id}/slack/interactions",
-        body={"payload": json.dumps(payload)},
-    )
-
-    assert status == 200
-
-    # Verify gate status unchanged
-    with connect(db_path) as conn:
-        storage = Storage(conn)
-        gate_state = storage.get_approval_gate(gate["id"])
-        assert gate_state["status"] == "pending"
-
-
-def test_slack_interaction_unknown_action_id_is_no_op(tmp_path):
-    """POST with unknown action_id returns 200 without updating anything."""
-    app, workspace_id = _make_workspace(tmp_path)
-
-    db_path = tmp_path / "sarathi.db"
-    with connect(db_path) as conn:
-        run_migrations(conn)
-        storage = Storage(conn)
-        task, gate = _create_task_with_pending_gate(storage, workspace_id)
-
-    # Send a block_actions payload but with an unknown action_id
-    payload = {
-        "type": "block_actions",
-        "user": {"id": "U123", "username": "alice"},
-        "actions": [
-            {
-                "action_id": "some_other_action",
-                "value": f"{task['id']}:{gate['id']}",
-            }
-        ],
-    }
-
-    status, _ = slack_request(
-        app,
-        "POST",
-        f"/api/workspaces/{workspace_id}/slack/interactions",
-        body={"payload": json.dumps(payload)},
-    )
-
-    assert status == 200
-
-    # Verify gate status unchanged
-    with connect(db_path) as conn:
-        storage = Storage(conn)
-        gate_state = storage.get_approval_gate(gate["id"])
-        assert gate_state["status"] == "pending"
-
-
-def test_slack_interaction_already_approved_gate_is_idempotent(tmp_path):
-    """POST to an already-approved gate is idempotent (no error, no double-record)."""
-    app, workspace_id = _make_workspace(tmp_path)
-
-    db_path = tmp_path / "sarathi.db"
-    with connect(db_path) as conn:
-        run_migrations(conn)
-        storage = Storage(conn)
-        task, gate = _create_task_with_pending_gate(storage, workspace_id)
-
-        # Pre-approve the gate
-        storage.update_approval_gate(gate["id"], status="approved")
-
-    payload = {
-        "type": "block_actions",
-        "user": {"id": "U123", "username": "alice"},
-        "actions": [
-            {
-                "action_id": "approve_gate",
-                "value": f"{task['id']}:{gate['id']}",
-            }
-        ],
-    }
-
-    status, _ = slack_request(
-        app,
-        "POST",
-        f"/api/workspaces/{workspace_id}/slack/interactions",
-        body={"payload": json.dumps(payload)},
-    )
-
-    # Should still return 200 (no error)
-    assert status == 200
-
-    # Verify gate is still approved
-    with connect(db_path) as conn:
-        storage = Storage(conn)
-        gate_state = storage.get_approval_gate(gate["id"])
-        assert gate_state["status"] == "approved"
+    workflow.process_next()
+    assert pending_gate.refresh()["status"] == "approved"

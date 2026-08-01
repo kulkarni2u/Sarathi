@@ -109,6 +109,231 @@ def waiting_subtasks(storage, task):
     ]
 
 
+def test_list_tasks_returns_all_tasks_across_workspaces(storage, workspace):
+    first = storage.create_task(
+        workspace_id=workspace["id"], title="Slack task one", status="prd_pending"
+    )
+    other = storage.create_workspace(name="Other", root_path="/work/other")
+    second = storage.create_task(
+        workspace_id=other["id"], title="Slack task two", status="in_progress"
+    )
+    tasks = storage.list_tasks()
+    assert [task["id"] for task in tasks] == [first["id"], second["id"]]
+    assert tasks[0]["status"] == "prd_pending"
+
+
+# ---------------------------------------------------------------------------
+# Command-processing composite: task + gate + binding + messages + outbox,
+# finished inbox — one atomic unit, at-most-once per envelope.
+# ---------------------------------------------------------------------------
+
+
+def _command_input(**overrides):
+    data = {
+        "envelope_id": "env-1",
+        "workspace_id": WORKSPACE_ID,
+        "team_id": "T00000000",
+        "channel_id": "C11111111",
+        "actor_id": "U33333333",
+        "thread_ts": "provisional:env-1",
+        "title": "ship the parser",
+        "prompt": "ship the parser",
+        "validation_version": "slack-input-v1",
+        "digest": "0" * 64,
+        "approve_action": "approve-opaque-1",
+        "reject_action": "reject-opaque-2",
+    }
+    data.update(overrides)
+    return data
+
+
+def test_create_slack_command_task_creates_full_draft_unit(storage, workspace):
+    storage.enqueue_slack_event(**validated_event("env-1", workspace_id=workspace["id"]))
+    result = storage.create_slack_command_task(
+        **_command_input(workspace_id=workspace["id"])
+    )
+    assert result["task_id"]
+    assert result["gate_id"]
+    assert result["duplicate"] is False
+
+    tasks = storage.list_tasks()
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task["status"] == "prd_pending"
+    assert task["workspace_id"] == workspace["id"]
+
+    gate = storage.get_approval_gate(result["gate_id"])
+    assert gate["status"] == "pending"
+    assert gate["metadata"]["slack_decision_actions"] == {
+        "approve": "approve-opaque-1",
+        "reject": "reject-opaque-2",
+    }
+
+    binding = storage.get_slack_task_binding(
+        team_id="T00000000", channel_id="C11111111", thread_ts="provisional:env-1"
+    )
+    assert binding["task_id"] == task["id"]
+
+    assert len(storage.list_messages(task_id=task["id"])) == 2
+
+    outbox = storage.claim_slack_outbox()
+    assert len(outbox) == 1
+    assert outbox[0]["task_id"] == task["id"]
+    assert outbox[0]["thread_ts"] == "provisional:env-1"
+    assert outbox[0]["operation"] == "message"
+    assert outbox[0]["payload"]["gate_id"] == result["gate_id"]
+
+    assert storage.claim_slack_events() == []
+
+    events = storage.list_events(workspace_id=workspace["id"])
+    event_types = [event["event_type"] for event in events]
+    assert event_types.count("task.draft_created") == 1
+    assert event_types.count("approval.requested") == 1
+
+
+def test_create_slack_command_task_duplicate_envelope_is_noop(storage, workspace):
+    storage.enqueue_slack_event(**validated_event("env-1", workspace_id=workspace["id"]))
+    storage.create_slack_command_task(**_command_input(workspace_id=workspace["id"]))
+    second = storage.create_slack_command_task(**_command_input(workspace_id=workspace["id"]))
+
+    assert second["duplicate"] is True
+    assert len(storage.list_tasks()) == 1
+    outbox = storage.claim_slack_outbox()
+    assert len(outbox) == 1
+    assert outbox[0]["operation_key"] == "task-created:env-1"
+    assert storage.claim_slack_outbox() == []
+
+    events = storage.list_events(workspace_id=workspace["id"])
+    event_types = [event["event_type"] for event in events]
+    assert event_types.count("task.draft_created") == 1
+    assert event_types.count("approval.requested") == 1
+
+
+def test_create_slack_command_task_rolls_back_on_failure(storage, workspace):
+    storage.enqueue_slack_event(**validated_event("env-1", workspace_id=workspace["id"]))
+    storage.conn.execute(
+        """
+        CREATE TRIGGER trg_fail_outbox AFTER INSERT ON slack_outbox
+        BEGIN
+            SELECT RAISE(FAIL, 'boom');
+        END
+        """
+    )
+    with pytest.raises(Exception, match="boom"):
+        storage.create_slack_command_task(**_command_input(workspace_id=workspace["id"]))
+
+    assert storage.list_tasks() == []
+    assert storage.claim_slack_outbox() == []
+    assert storage.get_slack_task_binding(
+        team_id="T00000000", channel_id="C11111111", thread_ts="provisional:env-1"
+    ) is None
+    assert len(storage.list_events(workspace_id=workspace["id"])) == 0
+
+    claim = storage.claim_slack_events()
+    assert len(claim) == 1
+    assert claim[0]["envelope_id"] == "env-1"
+    assert storage.list_messages() == []
+
+
+def test_find_slack_gate_by_action_value(storage, workspace, task):
+    approve_action = "approve-opaque-1"
+    reject_action = "reject-opaque-2"
+    gate = storage.create_approval_gate(
+        workspace_id=workspace["id"],
+        task_id=task["id"],
+        name="Requires human approval",
+        status="pending",
+        metadata={"slack_decision_actions": {"approve": approve_action, "reject": reject_action}},
+    )
+    assert storage.find_slack_gate_by_action_value(approve_action)["id"] == gate["id"]
+    assert storage.find_slack_gate_by_action_value(reject_action)["id"] == gate["id"]
+    assert storage.find_slack_gate_by_action_value("nope") is None
+    assert storage.find_slack_gate_by_action_value("") is None
+
+
+def _decision_input(**overrides):
+    data = {
+        "envelope_id": "env-dec-1",
+        "gate_id": "gate-1",
+        "task_id": "task-1",
+        "requested_status": "approved",
+        "actor_id": "U44444444",
+        "operation_key": "gate-decision:gate-1:env-dec-1",
+        "workspace_id": WORKSPACE_ID,
+        "channel_id": "C11111111",
+        "thread_ts": "1700000000.000000",
+        "payload": {"text": "Gate decision recorded: approved"},
+    }
+    data.update(overrides)
+    return data
+
+
+def test_apply_slack_gate_decision_transitions_gate_and_outboxes(storage, workspace, task):
+    gate = storage.create_approval_gate(
+        workspace_id=workspace["id"],
+        task_id=task["id"],
+        name="Requires human approval",
+        status="pending",
+    )
+    storage.enqueue_slack_event(**validated_event("env-dec-1", workspace_id=workspace["id"]))
+    result = storage.apply_slack_gate_decision(
+        **_decision_input(gate_id=gate["id"], task_id=task["id"], workspace_id=workspace["id"])
+    )
+    assert result["gate_status"] == "approved"
+    assert result["applied"] is True
+
+    gate_now = storage.get_approval_gate(gate["id"])
+    assert gate_now["status"] == "approved"
+
+    outbox = storage.claim_slack_outbox()
+    assert len(outbox) == 1
+    assert outbox[0]["operation_key"] == "gate-decision:gate-1:env-dec-1"
+    assert outbox[0]["payload"]["text"] == "Gate decision recorded: approved"
+
+    events = storage.list_events(workspace_id=workspace["id"])
+    assert [e["event_type"] for e in events] == ["approval.decision_recorded"]
+    assert storage.claim_slack_events() == []
+
+
+def test_apply_slack_gate_decision_terminal_gate_is_noop(storage, workspace, task):
+    gate = storage.create_approval_gate(
+        workspace_id=workspace["id"],
+        task_id=task["id"],
+        name="Requires human approval",
+        status="approved",
+    )
+    storage.enqueue_slack_event(**validated_event("env-dec-1", workspace_id=workspace["id"]))
+    result = storage.apply_slack_gate_decision(
+        **_decision_input(gate_id=gate["id"], task_id=task["id"], workspace_id=workspace["id"])
+    )
+    assert result["gate_status"] == "approved"
+    assert result["applied"] is False
+    assert storage.get_approval_gate(gate["id"])["status"] == "approved"
+    assert storage.claim_slack_outbox() == []
+    assert storage.list_events(workspace_id=workspace["id"]) == []
+    assert storage.claim_slack_events() == []
+
+
+def test_apply_slack_gate_decision_at_most_once_per_operation(storage, workspace, task):
+    gate = storage.create_approval_gate(
+        workspace_id=workspace["id"],
+        task_id=task["id"],
+        name="Requires human approval",
+        status="pending",
+    )
+    storage.enqueue_slack_event(**validated_event("env-dec-1", workspace_id=workspace["id"]))
+    storage.apply_slack_gate_decision(
+        **_decision_input(gate_id=gate["id"], task_id=task["id"], workspace_id=workspace["id"])
+    )
+    storage.enqueue_slack_event(**validated_event("env-dec-1", workspace_id=workspace["id"]))
+    second = storage.apply_slack_gate_decision(
+        **_decision_input(gate_id=gate["id"], task_id=task["id"], workspace_id=workspace["id"])
+    )
+    assert second["applied"] is False
+    assert second["gate_status"] == "approved"
+    assert len(storage.list_events(workspace_id=workspace["id"])) == 1
+
+
 def test_run_migrations_creates_slack_tables(tmp_path):
     with connect(tmp_path / "sarathi.db") as conn:
         run_migrations(conn)

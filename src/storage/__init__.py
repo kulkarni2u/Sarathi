@@ -664,6 +664,16 @@ class Storage:
         ).fetchall()
         return [_task_from_row(row) for row in rows]
 
+    def list_tasks(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at, project_id
+            FROM tasks
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+        return [_task_from_row(row) for row in rows]
+
     def create_subtask(
         self,
         *,
@@ -2351,6 +2361,347 @@ class Storage:
         if row is None:
             raise KeyError(f"No slack outbox row for operation_key {operation_key!r}")
         return _slack_outbox_from_row(row)
+
+    def create_slack_command_task(
+        self,
+        *,
+        envelope_id: str,
+        workspace_id: str,
+        team_id: str,
+        channel_id: str,
+        actor_id: str,
+        thread_ts: str,
+        title: str,
+        prompt: str,
+        validation_version: str,
+        digest: str,
+        approve_action: str,
+        reject_action: str,
+    ) -> dict[str, Any]:
+        """Materialize a validated Slack slash command into one draft unit.
+
+        A single transaction creates the draft task (``prd_pending``), the
+        provisional Slack thread binding, the human approval gate with opaque
+        decision actions, the two opening messages, the outbound message
+        intent, and the ``task.draft_created`` / ``approval.requested``
+        lifecycle events, then finishes the inbox event. At-most-once by
+        ``envelope_id``: a repeated call returns the canonical ``task_id`` /
+        ``gate_id`` with ``duplicate=True`` and creates nothing new.
+        """
+        action_values = {"approve": approve_action, "reject": reject_action}
+        task_metadata = {
+            "source": "slack",
+            "slack": {
+                "team_id": team_id,
+                "channel_id": channel_id,
+                "requester_user_id": actor_id,
+                "thread_ts": thread_ts,
+                "thread_ts_provisional": True,
+                "source_prompt": prompt,
+                "validation": {
+                    "validation_version": validation_version,
+                    "digest": digest,
+                },
+            },
+        }
+        _check_no_forbidden_keys(task_metadata, kind="slack command task metadata")
+        now = _utc_now()
+        operation_key = f"task-created:{envelope_id}"
+        with self.conn:
+            existing = self.conn.execute(
+                """
+                SELECT status FROM slack_inbox
+                WHERE envelope_id = ?
+                """,
+                (envelope_id,),
+            ).fetchone()
+            if existing is not None and existing["status"] == "processed":
+                binding = self.conn.execute(
+                    """
+                    SELECT task_id FROM slack_task_bindings
+                    WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
+                    """,
+                    (team_id, channel_id, thread_ts),
+                ).fetchone()
+                outbox = self.conn.execute(
+                    """
+                    SELECT payload FROM slack_outbox
+                    WHERE operation_key = ?
+                    """,
+                    (operation_key,),
+                ).fetchone()
+                if binding is not None and outbox is not None:
+                    gate_id = _load_json(outbox["payload"]).get("gate_id")
+                    if gate_id:
+                        return {
+                            "task_id": binding["task_id"],
+                            "gate_id": gate_id,
+                            "duplicate": True,
+                        }
+
+            task_id = _new_id()
+            gate_id = _new_id()
+            self.conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, workspace_id, title, description, status, metadata,
+                    created_at, updated_at, project_id
+                )
+                VALUES (?, ?, ?, NULL, 'prd_pending', ?, ?, ?, NULL)
+                """,
+                (task_id, workspace_id, title, _dump_json(task_metadata), now, now),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO approval_gates (
+                    id, workspace_id, task_id, name, status, metadata, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 'Requires human approval', 'pending', ?, ?, ?)
+                """,
+                (
+                    gate_id,
+                    workspace_id,
+                    task_id,
+                    _dump_json(
+                        {"requires_human": True, "slack_decision_actions": action_values}
+                    ),
+                    now,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO slack_task_bindings (
+                    id, task_id, workspace_id, team_id, channel_id, thread_ts,
+                    requester_user_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _new_id(),
+                    task_id,
+                    workspace_id,
+                    team_id,
+                    channel_id,
+                    thread_ts,
+                    actor_id,
+                    now,
+                    now,
+                ),
+            )
+            for role, content, message_metadata in (
+                (
+                    "system",
+                    "Draft task created from a Slack command",
+                    {"source": "slack", "slack": {"team_id": team_id, "channel_id": channel_id}},
+                ),
+                ("user", prompt, {"source": "slack"}),
+            ):
+                self.conn.execute(
+                    """
+                    INSERT INTO messages (
+                        id, workspace_id, task_id, session_id, role, content, metadata, created_at
+                    )
+                    VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        _new_id(),
+                        workspace_id,
+                        task_id,
+                        role,
+                        content,
+                        _dump_json(message_metadata),
+                        now,
+                    ),
+                )
+            outbox_payload = {
+                "text": "Draft task created — waiting on human approval.",
+                "task_id": task_id,
+                "gate_id": gate_id,
+                "actions": action_values,
+            }
+            _check_no_forbidden_keys(outbox_payload, kind="slack command outbox payload")
+            self.conn.execute(
+                """
+                INSERT INTO slack_outbox (
+                    id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                    operation, payload, status, error_code, attempt_count,
+                    slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'message', ?, 'pending', NULL, 0, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    _new_id(),
+                    operation_key,
+                    workspace_id,
+                    task_id,
+                    channel_id,
+                    thread_ts,
+                    _dump_json(outbox_payload),
+                    now,
+                    now,
+                ),
+            )
+            for event_type, payload in (
+                (
+                    "task.draft_created",
+                    {"object_id": task_id, "source": "slack", "envelope_id": envelope_id},
+                ),
+                (
+                    "approval.requested",
+                    {"object_id": gate_id, "task_id": task_id, "envelope_id": envelope_id},
+                ),
+            ):
+                self.conn.execute(
+                    """
+                    INSERT INTO lifecycle_events (
+                        id, workspace_id, task_id, event_type, payload, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _new_id(),
+                        workspace_id,
+                        task_id,
+                        event_type,
+                        _dump_json(payload),
+                        now,
+                    ),
+                )
+            self.conn.execute(
+                """
+                UPDATE slack_inbox
+                SET status = 'processed', error_code = NULL, processed_at = ?, updated_at = ?
+                WHERE envelope_id = ? AND status IN ('pending', 'processing')
+                """,
+                (now, now, envelope_id),
+            )
+        return {"task_id": task_id, "gate_id": gate_id, "duplicate": False}
+
+    def find_slack_gate_by_action_value(self, value: str) -> dict[str, Any] | None:
+        """Return the approval gate bound to an opaque Slack decision action.
+
+        Decision actions are stored under ``metadata["slack_decision_actions"]``;
+        the value is never persisted anywhere else, so a matching value is
+        proof the caller saw the gate's own message.
+        """
+        if not value:
+            return None
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, task_id, name, status, metadata, created_at, updated_at
+            FROM approval_gates
+            """
+        ).fetchall()
+        for row in rows:
+            gate = _approval_gate_from_row(row)
+            actions = gate["metadata"].get("slack_decision_actions")
+            if not isinstance(actions, dict):
+                continue
+            if actions.get("approve") == value or actions.get("reject") == value:
+                return gate
+        return None
+
+    def apply_slack_gate_decision(
+        self,
+        *,
+        envelope_id: str,
+        gate_id: str,
+        task_id: str,
+        requested_status: str,
+        actor_id: str,
+        operation_key: str,
+        workspace_id: str,
+        channel_id: str,
+        thread_ts: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Apply a human gate decision atomically and at most once.
+
+        A single transaction CAS-transitions the gate from ``pending`` to the
+        requested terminal status; only on a successful transition does it
+        enqueue the decision outbox message and the
+        ``approval.decision_recorded`` lifecycle event. The inbox event is
+        always finished. A repeated or stale decision leaves the gate at its
+        first terminal status and returns ``applied=False``.
+        """
+        if requested_status not in ("approved", "rejected"):
+            raise ValueError(f"Invalid gate decision status: {requested_status}")
+        _check_no_forbidden_keys(payload, kind="slack decision outbox payload")
+        now = _utc_now()
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                UPDATE approval_gates
+                SET status = ?, updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (requested_status, now, gate_id),
+            )
+            applied = cursor.rowcount == 1
+            row = self.conn.execute(
+                """
+                SELECT id, workspace_id, task_id, name, status, metadata, created_at, updated_at
+                FROM approval_gates
+                WHERE id = ?
+                """,
+                (gate_id,),
+            ).fetchone()
+            gate_status = _approval_gate_from_row(row)["status"] if row is not None else None
+            if applied:
+                self.conn.execute(
+                    """
+                    INSERT INTO slack_outbox (
+                        id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                        operation, payload, status, error_code, attempt_count,
+                        slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, 'message', ?, 'pending', NULL, 0, NULL, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        _new_id(),
+                        operation_key,
+                        workspace_id,
+                        task_id,
+                        channel_id,
+                        thread_ts,
+                        _dump_json(payload),
+                        now,
+                        now,
+                    ),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO lifecycle_events (
+                        id, workspace_id, task_id, event_type, payload, created_at
+                    )
+                    VALUES (?, ?, ?, 'approval.decision_recorded', ?, ?)
+                    """,
+                    (
+                        _new_id(),
+                        workspace_id,
+                        task_id,
+                        _dump_json(
+                            {
+                                "object_id": gate_id,
+                                "task_id": task_id,
+                                "status": requested_status,
+                                "actor_id": actor_id,
+                                "envelope_id": envelope_id,
+                            }
+                        ),
+                        now,
+                    ),
+                )
+            self.conn.execute(
+                """
+                UPDATE slack_inbox
+                SET status = 'processed', error_code = NULL, processed_at = ?, updated_at = ?
+                WHERE envelope_id = ? AND status IN ('pending', 'processing')
+                """,
+                (now, now, envelope_id),
+            )
+        return {"gate_status": gate_status, "applied": applied}
 
     def create_slack_external_input(
         self,

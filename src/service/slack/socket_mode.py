@@ -3,6 +3,7 @@
 slack_sdk is optional and imported only by the executable factory. Tests use
 injected app/client doubles and never open a network connection.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -71,12 +72,14 @@ class SocketModeRunner:
                     if isinstance(response, Mapping)
                     else getattr(response, "data", None)
                 )
-                if not isinstance(response_data, Mapping) or response_data.get("ok") is not True:
-                    raise RuntimeError("slack-delivery-failed")
                 if (
-                    response_data.get("channel") != row["channel_id"]
-                    or not response_data.get("ts")
+                    not isinstance(response_data, Mapping)
+                    or response_data.get("ok") is not True
                 ):
+                    raise RuntimeError("slack-delivery-failed")
+                if response_data.get("channel") != row[
+                    "channel_id"
+                ] or not response_data.get("ts"):
                     raise RuntimeError("slack-delivery-mismatch")
                 results.append(
                     self.storage.finish_slack_outbox(
@@ -86,9 +89,13 @@ class SocketModeRunner:
                     )
                 )
             except Exception as exc:  # Slack SDK errors may vary by version
-                code = "delivery-mismatch" if "mismatch" in str(exc) else "delivery-failed"
+                code = (
+                    "delivery-mismatch" if "mismatch" in str(exc) else "delivery-failed"
+                )
                 results.append(
-                    self.storage.fail_slack_outbox(row["operation_key"], error_code=code)
+                    self.storage.fail_slack_outbox(
+                        row["operation_key"], error_code=code
+                    )
                 )
         return results
 
@@ -131,7 +138,8 @@ class SocketModeRunner:
         user = body.get("user") if isinstance(body.get("user"), Mapping) else {}
         if kind == "slash_commands":
             return SlackEnvelope(
-                kind="command", envelope_id=envelope_id,
+                kind="command",
+                envelope_id=envelope_id,
                 event_id=str(raw.get("event_id") or "") or None,
                 team_id=str(body.get("team_id") or team.get("id") or ""),
                 channel_id=str(body.get("channel_id") or ""),
@@ -139,32 +147,49 @@ class SocketModeRunner:
                 payload={"command": body.get("command"), "text": body.get("text")},
             )
         if kind == "block_actions":
-            actions = body.get("actions") if isinstance(body.get("actions"), list) else []
+            actions = (
+                body.get("actions") if isinstance(body.get("actions"), list) else []
+            )
             action = actions[0] if actions and isinstance(actions[0], Mapping) else {}
-            channel = body.get("channel") if isinstance(body.get("channel"), Mapping) else {}
-            message = body.get("message") if isinstance(body.get("message"), Mapping) else {}
-            container = body.get("container") if isinstance(body.get("container"), Mapping) else {}
+            channel = (
+                body.get("channel") if isinstance(body.get("channel"), Mapping) else {}
+            )
+            message = (
+                body.get("message") if isinstance(body.get("message"), Mapping) else {}
+            )
+            container = (
+                body.get("container")
+                if isinstance(body.get("container"), Mapping)
+                else {}
+            )
             return SlackEnvelope(
-                kind="interaction", envelope_id=envelope_id,
+                kind="interaction",
+                envelope_id=envelope_id,
                 event_id=str(raw.get("event_id") or "") or None,
                 team_id=str(body.get("team_id") or team.get("id") or ""),
                 channel_id=str(body.get("channel_id") or channel.get("id") or ""),
                 actor_id=str(body.get("user_id") or user.get("id") or ""),
                 payload={
-                    "action_id": action.get("action_id"), "value": action.get("value"),
-                    "thread_ts": container.get("thread_ts") or message.get("thread_ts") or message.get("ts"),
+                    "action_id": action.get("action_id"),
+                    "value": action.get("value"),
+                    "thread_ts": container.get("thread_ts")
+                    or message.get("thread_ts")
+                    or message.get("ts"),
                 },
             )
         event = body.get("event") if isinstance(body.get("event"), Mapping) else {}
         return SlackEnvelope(
-            kind="reply", envelope_id=envelope_id,
+            kind="reply",
+            envelope_id=envelope_id,
             event_id=str(raw.get("event_id") or "") or None,
             team_id=str(body.get("team_id") or team.get("id") or ""),
             channel_id=str(event.get("channel") or ""),
             actor_id=str(event.get("user") or ""),
             payload={
-                "text": event.get("text"), "thread_ts": event.get("thread_ts") or event.get("ts"),
-                "bot_id": event.get("bot_id"), "is_bot": bool(event.get("subtype")),
+                "text": event.get("text"),
+                "thread_ts": event.get("thread_ts") or event.get("ts"),
+                "bot_id": event.get("bot_id"),
+                "is_bot": bool(event.get("subtype")),
             },
         )
 
@@ -174,7 +199,10 @@ def _selection_blocks(actions: Mapping[str, Any]) -> list[dict[str, Any]]:
         {
             "type": "button",
             "action_id": SELECTION_ACTION_ID,
-            "text": {"type": "plain_text", "text": str(value.get("title") or "Select")[:75]},
+            "text": {
+                "type": "plain_text",
+                "text": str(value.get("title") or "Select")[:75],
+            },
             "value": key,
         }
         for key, value in actions.items()
@@ -211,7 +239,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Sarathi Slack Socket Mode")
     parser.add_argument("--db", default=".sarathi/sarathi.db")
     parser.add_argument(
-        "--poll", type=float, default=1.0, dest="poll_interval", help="Seconds between polls when idle."
+        "--poll",
+        type=float,
+        default=1.0,
+        dest="poll_interval",
+        help="Seconds between polls when idle.",
     )
     args = parser.parse_args(argv)
     config = SlackSocketConfig.from_env()
@@ -222,7 +254,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         from slack_sdk.socket_mode.response import SocketModeResponse
         from slack_sdk.web import WebClient
     except ImportError as exc:
-        raise RuntimeError("Slack support is optional; install with: pip install 'sarathi-ai[slack]'") from exc
+        raise RuntimeError(
+            "Slack support is optional; install with: pip install 'sarathi-ai[slack]'"
+        ) from exc
     web_client = WebClient(token=config.bot_token)
     socket_client = SocketModeClient(app_token=config.app_token, web_client=web_client)
 
@@ -251,7 +285,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _handle_sigint)
     try:
         run_forever(
-            runner, poll_interval=args.poll_interval, should_stop=lambda: stop_requested["flag"]
+            runner,
+            poll_interval=args.poll_interval,
+            should_stop=lambda: stop_requested["flag"],
         )
     finally:
         signal.signal(signal.SIGINT, previous_handler)

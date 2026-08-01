@@ -6,6 +6,10 @@ import json
 from math import ceil
 from typing import Any, Iterable, Mapping
 
+from src.storage import SLACK_EXTERNAL_INPUT_SOURCE, SLACK_EXTERNAL_INPUT_TRUST
+
+MAX_EXTERNAL_INPUTS = 5
+
 
 def _estimate_tokens(payload: Any) -> int:
     try:
@@ -25,6 +29,7 @@ class AgentInputContract:
     relevant_files: list[str] = field(default_factory=list)
     prior_findings: list[str] = field(default_factory=list)
     available_tools: list[str] = field(default_factory=list)
+    external_inputs: list[dict[str, Any]] = field(default_factory=list)
     token_budget: int = 3000
 
     def to_artifact(self) -> dict[str, Any]:
@@ -35,6 +40,7 @@ class AgentInputContract:
             "relevant_files": list(self.relevant_files),
             "prior_findings": list(self.prior_findings),
             "available_tools": list(self.available_tools),
+            "external_inputs": [dict(item) for item in self.external_inputs],
             "token_budget": self.token_budget,
         }
 
@@ -104,7 +110,8 @@ class ContextCompiler:
         available_tools: Iterable[str] = (),
         token_budget: int | None = None,
     ) -> ContextPack:
-        metadata = subtask.get("metadata") if isinstance(subtask.get("metadata"), Mapping) else {}
+        raw_metadata = subtask.get("metadata")
+        metadata: Mapping[str, Any] = raw_metadata if isinstance(raw_metadata, Mapping) else {}
         task_metadata = task.get("metadata") if isinstance(task.get("metadata"), Mapping) else {}
         task_packet = metadata.get("task_packet") if isinstance(metadata.get("task_packet"), Mapping) else {}
         role = str(metadata.get("role") or "Sarathi")
@@ -121,6 +128,7 @@ class ContextCompiler:
         relevant_files = self._relevant_files_for(task_metadata=task_metadata, evidence_artifacts=evidence_artifacts)
         prior_findings = self._prior_findings_for(review_runs=review_runs)
         source_artifacts = self._source_artifacts_for(evidence_artifacts=evidence_artifacts, review_runs=review_runs)
+        external_inputs = self._external_inputs_for(metadata=metadata)
 
         contract = AgentInputContract(
             objective=objective,
@@ -129,6 +137,7 @@ class ContextCompiler:
             relevant_files=relevant_files,
             prior_findings=prior_findings,
             available_tools=[str(item) for item in available_tools if str(item).strip()],
+            external_inputs=external_inputs,
             token_budget=resolved_budget,
         )
         trimmed_sections: list[str] = []
@@ -310,6 +319,48 @@ class ContextCompiler:
                 deduped.append(finding)
         return deduped[:8]
 
+    def _external_inputs_for(self, *, metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Return canonical assigned external-input projections only.
+
+        Only entries written by the storage assign+resume transaction (carrying
+        the canonical source, trust, validation version, and envelope id) are
+        trusted as typed external data. Everything else is ignored so arbitrary
+        subtask metadata can never be promoted into the agent context.
+        """
+        raw = metadata.get("external_inputs")
+        if not isinstance(raw, list):
+            return []
+        items: list[dict[str, Any]] = []
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("source") != SLACK_EXTERNAL_INPUT_SOURCE:
+                continue
+            if item.get("trust") != SLACK_EXTERNAL_INPUT_TRUST:
+                continue
+            envelope_id = item.get("envelope_id")
+            validation_version = item.get("validation_version")
+            text = item.get("text")
+            if not isinstance(envelope_id, str) or not envelope_id:
+                continue
+            if not isinstance(validation_version, str) or not validation_version:
+                continue
+            if not isinstance(text, str):
+                continue
+            items.append(
+                {
+                    "source": SLACK_EXTERNAL_INPUT_SOURCE,
+                    "trust": SLACK_EXTERNAL_INPUT_TRUST,
+                    "text": text,
+                    "validation_version": validation_version,
+                    "digest": str(item.get("digest") or ""),
+                    "envelope_id": envelope_id,
+                    "actor_id": str(item.get("actor_id") or ""),
+                    "channel_id": str(item.get("channel_id") or ""),
+                }
+            )
+        return items
+
     def _source_artifacts_for(
         self,
         *,
@@ -347,6 +398,23 @@ class ContextCompiler:
         working = contract
 
         while True:
+            # External inputs carry a hard ceiling (MAX_EXTERNAL_INPUTS) that
+            # applies before any budget accounting: even a generous token
+            # budget must never let more than the cap through the early
+            # return, so human text can never displace instructions.
+            if len(working.external_inputs) > MAX_EXTERNAL_INPUTS:
+                trimmed_sections.append("external_inputs")
+                working = AgentInputContract(
+                    objective=working.objective,
+                    constraints=list(working.constraints),
+                    acceptance_criteria=list(working.acceptance_criteria),
+                    relevant_files=list(working.relevant_files),
+                    prior_findings=list(working.prior_findings),
+                    available_tools=list(working.available_tools),
+                    external_inputs=list(working.external_inputs[:MAX_EXTERNAL_INPUTS]),
+                    token_budget=working.token_budget,
+                )
+                continue
             payload = {
                 "summary": summary_text,
                 "agent_input": working.to_artifact(),
@@ -355,6 +423,22 @@ class ContextCompiler:
             if estimated <= budget:
                 return summary_text, working, trimmed_sections, estimated
 
+            # Under budget pressure, external inputs are the lowest-priority
+            # section: shed the oldest entries one at a time before any other
+            # section is trimmed.
+            if working.external_inputs:
+                trimmed_sections.append("external_inputs")
+                working = AgentInputContract(
+                    objective=working.objective,
+                    constraints=list(working.constraints),
+                    acceptance_criteria=list(working.acceptance_criteria),
+                    relevant_files=list(working.relevant_files),
+                    prior_findings=list(working.prior_findings),
+                    available_tools=list(working.available_tools),
+                    external_inputs=list(working.external_inputs[:-1]),
+                    token_budget=working.token_budget,
+                )
+                continue
             if working.prior_findings:
                 trimmed_sections.append("prior_findings")
                 working = AgentInputContract(
@@ -364,6 +448,7 @@ class ContextCompiler:
                     relevant_files=list(working.relevant_files),
                     prior_findings=list(working.prior_findings[:-1]),
                     available_tools=list(working.available_tools),
+                    external_inputs=list(working.external_inputs),
                     token_budget=working.token_budget,
                 )
                 continue
@@ -376,6 +461,7 @@ class ContextCompiler:
                     relevant_files=list(working.relevant_files[:4]),
                     prior_findings=list(working.prior_findings),
                     available_tools=list(working.available_tools),
+                    external_inputs=list(working.external_inputs),
                     token_budget=working.token_budget,
                 )
                 continue
@@ -388,6 +474,7 @@ class ContextCompiler:
                     relevant_files=[],
                     prior_findings=list(working.prior_findings),
                     available_tools=list(working.available_tools),
+                    external_inputs=list(working.external_inputs),
                     token_budget=working.token_budget,
                 )
                 continue
@@ -400,6 +487,7 @@ class ContextCompiler:
                     relevant_files=list(working.relevant_files),
                     prior_findings=list(working.prior_findings),
                     available_tools=list(working.available_tools),
+                    external_inputs=list(working.external_inputs),
                     token_budget=working.token_budget,
                 )
                 continue
@@ -412,6 +500,7 @@ class ContextCompiler:
                     relevant_files=list(working.relevant_files),
                     prior_findings=list(working.prior_findings),
                     available_tools=list(working.available_tools),
+                    external_inputs=list(working.external_inputs),
                     token_budget=working.token_budget,
                 )
                 continue
@@ -428,12 +517,17 @@ class ContextCompiler:
                     relevant_files=list(working.relevant_files),
                     prior_findings=list(working.prior_findings),
                     available_tools=list(working.available_tools),
+                    external_inputs=list(working.external_inputs),
                     token_budget=working.token_budget,
                 )
                 continue
             if len(summary_text) > 96:
                 trimmed_sections.append("summary")
                 summary_text = summary_text[:93].rstrip() + "..."
+                continue
+            if len(summary_text) > 48:
+                trimmed_sections.append("summary")
+                summary_text = summary_text[:45].rstrip() + "..."
                 continue
             if len(working.available_tools) > 2:
                 trimmed_sections.append("available_tools")
@@ -444,6 +538,7 @@ class ContextCompiler:
                     relevant_files=list(working.relevant_files),
                     prior_findings=list(working.prior_findings),
                     available_tools=list(working.available_tools[:2]),
+                    external_inputs=list(working.external_inputs),
                     token_budget=working.token_budget,
                 )
                 continue
@@ -456,6 +551,7 @@ class ContextCompiler:
                     relevant_files=list(working.relevant_files),
                     prior_findings=list(working.prior_findings),
                     available_tools=[],
+                    external_inputs=list(working.external_inputs),
                     token_budget=working.token_budget,
                 )
                 continue
@@ -468,6 +564,7 @@ class ContextCompiler:
                     relevant_files=list(working.relevant_files),
                     prior_findings=list(working.prior_findings),
                     available_tools=list(working.available_tools),
+                    external_inputs=list(working.external_inputs),
                     token_budget=working.token_budget,
                 )
                 continue
@@ -480,6 +577,7 @@ class ContextCompiler:
                     relevant_files=list(working.relevant_files),
                     prior_findings=list(working.prior_findings),
                     available_tools=list(working.available_tools),
+                    external_inputs=list(working.external_inputs),
                     token_budget=working.token_budget,
                 )
                 continue
@@ -492,6 +590,7 @@ class ContextCompiler:
                     relevant_files=list(working.relevant_files),
                     prior_findings=list(working.prior_findings),
                     available_tools=list(working.available_tools),
+                    external_inputs=list(working.external_inputs),
                     token_budget=working.token_budget,
                 )
                 continue

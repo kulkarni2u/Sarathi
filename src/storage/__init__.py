@@ -16,6 +16,16 @@ logger = logging.getLogger("sarathi.storage")
 
 LATEST_SCHEMA_VERSION = 14
 
+# Canonical projection identity for human external inputs appended to subtask
+# metadata by the atomic assign+resume transaction. The workflow and context
+# compiler treat only entries carrying these identities as typed external data.
+SLACK_EXTERNAL_INPUT_SOURCE = "slack"
+SLACK_EXTERNAL_INPUT_TRUST = "untrusted_external"
+
+
+class _AssignResumeAborted(Exception):
+    """Internal rollback signal for the atomic assign+resume transaction."""
+
 
 def connect(path: str | Path) -> sqlite3.Connection:
     """Open a SQLite database connection configured for repository use."""
@@ -2906,6 +2916,131 @@ class Storage:
         if row is None or cursor.rowcount == 0:
             return None
         return _slack_external_input_from_row(row)
+
+    def assign_slack_external_input_and_resume_subtask(
+        self, input_id: str, subtask_id: str
+    ) -> dict[str, Any] | None:
+        """Atomically assign an unassigned input and resume exactly one waiter.
+
+        In one transaction this verifies the canonical persisted input is still
+        ``unassigned``, verifies the input's ``workspace_id``/``task_id``
+        identity matches the target subtask, verifies that subtask belongs to
+        that task/workspace and is still ``waiting_human``, assigns the input,
+        appends the canonical typed external-input projection to the subtask
+        metadata, and transitions only that subtask to ``in_progress``.
+
+        If any condition fails, nothing is written: the input stays
+        ``unassigned`` and no subtask status or metadata changes. Returns the
+        canonical assigned input and resumed subtask on success, or ``None``
+        when the input is already assigned, the subtask is no longer waiting,
+        or the identities do not match (stale selection / lost race).
+        """
+        now = _utc_now()
+        try:
+            with self.conn:
+                input_row = self.conn.execute(
+                    """
+                    SELECT id, envelope_id, workspace_id, task_id, actor_id, channel_id,
+                           text, validation_version, digest, subtask_id, status,
+                           created_at, updated_at
+                    FROM slack_external_inputs
+                    WHERE id = ?
+                    """,
+                    (input_id,),
+                ).fetchone()
+                if (
+                    input_row is None
+                    or input_row["status"] != "unassigned"
+                    or input_row["subtask_id"] is not None
+                ):
+                    raise _AssignResumeAborted()
+
+                subtask_row = self.conn.execute(
+                    """
+                    SELECT id, workspace_id, task_id, title, status, metadata,
+                           created_at, updated_at, claimed_by, claimed_at, heartbeat_at
+                    FROM subtasks
+                    WHERE id = ?
+                    """,
+                    (subtask_id,),
+                ).fetchone()
+                if subtask_row is None or subtask_row["status"] != "waiting_human":
+                    raise _AssignResumeAborted()
+                if (
+                    subtask_row["workspace_id"] != input_row["workspace_id"]
+                    or subtask_row["task_id"] != input_row["task_id"]
+                ):
+                    raise _AssignResumeAborted()
+
+                assigned = self.conn.execute(
+                    """
+                    UPDATE slack_external_inputs
+                    SET subtask_id = ?, status = 'assigned', updated_at = ?
+                    WHERE id = ? AND subtask_id IS NULL AND status = 'unassigned'
+                    """,
+                    (subtask_id, now, input_id),
+                )
+                if assigned.rowcount != 1:
+                    raise _AssignResumeAborted()
+
+                metadata = _load_json(subtask_row["metadata"])
+                inputs = list(metadata.get("external_inputs") or [])
+                if not any(
+                    isinstance(item, dict)
+                    and item.get("envelope_id") == input_row["envelope_id"]
+                    for item in inputs
+                ):
+                    inputs.append(
+                        {
+                            "source": SLACK_EXTERNAL_INPUT_SOURCE,
+                            "trust": SLACK_EXTERNAL_INPUT_TRUST,
+                            "text": input_row["text"],
+                            "validation_version": input_row["validation_version"],
+                            "digest": input_row["digest"],
+                            "envelope_id": input_row["envelope_id"],
+                            "actor_id": input_row["actor_id"],
+                            "channel_id": input_row["channel_id"],
+                        }
+                    )
+                    metadata["external_inputs"] = inputs
+
+                resumed = self.conn.execute(
+                    """
+                    UPDATE subtasks
+                    SET status = 'in_progress', metadata = ?, updated_at = ?
+                    WHERE id = ? AND status = 'waiting_human'
+                    """,
+                    (_dump_json(metadata), now, subtask_id),
+                )
+                if resumed.rowcount != 1:
+                    raise _AssignResumeAborted()
+
+                assigned_row = self.conn.execute(
+                    """
+                    SELECT id, envelope_id, workspace_id, task_id, actor_id, channel_id,
+                           text, validation_version, digest, subtask_id, status,
+                           created_at, updated_at
+                    FROM slack_external_inputs
+                    WHERE id = ?
+                    """,
+                    (input_id,),
+                ).fetchone()
+                resumed_row = self.conn.execute(
+                    """
+                    SELECT id, workspace_id, task_id, title, status, metadata,
+                           created_at, updated_at, claimed_by, claimed_at, heartbeat_at
+                    FROM subtasks
+                    WHERE id = ?
+                    """,
+                    (subtask_id,),
+                ).fetchone()
+            return {
+                "input": _slack_external_input_from_row(assigned_row),
+                "subtask": _subtask_from_row(resumed_row),
+            }
+        except _AssignResumeAborted:
+            return None
+
 
 
 def _workspace_from_row(row: sqlite3.Row) -> dict[str, Any]:

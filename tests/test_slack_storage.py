@@ -757,6 +757,273 @@ def test_external_input_assignment_has_one_winner(storage, waiting_subtasks):
     assert second is None
 
 
+# ---------------------------------------------------------------------------
+# Atomic assign + resume transaction
+# ---------------------------------------------------------------------------
+
+
+def _atomic_reply_input(task, **overrides):
+    return reply_input(
+        task_id=task["id"],
+        workspace_id=task["workspace_id"],
+        **overrides,
+    )
+
+
+def test_atomic_assign_and_resume_resumes_waiting_subtask(storage, task, waiting_subtasks):
+    item = storage.create_slack_external_input(**_atomic_reply_input(task))
+    subtask = waiting_subtasks[0]
+    result = storage.assign_slack_external_input_and_resume_subtask(
+        item["id"], subtask["id"]
+    )
+    assert result is not None
+    assert result["input"]["status"] == "assigned"
+    assert result["input"]["subtask_id"] == subtask["id"]
+    assert result["subtask"]["status"] == "in_progress"
+
+    refreshed = storage.get_subtask(subtask["id"])
+    assert refreshed["status"] == "in_progress"
+    inputs = refreshed["metadata"].get("external_inputs")
+    assert isinstance(inputs, list) and len(inputs) == 1
+    projection = inputs[0]
+    assert projection["source"] == "slack"
+    assert projection["trust"] == "untrusted_external"
+    assert projection["envelope_id"] == "env-reply-1"
+    assert projection["text"] == "Use the existing migration pattern"
+    assert projection["validation_version"] == "slack-input-v1"
+    assert projection["digest"] == "0" * 64
+    assert projection["actor_id"] == "U33333333"
+    assert projection["channel_id"] == "C11111111"
+
+
+def test_atomic_assign_and_resume_is_idempotent(storage, task, waiting_subtasks):
+    item = storage.create_slack_external_input(**_atomic_reply_input(task))
+    subtask = waiting_subtasks[0]
+    first = storage.assign_slack_external_input_and_resume_subtask(item["id"], subtask["id"])
+    second = storage.assign_slack_external_input_and_resume_subtask(item["id"], subtask["id"])
+    assert first is not None
+    assert second is None
+    refreshed = storage.get_subtask(subtask["id"])
+    assert len(refreshed["metadata"]["external_inputs"]) == 1
+
+
+def test_two_inputs_racing_one_waiter_only_first_resumes(storage, task, waiting_subtasks):
+    first = storage.create_slack_external_input(
+        **_atomic_reply_input(task, envelope_id="env-race-a")
+    )
+    second = storage.create_slack_external_input(
+        **_atomic_reply_input(task, envelope_id="env-race-b")
+    )
+    subtask = waiting_subtasks[0]
+    result_a = storage.assign_slack_external_input_and_resume_subtask(
+        first["id"], subtask["id"]
+    )
+    result_b = storage.assign_slack_external_input_and_resume_subtask(
+        second["id"], subtask["id"]
+    )
+    assert result_a is not None
+    assert result_b is None
+
+    refreshed = storage.get_subtask(subtask["id"])
+    assert refreshed["status"] == "in_progress"
+    inputs = refreshed["metadata"]["external_inputs"]
+    assert len(inputs) == 1
+    assert inputs[0]["envelope_id"] == "env-race-a"
+    statuses = dict(
+        storage.conn.execute(
+            "SELECT envelope_id, status FROM slack_external_inputs WHERE id IN (?, ?)",
+            (first["id"], second["id"]),
+        ).fetchall()
+    )
+    assert statuses["env-race-a"] == "assigned"
+    assert statuses["env-race-b"] == "unassigned"
+
+
+def test_one_input_racing_multiple_waiters_resumes_exactly_one(storage, task, waiting_subtasks):
+    item = storage.create_slack_external_input(**_atomic_reply_input(task))
+    first_waiter, second_waiter = waiting_subtasks
+    result_a = storage.assign_slack_external_input_and_resume_subtask(
+        item["id"], first_waiter["id"]
+    )
+    result_b = storage.assign_slack_external_input_and_resume_subtask(
+        item["id"], second_waiter["id"]
+    )
+    assert result_a is not None
+    assert result_b is None
+
+    assert storage.get_subtask(first_waiter["id"])["status"] == "in_progress"
+    assert storage.get_subtask(second_waiter["id"])["status"] == "waiting_human"
+    inputs = storage.get_subtask(first_waiter["id"])["metadata"]["external_inputs"]
+    assert len(inputs) == 1
+    second_metadata = storage.get_subtask(second_waiter["id"])["metadata"]
+    assert not second_metadata.get("external_inputs")
+
+
+def test_atomic_assign_stale_waiter_is_a_noop(storage, task, waiting_subtasks):
+    item = storage.create_slack_external_input(**_atomic_reply_input(task))
+    subtask = waiting_subtasks[0]
+    storage.update_subtask(subtask_id=subtask["id"], status="in_progress")
+    result = storage.assign_slack_external_input_and_resume_subtask(item["id"], subtask["id"])
+    assert result is None
+    row = storage.conn.execute(
+        "SELECT status, subtask_id FROM slack_external_inputs WHERE id = ?", (item["id"],)
+    ).fetchone()
+    assert row["status"] == "unassigned"
+    assert row["subtask_id"] is None
+    refreshed = storage.get_subtask(subtask["id"])
+    assert refreshed["status"] == "in_progress"
+    assert not refreshed["metadata"].get("external_inputs")
+
+
+def test_atomic_assign_rejects_cross_task_subtask(storage, task):
+    item = storage.create_slack_external_input(**_atomic_reply_input(task))
+    other = storage.create_task(
+        workspace_id=task["workspace_id"], title="Other task", status="in_progress"
+    )
+    foreign_subtask = storage.create_subtask(
+        workspace_id=task["workspace_id"],
+        task_id=other["id"],
+        title="Foreign waiter",
+        status="waiting_human",
+    )
+    result = storage.assign_slack_external_input_and_resume_subtask(
+        item["id"], foreign_subtask["id"]
+    )
+    assert result is None
+    assert storage.get_subtask(foreign_subtask["id"])["status"] == "waiting_human"
+    assert (
+        storage.conn.execute(
+            "SELECT status FROM slack_external_inputs WHERE id = ?", (item["id"],)
+        ).fetchone()["status"]
+        == "unassigned"
+    )
+
+
+def test_atomic_assign_rejects_cross_workspace_subtask(storage, task, waiting_subtasks):
+    item = storage.create_slack_external_input(
+        **reply_input(
+            envelope_id="env-foreign-ws",
+            task_id=task["id"],
+            workspace_id="ws-foreign",
+        )
+    )
+    subtask = waiting_subtasks[0]
+    result = storage.assign_slack_external_input_and_resume_subtask(
+        item["id"], subtask["id"]
+    )
+    assert result is None
+    assert storage.get_subtask(subtask["id"])["status"] == "waiting_human"
+    assert (
+        storage.conn.execute(
+            "SELECT status FROM slack_external_inputs WHERE id = ?", (item["id"],)
+        ).fetchone()["status"]
+        == "unassigned"
+    )
+
+
+def test_atomic_assign_already_assigned_input_is_a_noop(storage, task, waiting_subtasks):
+    item = storage.create_slack_external_input(**_atomic_reply_input(task))
+    subtask = waiting_subtasks[0]
+    storage.assign_slack_external_input(item["id"], subtask["id"])
+    result = storage.assign_slack_external_input_and_resume_subtask(item["id"], subtask["id"])
+    assert result is None
+    assert storage.get_subtask(subtask["id"])["status"] == "waiting_human"
+
+
+def test_atomic_assign_rolls_back_input_and_subtask_when_resume_update_fails(
+    storage, task, waiting_subtasks
+):
+    # Forcing the subtask resume UPDATE to abort must roll back BOTH the input
+    # assignment and the subtask metadata/status transition: a partially
+    # applied assign+resume would orphan an input bound to a still-waiting
+    # subtask that never resumes.
+    item = storage.create_slack_external_input(**_atomic_reply_input(task))
+    subtask = waiting_subtasks[0]
+    storage.conn.execute(
+        """
+        CREATE TRIGGER trg_fail_subtask_resume BEFORE UPDATE ON subtasks
+        BEGIN
+            SELECT RAISE(ABORT, 'boom');
+        END
+        """
+    )
+    storage.conn.commit()
+
+    with pytest.raises(Exception, match="boom"):
+        storage.assign_slack_external_input_and_resume_subtask(item["id"], subtask["id"])
+
+    row = storage.conn.execute(
+        "SELECT status, subtask_id FROM slack_external_inputs WHERE id = ?", (item["id"],)
+    ).fetchone()
+    assert row["status"] == "unassigned"
+    assert row["subtask_id"] is None
+    refreshed = storage.get_subtask(subtask["id"])
+    assert refreshed["status"] == "waiting_human"
+    assert not refreshed["metadata"].get("external_inputs")
+
+
+def test_atomic_assign_two_connection_contention_has_single_winner(
+    storage, tmp_path, task, waiting_subtasks
+):
+    # Two workers on separate connections must observe the same CAS invariant:
+    # exactly one assign+resume commits; the losing connection sees the input
+    # already assigned and leaves the winner's state untouched.
+    item = storage.create_slack_external_input(**_atomic_reply_input(task))
+    subtask = waiting_subtasks[0]
+
+    now = _utc_now()
+    storage.conn.execute("BEGIN IMMEDIATE")
+    cursor = storage.conn.execute(
+        """
+        UPDATE slack_external_inputs
+        SET subtask_id = ?, status = 'assigned', updated_at = ?
+        WHERE id = ?
+        """,
+        (subtask["id"], now, item["id"]),
+    )
+    assert cursor.rowcount == 1
+    storage.conn.execute(
+        """
+        UPDATE subtasks
+        SET status = 'in_progress', updated_at = ?
+        WHERE id = ?
+        """,
+        (now, subtask["id"]),
+    )
+
+    holder: dict[str, Any] = {}
+
+    def race():
+        # The second worker opens its own connection to the same database file
+        # and races the first connection's uncommitted assign+resume.
+        conn = connect(tmp_path / "sarathi.db")
+        try:
+            second_storage = Storage(conn)
+            holder["result"] = second_storage.assign_slack_external_input_and_resume_subtask(
+                item["id"], subtask["id"]
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the main thread
+            holder["error"] = exc
+        finally:
+            conn.close()
+
+    worker = threading.Thread(target=race)
+    worker.start()
+    time.sleep(0.1)
+    storage.conn.commit()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert "error" not in holder, holder.get("error")
+
+    assert holder["result"] is None
+    assert storage.get_subtask(subtask["id"])["status"] == "in_progress"
+    row = storage.conn.execute(
+        "SELECT status, subtask_id FROM slack_external_inputs WHERE id = ?", (item["id"],)
+    ).fetchone()
+    assert row["status"] == "assigned"
+    assert row["subtask_id"] == subtask["id"]
+
+
 def test_slack_outbox_attempt_count_starts_at_zero(storage):
     row = storage.enqueue_slack_outbox(**outbox_message("task-created:1"))
     assert row["attempt_count"] == 0

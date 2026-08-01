@@ -18,6 +18,7 @@ except ImportError:
     from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
 
 from .base import ProviderAdapter, ProviderCapabilities
+from .cli_bridge import _provider_prompt
 
 
 class GatewayProviderAdapter(ProviderAdapter):
@@ -88,7 +89,7 @@ class GatewayProviderAdapter(ProviderAdapter):
                 "role": "system",
                 "content": f"Sarathi {request.mode} dispatch for phase '{request.phase}'.",
             },
-            {"role": "user", "content": request.prompt},
+            {"role": "user", "content": _provider_prompt(self.name, request)},
         ]
         payload = {"model": self.model, "messages": messages}
         timeout = request.timeout_seconds or self.timeout_seconds

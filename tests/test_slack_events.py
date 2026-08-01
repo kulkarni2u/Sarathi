@@ -295,15 +295,13 @@ def test_reply_with_no_waiting_subtask_stores_input_without_resume(workflow, sto
 
     assert probe.subtasks() == []
 
-    # Zero waiters still create the approved validated task message so the
-    # human learns their reply was received; nothing is resumed.
-    outbox = storage.claim_slack_outbox()
-    assert len(outbox) == 1
-    assert outbox[0]["operation"] == "message"
-    assert outbox[0]["operation_key"] == "reply-ack:env-reply-zero"
-    assert outbox[0]["task_id"] == task["id"]
-    assert outbox[0]["thread_ts"] == TEST_THREAD_TS
-    assert "response_url" not in json.dumps(outbox)
+    # Zero waiters persist a normal task message and send no Slack ack.
+    assert storage.claim_slack_outbox() == []
+    messages = storage.list_messages(task_id=task["id"])
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == "Use the existing migration pattern"
+    assert messages[0]["metadata"]["trust"] == "untrusted_external"
 
     rows = storage.conn.execute(
         "SELECT envelope_id, status, task_id, text FROM slack_external_inputs"
@@ -406,6 +404,22 @@ def test_reply_with_multiple_waiters_creates_ambiguity_and_resumes_none(workflow
     payload = outbox[0]["payload"]
     assert payload["selection_actions"] == actions
     assert "response_url" not in json.dumps(outbox)
+
+
+def test_second_ambiguous_reply_preserves_first_reply_buttons(
+    workflow, storage, many_waiting_task
+):
+    workflow.accept(reply_envelope(envelope_id="env-reply-many-first"))
+    workflow.process_next()
+    first_actions = dict(many_waiting_task.selection_actions())
+
+    workflow.accept(reply_envelope(envelope_id="env-reply-many-second"))
+    workflow.process_next()
+    combined = many_waiting_task.selection_actions()
+
+    assert set(first_actions) < set(combined)
+    assert len(combined) == len(first_actions) * 2
+    assert len(storage.claim_slack_outbox()) == 2
 
 
 def _first_selection(probe: WaitingTaskProbe):

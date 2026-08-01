@@ -83,6 +83,7 @@ def _dispatch_subtask(
         subtask=subtask,
         evidence_artifacts=storage.list_evidence_artifacts_for_task(task["id"]),
         review_runs=storage.list_review_runs_for_task(task["id"]),
+        external_inputs=storage.list_assigned_slack_external_inputs(subtask["id"]),
         available_tools=["workspace_files", "git_diff", "test_results", "provider_dispatch"],
     )
     context_pack_artifact = context_pack.to_artifact()

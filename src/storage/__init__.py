@@ -2322,6 +2322,85 @@ class Storage:
             raise KeyError(f"No slack outbox row for operation_key {operation_key!r}")
         return _slack_outbox_from_row(row)
 
+    def record_slack_reply_ambiguity(
+        self,
+        *,
+        operation_key: str,
+        workspace_id: str,
+        task_id: str,
+        channel_id: str,
+        thread_ts: str | None,
+        selections: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically preserve selection mappings and enqueue their message.
+
+        Retrying the same operation returns its original durable payload. New
+        ambiguous replies merge mappings, so earlier live buttons remain valid.
+        """
+        _check_no_forbidden_keys(selections, kind="slack reply selections")
+        now = _utc_now()
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            existing = self.conn.execute(
+                """
+                SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                FROM slack_outbox WHERE operation_key = ?
+                """,
+                (operation_key,),
+            ).fetchone()
+            if existing is not None:
+                return _slack_outbox_from_row(existing)
+
+            task_row = self.conn.execute(
+                "SELECT metadata FROM tasks WHERE id = ? AND workspace_id = ?",
+                (task_id, workspace_id),
+            ).fetchone()
+            if task_row is None:
+                raise KeyError(f"No task for Slack reply ambiguity {task_id!r}")
+            metadata = _load_json(task_row["metadata"])
+            slack_meta = metadata.get("slack")
+            slack_meta = dict(slack_meta) if isinstance(slack_meta, Mapping) else {}
+            prior = slack_meta.get("reply_selections")
+            merged = dict(prior) if isinstance(prior, Mapping) else {}
+            merged.update(dict(selections))
+            slack_meta["reply_selections"] = merged
+            metadata["slack"] = slack_meta
+            self.conn.execute(
+                "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                (_dump_json(metadata), now, task_id),
+            )
+            payload = {
+                "text": "Multiple subtasks are waiting for your input. Choose one:",
+                "selection_actions": dict(selections),
+            }
+            self.conn.execute(
+                """
+                INSERT INTO slack_outbox (
+                    id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                    operation, payload, status, error_code, attempt_count,
+                    slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'message', ?, 'pending', NULL, 0,
+                          NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    _new_id(), operation_key, workspace_id, task_id, channel_id,
+                    thread_ts, _dump_json(payload), now, now,
+                ),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                FROM slack_outbox WHERE operation_key = ?
+                """,
+                (operation_key,),
+            ).fetchone()
+        assert row is not None
+        return _slack_outbox_from_row(row)
+
     def claim_slack_outbox(self, limit: int = 20) -> list[dict[str, Any]]:
         """Atomically transition up to ``limit`` pending outbox rows to ``processing``."""
         if limit < 0:
@@ -2917,8 +2996,68 @@ class Storage:
             return None
         return _slack_external_input_from_row(row)
 
+    def list_assigned_slack_external_inputs(self, subtask_id: str) -> list[dict[str, Any]]:
+        """Return only canonical assigned input rows for one subtask."""
+        rows = self.conn.execute(
+            """
+            SELECT id, envelope_id, workspace_id, task_id, actor_id, channel_id,
+                   text, validation_version, digest, subtask_id, status,
+                   created_at, updated_at
+            FROM slack_external_inputs
+            WHERE subtask_id = ? AND status = 'assigned'
+            ORDER BY created_at, id
+            """,
+            (subtask_id,),
+        ).fetchall()
+        return [_slack_external_input_from_row(row) for row in rows]
+
+    def record_slack_external_input_as_task_message(
+        self, input_id: str
+    ) -> dict[str, Any]:
+        """Idempotently project one canonical Slack reply into task messages."""
+        input_row = self.conn.execute(
+            """
+            SELECT id, envelope_id, workspace_id, task_id, actor_id, channel_id,
+                   text, validation_version, digest, subtask_id, status,
+                   created_at, updated_at
+            FROM slack_external_inputs WHERE id = ?
+            """,
+            (input_id,),
+        ).fetchone()
+        if input_row is None:
+            raise KeyError(f"No slack external input row for id {input_id!r}")
+        message_id = f"slack-reply-{input_id}"
+        metadata = {
+            "source": SLACK_EXTERNAL_INPUT_SOURCE,
+            "trust": SLACK_EXTERNAL_INPUT_TRUST,
+            "envelope_id": input_row["envelope_id"],
+            "actor_id": input_row["actor_id"],
+            "channel_id": input_row["channel_id"],
+            "validation_version": input_row["validation_version"],
+            "digest": input_row["digest"],
+        }
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO messages (
+                    id, workspace_id, task_id, session_id, role, content, metadata, created_at
+                ) VALUES (?, ?, ?, NULL, 'user', ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    input_row["workspace_id"],
+                    input_row["task_id"],
+                    input_row["text"],
+                    _dump_json(metadata),
+                    input_row["created_at"],
+                ),
+            )
+        message = self.get_message(message_id)
+        assert message is not None
+        return message
+
     def assign_slack_external_input_and_resume_subtask(
-        self, input_id: str, subtask_id: str
+        self, input_id: str, subtask_id: str, *, selection_value: str | None = None
     ) -> dict[str, Any] | None:
         """Atomically assign an unassigned input and resume exactly one waiter.
 
@@ -2938,6 +3077,10 @@ class Storage:
         now = _utc_now()
         try:
             with self.conn:
+                # Acquire the write lock before reading either compare-and-set
+                # target so two SQLite connections cannot both observe a
+                # waiting subtask and later diverge during promotion.
+                self.conn.execute("BEGIN IMMEDIATE")
                 input_row = self.conn.execute(
                     """
                     SELECT id, envelope_id, workspace_id, task_id, actor_id, channel_id,
@@ -3014,6 +3157,34 @@ class Storage:
                 )
                 if resumed.rowcount != 1:
                     raise _AssignResumeAborted()
+
+                if selection_value is not None:
+                    task_row = self.conn.execute(
+                        "SELECT metadata FROM tasks WHERE id = ?",
+                        (input_row["task_id"],),
+                    ).fetchone()
+                    if task_row is not None:
+                        task_metadata = _load_json(task_row["metadata"])
+                        slack_meta = task_metadata.get("slack")
+                        if isinstance(slack_meta, Mapping):
+                            slack_meta = dict(slack_meta)
+                            raw_selections = slack_meta.get("reply_selections")
+                            if isinstance(raw_selections, Mapping):
+                                consumed = {}
+                                for key, value in raw_selections.items():
+                                    if (
+                                        isinstance(value, Mapping)
+                                        and value.get("input_id") == input_id
+                                    ):
+                                        consumed[key] = {**dict(value), "consumed": True}
+                                    else:
+                                        consumed[key] = value
+                                slack_meta["reply_selections"] = consumed
+                                task_metadata["slack"] = slack_meta
+                                self.conn.execute(
+                                    "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                                    (_dump_json(task_metadata), now, input_row["task_id"]),
+                                )
 
                 assigned_row = self.conn.execute(
                     """

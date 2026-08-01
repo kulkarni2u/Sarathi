@@ -4,11 +4,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 from math import ceil
+import re
 from typing import Any, Iterable, Mapping
 
 from src.storage import SLACK_EXTERNAL_INPUT_SOURCE, SLACK_EXTERNAL_INPUT_TRUST
 
 MAX_EXTERNAL_INPUTS = 5
+_SLACK_VALIDATION_VERSION = "slack-input-v1"
+_SLACK_INPUT_MAX_LENGTH = 4000
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _estimate_tokens(payload: Any) -> int:
@@ -107,6 +111,7 @@ class ContextCompiler:
         subtask: Mapping[str, Any],
         evidence_artifacts: Iterable[Mapping[str, Any]] = (),
         review_runs: Iterable[Mapping[str, Any]] = (),
+        external_inputs: Iterable[Mapping[str, Any]] = (),
         available_tools: Iterable[str] = (),
         token_budget: int | None = None,
     ) -> ContextPack:
@@ -128,7 +133,9 @@ class ContextCompiler:
         relevant_files = self._relevant_files_for(task_metadata=task_metadata, evidence_artifacts=evidence_artifacts)
         prior_findings = self._prior_findings_for(review_runs=review_runs)
         source_artifacts = self._source_artifacts_for(evidence_artifacts=evidence_artifacts, review_runs=review_runs)
-        external_inputs = self._external_inputs_for(metadata=metadata)
+        typed_external_inputs = self._external_inputs_for(
+            external_inputs=external_inputs, subtask_id=str(subtask.get("id") or "")
+        )
 
         contract = AgentInputContract(
             objective=objective,
@@ -137,7 +144,7 @@ class ContextCompiler:
             relevant_files=relevant_files,
             prior_findings=prior_findings,
             available_tools=[str(item) for item in available_tools if str(item).strip()],
-            external_inputs=external_inputs,
+            external_inputs=typed_external_inputs,
             token_budget=resolved_budget,
         )
         trimmed_sections: list[str] = []
@@ -319,7 +326,12 @@ class ContextCompiler:
                 deduped.append(finding)
         return deduped[:8]
 
-    def _external_inputs_for(self, *, metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
+    def _external_inputs_for(
+        self,
+        *,
+        external_inputs: Iterable[Mapping[str, Any]],
+        subtask_id: str,
+    ) -> list[dict[str, Any]]:
         """Return canonical assigned external-input projections only.
 
         Only entries written by the storage assign+resume transaction (carrying
@@ -327,25 +339,27 @@ class ContextCompiler:
         trusted as typed external data. Everything else is ignored so arbitrary
         subtask metadata can never be promoted into the agent context.
         """
-        raw = metadata.get("external_inputs")
-        if not isinstance(raw, list):
-            return []
         items: list[dict[str, Any]] = []
-        for item in raw:
+        for item in external_inputs:
             if not isinstance(item, Mapping):
                 continue
             if item.get("source") != SLACK_EXTERNAL_INPUT_SOURCE:
                 continue
             if item.get("trust") != SLACK_EXTERNAL_INPUT_TRUST:
                 continue
+            if item.get("status") != "assigned" or item.get("subtask_id") != subtask_id:
+                continue
             envelope_id = item.get("envelope_id")
             validation_version = item.get("validation_version")
             text = item.get("text")
             if not isinstance(envelope_id, str) or not envelope_id:
                 continue
-            if not isinstance(validation_version, str) or not validation_version:
+            if validation_version != _SLACK_VALIDATION_VERSION:
                 continue
-            if not isinstance(text, str):
+            if not isinstance(text, str) or not text or len(text) > _SLACK_INPUT_MAX_LENGTH:
+                continue
+            digest = item.get("digest")
+            if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
                 continue
             items.append(
                 {
@@ -353,7 +367,7 @@ class ContextCompiler:
                     "trust": SLACK_EXTERNAL_INPUT_TRUST,
                     "text": text,
                     "validation_version": validation_version,
-                    "digest": str(item.get("digest") or ""),
+                    "digest": digest,
                     "envelope_id": envelope_id,
                     "actor_id": str(item.get("actor_id") or ""),
                     "channel_id": str(item.get("channel_id") or ""),

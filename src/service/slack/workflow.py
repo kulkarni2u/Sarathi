@@ -572,6 +572,17 @@ class SlackWorkflow:
         ]
         if len(waiting) == 1:
             applied = self._resume_single_waiter(row, binding, content, waiting[0])
+            if not applied:
+                remaining = [
+                    subtask
+                    for subtask in self._storage.list_subtasks_for_task(binding["task_id"])
+                    if subtask["status"] == "waiting_human"
+                ]
+                if remaining:
+                    self._create_ambiguity(row, binding, content, remaining)
+                else:
+                    input_row = self._store_unassigned_input(row, binding, content)
+                    self._storage.record_slack_external_input_as_task_message(input_row["id"])
             self._storage.finish_slack_event(row["envelope_id"], status="processed")
             return {
                 "envelope_id": row["envelope_id"],
@@ -583,16 +594,8 @@ class SlackWorkflow:
                 "applied": applied,
             }
         if len(waiting) == 0:
-            self._store_unassigned_input(row, binding, content)
-            self._storage.enqueue_slack_outbox(
-                operation_key=f"reply-ack:{row['envelope_id']}",
-                workspace_id=row["workspace_id"],
-                task_id=binding["task_id"],
-                channel_id=row["channel_id"],
-                thread_ts=content.get("thread_ts"),
-                operation="message",
-                payload={"text": "Your reply was received and stored."},
-            )
+            input_row = self._store_unassigned_input(row, binding, content)
+            self._storage.record_slack_external_input_as_task_message(input_row["id"])
             self._storage.finish_slack_event(row["envelope_id"], status="processed")
             return {
                 "envelope_id": row["envelope_id"],
@@ -660,8 +663,8 @@ class SlackWorkflow:
         row: Mapping[str, Any],
         binding: Mapping[str, Any],
         content: Mapping[str, Any],
-    ) -> None:
-        self._storage.create_slack_external_input(
+    ) -> Mapping[str, Any]:
+        return self._storage.create_slack_external_input(
             envelope_id=row["envelope_id"],
             workspace_id=row["workspace_id"],
             task_id=binding["task_id"],
@@ -700,31 +703,13 @@ class SlackWorkflow:
                 "title": subtask.get("title") or subtask.get("id"),
                 "actor_id": row["actor_id"],
             }
-        task = self._storage.get_task(binding["task_id"])
-        if task is None:
-            raise RuntimeError("missing task for reply ambiguity")
-        raw_metadata = task.get("metadata")
-        if not isinstance(raw_metadata, Mapping):
-            raw_metadata = {}
-        task_metadata = dict(raw_metadata)
-        raw_slack = task_metadata.get("slack")
-        if not isinstance(raw_slack, Mapping):
-            raw_slack = {}
-        slack_meta = dict(raw_slack)
-        slack_meta[REPLY_SELECTIONS_KEY] = selections
-        task_metadata["slack"] = slack_meta
-        self._storage.update_task(task_id=task["id"], metadata=task_metadata)
-        self._storage.enqueue_slack_outbox(
+        self._storage.record_slack_reply_ambiguity(
             operation_key=f"reply-ambiguity:{row['envelope_id']}",
             workspace_id=row["workspace_id"],
             task_id=binding["task_id"],
             channel_id=row["channel_id"],
             thread_ts=content.get("thread_ts"),
-            operation="message",
-            payload={
-                "text": "Multiple subtasks are waiting for your input. Choose one:",
-                "selection_actions": selections,
-            },
+            selections=selections,
         )
 
     def _process_reply_selection(self, row: Mapping[str, Any]) -> dict[str, Any]:
@@ -762,7 +747,7 @@ class SlackWorkflow:
                 "reason": "stale-selection",
             }
         assigned = self._storage.assign_slack_external_input_and_resume_subtask(
-            selection["input_id"], selection["subtask_id"]
+            selection["input_id"], selection["subtask_id"], selection_value=value
         )
         if assigned is None:
             self._storage.finish_slack_event(row["envelope_id"], status="processed")

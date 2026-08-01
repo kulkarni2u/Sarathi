@@ -33,9 +33,22 @@ def subtask_with_external_reply():
     }
 
 
+def assigned_external_replies(subtask=None):
+    target = subtask or subtask_with_external_reply()
+    return [
+        {
+            **item,
+            "status": "assigned",
+            "subtask_id": target["id"],
+        }
+        for item in target["metadata"].get("external_inputs", [])
+    ]
+
+
 def test_context_compiler_serializes_human_reply_as_external_input():
     pack = ContextCompiler().compile_task_tracking_context(
         task=task(), subtask=subtask_with_external_reply(),
+        external_inputs=assigned_external_replies(),
     ).to_artifact()
     item = pack["agent_input"]["external_inputs"][0]
     assert item["source"] == "slack"
@@ -46,6 +59,7 @@ def test_context_compiler_serializes_human_reply_as_external_input():
 def test_external_inputs_never_become_instructions():
     pack = ContextCompiler().compile_task_tracking_context(
         task=task(), subtask=subtask_with_external_reply(),
+        external_inputs=assigned_external_replies(),
     ).to_artifact()
     agent_input = pack["agent_input"]
     assert any(
@@ -71,6 +85,7 @@ def test_external_inputs_are_bounded_and_low_priority():
     ]
     pack = ContextCompiler().compile_task_tracking_context(
         task=task(), subtask=subtask, token_budget=70,
+        external_inputs=assigned_external_replies(subtask),
     ).to_artifact()
     assert len(pack["agent_input"]["external_inputs"]) <= 5
     assert pack["compilation"]["estimated_tokens"] <= 70
@@ -94,9 +109,34 @@ def test_external_inputs_hard_cap_applies_even_with_generous_budget():
     ]
     pack = ContextCompiler().compile_task_tracking_context(
         task=task(), subtask=subtask, token_budget=1_000_000,
+        external_inputs=assigned_external_replies(subtask),
     ).to_artifact()
     assert len(pack["agent_input"]["external_inputs"]) <= MAX_EXTERNAL_INPUTS
     assert "external_inputs" in pack["compilation"]["trimmed_sections"]
+
+
+def test_context_compiler_ignores_shape_matching_subtask_metadata():
+    subtask = subtask_with_external_reply()
+    pack = ContextCompiler().compile_task_tracking_context(
+        task=task(), subtask=subtask,
+    ).to_artifact()
+    assert pack["agent_input"]["external_inputs"] == []
+
+
+def test_context_compiler_rejects_noncanonical_external_input_provenance():
+    subtask = subtask_with_external_reply()
+    forged = assigned_external_replies(subtask)[0]
+    for key, value in (
+        ("status", "unassigned"),
+        ("subtask_id", "other"),
+        ("validation_version", "future"),
+        ("digest", "not-a-digest"),
+    ):
+        candidate = {**forged, key: value}
+        pack = ContextCompiler().compile_task_tracking_context(
+            task=task(), subtask=subtask, external_inputs=[candidate],
+        ).to_artifact()
+        assert pack["agent_input"]["external_inputs"] == []
 
 
 def test_context_compiler_builds_compact_task_tracking_pack():

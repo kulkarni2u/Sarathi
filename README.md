@@ -545,9 +545,16 @@ Events API Request URL (subscribe to the `message.channels` bot event and
 answer the one-time `url_verification` handshake automatically). A reply
 posted in a task's thread is appended to the task as a user message
 (`metadata.source: "slack_message"`) and emits a `task.human_reply`
-lifecycle event; bot messages and edits/deletions are ignored. This is
-intake-only for now — no phase currently pauses to consume these replies,
-so the engine-side resume hook is future work.
+lifecycle event; bot messages and edits/deletions are ignored.
+
+Any subtask on the task sitting in `waiting_human` status is resumed —
+transitioned back to `queued` via the same path `POST /subtasks/{id}/transition`
+uses — so a reply actually unblocks work instead of only being recorded.
+A single reply resumes *every* `waiting_human` subtask on the task; there's
+no per-question correlation yet, so a task with multiple outstanding
+questions will have all of them resume together. This only resumes
+subtasks explicitly parked via that transition path — an engine run
+(CLI/TUI) that paused independently isn't affected.
 
 ## Verification Commands
 

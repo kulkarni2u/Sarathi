@@ -14,7 +14,7 @@ from uuid import uuid4
 logger = logging.getLogger("sarathi.storage")
 
 
-LATEST_SCHEMA_VERSION = 13
+LATEST_SCHEMA_VERSION = 14
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -150,6 +150,25 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
             (13, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 14:
+        # Bounded inbox retry metadata: mirror the outbox's attempt_count on the
+        # inbox so a failed Slack event can be requeued a bounded number of
+        # times before terminal failure. Migration 12's inbox has no such
+        # column, so add it only when missing (SQLite has no "ADD COLUMN IF
+        # NOT EXISTS"); fresh and already-v13 databases converge on the same
+        # v14 schema without editing any prior migration.
+        inbox_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(slack_inbox)")
+        }
+        if "attempt_count" not in inbox_columns:
+            conn.execute(
+                "ALTER TABLE slack_inbox ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (14, _utc_now()),
         )
         conn.commit()
 
@@ -1985,19 +2004,21 @@ class Storage:
         """Insert a validated Slack event, deduplicated by ``envelope_id``.
 
         A duplicate insert is a no-op and returns the previously recorded row so
-        Socket Mode envelopes are applied at most once.
+        Socket Mode envelopes are applied at most once. The returned row carries
+        an in-memory ``duplicate`` flag (true when the ``envelope_id`` was
+        already present, whatever its status) that is never persisted.
         """
         _check_no_forbidden_keys(content, kind="slack inbox content")
         now = _utc_now()
         with self.conn:
-            self.conn.execute(
+            cursor = self.conn.execute(
                 """
                 INSERT OR IGNORE INTO slack_inbox (
                     id, envelope_id, event_id, workspace_id, team_id, channel_id,
-                    actor_id, event_type, content, status, error_code, claimed_at,
-                    processed_at, created_at, updated_at
+                    actor_id, event_type, content, status, error_code, attempt_count,
+                    claimed_at, processed_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, 0, NULL, NULL, ?, ?)
                 """,
                 (
                     _new_id(),
@@ -2013,11 +2034,12 @@ class Storage:
                     now,
                 ),
             )
+            inserted = cursor.rowcount == 1
             row = self.conn.execute(
                 """
                 SELECT id, envelope_id, event_id, workspace_id, team_id, channel_id,
-                       actor_id, event_type, content, status, error_code, claimed_at,
-                       processed_at, created_at, updated_at
+                       actor_id, event_type, content, status, error_code, attempt_count,
+                       claimed_at, processed_at, created_at, updated_at
                 FROM slack_inbox
                 WHERE envelope_id = ?
                 """,
@@ -2025,7 +2047,9 @@ class Storage:
             ).fetchone()
         if row is None:
             raise KeyError(f"No slack inbox row for envelope_id {envelope_id!r}")
-        return _slack_inbox_from_row(row)
+        result = _slack_inbox_from_row(row)
+        result["duplicate"] = not inserted
+        return result
 
     def claim_slack_events(self, limit: int = 20) -> list[dict[str, Any]]:
         """Atomically transition up to ``limit`` pending inbox rows to ``processing``."""
@@ -2060,8 +2084,8 @@ class Storage:
             rows = self.conn.execute(
                 f"""
                 SELECT id, envelope_id, event_id, workspace_id, team_id, channel_id,
-                       actor_id, event_type, content, status, error_code, claimed_at,
-                       processed_at, created_at, updated_at
+                       actor_id, event_type, content, status, error_code, attempt_count,
+                       claimed_at, processed_at, created_at, updated_at
                 FROM slack_inbox
                 WHERE id IN ({placeholders})
                 ORDER BY created_at, id
@@ -2098,8 +2122,52 @@ class Storage:
             row = self.conn.execute(
                 """
                 SELECT id, envelope_id, event_id, workspace_id, team_id, channel_id,
-                       actor_id, event_type, content, status, error_code, claimed_at,
-                       processed_at, created_at, updated_at
+                       actor_id, event_type, content, status, error_code, attempt_count,
+                       claimed_at, processed_at, created_at, updated_at
+                FROM slack_inbox
+                WHERE envelope_id = ?
+                """,
+                (envelope_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"No slack inbox row for envelope_id {envelope_id!r}")
+        return _slack_inbox_from_row(row)
+
+    def fail_slack_event(
+        self,
+        envelope_id: str,
+        *,
+        error_code: str,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        """Record a failed inbox process with bounded retry metadata.
+
+        Increments ``attempt_count``. Below ``max_attempts`` the row is requeued
+        to ``pending`` so the worker can claim and retry it; at or above the
+        bound it becomes terminal ``failed``. ``error_code`` is a stable,
+        redacted code. Only applies from ``pending`` or ``processing`` — an
+        already-terminal row is returned unchanged.
+        """
+        now = _utc_now()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE slack_inbox
+                SET attempt_count = attempt_count + 1,
+                    status = CASE WHEN attempt_count + 1 >= ? THEN 'failed' ELSE 'pending' END,
+                    error_code = ?,
+                    processed_at = CASE WHEN attempt_count + 1 >= ? THEN ? ELSE NULL END,
+                    claimed_at = CASE WHEN attempt_count + 1 >= ? THEN claimed_at ELSE NULL END,
+                    updated_at = ?
+                WHERE envelope_id = ? AND status IN ('pending', 'processing')
+                """,
+                (max_attempts, error_code, max_attempts, now, max_attempts, now, envelope_id),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id, envelope_id, event_id, workspace_id, team_id, channel_id,
+                       actor_id, event_type, content, status, error_code, attempt_count,
+                       claimed_at, processed_at, created_at, updated_at
                 FROM slack_inbox
                 WHERE envelope_id = ?
                 """,
@@ -2380,13 +2448,17 @@ class Storage:
     ) -> dict[str, Any]:
         """Materialize a validated Slack slash command into one draft unit.
 
-        A single transaction creates the draft task (``prd_pending``), the
-        provisional Slack thread binding, the human approval gate with opaque
-        decision actions, the two opening messages, the outbound message
-        intent, and the ``task.draft_created`` / ``approval.requested``
-        lifecycle events, then finishes the inbox event. At-most-once by
-        ``envelope_id``: a repeated call returns the canonical ``task_id`` /
-        ``gate_id`` with ``duplicate=True`` and creates nothing new.
+        Requires the inbox row for ``envelope_id`` to exist and be claimed
+        (``processing``): a missing row raises ``KeyError`` and a row still in
+        ``pending`` or in a terminal ``failed``/``rejected`` state raises
+        ``ValueError``. A single transaction creates the draft task
+        (``prd_pending``), the provisional Slack thread binding, the human
+        approval gate with opaque decision actions, the two opening messages,
+        the outbound message intent, and the ``task.draft_created`` /
+        ``approval.requested`` lifecycle events, then finishes the inbox event.
+        At-most-once by ``envelope_id``: a repeated call on an already
+        ``processed`` row returns the canonical ``task_id`` / ``gate_id`` with
+        ``duplicate=True`` and creates nothing new.
         """
         action_values = {"approve": approve_action, "reject": reject_action}
         task_metadata = {
@@ -2415,7 +2487,9 @@ class Storage:
                 """,
                 (envelope_id,),
             ).fetchone()
-            if existing is not None and existing["status"] == "processed":
+            if existing is None:
+                raise KeyError(f"No slack inbox row for envelope_id {envelope_id!r}")
+            if existing["status"] == "processed":
                 binding = self.conn.execute(
                     """
                     SELECT task_id FROM slack_task_bindings
@@ -2438,6 +2512,15 @@ class Storage:
                             "gate_id": gate_id,
                             "duplicate": True,
                         }
+                raise ValueError(
+                    f"Slack inbox row {envelope_id!r} is processed but its canonical "
+                    "task is unavailable"
+                )
+            if existing["status"] != "processing":
+                raise ValueError(
+                    f"Cannot create a task from slack inbox row {envelope_id!r} in "
+                    f"status {existing['status']!r}; expected 'processing'"
+                )
 
             task_id = _new_id()
             gate_id = _new_id()
@@ -2578,12 +2661,16 @@ class Storage:
             )
         return {"task_id": task_id, "gate_id": gate_id, "duplicate": False}
 
-    def find_slack_gate_by_action_value(self, value: str) -> dict[str, Any] | None:
-        """Return the approval gate bound to an opaque Slack decision action.
+    def find_slack_gate_by_action_value(
+        self, value: str, *, workspace_id: str
+    ) -> dict[str, Any] | None:
+        """Return the approval gate in ``workspace_id`` bound to an opaque action.
 
         Decision actions are stored under ``metadata["slack_decision_actions"]``;
         the value is never persisted anywhere else, so a matching value is
-        proof the caller saw the gate's own message.
+        proof the caller saw the gate's own message. The lookup is scoped to a
+        single workspace so an action value can never resolve a gate that
+        belongs to a different Sarathi workspace.
         """
         if not value:
             return None
@@ -2591,7 +2678,9 @@ class Storage:
             """
             SELECT id, workspace_id, task_id, name, status, metadata, created_at, updated_at
             FROM approval_gates
-            """
+            WHERE workspace_id = ?
+            """,
+            (workspace_id,),
         ).fetchall()
         for row in rows:
             gate = _approval_gate_from_row(row)
@@ -2624,21 +2713,50 @@ class Storage:
         ``approval.decision_recorded`` lifecycle event. The inbox event is
         always finished. A repeated or stale decision leaves the gate at its
         first terminal status and returns ``applied=False``.
+
+        The canonical ``workspace_id`` and ``task_id`` are derived from the
+        gate row itself; caller-supplied values that disagree with the gate
+        raise ``ValueError`` before any CAS or outbox write, so a decision can
+        never mutate a gate that does not belong to the caller's workspace or
+        task.
         """
         if requested_status not in ("approved", "rejected"):
             raise ValueError(f"Invalid gate decision status: {requested_status}")
         _check_no_forbidden_keys(payload, kind="slack decision outbox payload")
         now = _utc_now()
         with self.conn:
-            cursor = self.conn.execute(
+            gate_row = self.conn.execute(
                 """
-                UPDATE approval_gates
-                SET status = ?, updated_at = ?
-                WHERE id = ? AND status = 'pending'
+                SELECT id, workspace_id, task_id, name, status, metadata, created_at, updated_at
+                FROM approval_gates
+                WHERE id = ?
                 """,
-                (requested_status, now, gate_id),
-            )
-            applied = cursor.rowcount == 1
+                (gate_id,),
+            ).fetchone()
+            if gate_row is not None:
+                if gate_row["workspace_id"] != workspace_id:
+                    raise ValueError(
+                        f"Gate {gate_id!r} belongs to workspace "
+                        f"{gate_row['workspace_id']!r}, not {workspace_id!r}"
+                    )
+                if gate_row["task_id"] != task_id:
+                    raise ValueError(
+                        f"Gate {gate_id!r} is bound to task {gate_row['task_id']!r}, "
+                        f"not {task_id!r}"
+                    )
+                workspace_id = gate_row["workspace_id"]
+                task_id = gate_row["task_id"]
+                cursor = self.conn.execute(
+                    """
+                    UPDATE approval_gates
+                    SET status = ?, updated_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (requested_status, now, gate_id),
+                )
+                applied = cursor.rowcount == 1
+            else:
+                applied = False
             row = self.conn.execute(
                 """
                 SELECT id, workspace_id, task_id, name, status, metadata, created_at, updated_at
@@ -3210,6 +3328,7 @@ def _slack_inbox_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "content": _load_json(row["content"]),
         "status": row["status"],
         "error_code": row["error_code"],
+        "attempt_count": row["attempt_count"],
         "claimed_at": row["claimed_at"],
         "processed_at": row["processed_at"],
         "created_at": row["created_at"],

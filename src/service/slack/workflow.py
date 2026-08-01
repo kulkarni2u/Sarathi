@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import secrets
+import sqlite3
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Mapping, NoReturn
@@ -31,6 +32,7 @@ DECISION_ACTION_ID = "sarathi_gate_decision"
 GATE_ACTIONS_KEY = "slack_decision_actions"
 PROVISIONAL_PREFIX = "provisional:"
 SECURITY_EVENT_TYPE = "slack.security_rejected"
+MAX_THREAD_TS_LENGTH = 64
 
 
 class SlackAuthorizationError(RuntimeError):
@@ -78,6 +80,25 @@ def _derive_task_title(prompt: str) -> str:
 def _text_digest(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _stable_error_code(exc: Exception) -> str:
+    """Map an exception to a stable, redacted code for inbox error_code.
+
+    The raw exception message can contain task text, IDs, or secrets and is
+    never persisted; only the bounded code below reaches the database.
+    """
+    if isinstance(exc, sqlite3.IntegrityError):
+        return "integrity-error"
+    if isinstance(exc, sqlite3.OperationalError):
+        return "database-locked"
+    if isinstance(exc, sqlite3.DatabaseError):
+        return "database-error"
+    if isinstance(exc, ValueError):
+        return "value-error"
+    if isinstance(exc, KeyError):
+        return "missing-row"
+    return "internal-error"
 
 
 class SlackWorkflow:
@@ -176,11 +197,18 @@ class SlackWorkflow:
         value = envelope.payload.get("value")
         if not isinstance(value, str) or not value:
             self._reject(envelope, reason="missing-action-value")
+        thread_ts = envelope.payload.get("thread_ts")
+        if (
+            not isinstance(thread_ts, str)
+            or not thread_ts
+            or len(thread_ts) > MAX_THREAD_TS_LENGTH
+        ):
+            self._reject(envelope, reason="invalid-thread-ts")
         content = {
             "kind": "interaction",
             "action_id": DECISION_ACTION_ID,
             "value": value,
-            "thread_ts": envelope.payload.get("thread_ts"),
+            "thread_ts": thread_ts,
         }
         return self._enqueue(envelope, event_type="block_actions", content=content)
 
@@ -206,7 +234,7 @@ class SlackWorkflow:
             "envelope_id": envelope.envelope_id,
             "status": row["status"],
             "event_type": row["event_type"],
-            "duplicate": row["status"] != "pending",
+            "duplicate": bool(row.get("duplicate", False)),
         }
 
     def _reject(self, envelope: SlackEnvelope, *, reason: str) -> NoReturn:
@@ -252,20 +280,53 @@ class SlackWorkflow:
         results: list[dict[str, Any]] = []
         for row in self._storage.claim_slack_events(limit=limit):
             kind = row["content"].get("kind")
-            if kind == "command":
-                results.append(self._process_command(row))
-            elif kind == "interaction":
-                results.append(self._process_interaction(row))
-            else:
-                self._storage.finish_slack_event(
-                    row["envelope_id"], status="rejected", error_code="unknown-kind"
-                )
+            try:
+                if kind == "command":
+                    results.append(self._process_command(row))
+                elif kind == "interaction":
+                    results.append(self._process_interaction(row))
+                else:
+                    self._storage.finish_slack_event(
+                        row["envelope_id"], status="rejected", error_code="unknown-kind"
+                    )
+                    results.append(
+                        {
+                            "envelope_id": row["envelope_id"],
+                            "kind": kind,
+                            "status": "rejected",
+                            "error_code": "unknown-kind",
+                        }
+                    )
+            except Exception as exc:  # noqa: BLE001 - per-row isolation
+                # A processing failure must never strand the row in
+                # 'processing' nor stop the remaining rows. Persist only a
+                # stable redacted code, requeue below the bound, and terminal-
+                # fail at the bound (mirrors the outbox retry semantics).
+                error_code = _stable_error_code(exc)
+                try:
+                    failed = self._storage.fail_slack_event(
+                        row["envelope_id"], error_code=error_code
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to mark Slack inbox row failed", exc_info=True
+                    )
+                    results.append(
+                        {
+                            "envelope_id": row["envelope_id"],
+                            "kind": kind,
+                            "status": "failed",
+                            "error_code": error_code,
+                        }
+                    )
+                    continue
                 results.append(
                     {
                         "envelope_id": row["envelope_id"],
                         "kind": kind,
-                        "status": "rejected",
-                        "error_code": "unknown-kind",
+                        "status": failed["status"],
+                        "error_code": error_code,
+                        "attempt_count": failed["attempt_count"],
                     }
                 )
         return results
@@ -301,7 +362,9 @@ class SlackWorkflow:
         value = content.get("value")
         thread_ts = content.get("thread_ts")
         gate = (
-            self._storage.find_slack_gate_by_action_value(value)
+            self._storage.find_slack_gate_by_action_value(
+                value, workspace_id=row["workspace_id"]
+            )
             if isinstance(value, str)
             else None
         )
@@ -349,7 +412,7 @@ class SlackWorkflow:
             requested_status=requested,
             actor_id=row["actor_id"],
             operation_key=f"gate-decision:{gate['id']}:{row['envelope_id']}",
-            workspace_id=row["workspace_id"],
+            workspace_id=gate["workspace_id"],
             channel_id=row["channel_id"],
             thread_ts=thread_ts,
             payload={"text": f"Gate decision recorded: {requested}"},
@@ -371,12 +434,16 @@ class SlackWorkflow:
     ) -> bool:
         if not isinstance(thread_ts, str) or not thread_ts:
             return False
+        if gate["workspace_id"] != row["workspace_id"]:
+            return False
         binding = self._storage.get_slack_task_binding(
             team_id=row["team_id"],
             channel_id=row["channel_id"],
             thread_ts=thread_ts,
         )
         if binding is None:
+            return False
+        if binding["workspace_id"] != row["workspace_id"]:
             return False
         return binding["task_id"] == gate["task_id"]
 

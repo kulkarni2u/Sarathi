@@ -6,13 +6,19 @@ never contact Slack or any external host.
 """
 
 import json
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from src.storage import (
     LATEST_SCHEMA_VERSION,
     Storage,
+    _dump_json,
+    _new_id,
+    _utc_now,
     connect,
     current_schema_version,
     run_migrations,
@@ -149,6 +155,7 @@ def _command_input(**overrides):
 
 def test_create_slack_command_task_creates_full_draft_unit(storage, workspace):
     storage.enqueue_slack_event(**validated_event("env-1", workspace_id=workspace["id"]))
+    storage.claim_slack_events(limit=1)
     result = storage.create_slack_command_task(
         **_command_input(workspace_id=workspace["id"])
     )
@@ -193,6 +200,7 @@ def test_create_slack_command_task_creates_full_draft_unit(storage, workspace):
 
 def test_create_slack_command_task_duplicate_envelope_is_noop(storage, workspace):
     storage.enqueue_slack_event(**validated_event("env-1", workspace_id=workspace["id"]))
+    storage.claim_slack_events(limit=1)
     storage.create_slack_command_task(**_command_input(workspace_id=workspace["id"]))
     second = storage.create_slack_command_task(**_command_input(workspace_id=workspace["id"]))
 
@@ -211,6 +219,7 @@ def test_create_slack_command_task_duplicate_envelope_is_noop(storage, workspace
 
 def test_create_slack_command_task_rolls_back_on_failure(storage, workspace):
     storage.enqueue_slack_event(**validated_event("env-1", workspace_id=workspace["id"]))
+    storage.claim_slack_events(limit=1)
     storage.conn.execute(
         """
         CREATE TRIGGER trg_fail_outbox AFTER INSERT ON slack_outbox
@@ -229,10 +238,76 @@ def test_create_slack_command_task_rolls_back_on_failure(storage, workspace):
     ) is None
     assert len(storage.list_events(workspace_id=workspace["id"])) == 0
 
+    requeued = storage.fail_slack_event("env-1", error_code="test-boom")
+    assert requeued["status"] == "pending"
+    assert requeued["attempt_count"] == 1
     claim = storage.claim_slack_events()
     assert len(claim) == 1
     assert claim[0]["envelope_id"] == "env-1"
     assert storage.list_messages() == []
+
+
+def test_create_slack_command_task_requires_existing_inbox_row(storage, workspace):
+    with pytest.raises(KeyError, match="env-1"):
+        storage.create_slack_command_task(**_command_input(workspace_id=workspace["id"]))
+
+
+def test_create_slack_command_task_rejects_pending_inbox_row(storage, workspace):
+    storage.enqueue_slack_event(**validated_event("env-1", workspace_id=workspace["id"]))
+    with pytest.raises(ValueError, match="pending"):
+        storage.create_slack_command_task(**_command_input(workspace_id=workspace["id"]))
+
+
+@pytest.mark.parametrize("terminal", ["failed", "rejected"])
+def test_create_slack_command_task_rejects_terminal_inbox_states(storage, workspace, terminal):
+    storage.enqueue_slack_event(**validated_event("env-1", workspace_id=workspace["id"]))
+    storage.finish_slack_event("env-1", status=terminal, error_code="previous-failure")
+    with pytest.raises(ValueError, match=terminal):
+        storage.create_slack_command_task(**_command_input(workspace_id=workspace["id"]))
+    assert storage.list_tasks() == []
+    assert storage.claim_slack_outbox() == []
+
+
+def test_slack_inbox_attempt_count_starts_at_zero(storage):
+    row = storage.enqueue_slack_event(**validated_event("env-1"))
+    assert row["attempt_count"] == 0
+
+
+def test_slack_inbox_fail_requeues_below_bound_and_fails_at_bound(storage):
+    storage.enqueue_slack_event(**validated_event("env-1"))
+    for expected in (1, 2):
+        storage.claim_slack_events(limit=1)
+        requeued = storage.fail_slack_event("env-1", error_code="internal-error")
+        assert requeued["status"] == "pending"
+        assert requeued["attempt_count"] == expected
+        assert requeued["error_code"] == "internal-error"
+        assert requeued["processed_at"] is None
+    storage.claim_slack_events(limit=1)
+    failed = storage.fail_slack_event("env-1", error_code="internal-error")
+    assert failed["status"] == "failed"
+    assert failed["attempt_count"] == 3
+    assert failed["error_code"] == "internal-error"
+    assert failed["processed_at"] is not None
+    assert storage.claim_slack_events() == []
+
+
+def test_slack_inbox_fail_respects_custom_attempt_bound(storage):
+    storage.enqueue_slack_event(**validated_event("env-1"))
+    storage.claim_slack_events(limit=1)
+    failed = storage.fail_slack_event(
+        "env-1", error_code="internal-error", max_attempts=1
+    )
+    assert failed["status"] == "failed"
+    assert failed["attempt_count"] == 1
+
+
+def test_slack_inbox_fail_does_not_overwrite_terminal_state(storage):
+    storage.enqueue_slack_event(**validated_event("env-1"))
+    storage.finish_slack_event("env-1", status="processed")
+    second = storage.fail_slack_event("env-1", error_code="late-error")
+    assert second["status"] == "processed"
+    assert second["attempt_count"] == 0
+    assert second["error_code"] is None
 
 
 def test_find_slack_gate_by_action_value(storage, workspace, task):
@@ -245,10 +320,46 @@ def test_find_slack_gate_by_action_value(storage, workspace, task):
         status="pending",
         metadata={"slack_decision_actions": {"approve": approve_action, "reject": reject_action}},
     )
-    assert storage.find_slack_gate_by_action_value(approve_action)["id"] == gate["id"]
-    assert storage.find_slack_gate_by_action_value(reject_action)["id"] == gate["id"]
-    assert storage.find_slack_gate_by_action_value("nope") is None
-    assert storage.find_slack_gate_by_action_value("") is None
+    assert (
+        storage.find_slack_gate_by_action_value(approve_action, workspace_id=workspace["id"])["id"]
+        == gate["id"]
+    )
+    assert (
+        storage.find_slack_gate_by_action_value(reject_action, workspace_id=workspace["id"])["id"]
+        == gate["id"]
+    )
+    assert storage.find_slack_gate_by_action_value("nope", workspace_id=workspace["id"]) is None
+    assert storage.find_slack_gate_by_action_value("", workspace_id=workspace["id"]) is None
+
+
+def test_find_slack_gate_by_action_value_is_workspace_scoped(storage, workspace, task):
+    approve_action = "approve-opaque-1"
+    other = storage.create_workspace(name="Other", root_path="/work/other")
+    other_task = storage.create_task(
+        workspace_id=other["id"], title="Other task", status="prd_pending"
+    )
+    gate_a = storage.create_approval_gate(
+        workspace_id=workspace["id"],
+        task_id=task["id"],
+        name="A gate",
+        status="pending",
+        metadata={"slack_decision_actions": {"approve": approve_action, "reject": "reject-a"}},
+    )
+    gate_b = storage.create_approval_gate(
+        workspace_id=other["id"],
+        task_id=other_task["id"],
+        name="B gate",
+        status="pending",
+        metadata={"slack_decision_actions": {"approve": approve_action, "reject": "reject-b"}},
+    )
+    assert (
+        storage.find_slack_gate_by_action_value(approve_action, workspace_id=workspace["id"])["id"]
+        == gate_a["id"]
+    )
+    assert (
+        storage.find_slack_gate_by_action_value(approve_action, workspace_id=other["id"])["id"]
+        == gate_b["id"]
+    )
 
 
 def _decision_input(**overrides):
@@ -334,6 +445,167 @@ def test_apply_slack_gate_decision_at_most_once_per_operation(storage, workspace
     assert len(storage.list_events(workspace_id=workspace["id"])) == 1
 
 
+def test_apply_slack_gate_decision_rejects_workspace_mismatch(storage, workspace, task):
+    gate = storage.create_approval_gate(
+        workspace_id=workspace["id"],
+        task_id=task["id"],
+        name="Requires human approval",
+        status="pending",
+    )
+    storage.enqueue_slack_event(**validated_event("env-dec-1", workspace_id=workspace["id"]))
+    other = storage.create_workspace(name="Other", root_path="/work/other")
+    with pytest.raises(ValueError, match="workspace"):
+        storage.apply_slack_gate_decision(
+            **_decision_input(
+                gate_id=gate["id"], task_id=task["id"], workspace_id=other["id"]
+            )
+        )
+    assert storage.get_approval_gate(gate["id"])["status"] == "pending"
+    assert storage.claim_slack_outbox() == []
+
+
+def test_apply_slack_gate_decision_rejects_task_mismatch(storage, workspace, task):
+    gate = storage.create_approval_gate(
+        workspace_id=workspace["id"],
+        task_id=task["id"],
+        name="Requires human approval",
+        status="pending",
+    )
+    storage.enqueue_slack_event(**validated_event("env-dec-1", workspace_id=workspace["id"]))
+    other = storage.create_task(
+        workspace_id=workspace["id"], title="Other task", status="in_progress"
+    )
+    with pytest.raises(ValueError, match="task"):
+        storage.apply_slack_gate_decision(
+            **_decision_input(
+                gate_id=gate["id"], task_id=other["id"], workspace_id=workspace["id"]
+            )
+        )
+    assert storage.get_approval_gate(gate["id"])["status"] == "pending"
+    assert storage.claim_slack_outbox() == []
+
+
+def test_apply_slack_gate_decision_rolls_back_on_failure(storage, workspace, task):
+    gate = storage.create_approval_gate(
+        workspace_id=workspace["id"],
+        task_id=task["id"],
+        name="Requires human approval",
+        status="pending",
+    )
+    storage.enqueue_slack_event(**validated_event("env-dec-1", workspace_id=workspace["id"]))
+    storage.conn.execute(
+        """
+        CREATE TRIGGER trg_fail_decision_outbox AFTER INSERT ON slack_outbox
+        BEGIN
+            SELECT RAISE(FAIL, 'boom');
+        END
+        """
+    )
+    with pytest.raises(Exception, match="boom"):
+        storage.apply_slack_gate_decision(
+            **_decision_input(gate_id=gate["id"], task_id=task["id"], workspace_id=workspace["id"])
+        )
+
+    assert storage.get_approval_gate(gate["id"])["status"] == "pending"
+    assert storage.claim_slack_outbox() == []
+    assert storage.list_events(workspace_id=workspace["id"]) == []
+
+    claim = storage.claim_slack_events()
+    assert len(claim) == 1
+    assert claim[0]["envelope_id"] == "env-dec-1"
+
+
+def test_two_connection_cas_race_has_single_winner(storage, tmp_path, workspace, task):
+    # Two workers on separate connections must observe the same CAS invariant:
+    # exactly one decision transitions the gate; the losing connection sees the
+    # canonical terminal status and enqueues no competing effect.
+    gate = storage.create_approval_gate(
+        workspace_id=workspace["id"],
+        task_id=task["id"],
+        name="Requires human approval",
+        status="pending",
+    )
+    storage.enqueue_slack_event(**validated_event("env-dec-1", workspace_id=workspace["id"]))
+    storage.enqueue_slack_event(**validated_event("env-dec-2", workspace_id=workspace["id"]))
+
+    now = _utc_now()
+    storage.conn.execute("BEGIN IMMEDIATE")
+    cursor = storage.conn.execute(
+        """
+        UPDATE approval_gates
+        SET status = 'approved', updated_at = ?
+        WHERE id = ? AND status = 'pending'
+        """,
+        (now, gate["id"]),
+    )
+    assert cursor.rowcount == 1
+    storage.conn.execute(
+        """
+        INSERT INTO slack_outbox (
+            id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+            operation, payload, status, error_code, attempt_count,
+            slack_message_ts, claimed_at, processed_at, created_at, updated_at
+        )
+        VALUES (?, 'gate-decision:gate-1:env-dec-1', ?, ?, 'C11111111',
+                '1700000000.000000', 'message', ?, 'pending', NULL, 0,
+                NULL, NULL, NULL, ?, ?)
+        """,
+        (_new_id(), workspace["id"], task["id"], _dump_json({}), now, now),
+    )
+    storage.conn.execute(
+        """
+        UPDATE slack_inbox
+        SET status = 'processed', error_code = NULL, processed_at = ?, updated_at = ?
+        WHERE envelope_id = 'env-dec-1' AND status IN ('pending', 'processing')
+        """,
+        (now, now),
+    )
+
+    holder: dict[str, Any] = {}
+
+    def decide_reject():
+        # The second worker opens its own connection to the same database file
+        # and races the first worker's CAS for the same gate.
+        conn = connect(tmp_path / "sarathi.db")
+        try:
+            second_storage = Storage(conn)
+            holder["pre_status"] = second_storage.get_approval_gate(gate["id"])["status"]
+            holder["result"] = second_storage.apply_slack_gate_decision(
+                **_decision_input(
+                    envelope_id="env-dec-2",
+                    gate_id=gate["id"],
+                    task_id=task["id"],
+                    workspace_id=workspace["id"],
+                    operation_key="gate-decision:gate-1:env-dec-2",
+                    requested_status="rejected",
+                    payload={"text": "Gate decision recorded: rejected"},
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the main thread
+            holder["error"] = exc
+        finally:
+            conn.close()
+
+    worker = threading.Thread(target=decide_reject)
+    worker.start()
+    time.sleep(0.1)
+    storage.conn.commit()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert "error" not in holder, holder.get("error")
+    assert holder["pre_status"] == "pending"
+
+    result = holder["result"]
+    assert result["applied"] is False
+    assert result["gate_status"] == "approved"
+
+    assert storage.get_approval_gate(gate["id"])["status"] == "approved"
+    outbox = storage.claim_slack_outbox()
+    assert len(outbox) == 1
+    assert outbox[0]["operation_key"] == "gate-decision:gate-1:env-dec-1"
+    assert storage.list_events(workspace_id=workspace["id"]) == []
+
+
 def test_run_migrations_creates_slack_tables(tmp_path):
     with connect(tmp_path / "sarathi.db") as conn:
         run_migrations(conn)
@@ -351,6 +623,8 @@ def test_slack_inbox_deduplicates_envelope_and_omits_raw_payload(storage):
     second = storage.enqueue_slack_event(**validated_event("env-1"))
     assert first["id"] == second["id"]
     assert first["status"] == "pending"
+    assert first["duplicate"] is False
+    assert second["duplicate"] is True
     assert "raw_envelope" not in first
     assert "response_url" not in json.dumps(first)
 

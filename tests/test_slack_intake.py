@@ -10,6 +10,7 @@ gone; Task 5 removes the public routes from the main service.
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Any
 
 import pytest
@@ -162,6 +163,11 @@ def _security_events(storage) -> list[dict]:
     return storage.list_events(workspace_id=TEST_WS_ID)
 
 
+def _table_count(storage, table: str) -> int:
+    row = storage.conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+    return int(row["n"])
+
+
 # ---------------------------------------------------------------------------
 # Authorization happens before any persistence
 # ---------------------------------------------------------------------------
@@ -179,6 +185,9 @@ def test_command_authorization_fails_before_persistence(workflow, storage, works
     assert storage.list_tasks() == []
     assert storage.claim_slack_events() == []
     assert storage.claim_slack_outbox() == []
+    assert _table_count(storage, "slack_inbox") == 0
+    assert _table_count(storage, "slack_outbox") == 0
+    assert _table_count(storage, "tasks") == 0
 
 
 def test_rejected_command_records_redacted_security_event(workflow, storage, workspace):
@@ -221,6 +230,37 @@ def test_empty_command_text_is_rejected(workflow, storage, workspace):
     assert storage.list_tasks() == []
 
 
+@pytest.mark.parametrize("bot_flag", [
+    {"is_bot": True},
+    {"bot_id": "B01234567"},
+    {"user_type": "bot"},
+])
+def test_command_with_typed_bot_flag_is_rejected(workflow, storage, workspace, bot_flag):
+    envelope = command_envelope(payload={
+        "command": "/sarathi-task",
+        "text": "Build the flow",
+        **bot_flag,
+    })
+    with pytest.raises(SlackAuthorizationError) as exc:
+        workflow.accept(envelope)
+    assert exc.value.reason == "bot-actor"
+    assert storage.claim_slack_events() == []
+    assert storage.list_tasks() == []
+
+
+def test_command_with_u_prefixed_actor_but_bot_flag_is_rejected(workflow, storage, workspace):
+    envelope = command_envelope(actor_id=TEST_ACTOR_ID, payload={
+        "command": "/sarathi-task",
+        "text": "Build the flow",
+        "is_bot": True,
+    })
+    with pytest.raises(SlackAuthorizationError) as exc:
+        workflow.accept(envelope)
+    assert exc.value.reason == "bot-actor"
+    assert storage.claim_slack_events() == []
+    assert storage.list_tasks() == []
+
+
 def test_unsupported_kind_is_rejected(workflow, storage, workspace):
     with pytest.raises(SlackAuthorizationError):
         workflow.accept(command_envelope(kind="message"))
@@ -238,6 +278,17 @@ def test_authorized_command_is_durably_accepted(workflow, storage, workspace):
     assert inbox[0]["content"]["text"] == "Build the workspace task initiation flow"
     assert inbox[0]["content"]["kind"] == "command"
     assert "response_url" not in json.dumps(inbox)
+    assert storage.list_tasks() == []
+
+
+def test_duplicate_accept_while_pending_reports_duplicate(workflow, storage, workspace):
+    first = workflow.accept(command_envelope(envelope_id="env-1"))
+    second = workflow.accept(command_envelope(envelope_id="env-1"))
+    assert first["status"] == "pending"
+    assert first["duplicate"] is False
+    assert second["status"] == "pending"
+    assert second["duplicate"] is True
+    assert len(storage.claim_slack_events()) == 1
     assert storage.list_tasks() == []
 
 
@@ -321,3 +372,69 @@ def test_command_processing_generates_opaque_bound_decision_actions(workflow, st
 
 def test_process_next_with_no_pending_events_is_empty(workflow, storage, workspace):
     assert workflow.process_next() == []
+
+
+def test_processing_failure_requeues_and_never_duplicates(workflow, storage, workspace, monkeypatch):
+    workflow.accept(command_envelope(envelope_id="env-1"))
+    real = storage.create_slack_command_task
+    calls = {"n": 0}
+
+    def flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(**kwargs)
+
+    monkeypatch.setattr(storage, "create_slack_command_task", flaky)
+
+    results = workflow.process_next()
+    assert len(results) == 1
+    assert results[0]["status"] == "pending"
+    assert results[0]["error_code"] == "database-locked"
+    assert storage.list_tasks() == []
+
+    results = workflow.process_next()
+    assert len(results) == 1
+    assert results[0]["status"] == "processed"
+    tasks = storage.list_tasks()
+    assert len(tasks) == 1
+    assert len(storage.list_approval_gates_for_task(tasks[0]["id"])) == 1
+    assert storage.claim_slack_events() == []
+
+
+def test_processing_failure_does_not_block_other_rows(workflow, storage, workspace, monkeypatch):
+    workflow.accept(command_envelope(envelope_id="env-good", text="Build the flow"))
+    workflow.accept(command_envelope(envelope_id="env-bad"))
+    real = storage.create_slack_command_task
+
+    def fail_bad(**kwargs):
+        if kwargs["envelope_id"] == "env-bad":
+            raise sqlite3.OperationalError("database is locked")
+        return real(**kwargs)
+
+    monkeypatch.setattr(storage, "create_slack_command_task", fail_bad)
+
+    results = workflow.process_next()
+    by_id = {result["envelope_id"]: result for result in results}
+    assert by_id["env-good"]["status"] == "processed"
+    assert by_id["env-bad"]["status"] == "pending"
+    assert by_id["env-bad"]["error_code"] == "database-locked"
+
+    tasks = storage.list_tasks()
+    assert len(tasks) == 1
+    assert tasks[0]["metadata"]["slack"]["channel_id"] == TEST_CHANNEL_ID
+
+
+def test_processing_failure_terminal_at_attempt_bound(workflow, storage, workspace, monkeypatch):
+    workflow.accept(command_envelope(envelope_id="env-1"))
+    monkeypatch.setattr(
+        storage,
+        "create_slack_command_task",
+        lambda **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+    )
+    for _ in range(3):
+        results = workflow.process_next()
+        assert results[0]["error_code"] == "database-locked"
+    assert results[0]["status"] == "failed"
+    assert storage.list_tasks() == []
+    assert storage.claim_slack_events() == []

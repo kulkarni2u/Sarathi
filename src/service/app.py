@@ -2017,6 +2017,28 @@ class ServiceApp:
             event_type="task.human_reply",
             payload={"object_id": message["id"], "slack_user_id": event.get("user")},
         )
+
+        # Resume any subtask parked awaiting a human decision: reuse the same
+        # transition path a human would trigger via POST /subtasks/{id}/transition.
+        # Best-effort -- Slack retries aggressively on non-200, and the reply is
+        # already durably recorded above.
+        slack_user = event.get("user") or "unknown"
+        for subtask in storage.list_subtasks_for_task(task["id"]):
+            if subtask["status"] != "waiting_human":
+                continue
+            try:
+                _transition_subtask(
+                    storage,
+                    subtask,
+                    {
+                        "status": "queued",
+                        "actor": f"slack:{slack_user}",
+                        "reason": "Resumed by Slack thread reply.",
+                    },
+                )
+            except Exception:
+                pass
+
         return RawResponse(200, "application/json", b"{}")
 
     def _authorize(self, headers: Mapping[str, str] | None) -> Principal | None:

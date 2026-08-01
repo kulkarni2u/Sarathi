@@ -31,12 +31,18 @@ class ExternalSlackInput:
     digest: str
 
 
-_SENTENCE_BOUNDARY = r"(?:^|(?:[.!?;,:>—\-])(?:\s+|$))"
+# Zero-width true word-start assertion: fires at the beginning of any word,
+# whatever precedes it (string start, punctuation, or a prior word plus
+# whitespace) — unlike a punctuation-gated boundary, it can't be evaded by
+# tacking a filler word in front of the injection phrase — while still
+# refusing to fire mid-word, so the phrase can't be matched as a substring
+# embedded inside an unrelated larger word.
+_WORD_START = r"\b"
 
 _DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
-            _SENTENCE_BOUNDARY
+            _WORD_START
             + r"(?:please\s+)?"
             + r"(?:ignore|disregard|forget)\s+"
             + r"(?:all\s+|any\s+)?(?:previous|prior|above|earlier)\s+"
@@ -47,7 +53,7 @@ _DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            _SENTENCE_BOUNDARY
+            _WORD_START
             + r"(?:you\s+(?:are|were)\s+(?:now\s+)?|you\s+should\s+)?"
             + r"(?:act|behave|function)\s+as\s+(?:the\s+)?"
             + r"(?:system|assistant|admin|root)\s+(?:message|prompt|role)\b",
@@ -57,7 +63,7 @@ _DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            _SENTENCE_BOUNDARY
+            _WORD_START
             + r"(?:please\s+)?"
             + r"(?:reveal|show|print|leak|expose|output|dump|share)\s+"
             + r"(?:the\s+)?"
@@ -69,7 +75,7 @@ _DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            _SENTENCE_BOUNDARY
+            _WORD_START
             + r"(?:please\s+)?"
             + r"(?:disable|bypass|remove|turn\s+off|override)\s+"
             + r"(?:the\s+)?"
@@ -80,7 +86,7 @@ _DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            _SENTENCE_BOUNDARY
+            _WORD_START
             + r"(?:please\s+)?"
             + r"(?:grant|give|enable|unlock)\s+(?:me\s+)?"
             + r"(?:all|full|every|complete)\s+(?:tools?|permissions?|access|privileges?)\b",

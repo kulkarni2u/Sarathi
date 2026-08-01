@@ -75,6 +75,18 @@ def test_health_returns_ok_with_correlation_id(tmp_path):
     assert data == {"status": "ok"}
 
 
+@pytest.mark.parametrize(
+    "suffix", ["commands/task", "interactions", "events"]
+)
+def test_main_service_does_not_expose_slack_callbacks(tmp_path, suffix):
+    app = create_app(tmp_path / "sarathi.db", token="test-token", auth_enabled=True)
+    path = f"/api/workspaces/ws-test/slack/{suffix}"
+    assert app.handle("POST", path, body={})[0] == 401
+    assert app.handle(
+        "POST", path, body={}, headers={"authorization": "Bearer test-token"}
+    )[0] == 404
+
+
 def test_workspace_creation_bootstraps_policy_pack_and_generated_wiki(tmp_path):
     db_path = tmp_path / "state" / "sarathi.db"
     root_path = tmp_path / "repo-to-bootstrap"

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hmac
 import json
-import shutil
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,7 +11,7 @@ from typing import Any, Mapping
 from urllib.parse import unquote
 
 from src.init import bootstrap_workspace
-from src.notifications import build_gate_decision_text, lifecycle_event_listener, post_response_url
+from src.notifications import lifecycle_event_listener
 from src.pr_body import build_pr_body
 from src.storage import Storage, connect, run_migrations
 
@@ -31,19 +30,15 @@ from .usage_stats import build_usage_stats
 from .intake import (
     _build_github_issue_reference,
     _create_github_issue_task_draft,
-    _create_slack_task_draft,
     _derive_task_title,
     _emit_brainstorm_event,
-    _find_task_by_slack_thread,
     _get_policy_pack,
     _initialize_workspace_repository,
-    _parse_slack_body,
     _preview_repository_intake,
     _put_policy_pack_file,
     _sync_github_issues_by_label,
     _task_context_project_id,
     _task_draft_metadata,
-    _verify_slack_request,
     _write_brainstorm_spec,
 )
 from .openapi import build_openapi_spec
@@ -283,49 +278,6 @@ class ServiceApp:
                 public_response = self._public_get_response(raw_parts, correlation_id)
                 if public_response is not None:
                     return public_response
-
-            # Slack slash-command intake — self-authenticating via HMAC
-            # signing secret, so it bypasses the bearer-token authorize.
-            if (
-                is_api_request
-                and method == "POST"
-                and len(raw_parts) == 6
-                and raw_parts[1] == "workspaces"
-                and raw_parts[3] == "slack"
-                and raw_parts[4] == "commands"
-                and raw_parts[5] == "task"
-            ):
-                return self._handle_slack_command(
-                    raw_parts[2], body or {}, headers, raw_body
-                )
-
-            # Slack interactive component (block_actions) intake — same
-            # self-authenticating HMAC bypass as the slash-command route
-            # above.
-            if (
-                is_api_request
-                and method == "POST"
-                and len(raw_parts) == 5
-                and raw_parts[1] == "workspaces"
-                and raw_parts[3] == "slack"
-                and raw_parts[4] == "interactions"
-            ):
-                return self._handle_slack_interaction(
-                    raw_parts[2], body or {}, headers, raw_body
-                )
-
-            # Slack Events API intake — same self-authenticating HMAC bypass.
-            if (
-                is_api_request
-                and method == "POST"
-                and len(raw_parts) == 5
-                and raw_parts[1] == "workspaces"
-                and raw_parts[3] == "slack"
-                and raw_parts[4] == "events"
-            ):
-                return self._handle_slack_events(
-                    raw_parts[2], body or {}, headers, raw_body
-                )
 
             principal = None if skip_auth else self._authorize(headers)
             parts = raw_parts[1:] if is_api_request else raw_parts
@@ -1830,216 +1782,6 @@ class ServiceApp:
             return 200, {"session": approved, "task": task}
 
         raise ServiceError("not_found", "Endpoint not found.", 404)
-
-    def _handle_slack_command(
-        self,
-        workspace_id: str,
-        body: Mapping[str, Any],
-        headers: Mapping[str, str] | None,
-        raw_body: str | None,
-    ) -> RawResponse | tuple[int, dict[str, Any]]:
-        """Handle a Slack slash-command ``/task`` request.
-
-        Verifies the Slack HMAC signature (if ``SARATHI_SLACK_SIGNING_SECRET``
-        is set), parses the form body, creates a PRD/AC-gated task draft, and
-        returns a Slack-friendly JSON response.
-        """
-        slack_data = _parse_slack_body(body)
-        _verify_slack_request(headers, raw_body)
-
-        conn, storage = self._storage()
-        if storage.get_workspace(workspace_id) is None:
-            raise ServiceError("not_found", "Workspace not found.", 404)
-
-        result = _create_slack_task_draft(storage, workspace_id, slack_data)
-
-        task = result["task"]
-        gate = result["approval_gate"]
-        slack_reply = json.dumps({
-            "response_type": "ephemeral",
-            "text": (
-                f"Task draft created (ID: {task['id']}). "
-                f"PRD/AC approval gate: {gate['id']}."
-            ),
-            "task_id": task["id"],
-            "approval_gate_id": gate["id"],
-        })
-        return RawResponse(
-            200,
-            "application/json",
-            slack_reply.encode("utf-8"),
-        )
-
-    def _handle_slack_interaction(
-        self,
-        workspace_id: str,
-        body: Mapping[str, Any],
-        headers: Mapping[str, str] | None,
-        raw_body: str | None,
-    ) -> RawResponse | tuple[int, dict[str, Any]]:
-        """Handle a Slack interactive-component (block_actions) callback.
-
-        Verifies the Slack HMAC signature (if ``SARATHI_SLACK_SIGNING_SECRET``
-        is set), parses the ``payload`` form field, records an approve/reject
-        gate decision, and best-effort updates the original Slack message via
-        ``response_url``. Always replies 200 within Slack's window.
-        """
-        form = _parse_slack_body(body)
-        _verify_slack_request(headers, raw_body)
-
-        payload = json.loads(form.get("payload") or "{}")
-        if payload.get("type") != "block_actions":
-            return RawResponse(200, "application/json", b"{}")
-
-        action = (payload.get("actions") or [{}])[0]
-        action_id = action.get("action_id")
-        if action_id not in ("approve_gate", "reject_gate"):
-            return RawResponse(200, "application/json", b"{}")
-
-        raw_value = str(action.get("value", ""))
-        task_id, _, gate_id = raw_value.partition(":")
-        user_obj = payload.get("user") or {}
-        user = user_obj.get("username") or user_obj.get("id")
-        response_url = payload.get("response_url")
-
-        conn, storage = self._storage()
-        if storage.get_workspace(workspace_id) is None:
-            raise ServiceError("not_found", "Workspace not found.", 404)
-
-        task = storage.get_task(task_id)
-        if task is None or task["workspace_id"] != workspace_id:
-            raise ServiceError("not_found", "Task not found.", 404)
-
-        gate = storage.get_approval_gate(gate_id)
-        if gate is None or gate["task_id"] != task_id:
-            raise ServiceError("not_found", "Approval gate not found.", 404)
-
-        if gate["status"] != "pending":
-            final_status = gate["status"]
-        else:
-            final_status = "approved" if action_id == "approve_gate" else "rejected"
-            record_gate_decision(
-                storage,
-                task,
-                name=gate["name"],
-                status=final_status,
-                gate_id=gate["id"],
-                metadata={**gate["metadata"], "decided_by": user, "decided_via": "slack"},
-            )
-            if final_status == "rejected":
-                storage.update_task(
-                    task_id,
-                    status="rejected",
-                    metadata={**task["metadata"], "rejection_reason": "prd_ac_rejected"},
-                )
-                storage.create_lifecycle_event(
-                    workspace_id=workspace_id,
-                    task_id=task_id,
-                    event_type="task.cancelled",
-                    payload={
-                        "object_id": task_id,
-                        "reason": "prd_ac_rejected",
-                        "gate": gate_id,
-                        "by": user,
-                    },
-                )
-
-        if response_url:
-            try:
-                post_response_url(
-                    response_url,
-                    {
-                        "replace_original": True,
-                        "text": build_gate_decision_text(
-                            status=final_status, gate_id=gate_id, user=user
-                        ),
-                    },
-                )
-            except Exception:
-                pass
-
-        return RawResponse(200, "application/json", b"{}")
-
-    def _handle_slack_events(
-        self,
-        workspace_id: str,
-        body: Mapping[str, Any],
-        headers: Mapping[str, str] | None,
-        raw_body: str | None,
-    ) -> RawResponse:
-        """Handle a Slack Events API callback (URL verification + threaded replies).
-
-        Verifies the Slack HMAC signature (if SARATHI_SLACK_SIGNING_SECRET is
-        set), answers the one-time url_verification handshake, and appends
-        threaded channel replies as user messages on the matching task. Always
-        acks 200 quickly -- Slack retries aggressively on non-200/timeout.
-        """
-        payload = _parse_slack_body(body)
-        _verify_slack_request(headers, raw_body)
-
-        if payload.get("type") == "url_verification":
-            return RawResponse(
-                200,
-                "application/json",
-                json.dumps({"challenge": payload.get("challenge", "")}).encode("utf-8"),
-            )
-        if payload.get("type") != "event_callback":
-            return RawResponse(200, "application/json", b"{}")
-
-        event = payload.get("event") or {}
-        if event.get("type") != "message" or event.get("bot_id") or event.get("subtype"):
-            return RawResponse(200, "application/json", b"{}")
-
-        channel = event.get("channel")
-        thread_ts = event.get("thread_ts") or event.get("ts")
-        text = (event.get("text") or "").strip()
-        if not (channel and thread_ts and text):
-            return RawResponse(200, "application/json", b"{}")
-
-        conn, storage = self._storage()
-        if storage.get_workspace(workspace_id) is None:
-            raise ServiceError("not_found", "Workspace not found.", 404)
-
-        task = _find_task_by_slack_thread(storage, workspace_id, channel, thread_ts)
-        if task is None:
-            return RawResponse(200, "application/json", b"{}")
-
-        message = storage.create_message(
-            workspace_id=workspace_id,
-            task_id=task["id"],
-            role="user",
-            content=text,
-            metadata={"source": "slack_message", "slack_user_id": event.get("user")},
-        )
-        storage.create_lifecycle_event(
-            workspace_id=workspace_id,
-            task_id=task["id"],
-            event_type="task.human_reply",
-            payload={"object_id": message["id"], "slack_user_id": event.get("user")},
-        )
-
-        # Resume any subtask parked awaiting a human decision: reuse the same
-        # transition path a human would trigger via POST /subtasks/{id}/transition.
-        # Best-effort -- Slack retries aggressively on non-200, and the reply is
-        # already durably recorded above.
-        slack_user = event.get("user") or "unknown"
-        for subtask in storage.list_subtasks_for_task(task["id"]):
-            if subtask["status"] != "waiting_human":
-                continue
-            try:
-                _transition_subtask(
-                    storage,
-                    subtask,
-                    {
-                        "status": "queued",
-                        "actor": f"slack:{slack_user}",
-                        "reason": "Resumed by Slack thread reply.",
-                    },
-                )
-            except Exception:
-                pass
-
-        return RawResponse(200, "application/json", b"{}")
 
     def _authorize(self, headers: Mapping[str, str] | None) -> Principal | None:
         # Opt-in multi-user mode: the bearer must be the admin token or an

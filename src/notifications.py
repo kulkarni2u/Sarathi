@@ -391,28 +391,6 @@ def build_slack_notifier(
     return notifier
 
 
-def post_response_url(
-    response_url: str, payload: Mapping[str, Any], *,
-    timeout_seconds: float = 5.0, opener: Callable[..., Any] | None = None,
-) -> bool:
-    """Bare-urllib POST to a Slack response_url (e.g. {"replace_original": True, "text": ...}).
-    Never raises; returns True only on HTTP < 300."""
-    try:
-        body = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
-            response_url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        http_opener = opener or urllib.request.urlopen
-        with http_opener(request, timeout=timeout_seconds) as response:
-            status = getattr(response, "status", 200)
-        return status < 300
-    except Exception:
-        return False
-
-
 def phase_event(
     task_id: str,
     description: str,

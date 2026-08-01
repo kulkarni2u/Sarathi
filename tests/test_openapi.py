@@ -47,6 +47,14 @@ def test_known_paths_present():
         assert path in paths, f"missing path: {path}"
 
 
+def test_openapi_has_no_public_slack_callback_surface():
+    serialized = __import__("json").dumps(build_openapi_spec())
+    assert "/slack/commands" not in serialized
+    assert "/slack/interactions" not in serialized
+    assert "/slack/events" not in serialized
+    assert "response_url" not in serialized
+
+
 def test_every_path_has_at_least_one_method():
     spec = build_openapi_spec()
 

@@ -1,13 +1,14 @@
 """Outbound-only Slack Socket Mode adapter.
 
-Slack Bolt is optional and imported only by the executable factory. Tests use
+slack_sdk is optional and imported only by the executable factory. Tests use
 injected app/client doubles and never open a network connection.
 """
 from __future__ import annotations
 
 import argparse
+import signal
+import time
 from collections.abc import Callable, Mapping, Sequence
-from threading import Event
 from typing import Any
 
 from src.service.slack.config import SlackSocketConfig
@@ -182,9 +183,36 @@ def _selection_blocks(actions: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [{"type": "actions", "elements": elements}]
 
 
+def run_forever(
+    runner: SocketModeRunner,
+    *,
+    poll_interval: float = 1.0,
+    should_stop: Callable[[], bool] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Drain the inbox/outbox queues until ``should_stop`` returns True.
+
+    Each iteration processes any durably-accepted envelopes and drains the
+    outbox; it only sleeps when there was nothing to do, mirroring
+    ``worker.run_worker``.
+    """
+    while True:
+        if should_stop is not None and should_stop():
+            break
+        inbox = runner.process_inbox_once()
+        outbox = runner.process_outbox_once()
+        if should_stop is not None and should_stop():
+            break
+        if not inbox and not outbox:
+            sleep(poll_interval)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Sarathi Slack Socket Mode")
     parser.add_argument("--db", default=".sarathi/sarathi.db")
+    parser.add_argument(
+        "--poll", type=float, default=1.0, dest="poll_interval", help="Seconds between polls when idle."
+    )
     args = parser.parse_args(argv)
     config = SlackSocketConfig.from_env()
     conn = connect(args.db)
@@ -210,7 +238,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     socket_client.connect()
-    Event().wait()
+
+    stop_requested = {"flag": False}
+
+    def _handle_sigint(signum: int, frame: Any) -> None:
+        if stop_requested["flag"]:
+            # Second Ctrl-C: exit immediately.
+            raise SystemExit(130)
+        stop_requested["flag"] = True
+
+    previous_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, _handle_sigint)
+    try:
+        run_forever(
+            runner, poll_interval=args.poll_interval, should_stop=lambda: stop_requested["flag"]
+        )
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
     return 0
 
 

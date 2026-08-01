@@ -22,7 +22,7 @@ sarathi-slack = "src.service.slack.socket_mode:main"
 Homepage = "https://github.com/kulkarni2u/Sarathi"
 
 [project.optional-dependencies]
-slack = ["slack-bolt>=1,<2"]
+slack = ["slack-sdk>=3,<4"]
 tui = [
     "textual>=0.90.0",
     "rich>=13.0.0",

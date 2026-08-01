@@ -31,7 +31,7 @@ class ExternalSlackInput:
     digest: str
 
 
-_SENTENCE_BOUNDARY = r"(?:^|[.!?;](?:\s+|$))"
+_SENTENCE_BOUNDARY = r"(?:^|(?:[.!?;,:>—\-])(?:\s+|$))"
 
 _DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
@@ -41,7 +41,7 @@ _DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
             + r"(?:ignore|disregard|forget)\s+"
             + r"(?:all\s+|any\s+)?(?:previous|prior|above|earlier)\s+"
             + r"(?:instructions|prompts?|messages?|context)\b",
-            re.IGNORECASE,
+            re.MULTILINE | re.IGNORECASE,
         ),
         "instruction-hierarchy",
     ),
@@ -51,7 +51,7 @@ _DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
             + r"(?:you\s+(?:are|were)\s+(?:now\s+)?|you\s+should\s+)?"
             + r"(?:act|behave|function)\s+as\s+(?:the\s+)?"
             + r"(?:system|assistant|admin|root)\s+(?:message|prompt|role)\b",
-            re.IGNORECASE,
+            re.MULTILINE | re.IGNORECASE,
         ),
         "instruction-hierarchy",
     ),
@@ -63,7 +63,7 @@ _DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
             + r"(?:the\s+)?"
             + r"(?:system\s+prompt|system\s+message|every\s+environment\s+variable|"
             + r"environment\s+variables?|slack\s+token|api\s+key|access\s+token|secret)s?\b",
-            re.IGNORECASE,
+            re.MULTILINE | re.IGNORECASE,
         ),
         "secret-extraction",
     ),
@@ -74,7 +74,7 @@ _DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
             + r"(?:disable|bypass|remove|turn\s+off|override)\s+"
             + r"(?:the\s+)?"
             + r"(?:safety|security|content)\s+(?:policy|guardrails?|restrictions?|filters?)\b",
-            re.IGNORECASE,
+            re.MULTILINE | re.IGNORECASE,
         ),
         "safety-bypass",
     ),
@@ -84,7 +84,7 @@ _DENY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
             + r"(?:please\s+)?"
             + r"(?:grant|give|enable|unlock)\s+(?:me\s+)?"
             + r"(?:all|full|every|complete)\s+(?:tools?|permissions?|access|privileges?)\b",
-            re.IGNORECASE,
+            re.MULTILINE | re.IGNORECASE,
         ),
         "permission-escalation",
     ),
@@ -138,7 +138,7 @@ def _try_base64_decode(value: str) -> str | None:
 
 
 def _one_level_decoded(text: str) -> Iterator[str]:
-    unquoted = urllib.parse.unquote(text)
+    unquoted = urllib.parse.unquote_plus(text)
     if unquoted != text:
         yield unquoted
     stripped = text.removeprefix("base64:")

@@ -570,6 +570,27 @@ def test_migration_8_applies_on_top_of_v7_db(tmp_path):
         assert versions == list(range(1, LATEST_SCHEMA_VERSION + 1))
 
 
+def test_migration_12_creates_slack_tables_on_fresh_db(tmp_path):
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert {
+            "slack_inbox",
+            "slack_outbox",
+            "slack_task_bindings",
+            "slack_external_inputs",
+        } <= tables
+
+        outbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_outbox)")}
+        assert "attempt_count" in outbox_columns
+
+
 def test_migration_10_creates_users_table_on_fresh_db(tmp_path):
     with connect(tmp_path / "sarathi.db") as conn:
         run_migrations(conn)
@@ -591,7 +612,7 @@ def test_migration_11_creates_proposal_decisions_table_on_fresh_db(tmp_path):
         run_migrations(conn)
 
         assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
-        assert LATEST_SCHEMA_VERSION == 11
+        assert LATEST_SCHEMA_VERSION == 12
 
         tables = {
             row["name"]

@@ -256,3 +256,101 @@ def test_external_input_assignment_has_one_winner(storage, waiting_subtasks):
     assert first["subtask_id"] == waiting_subtasks[0]["id"]
     assert first["status"] == "assigned"
     assert second is None
+
+
+def test_slack_outbox_attempt_count_starts_at_zero(storage):
+    row = storage.enqueue_slack_outbox(**outbox_message("task-created:1"))
+    assert row["attempt_count"] == 0
+
+
+def test_slack_outbox_fail_requeues_below_bound_and_fails_at_bound(storage):
+    storage.enqueue_slack_outbox(**outbox_message("task-created:1"))
+    for expected in (1, 2):
+        storage.claim_slack_outbox(limit=1)
+        requeued = storage.fail_slack_outbox("task-created:1", error_code="slack-api-error")
+        assert requeued["status"] == "pending"
+        assert requeued["attempt_count"] == expected
+        assert requeued["error_code"] == "slack-api-error"
+        assert requeued["processed_at"] is None
+    storage.claim_slack_outbox(limit=1)
+    failed = storage.fail_slack_outbox("task-created:1", error_code="slack-api-error")
+    assert failed["status"] == "failed"
+    assert failed["attempt_count"] == 3
+    assert failed["error_code"] == "slack-api-error"
+    assert failed["processed_at"] is not None
+    assert storage.claim_slack_outbox() == []
+
+
+def test_slack_outbox_fail_respects_custom_attempt_bound(storage):
+    storage.enqueue_slack_outbox(**outbox_message("task-created:1"))
+    storage.claim_slack_outbox(limit=1)
+    failed = storage.fail_slack_outbox(
+        "task-created:1", error_code="slack-api-error", max_attempts=1
+    )
+    assert failed["status"] == "failed"
+    assert failed["attempt_count"] == 1
+
+
+def test_slack_task_binding_rebind_to_different_task_raises_conflict(storage, task):
+    storage.bind_slack_task(
+        task_id=task["id"],
+        workspace_id=task["workspace_id"],
+        team_id="T00000000",
+        channel_id="C11111111",
+        thread_ts="1700000000.000000",
+        requester_user_id="U33333333",
+    )
+    other = storage.create_task(
+        workspace_id=task["workspace_id"], title="Other task", status="in_progress"
+    )
+    with pytest.raises(ValueError, match="already bound"):
+        storage.bind_slack_task(
+            task_id=other["id"],
+            workspace_id=other["workspace_id"],
+            team_id="T00000000",
+            channel_id="C11111111",
+            thread_ts="1700000000.000000",
+            requester_user_id="U33333333",
+        )
+
+
+@pytest.mark.parametrize("key", ["response_url", "raw_envelope", "app_token", "bot_token", "token"])
+def test_slack_inbox_rejects_forbidden_content_keys(storage, key):
+    content = {"command": "/sarathi-task", "text": "ship the parser", key: "secret-value"}
+    with pytest.raises(ValueError, match=key):
+        storage.enqueue_slack_event(**validated_event("env-x", content=content))
+    assert storage.claim_slack_events() == []
+
+
+@pytest.mark.parametrize("key", ["response_url", "raw_envelope", "app_token", "bot_token", "token"])
+def test_slack_outbox_rejects_forbidden_payload_keys(storage, key):
+    payload = {"text": "Draft created", key: "secret-value"}
+    with pytest.raises(ValueError, match=key):
+        storage.enqueue_slack_outbox(**outbox_message("task-created:1", payload=payload))
+    assert storage.claim_slack_outbox() == []
+
+
+def test_slack_event_finish_does_not_overwrite_terminal_state(storage):
+    storage.enqueue_slack_event(**validated_event("env-1"))
+    storage.finish_slack_event("env-1", status="processed")
+    second = storage.finish_slack_event("env-1", status="failed", error_code="late-timeout")
+    assert second["status"] == "processed"
+    assert second["error_code"] is None
+    assert second["processed_at"] is not None
+
+
+def test_slack_outbox_finish_does_not_overwrite_terminal_state(storage):
+    storage.enqueue_slack_outbox(**outbox_message("task-created:1"))
+    storage.finish_slack_outbox("task-created:1", slack_message_ts="1700000001.000001")
+    second = storage.finish_slack_outbox("task-created:1", slack_message_ts="9999999999.999999")
+    assert second["status"] == "sent"
+    assert second["slack_message_ts"] == "1700000001.000001"
+
+
+def test_slack_outbox_fail_does_not_overwrite_sent_terminal_state(storage):
+    storage.enqueue_slack_outbox(**outbox_message("task-created:1"))
+    storage.finish_slack_outbox("task-created:1", slack_message_ts="1700000001.000001")
+    second = storage.fail_slack_outbox("task-created:1", error_code="late-error")
+    assert second["status"] == "sent"
+    assert second["attempt_count"] == 0
+    assert second["error_code"] is None

@@ -1958,6 +1958,7 @@ class Storage:
         A duplicate insert is a no-op and returns the previously recorded row so
         Socket Mode envelopes are applied at most once.
         """
+        _check_no_forbidden_keys(content, kind="slack inbox content")
         now = _utc_now()
         with self.conn:
             self.conn.execute(
@@ -2044,16 +2045,21 @@ class Storage:
         status: str,
         error_code: str | None = None,
     ) -> dict[str, Any]:
-        """Record a terminal inbox state: ``processed``, ``rejected``, or ``failed``."""
+        """Record a terminal inbox state: ``processed``, ``rejected``, or ``failed``.
+
+        Transitions only from ``pending`` or ``processing``; an already-terminal
+        row is returned unchanged so repeated or conflicting finishes never
+        overwrite the first terminal result (at-most-once).
+        """
         if status not in ("processed", "rejected", "failed"):
             raise ValueError(f"Invalid slack inbox terminal status: {status}")
         now = _utc_now()
         with self.conn:
-            cursor = self.conn.execute(
+            self.conn.execute(
                 """
                 UPDATE slack_inbox
                 SET status = ?, error_code = ?, processed_at = ?, updated_at = ?
-                WHERE envelope_id = ?
+                WHERE envelope_id = ? AND status IN ('pending', 'processing')
                 """,
                 (status, error_code, now, now, envelope_id),
             )
@@ -2069,7 +2075,6 @@ class Storage:
             ).fetchone()
         if row is None:
             raise KeyError(f"No slack inbox row for envelope_id {envelope_id!r}")
-        assert cursor.rowcount == 1
         return _slack_inbox_from_row(row)
 
     def bind_slack_task(
@@ -2085,10 +2090,25 @@ class Storage:
         """Record the exact Slack thread a Sarathi task is bound to.
 
         Re-binding an already-bound task is a no-op that returns the canonical
-        row, keeping the mapping idempotent across retries.
+        row, keeping the mapping idempotent across retries. Rebinding a thread
+        that is already owned by a *different* task raises ``ValueError``; the
+        exact thread mapping is never silently reassigned.
         """
         now = _utc_now()
         with self.conn:
+            existing = self.conn.execute(
+                """
+                SELECT task_id FROM slack_task_bindings
+                WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
+                """,
+                (team_id, channel_id, thread_ts),
+            ).fetchone()
+            if existing is not None and existing["task_id"] != task_id:
+                raise ValueError(
+                    f"Slack thread {team_id}/{channel_id}/{thread_ts} is already "
+                    f"bound to task {existing['task_id']!r}; cannot rebind to task "
+                    f"{task_id!r}"
+                )
             self.conn.execute(
                 """
                 INSERT OR IGNORE INTO slack_task_bindings (
@@ -2118,7 +2138,8 @@ class Storage:
                 """,
                 (task_id,),
             ).fetchone()
-        assert row is not None
+        if row is None:
+            raise KeyError(f"No slack task binding for task_id {task_id!r}")
         return _slack_task_binding_from_row(row)
 
     def get_slack_task_binding(
@@ -2152,16 +2173,17 @@ class Storage:
         payload: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Record outbound Slack intent, deduplicated by ``operation_key``."""
+        _check_no_forbidden_keys(payload, kind="slack outbox payload")
         now = _utc_now()
         with self.conn:
             self.conn.execute(
                 """
                 INSERT OR IGNORE INTO slack_outbox (
                     id, operation_key, workspace_id, task_id, channel_id, thread_ts,
-                    operation, payload, status, error_code, slack_message_ts,
-                    claimed_at, processed_at, created_at, updated_at
+                    operation, payload, status, error_code, attempt_count,
+                    slack_message_ts, claimed_at, processed_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, 0, NULL, NULL, NULL, ?, ?)
                 """,
                 (
                     _new_id(),
@@ -2179,14 +2201,15 @@ class Storage:
             row = self.conn.execute(
                 """
                 SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
-                       operation, payload, status, error_code, slack_message_ts,
-                       claimed_at, processed_at, created_at, updated_at
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
                 FROM slack_outbox
                 WHERE operation_key = ?
                 """,
                 (operation_key,),
             ).fetchone()
-        assert row is not None
+        if row is None:
+            raise KeyError(f"No slack outbox row for operation_key {operation_key!r}")
         return _slack_outbox_from_row(row)
 
     def claim_slack_outbox(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -2220,8 +2243,8 @@ class Storage:
             rows = self.conn.execute(
                 f"""
                 SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
-                       operation, payload, status, error_code, slack_message_ts,
-                       claimed_at, processed_at, created_at, updated_at
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
                 FROM slack_outbox
                 WHERE id IN ({placeholders})
                 ORDER BY created_at, id
@@ -2231,23 +2254,28 @@ class Storage:
         return [_slack_outbox_from_row(row) for row in rows]
 
     def finish_slack_outbox(self, operation_key: str, *, slack_message_ts: str) -> dict[str, Any]:
-        """Record successful delivery of an outbox row as ``sent``."""
+        """Record successful delivery of an outbox row as ``sent``.
+
+        Transitions only from ``pending`` or ``processing``; an already-terminal
+        row is returned unchanged so a repeated or conflicting finish never
+        overwrites the first terminal result (at-most-once).
+        """
         now = _utc_now()
         with self.conn:
-            cursor = self.conn.execute(
+            self.conn.execute(
                 """
                 UPDATE slack_outbox
                 SET status = 'sent', slack_message_ts = ?, error_code = NULL,
                     processed_at = ?, updated_at = ?
-                WHERE operation_key = ?
+                WHERE operation_key = ? AND status IN ('pending', 'processing')
                 """,
                 (slack_message_ts, now, now, operation_key),
             )
             row = self.conn.execute(
                 """
                 SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
-                       operation, payload, status, error_code, slack_message_ts,
-                       claimed_at, processed_at, created_at, updated_at
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
                 FROM slack_outbox
                 WHERE operation_key = ?
                 """,
@@ -2255,7 +2283,49 @@ class Storage:
             ).fetchone()
         if row is None:
             raise KeyError(f"No slack outbox row for operation_key {operation_key!r}")
-        assert cursor.rowcount == 1
+        return _slack_outbox_from_row(row)
+
+    def fail_slack_outbox(
+        self,
+        operation_key: str,
+        *,
+        error_code: str,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        """Record a failed outbox delivery with bounded retry metadata.
+
+        Increments ``attempt_count``. Below ``max_attempts`` the row is requeued
+        to ``pending`` so the worker can claim and retry it; at or above the
+        bound it becomes terminal ``failed``. Only applies from ``pending`` or
+        ``processing`` — an already-terminal row is returned unchanged.
+        """
+        now = _utc_now()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE slack_outbox
+                SET attempt_count = attempt_count + 1,
+                    status = CASE WHEN attempt_count + 1 >= ? THEN 'failed' ELSE 'pending' END,
+                    error_code = ?,
+                    processed_at = CASE WHEN attempt_count + 1 >= ? THEN ? ELSE NULL END,
+                    claimed_at = CASE WHEN attempt_count + 1 >= ? THEN claimed_at ELSE NULL END,
+                    updated_at = ?
+                WHERE operation_key = ? AND status IN ('pending', 'processing')
+                """,
+                (max_attempts, error_code, max_attempts, now, max_attempts, now, operation_key),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                FROM slack_outbox
+                WHERE operation_key = ?
+                """,
+                (operation_key,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"No slack outbox row for operation_key {operation_key!r}")
         return _slack_outbox_from_row(row)
 
     def create_slack_external_input(
@@ -2783,6 +2853,7 @@ def _slack_outbox_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "payload": _load_json(row["payload"]),
         "status": row["status"],
         "error_code": row["error_code"],
+        "attempt_count": row["attempt_count"],
         "slack_message_ts": row["slack_message_ts"],
         "claimed_at": row["claimed_at"],
         "processed_at": row["processed_at"],
@@ -2825,6 +2896,28 @@ def _slack_external_input_from_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def _dump_json(value: Any | None) -> str:
     return json.dumps({} if value is None else value, sort_keys=True)
+
+
+_FORBIDDEN_CONTENT_KEYS = frozenset(
+    {"response_url", "raw_envelope", "app_token", "bot_token", "token"}
+)
+
+
+def _check_no_forbidden_keys(value: Any, *, kind: str) -> None:
+    """Reject Slack secrets that must never be persisted inside stored JSON.
+
+    ``response_url``, the raw Socket Mode envelope, and app/bot tokens are
+    runtime-only credentials; persisting any of them (at any nesting depth)
+    would defeat the redaction boundary.
+    """
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in _FORBIDDEN_CONTENT_KEYS:
+                raise ValueError(f"{kind} must not contain forbidden key {key!r}")
+            _check_no_forbidden_keys(child, kind=kind)
+    elif isinstance(value, list):
+        for item in value:
+            _check_no_forbidden_keys(item, kind=kind)
 
 
 def _load_json_list(value: str | None) -> list[Any]:
@@ -3303,6 +3396,7 @@ CREATE TABLE IF NOT EXISTS slack_outbox (
     payload TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'pending',
     error_code TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
     slack_message_ts TEXT,
     claimed_at TEXT,
     processed_at TEXT,

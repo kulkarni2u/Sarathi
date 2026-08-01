@@ -354,3 +354,120 @@ def test_slack_outbox_fail_does_not_overwrite_sent_terminal_state(storage):
     assert second["status"] == "sent"
     assert second["attempt_count"] == 0
     assert second["error_code"] is None
+
+
+def _nested_forbidden(key, shape):
+    if shape == "dict-in-list":
+        return {"blocks": [{"type": "section", key: "secret-value"}]}
+    if shape == "list-top-level":
+        return [{"elements": [{key: "secret-value"}]}]
+    if shape == "triple-nested-dict":
+        return {"a": {"b": {"c": {key: "secret-value"}}}}
+    if shape == "list-of-dict-of-list":
+        return {"items": [{"elements": [{key: "secret-value"}]}]}
+    raise AssertionError(f"unknown shape {shape!r}")
+
+
+@pytest.mark.parametrize("key", ["response_url", "raw_envelope", "app_token", "bot_token", "token"])
+@pytest.mark.parametrize(
+    "shape", ["dict-in-list", "list-top-level", "triple-nested-dict", "list-of-dict-of-list"]
+)
+def test_slack_inbox_rejects_nested_forbidden_content_keys(storage, key, shape):
+    content = _nested_forbidden(key, shape)
+    with pytest.raises(ValueError, match=key):
+        storage.enqueue_slack_event(**validated_event("env-x", content=content))
+    assert storage.claim_slack_events() == []
+
+
+@pytest.mark.parametrize("key", ["response_url", "raw_envelope", "app_token", "bot_token", "token"])
+@pytest.mark.parametrize(
+    "shape", ["dict-in-list", "list-top-level", "triple-nested-dict", "list-of-dict-of-list"]
+)
+def test_slack_outbox_rejects_nested_forbidden_payload_keys(storage, key, shape):
+    payload = _nested_forbidden(key, shape)
+    with pytest.raises(ValueError, match=key):
+        storage.enqueue_slack_outbox(**outbox_message("task-created:1", payload=payload))
+    assert storage.claim_slack_outbox() == []
+
+
+def test_slack_inbox_missing_readback_raises_key_error(storage):
+    storage.conn.execute(
+        """
+        CREATE TRIGGER trg_delete_slack_inbox AFTER INSERT ON slack_inbox
+        BEGIN
+            DELETE FROM slack_inbox WHERE envelope_id = 'env-ghost';
+        END
+        """
+    )
+    storage.conn.commit()
+    with pytest.raises(KeyError, match="env-ghost"):
+        storage.enqueue_slack_event(
+            envelope_id="env-ghost",
+            event_id=None,
+            workspace_id=WORKSPACE_ID,
+            team_id="T00000000",
+            channel_id="C11111111",
+            actor_id="U33333333",
+            event_type="slash_commands",
+            content={},
+        )
+
+
+def test_slack_external_input_missing_readback_raises_key_error(storage):
+    storage.conn.execute(
+        """
+        CREATE TRIGGER trg_delete_slack_external AFTER INSERT ON slack_external_inputs
+        BEGIN
+            DELETE FROM slack_external_inputs WHERE envelope_id = 'env-ghost';
+        END
+        """
+    )
+    storage.conn.commit()
+    with pytest.raises(KeyError, match="env-ghost"):
+        storage.create_slack_external_input(**reply_input(envelope_id="env-ghost"))
+
+
+@pytest.mark.parametrize("claim", ["claim_slack_events", "claim_slack_outbox"])
+def test_slack_claim_rejects_negative_limit(storage, claim):
+    with pytest.raises(ValueError, match="limit"):
+        getattr(storage, claim)(limit=-1)
+
+
+def test_slack_claim_zero_limit_returns_empty_and_leaves_rows_pending(storage):
+    storage.enqueue_slack_event(**validated_event("env-1"))
+    storage.enqueue_slack_outbox(**outbox_message("task-created:1"))
+    assert storage.claim_slack_events(limit=0) == []
+    assert storage.claim_slack_outbox(limit=0) == []
+    assert len(storage.claim_slack_events()) == 1
+    assert len(storage.claim_slack_outbox()) == 1
+
+
+def test_slack_event_finish_does_not_overwrite_rejected_terminal_state(storage):
+    storage.enqueue_slack_event(**validated_event("env-1"))
+    storage.finish_slack_event("env-1", status="rejected", error_code="injection-detected")
+    second = storage.finish_slack_event("env-1", status="processed")
+    assert second["status"] == "rejected"
+    assert second["error_code"] == "injection-detected"
+    assert second["processed_at"] is not None
+
+
+def test_slack_outbox_fail_does_not_overwrite_failed_terminal_state(storage):
+    storage.enqueue_slack_outbox(**outbox_message("task-created:1"))
+    storage.claim_slack_outbox(limit=1)
+    failed = storage.fail_slack_outbox(
+        "task-created:1", error_code="slack-api-error", max_attempts=1
+    )
+    assert failed["status"] == "failed"
+    assert failed["attempt_count"] == 1
+
+    second_fail = storage.fail_slack_outbox("task-created:1", error_code="late-error")
+    assert second_fail["status"] == "failed"
+    assert second_fail["error_code"] == "slack-api-error"
+    assert second_fail["attempt_count"] == 1
+
+    finished = storage.finish_slack_outbox(
+        "task-created:1", slack_message_ts="9999999999.999999"
+    )
+    assert finished["status"] == "failed"
+    assert finished["slack_message_ts"] is None
+    assert storage.claim_slack_outbox() == []

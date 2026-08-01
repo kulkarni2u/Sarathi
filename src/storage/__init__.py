@@ -14,7 +14,7 @@ from uuid import uuid4
 logger = logging.getLogger("sarathi.storage")
 
 
-LATEST_SCHEMA_VERSION = 12
+LATEST_SCHEMA_VERSION = 13
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -131,6 +131,25 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
             (12, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 13:
+        # Migration 12 shipped two slack_outbox shapes: the original 6f9605f
+        # shape (no attempt_count) and the round-1 shape whose migration was
+        # edited in place (attempt_count present). Add the column only when
+        # missing so fresh databases and already-v12 databases converge on the
+        # same v13 schema without touching prior migrations. SQLite has no
+        # "ADD COLUMN IF NOT EXISTS", so guard on PRAGMA table_info.
+        outbox_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(slack_outbox)")
+        }
+        if "attempt_count" not in outbox_columns:
+            conn.execute(
+                "ALTER TABLE slack_outbox ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (13, _utc_now()),
         )
         conn.commit()
 
@@ -1994,11 +2013,14 @@ class Storage:
                 """,
                 (envelope_id,),
             ).fetchone()
-        assert row is not None
+        if row is None:
+            raise KeyError(f"No slack inbox row for envelope_id {envelope_id!r}")
         return _slack_inbox_from_row(row)
 
     def claim_slack_events(self, limit: int = 20) -> list[dict[str, Any]]:
         """Atomically transition up to ``limit`` pending inbox rows to ``processing``."""
+        if limit < 0:
+            raise ValueError(f"claim_slack_events limit must be >= 0, got {limit}")
         now = _utc_now()
         with self.conn:
             claimed: list[str] = []
@@ -2214,6 +2236,8 @@ class Storage:
 
     def claim_slack_outbox(self, limit: int = 20) -> list[dict[str, Any]]:
         """Atomically transition up to ``limit`` pending outbox rows to ``processing``."""
+        if limit < 0:
+            raise ValueError(f"claim_slack_outbox limit must be >= 0, got {limit}")
         now = _utc_now()
         with self.conn:
             claimed: list[str] = []
@@ -2380,7 +2404,8 @@ class Storage:
                 """,
                 (envelope_id,),
             ).fetchone()
-        assert row is not None
+        if row is None:
+            raise KeyError(f"No slack external input row for envelope_id {envelope_id!r}")
         return _slack_external_input_from_row(row)
 
     def assign_slack_external_input(self, input_id: str, subtask_id: str) -> dict[str, Any] | None:

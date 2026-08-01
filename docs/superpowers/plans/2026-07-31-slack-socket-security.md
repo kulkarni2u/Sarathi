@@ -1,6 +1,6 @@
 # Slack Socket Mode Security Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Replace the branch's unauthenticated Slack HTTP callbacks with an outbound-only Socket Mode process that reads secrets from environment variables, authorizes every Slack actor and route, blocks recognized prompt-injection attempts, and processes state changes idempotently without real network calls in tests.
 
@@ -55,7 +55,7 @@
 - Produces: `validate_slack_text(text: object, *, actor_id: str, channel_id: str, event_id: str) -> ExternalSlackInput`
 - Produces: `SlackInputRejected(reason: str)`
 
-- [ ] **Step 1: Write failing configuration tests**
+- [x] **Step 1: Write failing configuration tests**
 
 ```python
 def test_socket_config_requires_every_environment_variable():
@@ -73,12 +73,12 @@ def test_socket_config_repr_redacts_tokens_and_ids():
     assert rendered.count("<redacted>") >= 6
 ```
 
-- [ ] **Step 2: Run configuration tests and verify RED**
+- [x] **Step 2: Run configuration tests and verify RED**
 
 Run: `python3 -m pytest tests/test_slack_security.py -k config -q`
 Expected: FAIL because `src.service.slack.config` does not exist.
 
-- [ ] **Step 3: Implement immutable redacted configuration**
+- [x] **Step 3: Implement immutable redacted configuration**
 
 ```python
 class SlackConfigurationError(RuntimeError):
@@ -129,12 +129,12 @@ class SlackSocketConfig:
         )
 ```
 
-- [ ] **Step 4: Run configuration tests and verify GREEN**
+- [x] **Step 4: Run configuration tests and verify GREEN**
 
 Run: `python3 -m pytest tests/test_slack_security.py -k config -q`
 Expected: PASS.
 
-- [ ] **Step 5: Write failing validator tests**
+- [x] **Step 5: Write failing validator tests**
 
 ```python
 @pytest.mark.parametrize("text", [
@@ -164,21 +164,21 @@ def test_legitimate_near_match_remains_data():
     assert result.validation_version == "slack-input-v1"
 ```
 
-- [ ] **Step 6: Run validator tests and verify RED**
+- [x] **Step 6: Run validator tests and verify RED**
 
 Run: `python3 -m pytest tests/test_slack_security.py -k 'injection or unicode or legitimate' -q`
 Expected: FAIL because `validate_slack_text` is missing.
 
-- [ ] **Step 7: Implement bounded deterministic validation**
+- [x] **Step 7: Implement bounded deterministic validation**
 
 Implement NFKC normalization, a 4,000-character limit, disallowed-control checks, one-level bounded URL/hex/Base64 decoding, contextual deny patterns for instruction hierarchy, secret extraction, safety bypass, and permission escalation, plus SHA-256 digest generation. Do not reject a safe sentence merely because it quotes a deny phrase as test data.
 
-- [ ] **Step 8: Run all Task 1 tests**
+- [x] **Step 8: Run all Task 1 tests**
 
 Run: `python3 -m pytest tests/test_slack_security.py -q`
 Expected: PASS with no network access.
 
-- [ ] **Step 9: Commit Task 1**
+- [x] **Step 9: Commit Task 1**
 
 ```bash
 git add src/service/slack/__init__.py src/service/slack/config.py src/service/slack/security.py tests/test_slack_security.py
@@ -203,7 +203,7 @@ git commit -m "Add Slack environment and input security boundary"
 - Produces: `Storage.create_slack_external_input(*, envelope_id: str, workspace_id: str, task_id: str, actor_id: str, channel_id: str, text: str, validation_version: str, digest: str, subtask_id: str | None = None) -> dict[str, Any]`
 - Produces: `Storage.assign_slack_external_input(input_id: str, subtask_id: str) -> dict[str, Any] | None`
 
-- [ ] **Step 1: Write failing migration and redaction tests**
+- [x] **Step 1: Write failing migration and redaction tests**
 
 ```python
 def test_slack_inbox_deduplicates_envelope_and_omits_raw_payload(storage):
@@ -221,16 +221,16 @@ def test_slack_outbox_operation_key_is_unique(storage):
     assert first["id"] == second["id"]
 ```
 
-- [ ] **Step 2: Run storage tests and verify RED**
+- [x] **Step 2: Run storage tests and verify RED**
 
 Run: `python3 -m pytest tests/test_slack_storage.py -q`
 Expected: FAIL because Slack storage methods are absent.
 
-- [ ] **Step 3: Add append-only schema migration**
+- [x] **Step 3: Add append-only schema migration**
 
 Add `slack_inbox`, `slack_outbox`, `slack_task_bindings`, and `slack_external_inputs` tables with unique constraints on `envelope_id`, `operation_key`, `task_id`, and `(team_id, channel_id, thread_ts)` as appropriate. Store validated JSON only. Add indexes for pending status and task lookup.
 
-- [ ] **Step 4: Implement atomic storage methods**
+- [x] **Step 4: Implement atomic storage methods**
 
 Use `with self.connection:` transactions and SQLite `INSERT OR IGNORE` into
 `slack_inbox` or `slack_outbox`, then read back the canonical row by its unique
@@ -238,7 +238,7 @@ key. Claim methods transition `pending` rows to `processing` in the same
 transaction. Finishing methods accept only `processed`, `rejected`, or `failed`
 for inbox rows and only `sent` or `failed` for outbox rows.
 
-- [ ] **Step 5: Add compare-and-set concurrency tests**
+- [x] **Step 5: Add compare-and-set concurrency tests**
 
 ```python
 def test_external_input_assignment_has_one_winner(storage, waiting_subtasks):
@@ -249,12 +249,12 @@ def test_external_input_assignment_has_one_winner(storage, waiting_subtasks):
     assert second is None
 ```
 
-- [ ] **Step 6: Run storage tests and existing storage regressions**
+- [x] **Step 6: Run storage tests and existing storage regressions**
 
 Run: `python3 -m pytest tests/test_slack_storage.py tests/test_storage.py -q`
 Expected: PASS.
 
-- [ ] **Step 7: Commit Task 2**
+- [x] **Step 7: Commit Task 2**
 
 ```bash
 git add src/storage/__init__.py tests/test_slack_storage.py
@@ -275,7 +275,7 @@ git commit -m "Add durable Slack inbox and outbox storage"
 - Produces: `SlackWorkflow.process_next(limit: int = 20) -> list[dict[str, Any]]`
 - Produces: `SlackAuthorizationError(reason: str)`
 
-- [ ] **Step 1: Write failing authorization tests**
+- [x] **Step 1: Write failing authorization tests**
 
 ```python
 @pytest.mark.parametrize("field,value", [
@@ -290,16 +290,16 @@ def test_command_authorization_fails_before_persistence(workflow, storage, field
     assert storage.list_tasks() == []
 ```
 
-- [ ] **Step 2: Run authorization tests and verify RED**
+- [x] **Step 2: Run authorization tests and verify RED**
 
 Run: `python3 -m pytest tests/test_slack_intake.py -k authorization -q`
 Expected: FAIL because `SlackWorkflow` is absent.
 
-- [ ] **Step 3: Implement authorization and durable acceptance**
+- [x] **Step 3: Implement authorization and durable acceptance**
 
 Validate kind, exact command name, team, channel, non-bot actor, and prompt through `validate_slack_text`; insert the validated inbox record; return a result suitable for immediate Socket acknowledgement. Rejected text records only digest, length, actor/channel IDs, validator version, and reason code in a lifecycle security event.
 
-- [ ] **Step 4: Write failing command-processing tests**
+- [x] **Step 4: Write failing command-processing tests**
 
 ```python
 def test_command_processing_creates_one_draft_gate_and_outbox(workflow, storage):
@@ -314,11 +314,11 @@ def test_command_processing_creates_one_draft_gate_and_outbox(workflow, storage)
     assert len(storage.list_approval_gates_for_task(tasks[0]["id"])) == 1
 ```
 
-- [ ] **Step 5: Implement idempotent command processing**
+- [x] **Step 5: Implement idempotent command processing**
 
 Create the task, initial messages, PRD/AC gate, Slack task binding seed, and outbox operation in one composite storage transaction keyed by `envelope_id`. Preserve team/channel/requester IDs but no team domain, username, token, raw envelope, or response URL.
 
-- [ ] **Step 6: Write failing gate decision tests**
+- [x] **Step 6: Write failing gate decision tests**
 
 ```python
 def test_only_approver_can_decide_and_first_decision_wins(workflow, pending_gate):
@@ -330,16 +330,16 @@ def test_only_approver_can_decide_and_first_decision_wins(workflow, pending_gate
     assert pending_gate.refresh()["status"] == "approved"
 ```
 
-- [ ] **Step 7: Implement opaque action binding and atomic gate decision**
+- [x] **Step 7: Implement opaque action binding and atomic gate decision**
 
 Parse only Sarathi-generated opaque action values. Verify team/channel/task/thread/gate binding and approver allowlist. Use one compare-and-set update from `pending` to `approved` or `rejected`, and enqueue the decision update in the same transaction.
 
-- [ ] **Step 8: Run workflow tests**
+- [x] **Step 8: Run workflow tests**
 
 Run: `python3 -m pytest tests/test_slack_intake.py tests/test_slack_interactions.py -q`
 Expected: PASS.
 
-- [ ] **Step 9: Commit Task 3**
+- [x] **Step 9: Commit Task 3**
 
 ```bash
 git add src/service/slack/workflow.py tests/test_slack_intake.py tests/test_slack_interactions.py
@@ -361,7 +361,7 @@ git commit -m "Process authorized Slack commands and decisions"
 - Produces: `AgentInputContract.external_inputs: list[dict[str, Any]]`
 - Produces: fixed `EXTERNAL_INPUT_SECURITY_RULE` serialized before context JSON.
 
-- [ ] **Step 1: Write failing exact-thread and actor tests**
+- [x] **Step 1: Write failing exact-thread and actor tests**
 
 ```python
 def test_reply_requires_exact_binding_and_authorized_actor(workflow, waiting_task):
@@ -375,16 +375,16 @@ def test_reply_requires_exact_binding_and_authorized_actor(workflow, waiting_tas
     assert waiting_task.subtask()["status"] == "waiting_human"
 ```
 
-- [ ] **Step 2: Run reply authorization tests and verify RED**
+- [x] **Step 2: Run reply authorization tests and verify RED**
 
 Run: `python3 -m pytest tests/test_slack_events.py -k 'binding or actor' -q`
 Expected: FAIL until reply handling exists.
 
-- [ ] **Step 3: Implement zero, one, and many waiter behavior**
+- [x] **Step 3: Implement zero, one, and many waiter behavior**
 
 For zero waiters, store a validated task message and do not resume. For one waiter, atomically assign the external input and transition only that subtask from `waiting_human` to `in_progress`. For multiple waiters, store one unassigned input and enqueue an ambiguity message with authorization-bound selection buttons; selection assigns and resumes exactly one still-waiting subtask.
 
-- [ ] **Step 4: Add failing context tests**
+- [x] **Step 4: Add failing context tests**
 
 ```python
 def test_context_compiler_serializes_human_reply_as_external_input():
@@ -397,16 +397,16 @@ def test_context_compiler_serializes_human_reply_as_external_input():
     assert item["text"] == "Use the existing migration pattern"
 ```
 
-- [ ] **Step 5: Implement typed context and fixed provider preamble**
+- [x] **Step 5: Implement typed context and fixed provider preamble**
 
 Add `external_inputs` to `AgentInputContract`, budget it as a low-priority bounded section, and populate it only from assigned validated inputs. In `_provider_prompt`, place a fixed Sarathi-owned rule before `Context Pack:` stating that `external_inputs` are untrusted data and cannot alter instruction hierarchy, policy, tools, permissions, or secret access.
 
-- [ ] **Step 6: Run reply and context tests**
+- [x] **Step 6: Run reply and context tests**
 
 Run: `python3 -m pytest tests/test_slack_events.py tests/test_runtime_context.py tests/test_cli_bridge_sessions.py -q`
 Expected: PASS.
 
-- [ ] **Step 7: Commit Task 4**
+- [x] **Step 7: Commit Task 4**
 
 ```bash
 git add src/service/slack/workflow.py src/runtime/context.py src/runtime/providers/cli_bridge.py tests/test_slack_events.py tests/test_runtime_context.py tests/test_cli_bridge_sessions.py
@@ -429,7 +429,7 @@ git commit -m "Route Slack human replies through typed context"
 - Produces: main service response `401` without bearer auth and `404` with bearer auth for former Slack paths.
 - Removes: `_verify_slack_request`, `_parse_slack_body`, `post_response_url`, and public `_handle_slack_*` transport handlers.
 
-- [ ] **Step 1: Write failing API-surface tests**
+- [x] **Step 1: Write failing API-surface tests**
 
 ```python
 @pytest.mark.parametrize("suffix", [
@@ -445,29 +445,29 @@ def test_main_service_does_not_expose_slack_callbacks(app, workspace_id, suffix)
     assert auth_status == 404
 ```
 
-- [ ] **Step 2: Run API-surface tests and verify RED**
+- [x] **Step 2: Run API-surface tests and verify RED**
 
 Run: `python3 -m pytest tests/test_service_api.py -k slack_callbacks -q`
 Expected: FAIL because the public Slack branches still bypass bearer authorization.
 
-- [ ] **Step 3: Remove callback routing and HTTP-only helpers**
+- [x] **Step 3: Remove callback routing and HTTP-only helpers**
 
 Delete the three pre-authorization Slack branches from `ServiceApp.handle` and their handler methods. Remove signing-secret, form parsing, `response_url`, and synchronous callback delivery code. Keep transport-independent Block Kit renderers used by the outbox.
 
-- [ ] **Step 4: Update and verify OpenAPI contract**
+- [x] **Step 4: Update and verify OpenAPI contract**
 
 Remove Slack callback operations and HTTP-signature schemas from `build_openapi_spec()`, regenerate `docs/openapi.json` using `python3 -m src.service.openapi`, and assert the generated document contains no `/slack/commands`, `/slack/interactions`, `/slack/events`, or `response_url` strings.
 
-- [ ] **Step 5: Replace network-prone notification tests**
+- [x] **Step 5: Replace network-prone notification tests**
 
 Inject a fake bot client/outbox in notification tests. Add a session-wide socket guard fixture for Slack-focused tests that raises on `socket.socket.connect`. Assert all formerly fake `hooks.slack.com` cases remain local.
 
-- [ ] **Step 6: Run API, OpenAPI, and notification regressions**
+- [x] **Step 6: Run API, OpenAPI, and notification regressions**
 
 Run: `python3 -m pytest tests/test_service_api.py tests/test_openapi.py tests/test_notifications.py -q`
 Expected: PASS with no external connection attempt.
 
-- [ ] **Step 7: Commit Task 5**
+- [x] **Step 7: Commit Task 5**
 
 ```bash
 git add src/service/app.py src/service/intake.py src/notifications.py src/service/openapi.py docs/openapi.json tests/test_service_api.py tests/test_openapi.py tests/test_notifications.py
@@ -487,7 +487,7 @@ git commit -m "Remove public Slack callback surface"
 - Produces: `SocketModeRunner.process_outbox_once(limit: int = 20) -> list[dict[str, Any]]`
 - Produces: `main(argv: Sequence[str] | None = None) -> int`
 
-- [ ] **Step 1: Write failing acknowledgement and network-isolation tests**
+- [x] **Step 1: Write failing acknowledgement and network-isolation tests**
 
 ```python
 def test_runner_persists_before_ack(runner, storage):
@@ -505,20 +505,20 @@ def test_runner_does_not_ack_when_insert_fails(runner, storage):
     assert not acked
 ```
 
-- [ ] **Step 2: Run Socket tests and verify RED**
+- [x] **Step 2: Run Socket tests and verify RED**
 
 Run: `python3 -m pytest tests/test_slack_socket_mode.py -q`
 Expected: FAIL because `SocketModeRunner` is absent.
 
-- [ ] **Step 3: Implement optional adapter**
+- [x] **Step 3: Implement optional adapter**
 
 Import Slack Bolt only inside the adapter factory. Register slash command, block action, and message event listeners that convert payloads to `SlackEnvelope`. Each listener calls `SlackWorkflow.accept`, then acknowledges. Missing optional dependency exits with `pip install 'sarathi-ai[slack]'` guidance and no configuration values.
 
-- [ ] **Step 4: Implement outbox delivery through injected client**
+- [x] **Step 4: Implement outbox delivery through injected client**
 
 Use `client.chat_postMessage` or `client.chat_update` based on the stored operation. Pass stored channel/thread IDs, never a global channel. Mark delivery only after Slack returns `ok`, channel, and timestamp. Retriable errors return the row to pending with bounded attempt count and a redacted error code.
 
-- [ ] **Step 5: Add optional dependency and entry point**
+- [x] **Step 5: Add optional dependency and entry point**
 
 ```toml
 [project.scripts]
@@ -528,7 +528,7 @@ sarathi-slack = "src.service.slack.socket_mode:main"
 slack = ["slack-bolt>=1,<2"]
 ```
 
-- [ ] **Step 6: Run transport and packaging tests**
+- [x] **Step 6: Run transport and packaging tests**
 
 Run: `python3 -m pytest tests/test_slack_socket_mode.py -q`
 Expected: PASS using only fake app and client factories.
@@ -536,7 +536,7 @@ Expected: PASS using only fake app and client factories.
 Run: `python3 -m build --sdist --wheel`
 Expected: exit 0 and both artifacts include `src/service/slack/`.
 
-- [ ] **Step 7: Commit Task 6**
+- [x] **Step 7: Commit Task 6**
 
 ```bash
 git add src/service/slack/socket_mode.py tests/test_slack_socket_mode.py pyproject.toml
@@ -554,21 +554,21 @@ git commit -m "Add outbound-only Slack Socket Mode runner"
 - Documents: environment variables without example token values.
 - Documents: `sarathi-slack --db .sarathi/sarathi.db` outbound-only startup.
 
-- [ ] **Step 1: Update local setup documentation**
+- [x] **Step 1: Update local setup documentation**
 
 Document Slack app Socket Mode enablement, required bot scopes, app-level `connections:write`, required environment variable names, allowlist behavior, and the outbound-only command. State that the shared invite URL is neither parsed nor persisted and that no tunnel or public request URL is supported.
 
-- [ ] **Step 2: Run focused Slack suite**
+- [x] **Step 2: Run focused Slack suite**
 
 Run: `python3 -m pytest tests/test_slack_security.py tests/test_slack_storage.py tests/test_slack_intake.py tests/test_slack_interactions.py tests/test_slack_events.py tests/test_slack_socket_mode.py tests/test_notifications.py tests/test_runtime_context.py tests/test_openapi.py -q`
 Expected: PASS with no external connection attempt.
 
-- [ ] **Step 3: Run Ruff on every touched Python file**
+- [x] **Step 3: Run Ruff on every touched Python file**
 
 Run: `python3 -m ruff check src/service/slack src/service/app.py src/service/intake.py src/notifications.py src/service/openapi.py src/storage/__init__.py src/runtime/context.py src/runtime/providers/cli_bridge.py tests/test_slack_security.py tests/test_slack_storage.py tests/test_slack_intake.py tests/test_slack_interactions.py tests/test_slack_events.py tests/test_slack_socket_mode.py tests/test_notifications.py tests/test_runtime_context.py tests/test_openapi.py`
 Expected: exit 0.
 
-- [ ] **Step 4: Run the complete regression suite and package build**
+- [x] **Step 4: Run the complete regression suite and package build**
 
 Run: `python3 -m pytest -q`
 Expected: exit 0 with no failures.
@@ -576,20 +576,20 @@ Expected: exit 0 with no failures.
 Run: `python3 -m build --sdist --wheel`
 Expected: exit 0.
 
-- [ ] **Step 5: Run secret and public-surface scans**
+- [x] **Step 5: Run secret and public-surface scans**
 
 Run: `git diff origin/main...HEAD -- . ':!docs/superpowers/plans/2026-07-31-slack-socket-security.md' | rg -n 'xox[baprs]-|hooks\.slack\.com|response_url|SARATHI_SLACK_SIGNING_SECRET|/slack/(commands|interactions|events)'`
 Expected: no token-shaped literals, webhook URLs, response URLs, signing-secret fallback, or public Slack callback path remains in implementation or tests.
 
-- [ ] **Step 6: Ask OpenCode for a no-edit two-stage review**
+- [x] **Step 6: Ask OpenCode for a no-edit two-stage review**
 
 OpenCode must first check spec compliance against `docs/superpowers/specs/2026-07-31-slack-socket-security-design.md`, then review code quality and adversarial security. It must inspect the diff and test evidence, make no edits, and return actionable findings with file and line references.
 
-- [ ] **Step 7: Apply valid review findings test-first and rerun Steps 2-5**
+- [x] **Step 7: Apply valid review findings test-first and rerun Steps 2-5**
 
 For each accepted finding, add a focused failing regression test, verify RED, implement the smallest fix, verify GREEN, and repeat the focused/full verification commands.
 
-- [ ] **Step 8: Mark plan checkpoints complete and commit documentation**
+- [x] **Step 8: Mark plan checkpoints complete and commit documentation**
 
 ```bash
 git add README.md docs/superpowers/plans/2026-07-31-slack-socket-security.md

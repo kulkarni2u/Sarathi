@@ -78,6 +78,8 @@ def _dispatch_subtask(
     task = storage.get_task(subtask["task_id"])
     if task is None:
         raise ServiceError("not_found", "Task not found.", 404)
+    workspace = storage.get_workspace(subtask["workspace_id"])
+    workspace_root = Path(workspace["root_path"]).expanduser() if workspace is not None else None
     context_pack = ContextCompiler().compile_task_tracking_context(
         task=task,
         subtask=subtask,
@@ -85,10 +87,9 @@ def _dispatch_subtask(
         review_runs=storage.list_review_runs_for_task(task["id"]),
         external_inputs=storage.list_assigned_slack_external_inputs(subtask["id"]),
         available_tools=["workspace_files", "git_diff", "test_results", "provider_dispatch"],
+        repo_index_root=str(workspace_root) if workspace_root is not None else None,
     )
     context_pack_artifact = context_pack.to_artifact()
-    workspace = storage.get_workspace(subtask["workspace_id"])
-    workspace_root = Path(workspace["root_path"]).expanduser() if workspace is not None else None
     use_ncp_handoff = bool(
         provider in {"claude", "opencode"}
         and workspace_root is not None

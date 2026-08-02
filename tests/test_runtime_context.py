@@ -1,3 +1,4 @@
+from src.repo_index import build_repo_index
 from src.runtime.context import ContextCompiler, MAX_EXTERNAL_INPUTS
 
 
@@ -275,3 +276,95 @@ def test_context_compiler_prefers_normalized_artifact_index_for_relevant_files()
     )
 
     assert "src/runtime/output_index.py" in pack.to_artifact()["agent_input"]["relevant_files"]
+
+
+# ── repo-index hints ──────────────────────────────────────────────────────
+#
+# When a repo_index_root is supplied and the workspace has a built symbol
+# index (.sarathi/index), relevant_files gets enriched with ranked
+# "file:line symbol (kind)" hints so a dispatched agent can jump straight to
+# likely-relevant code instead of re-discovering it with Glob/Grep.
+
+def _indexed_workspace(tmp_path):
+    (tmp_path / "auth.py").write_text(
+        'def authenticate_user(token):\n'
+        '    """Verify a user session token."""\n'
+        '    return True\n',
+        encoding="utf-8",
+    )
+    build_repo_index(tmp_path)
+    return tmp_path
+
+
+def test_compile_task_tracking_context_adds_repo_index_hints(tmp_path):
+    _indexed_workspace(tmp_path)
+    compiler = ContextCompiler()
+
+    pack = compiler.compile_task_tracking_context(
+        task={"id": "task-1", "title": "authenticate user", "status": "planning", "metadata": {}},
+        subtask={
+            "id": "subtask-1",
+            "title": "authenticate user",
+            "status": "in_progress",
+            "metadata": {
+                "role": "Pravaha",
+                "task_packet": {"goal": "authenticate user"},
+            },
+        },
+        repo_index_root=str(tmp_path),
+    )
+
+    relevant_files = pack.to_artifact()["agent_input"]["relevant_files"]
+    assert any("authenticate_user" in entry for entry in relevant_files)
+
+
+def test_compile_task_tracking_context_skips_repo_index_when_root_omitted(tmp_path):
+    _indexed_workspace(tmp_path)
+    compiler = ContextCompiler()
+
+    pack = compiler.compile_task_tracking_context(
+        task={"id": "task-1", "title": "authenticate user", "status": "planning", "metadata": {}},
+        subtask={
+            "id": "subtask-1",
+            "title": "authenticate user",
+            "status": "in_progress",
+            "metadata": {"role": "Pravaha", "task_packet": {"goal": "authenticate user"}},
+        },
+    )
+
+    relevant_files = pack.to_artifact()["agent_input"]["relevant_files"]
+    assert relevant_files == []
+
+
+def test_compile_graph_node_context_adds_repo_index_hints(tmp_path):
+    _indexed_workspace(tmp_path)
+    compiler = ContextCompiler()
+
+    pack = compiler.compile_graph_node_context(
+        node={
+            "id": "node-1",
+            "title": "authenticate user",
+            "task_packet": {"goal": "authenticate user"},
+        },
+        repo_index_root=str(tmp_path),
+    )
+
+    relevant_files = pack.to_artifact()["agent_input"]["relevant_files"]
+    assert any("authenticate_user" in entry for entry in relevant_files)
+
+
+def test_repo_index_hints_never_raise_when_index_missing(tmp_path):
+    compiler = ContextCompiler()
+
+    pack = compiler.compile_task_tracking_context(
+        task={"id": "task-1", "title": "unindexed", "status": "planning", "metadata": {}},
+        subtask={
+            "id": "subtask-1",
+            "title": "unindexed",
+            "status": "in_progress",
+            "metadata": {"role": "Pravaha", "task_packet": {"goal": "unindexed workspace"}},
+        },
+        repo_index_root=str(tmp_path),
+    )
+
+    assert pack.to_artifact()["agent_input"]["relevant_files"] == []

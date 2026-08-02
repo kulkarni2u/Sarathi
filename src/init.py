@@ -6,8 +6,10 @@ import json
 import os
 
 try:
+    from .repo_index import build_repo_index
     from .repo_wiki import generate_repo_wiki
 except ImportError:  # pragma: no cover - direct execution fallback
+    from repo_index import build_repo_index
     from repo_wiki import generate_repo_wiki
 
 
@@ -600,6 +602,7 @@ def bootstrap_workspace(
     *,
     engine_path: str = "markdown",
     with_wiki: bool = True,
+    with_index: bool = True,
     overwrite_policy_pack: bool = False,
 ) -> dict[str, Any]:
     """Initialize or reuse Sarathi workspace artifacts for a root path."""
@@ -619,6 +622,11 @@ def bootstrap_workspace(
         if with_wiki
         else {"status": "skipped", "path": str(target / ".sarathi" / "wiki")}
     )
+    index_result = (
+        build_repo_index(target)
+        if with_index
+        else {"status": "skipped", "path": str(target / ".sarathi" / "index")}
+    )
     return {
         "root_path": str(target),
         "policy_pack": {
@@ -626,6 +634,7 @@ def bootstrap_workspace(
             "path": str(policy_path),
         },
         "wiki": wiki_result,
+        "index": index_result,
         "inspection": {
             "languages": inspection.get("languages", []),
             "frameworks": inspection.get("frameworks", []),

@@ -93,6 +93,61 @@ def _ensure_ncp_sidecar(init_target: Path) -> dict[str, bool]:
     return created
 
 
+def _bootstrap_ncp(init_target: Path, *, step_label: str) -> None:
+    """Bootstrap .ncp/ so NCP's bounded-context handoff + whispers activate by default.
+
+    Runs `ncp init` when the `ncp` CLI is available (it ships as a core
+    dependency, but degrades to a warning rather than crashing `sarathi init`
+    if it's missing) then writes Sarathi's own sidecar files regardless,
+    since those come from bundled templates and don't need the CLI at all.
+    """
+    print(f"\n{step_label} NCP: Initializing Neural Context Protocol...")
+    import subprocess
+
+    try:
+        ncp_init_result = subprocess.run(
+            ["ncp", "init"],
+            capture_output=True, text=True, cwd=str(init_target),
+        )
+        if ncp_init_result.returncode == 0:
+            print("  ✓ NCP initialized")
+        else:
+            print(f"  ⚠ NCP init warning: {ncp_init_result.stderr.strip()}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"  ⚠ NCP init skipped: {exc}")
+
+    sidecar_created = _ensure_ncp_sidecar(init_target)
+    if sidecar_created["config"]:
+        print("  ✓ Wrote .ncp/config.toml from Sarathi template")
+    if sidecar_created["run_py"]:
+        print("  ✓ Wrote .ncp/run.py direct-mode bridge")
+    elif (init_target / ".ncp" / "run.py").exists():
+        print("  ✓ Verified .ncp/run.py direct-mode bridge")
+
+    # Write Sarathi-optimized config overrides (bounded chunk size keeps
+    # handoff context small — see docs/ncp/config.toml.example for defaults).
+    ncp_config_path = init_target / ".ncp" / "config.toml"
+    if ncp_config_path.exists():
+        config_text = ncp_config_path.read_text()
+        overrides = """
+# Sarathi-optimized overrides
+max_chunk_tokens = 400
+default_ttl_hours = 168
+"""
+        if "Sarathi-optimized" not in config_text:
+            ncp_config_path.write_text(config_text.strip() + "\n" + overrides.strip() + "\n")
+            print("  ✓ Wrote Sarathi-optimized NCP config (max_chunk_tokens=400, ttl=168h)")
+
+    welcome_path = init_target / ".ncp" / "WELCOME.md"
+    welcome_path.write_text(
+        "# NCP + Sarathi\n\n"
+        "NCP is configured as the context handler for this project.\n"
+        "Run `sarathi run \"task description\"` to use auto-detected NCP, "
+        "or pass `--no-ncp` to use native adapters.\n"
+    )
+    print("  ✓ Wrote .ncp/WELCOME.md")
+
+
 def _prompt_yes_no(label: str, default: bool) -> bool:
     """Prompt for a yes/no setup choice."""
     suffix = "[Y/n]" if default else "[y/N]"
@@ -616,12 +671,23 @@ def main() -> None:
     init_parser.add_argument(
         "--ncp",
         action="store_true",
-        help="Initialize with NCP context protocol (bootstraps .ncp/ directory required for auto-detect)",
+        help="Initialize with NCP context protocol (default; this flag is now a no-op kept for backward compatibility)",
+    )
+    init_parser.add_argument(
+        "--no-ncp",
+        action="store_true",
+        help="Skip NCP bootstrap: no .ncp/ directory, dispatches fall back to native adapters "
+             "with full (unbounded) context packs instead of NCP's bounded context + whispers.",
     )
     init_parser.add_argument(
         "--no-wiki",
         action="store_true",
         help="Skip generated .sarathi/wiki creation.",
+    )
+    init_parser.add_argument(
+        "--no-index",
+        action="store_true",
+        help="Skip generated .sarathi/index (offline repo symbol index) creation.",
     )
     init_parser.add_argument(
         "--from",
@@ -908,6 +974,23 @@ def main() -> None:
         help="Directory containing recipe sub-packs (default: policy-pack/RECIPES)",
     )
 
+    # Index command (build/query the offline repo symbol index)
+    index_parser = subparsers.add_parser(
+        "index", help="Build or query the offline repo symbol index (.sarathi/index)"
+    )
+    index_parser.add_argument(
+        "target_path", nargs="?", default=".", help="Workspace root to index (default: .)"
+    )
+    index_parser.add_argument(
+        "--query", default=None, help="Query the existing index instead of (re)building it"
+    )
+    index_parser.add_argument(
+        "--force", action="store_true", help="Reparse every file instead of reusing unchanged ones"
+    )
+    index_parser.add_argument(
+        "--limit", type=int, default=10, help="Max results to show for --query (default: 10)"
+    )
+
     # Attach command (join a shared session)
     attach_parser = subparsers.add_parser(
         "attach", help="Attach to a shared Sarathi session via its share token"
@@ -985,6 +1068,35 @@ def main() -> None:
         handle_agents()
     elif args.command == "recipes":
         handle_recipes(args)
+    elif args.command == "index":
+        handle_index(args)
+
+
+def handle_index(args: argparse.Namespace) -> None:
+    """Handle the index command: build or query the offline repo symbol index."""
+    try:
+        from .repo_index import build_repo_index, format_symbol_hint, query_repo_index
+    except ImportError:
+        from repo_index import build_repo_index, format_symbol_hint, query_repo_index
+
+    query = getattr(args, "query", None)
+    if query:
+        matches = query_repo_index(args.target_path, query, limit=args.limit)
+        if not matches:
+            print(f"No index matches for {query!r}. Run `sarathi index {args.target_path}` first.")
+            return
+        print(f"Top {len(matches)} match(es) for {query!r}:")
+        for entry in matches:
+            print(f"  {format_symbol_hint(entry)}")
+        return
+
+    result = build_repo_index(args.target_path, force=getattr(args, "force", False))
+    print(f"Index: {result['status']} -> {result['path']}")
+    print(
+        f"  Files indexed: {result['files_indexed']} "
+        f"(parsed {result['files_parsed']}, reused {result['files_reused']})"
+    )
+    print(f"  Symbols: {result['symbol_count']}")
 
 
 def handle_init(args: argparse.Namespace) -> None:
@@ -1027,7 +1139,7 @@ def handle_init(args: argparse.Namespace) -> None:
         todos = sum(1 for r in validation_results if r.status.value == "TODO")
         print(f"  Results: {passed} PASS, {warnings} DRIFT, {todos} TODO")
 
-        # Generate wiki if needed
+        # Generate wiki and repo index if needed
         print("\n[3/3] Bootstrap: Finalizing workspace artifacts...")
         if not getattr(args, "no_wiki", False):
             try:
@@ -1036,6 +1148,15 @@ def handle_init(args: argparse.Namespace) -> None:
                 from repo_wiki import generate_repo_wiki
             wiki_result = generate_repo_wiki(Path(args.target_path))
             print(f"  Wiki: {wiki_result.get('status')} → {wiki_result.get('path')}")
+        if not getattr(args, "no_index", False):
+            try:
+                from .repo_index import build_repo_index
+            except ImportError:
+                from repo_index import build_repo_index
+            index_result = build_repo_index(Path(args.target_path))
+            print(f"  Index: {index_result.get('status')} → {index_result.get('path')} ({index_result.get('symbol_count')} symbols)")
+        if not getattr(args, "no_ncp", False):
+            _bootstrap_ncp(Path(args.target_path), step_label="[3/3]")
 
         # Write provider-native permission config files
         try:
@@ -1062,16 +1183,21 @@ def handle_init(args: argparse.Namespace) -> None:
     print(f"  Build tools: {inspection.get('build_tools', [])}")
     print(f"  Test patterns: {inspection.get('test_patterns', [])}")
 
-    # Phases 2-3: bootstrap policy pack and wiki.
+    # Phases 2-3: bootstrap policy pack, wiki, and repo index.
     print("\n[2/5] Bootstrap: Creating or reusing workspace artifacts...")
     bootstrap = bootstrap_workspace(
         args.target_path,
         engine_path=args.engine,
         with_wiki=not getattr(args, "no_wiki", False),
+        with_index=not getattr(args, "no_index", False),
     )
     policy_path = Path(bootstrap["policy_pack"]["path"])
     print(f"  Policy pack: {bootstrap['policy_pack']['status']} → {policy_path}")
     print(f"  Wiki: {bootstrap['wiki']['status']} → {bootstrap['wiki']['path']}")
+    print(
+        f"  Index: {bootstrap['index']['status']} → {bootstrap['index']['path']}"
+        + (f" ({bootstrap['index']['symbol_count']} symbols)" if "symbol_count" in bootstrap["index"] else "")
+    )
     # Write provider-native permission config files from the generated permissions.md
     try:
         from .runtime.providers.cli_bridge import ensure_provider_permissions
@@ -1091,55 +1217,9 @@ def handle_init(args: argparse.Namespace) -> None:
     print("\n[4/5] Evolve: Learning from setup...")
     workflow.evolve()
 
-    # NCP Integration
-    if args.ncp:
-        print("\n[6/6] NCP: Initializing Neural Context Protocol...")
-        import subprocess
-
-        # Determine init target — use explicit target_path or CWD
-        init_target = Path(args.target_path)
-
-        # 1. Run ncp init to bootstrap
-        ncp_init_result = subprocess.run(
-            ["ncp", "init"],
-            capture_output=True, text=True, cwd=str(init_target),
-        )
-        if ncp_init_result.returncode == 0:
-            print("  ✓ NCP initialized")
-        else:
-            print(f"  ⚠ NCP init warning: {ncp_init_result.stderr.strip()}")
-
-        sidecar_created = _ensure_ncp_sidecar(init_target)
-        if sidecar_created["config"]:
-            print("  ✓ Wrote .ncp/config.toml from Sarathi template")
-        if sidecar_created["run_py"]:
-            print("  ✓ Wrote .ncp/run.py direct-mode bridge")
-        elif (init_target / ".ncp" / "run.py").exists():
-            print("  ✓ Verified .ncp/run.py direct-mode bridge")
-
-        # 2. Write Sarathi-optimized config overrides
-        ncp_config_path = init_target / ".ncp" / "config.toml"
-        if ncp_config_path.exists():
-            config_text = ncp_config_path.read_text()
-            overrides = """
-# Sarathi-optimized overrides
-max_chunk_tokens = 400
-default_ttl_hours = 168
-"""
-            # Only append if not already present
-            if "Sarathi-optimized" not in config_text:
-                ncp_config_path.write_text(config_text.strip() + "\n" + overrides.strip() + "\n")
-                print("  ✓ Wrote Sarathi-optimized NCP config (max_chunk_tokens=400, ttl=168h)")
-
-        # 3. Write welcome note
-        welcome_path = init_target / ".ncp" / "WELCOME.md"
-        welcome_path.write_text(
-            "# NCP + Sarathi\n\n"
-            "NCP is configured as the context handler for this project.\n"
-            "Run `sarathi run \"task description\"` to use auto-detected NCP, "
-            "or pass `--no-ncp` to use native adapters.\n"
-        )
-        print("  ✓ Wrote .ncp/WELCOME.md")
+    # NCP Integration — on by default; pass --no-ncp to skip.
+    if not getattr(args, "no_ncp", False):
+        _bootstrap_ncp(Path(args.target_path), step_label="[5/5]")
 
     print("\n✓ Policy pack initialized successfully!")
     print(f"\nNext steps:")

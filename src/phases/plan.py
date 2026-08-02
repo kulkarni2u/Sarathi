@@ -26,8 +26,13 @@ class PlanHandler:
         if task.phase_results:
             prev_artifacts = task.phase_results[-1].artifacts
 
+        # LOW complexity tasks skip the model call: the deterministic fallback
+        # below (_create_implementation_plan) is a fixed 5-step template
+        # regardless of dispatch outcome, so a genuinely low-stakes task
+        # gets nothing from spending a dispatch to reach it.
+        low_complexity = getattr(task.complexity, "value", None) == "low"
         response = None
-        if self.dispatcher is not None:
+        if self.dispatcher is not None and not low_complexity:
             hint = getattr(task, "gate_retry_hint", None)
             extra_constraints: dict = {}
             if isinstance(hint, dict) and hint.get("phase") == phase.value:
@@ -62,6 +67,7 @@ class PlanHandler:
                 "dependency_map": response.evidence.get("dependency_map", False),
                 "rollback_plan": response.evidence.get("rollback_plan", False),
                 "workflow_typed": bool(workflow.get("nodes")),
+                "dispatch_skipped_reason": None,
             }
             task_graph = (
                 graph_from_workflow(workflow).to_artifact()
@@ -95,6 +101,7 @@ class PlanHandler:
                 "checkpoint_list": len(plan.get("steps", [])) > 0,
                 "dependency_map": len(deps) > 0,
                 "rollback_plan": has_rollback,
+                "dispatch_skipped_reason": "low_complexity" if low_complexity else None,
             }
             artifacts = {
                 "implementation_plan": plan,

@@ -34,6 +34,11 @@ except ImportError:
     from engine_mirror import EngineRunRecorder
 
 try:
+    from .runtime.providers.registry import all_specs as _all_provider_specs
+except ImportError:
+    from runtime.providers.registry import all_specs as _all_provider_specs
+
+try:
     from .dispatch import Dispatcher, LocalDispatcher, require_harness_id
     from .phases import (
         BrainstormHandler,
@@ -538,23 +543,43 @@ class TaskContext:
         return datetime.now().isoformat()
 
 
+def _provider_session_constraint_keys() -> dict[str, str]:
+    """Map provider name -> its session-resume constraint key (e.g. claude -> claude_session_id).
+
+    Sourced from the provider registry so adding a new native provider spec
+    (see cli_bridge.py's "one spec, not a 10-file surgery" seam) automatically
+    gets session continuity here without touching this file.
+    """
+    try:
+        specs = _all_provider_specs()
+    except Exception:
+        return {}
+    return {
+        name: spec.session_constraint_key
+        for name, spec in specs.items()
+        if spec.session_constraint_key
+    }
+
+
 class _HarnessAwareDispatcher:
     """Wraps any dispatcher and injects the harness-resolved preferred agent.
 
     Reads preferred_agent at dispatch time so RouteHandler can set it after
     the ROUTE phase without needing to rebuild phase handlers.
 
-    Also threads provider session continuity across phases: when a Claude CLI
-    dispatch returns a session_id, later dispatches in the same task resume it
-    (--resume) so the provider keeps its working context instead of replaying
-    the full context pack from scratch each phase.
+    Also threads provider session continuity across phases: when a CLI
+    dispatch returns a session_id, later dispatches to that same provider in
+    the same task resume it (--resume / --session / resume <id>, depending on
+    provider) so the provider keeps its working context instead of replaying
+    the full context pack from scratch each phase. Tracked per-provider (not
+    just Claude) since BUILD's graph-node dispatches default to opencode.
     """
 
     def __init__(self, base: Any) -> None:
         self._base = base
         self.preferred_agent: str | None = None
         self.preferred_permission_mode: str | None = None
-        self.claude_session_id: str | None = None
+        self.session_ids: dict[str, str] = {}
         self.fallback_agents: list[str] = []
         self.journal: Any | None = None
         self.workspace_root: str | None = None
@@ -569,7 +594,7 @@ class _HarnessAwareDispatcher:
         """Clear per-task routing/session state before a new task starts."""
         self.preferred_agent = None
         self.preferred_permission_mode = None
-        self.claude_session_id = None
+        self.session_ids = {}
         self.fallback_agents = []
         self.harness_id = None
 
@@ -581,11 +606,15 @@ class _HarnessAwareDispatcher:
                 constraints={**request.constraints, "provider": self.preferred_agent},
             )
             injected_provider = True
-        if self.claude_session_id and not request.constraints.get("claude_session_id"):
-            request = _dc_replace(
-                request,
-                constraints={**request.constraints, "claude_session_id": self.claude_session_id},
-            )
+        effective_provider = request.constraints.get("provider")
+        if self.session_ids and effective_provider:
+            constraint_key = _provider_session_constraint_keys().get(effective_provider)
+            session_id = self.session_ids.get(effective_provider)
+            if constraint_key and session_id and not request.constraints.get(constraint_key):
+                request = _dc_replace(
+                    request,
+                    constraints={**request.constraints, constraint_key: session_id},
+                )
         if self.preferred_permission_mode and not request.constraints.get("permission_mode"):
             request = _dc_replace(
                 request,
@@ -716,10 +745,12 @@ class _HarnessAwareDispatcher:
 
     def _track_session(self, response: Any) -> None:
         artifacts = getattr(response, "artifacts", None)
-        if isinstance(artifacts, dict):
-            session_id = artifacts.get("claude_session_id")
+        if not isinstance(artifacts, dict):
+            return
+        for provider, constraint_key in _provider_session_constraint_keys().items():
+            session_id = artifacts.get(constraint_key)
             if isinstance(session_id, str) and session_id:
-                self.claude_session_id = session_id
+                self.session_ids[provider] = session_id
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base, name)

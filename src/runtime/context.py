@@ -7,6 +7,7 @@ from math import ceil
 import re
 from typing import Any, Iterable, Mapping
 
+from src.repo_index import format_symbol_hint, query_repo_index
 from src.storage import SLACK_EXTERNAL_INPUT_SOURCE, SLACK_EXTERNAL_INPUT_TRUST
 
 MAX_EXTERNAL_INPUTS = 5
@@ -114,6 +115,7 @@ class ContextCompiler:
         external_inputs: Iterable[Mapping[str, Any]] = (),
         available_tools: Iterable[str] = (),
         token_budget: int | None = None,
+        repo_index_root: str | None = None,
     ) -> ContextPack:
         raw_metadata = subtask.get("metadata")
         metadata: Mapping[str, Any] = raw_metadata if isinstance(raw_metadata, Mapping) else {}
@@ -131,6 +133,9 @@ class ContextCompiler:
         constraints = self._constraints_for(task=task, subtask=subtask)
         acceptance_criteria = self._acceptance_criteria_for(task_metadata=task_metadata, task_packet=task_packet)
         relevant_files = self._relevant_files_for(task_metadata=task_metadata, evidence_artifacts=evidence_artifacts)
+        relevant_files = self._with_repo_index_hints(
+            objective=objective, relevant_files=relevant_files, repo_index_root=repo_index_root
+        )
         prior_findings = self._prior_findings_for(review_runs=review_runs)
         source_artifacts = self._source_artifacts_for(evidence_artifacts=evidence_artifacts, review_runs=review_runs)
         typed_external_inputs = self._external_inputs_for(
@@ -176,6 +181,7 @@ class ContextCompiler:
         phase: str = "Build",
         available_tools: Iterable[str] = (),
         token_budget: int | None = None,
+        repo_index_root: str | None = None,
     ) -> ContextPack:
         role = str(node.get("role") or "Pravaha")
         resolved_budget = int(token_budget or self.DEFAULT_TOKEN_BUDGETS.get(role, 2600))
@@ -204,6 +210,10 @@ class ContextCompiler:
         raw_files = node.get("relevant_files")
         if isinstance(raw_files, list):
             relevant_files = [str(item) for item in raw_files if str(item).strip()]
+        objective_text = str(packet.get("goal") or node.get("title") or node.get("id") or "")
+        relevant_files = self._with_repo_index_hints(
+            objective=objective_text, relevant_files=relevant_files, repo_index_root=repo_index_root
+        )
 
         prior_findings: list[str] = []
         if isinstance(graph, Mapping):
@@ -240,6 +250,35 @@ class ContextCompiler:
                 "trimmed_sections": trimmed_sections,
             },
         )
+
+    def _with_repo_index_hints(
+        self,
+        *,
+        objective: str,
+        relevant_files: list[str],
+        repo_index_root: str | None,
+        limit: int = 5,
+    ) -> list[str]:
+        """Append ranked "file:line symbol (kind)" hints from the repo index.
+
+        Lets a dispatched agent jump straight to likely-relevant code instead
+        of re-discovering it with Glob/Grep every phase. Best-effort: an
+        unindexed workspace or a query with no matches leaves relevant_files
+        untouched, and any lookup failure is swallowed since this is an
+        enrichment, not a required input.
+        """
+        if not repo_index_root or not objective.strip():
+            return relevant_files
+        try:
+            matches = query_repo_index(repo_index_root, objective, limit=limit)
+        except Exception:
+            return relevant_files
+        hints = [format_symbol_hint(entry) for entry in matches]
+        merged = list(relevant_files)
+        for hint in hints:
+            if hint not in merged:
+                merged.append(hint)
+        return merged
 
     def _constraints_for(self, *, task: Mapping[str, Any], subtask: Mapping[str, Any]) -> list[str]:
         metadata = subtask.get("metadata") if isinstance(subtask.get("metadata"), Mapping) else {}

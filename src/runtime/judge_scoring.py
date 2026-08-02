@@ -80,6 +80,7 @@ class JudgeScoringPolicy:
     weights: dict[str, float]
     prefer: dict[str, str] = field(default_factory=dict)
     validation_issue: str | None = None
+    auto_select_lone_survivor: bool = False
 
     @classmethod
     def from_review(cls, review: Any) -> "JudgeScoringPolicy | None":
@@ -116,7 +117,12 @@ class JudgeScoringPolicy:
             direction = str(raw_prefer.get(name, _SIGNAL_PREFER_DEFAULT)).strip().lower()
             prefer[name] = direction if direction in _VALID_PREFER_DIRECTIONS else _SIGNAL_PREFER_DEFAULT
 
-        return cls(weights=weights, prefer=prefer, validation_issue=_weight_sum_issue(weights))
+        return cls(
+            weights=weights,
+            prefer=prefer,
+            validation_issue=_weight_sum_issue(weights),
+            auto_select_lone_survivor=bool(config.get("auto_select_lone_survivor", False)),
+        )
 
 
 def _weight_sum_issue(weights: dict[str, float]) -> str | None:
@@ -330,6 +336,35 @@ def assemble_judge_scorecard(
     if not branch_entries:
         return []
     return build_scorecard(policy, branch_entries)
+
+
+def lone_verified_survivor(scorecard: list[dict[str, Any]]) -> str | None:
+    """Return the sole branch id worth judging, or ``None`` if a real judgment is needed.
+
+    Strict by construction: every branch must carry an unambiguous, measured
+    ``test_pass_rate`` (never ``None`` -- a branch the executor couldn't
+    verify is never assumed to have failed), exactly one branch must be at
+    1.0, and every other branch must be at 0.0. Any tie, any branch missing a
+    verification signal, or more than one passing branch returns ``None`` --
+    that's a real judgment call the JUDGE dispatch still has to make, e.g.
+    two branches both pass tests and only qualitative differences (style,
+    approach) separate them, which pass/fail alone can't decide. Called only
+    when a policy explicitly opts in (``judge_scoring.auto_select_lone_survivor``);
+    absent that opt-in this function is never consulted.
+    """
+    passed: list[str] = []
+    for entry in scorecard:
+        branch = entry.get("branch")
+        if not isinstance(branch, str):
+            return None
+        rate = entry.get("test_pass_rate")
+        if rate is None or not isinstance(rate, (int, float)) or isinstance(rate, bool):
+            return None
+        if rate == 1.0:
+            passed.append(branch)
+        elif rate != 0.0:
+            return None
+    return passed[0] if len(passed) == 1 else None
 
 
 def format_scorecard_for_prompt(scorecard: list[dict[str, Any]]) -> list[str]:

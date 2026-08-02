@@ -86,6 +86,14 @@ judge_scoring:
     blast_radius: low
     cost_usd: low
     latency_ms: low
+  # Opt-in: when local verification already leaves exactly one candidate
+  # with test_pass_rate == 1.0 and every other candidate at 0.0 (no
+  # ambiguity, no missing signals), skip the JUDGE dispatch entirely and
+  # declare that candidate the winner deterministically — see
+  # lone_verified_survivor() in src/runtime/judge_scoring.py. Any tie, any
+  # branch with an unmeasured test_pass_rate, or more than one passing
+  # branch still gets a real JUDGE dispatch.
+  auto_select_lone_survivor: true
 ```
 
 Every judged bake-off's winner (provider, task_class, weighted_score) is

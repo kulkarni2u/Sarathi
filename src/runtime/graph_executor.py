@@ -22,6 +22,7 @@ try:
         JudgeScoringPolicy,
         assemble_judge_scorecard,
         format_scorecard_for_prompt,
+        lone_verified_survivor,
     )
     from src.runtime.output_index import build_artifact_index, normalize_agent_output
     from src.runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
@@ -42,6 +43,7 @@ except ImportError:
         JudgeScoringPolicy,
         assemble_judge_scorecard,
         format_scorecard_for_prompt,
+        lone_verified_survivor,
     )
     from runtime.output_index import build_artifact_index, normalize_agent_output
     from runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
@@ -984,6 +986,19 @@ class TaskGraphExecutor:
             judge_scorecard = assemble_judge_scorecard(
                 self.judge_scoring_policy, node_for_context, graph
             )
+            # Deterministic auto-select (opt-in via judge_scoring.auto_select_
+            # lone_survivor): when local verification already eliminated every
+            # candidate but one, there's no judgment left to make -- spending a
+            # JUDGE dispatch to confirm it would only replay the same
+            # already-measured pass/fail signals back at a model. Skips the
+            # dispatch entirely and completes the node with a synthesized
+            # result shaped exactly like a real one, so every downstream step
+            # (bakeoff history, winner-propagation node injection, NCP judge
+            # whisper) runs unmodified.
+            if judge_scorecard and self.judge_scoring_policy.auto_select_lone_survivor:
+                auto_winner = lone_verified_survivor(judge_scorecard)
+                if auto_winner is not None:
+                    return self._auto_selected_judge_result(judge_scorecard, auto_winner)
             if judge_scorecard:
                 context_pack_artifact = dict(context_pack_artifact)
                 agent_input = dict(context_pack_artifact.get("agent_input", {}))
@@ -1097,3 +1112,27 @@ class TaskGraphExecutor:
             result["isolation"] = isolation_metadata
             result.setdefault("artifacts", {}).setdefault("isolation", isolation_metadata)
         return result
+
+    @staticmethod
+    def _auto_selected_judge_result(judge_scorecard: list[dict[str, Any]], winner_branch: str) -> dict[str, Any]:
+        """Synthesize a JUDGE node result without dispatching, for the lone-survivor case.
+
+        Shaped like a real dispatch result (``outputs["winner"]``,
+        ``artifacts["judge_scorecard"]``) so ``_record_bakeoff_outcome``,
+        ``_inject_judge_result``, and ``_ncp_emit_judge_whisper`` -- all of
+        which only ever read a ``provider_result`` dict, never a real
+        ``DispatchResponse`` -- treat it identically to a judged outcome.
+        """
+        return {
+            "dispatched": False,
+            "success": True,
+            "outputs": {
+                "winner": winner_branch,
+                "reasoning": (
+                    f"Auto-selected {winner_branch}: the only candidate that passed "
+                    "local verification, while every other candidate failed it."
+                ),
+            },
+            "evidence": {"auto_selected": True, "reason": "lone_verified_survivor"},
+            "artifacts": {"judge_scorecard": judge_scorecard, "auto_selected": True},
+        }

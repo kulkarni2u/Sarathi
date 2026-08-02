@@ -935,6 +935,7 @@ class TaskGraphExecutor:
             graph=graph,
             phase=self.dispatch_phase,
             available_tools=["task_graph", "workspace_files", "git_diff", "test_results"],
+            repo_index_root=str(self.isolation_repo_root),
         )
         return cp.to_artifact(), cp.agent_input.token_budget
 

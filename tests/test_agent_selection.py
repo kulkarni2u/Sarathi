@@ -270,3 +270,91 @@ def test_engine_updates_dispatcher_harness_id_after_route():
     route = next(result for result in task.phase_results if result.phase.value == "Route")
     assert route.artifacts["permission_scope"] == "infra_write_declared"
     assert route.artifacts["permission_mode"] == "full"
+
+
+# ── _HarnessAwareDispatcher: multi-provider session continuity ──────────────
+#
+# Session resume (--resume/--session/etc.) lets a provider CLI keep its own
+# working context across phases instead of replaying the full context pack
+# from scratch every dispatch. Originally tracked for Claude only; these
+# tests cover the generalization to any provider with a registered
+# session_constraint_key (codex, opencode), since BUILD's graph-node
+# dispatches default to opencode, not claude.
+
+class _SessionRespondingDispatcher:
+    """Records the last request and returns canned session-id artifacts."""
+    def __init__(self, session_artifacts: dict[str, str] | None = None):
+        self.last_request: DispatchRequest | None = None
+        self._session_artifacts = session_artifacts or {}
+
+    def dispatch(self, request: DispatchRequest) -> DispatchResponse:
+        self.last_request = request
+        return DispatchResponse(success=True, artifacts=dict(self._session_artifacts))
+
+
+def test_harness_aware_dispatcher_tracks_opencode_session_id():
+    from src.engine import _HarnessAwareDispatcher
+    cap = _SessionRespondingDispatcher({"opencode_session_id": "oc-sess-1"})
+    d = _HarnessAwareDispatcher(cap)
+
+    d.dispatch(_make_request(constraints={"provider": "opencode"}))
+
+    assert d.session_ids.get("opencode") == "oc-sess-1"
+
+
+def test_harness_aware_dispatcher_resumes_tracked_session_for_same_provider():
+    from src.engine import _HarnessAwareDispatcher
+    cap = _CapturingDispatcher()
+    d = _HarnessAwareDispatcher(cap)
+    d.session_ids["opencode"] = "oc-sess-1"
+
+    d.dispatch(_make_request(constraints={"provider": "opencode"}))
+
+    assert cap.last_request.constraints["opencode_session_id"] == "oc-sess-1"
+
+
+def test_harness_aware_dispatcher_does_not_leak_session_across_providers():
+    """A session tracked for opencode must never be injected into a claude dispatch."""
+    from src.engine import _HarnessAwareDispatcher
+    cap = _CapturingDispatcher()
+    d = _HarnessAwareDispatcher(cap)
+    d.session_ids["opencode"] = "oc-sess-1"
+
+    d.dispatch(_make_request(constraints={"provider": "claude"}))
+
+    assert "opencode_session_id" not in cap.last_request.constraints
+    assert "claude_session_id" not in cap.last_request.constraints
+
+
+def test_harness_aware_dispatcher_does_not_override_explicit_session_id():
+    from src.engine import _HarnessAwareDispatcher
+    cap = _CapturingDispatcher()
+    d = _HarnessAwareDispatcher(cap)
+    d.session_ids["claude"] = "tracked-sess"
+
+    d.dispatch(_make_request(constraints={"provider": "claude", "claude_session_id": "explicit-sess"}))
+
+    assert cap.last_request.constraints["claude_session_id"] == "explicit-sess"
+
+
+def test_harness_aware_dispatcher_tracks_multiple_providers_independently():
+    from src.engine import _HarnessAwareDispatcher
+
+    d = _HarnessAwareDispatcher(_SessionRespondingDispatcher({"codex_session_id": "cx-1"}))
+    d.dispatch(_make_request(constraints={"provider": "codex"}))
+    assert d.session_ids == {"codex": "cx-1"}
+
+    d._base = _SessionRespondingDispatcher({"opencode_session_id": "oc-1"})
+    d.dispatch(_make_request(constraints={"provider": "opencode"}))
+    assert d.session_ids == {"codex": "cx-1", "opencode": "oc-1"}
+
+
+def test_harness_aware_dispatcher_reset_clears_all_session_ids():
+    from src.engine import _HarnessAwareDispatcher
+    d = _HarnessAwareDispatcher(_SessionRespondingDispatcher({"claude_session_id": "sess-1"}))
+    d.dispatch(_make_request(constraints={"provider": "claude"}))
+    assert d.session_ids
+
+    d.reset_task_state()
+
+    assert d.session_ids == {}

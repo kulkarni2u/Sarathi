@@ -624,6 +624,11 @@ def main() -> None:
         help="Skip generated .sarathi/wiki creation.",
     )
     init_parser.add_argument(
+        "--no-index",
+        action="store_true",
+        help="Skip generated .sarathi/index (offline repo symbol index) creation.",
+    )
+    init_parser.add_argument(
         "--from",
         dest="from_source",
         default=None,
@@ -908,6 +913,23 @@ def main() -> None:
         help="Directory containing recipe sub-packs (default: policy-pack/RECIPES)",
     )
 
+    # Index command (build/query the offline repo symbol index)
+    index_parser = subparsers.add_parser(
+        "index", help="Build or query the offline repo symbol index (.sarathi/index)"
+    )
+    index_parser.add_argument(
+        "target_path", nargs="?", default=".", help="Workspace root to index (default: .)"
+    )
+    index_parser.add_argument(
+        "--query", default=None, help="Query the existing index instead of (re)building it"
+    )
+    index_parser.add_argument(
+        "--force", action="store_true", help="Reparse every file instead of reusing unchanged ones"
+    )
+    index_parser.add_argument(
+        "--limit", type=int, default=10, help="Max results to show for --query (default: 10)"
+    )
+
     # Attach command (join a shared session)
     attach_parser = subparsers.add_parser(
         "attach", help="Attach to a shared Sarathi session via its share token"
@@ -985,6 +1007,35 @@ def main() -> None:
         handle_agents()
     elif args.command == "recipes":
         handle_recipes(args)
+    elif args.command == "index":
+        handle_index(args)
+
+
+def handle_index(args: argparse.Namespace) -> None:
+    """Handle the index command: build or query the offline repo symbol index."""
+    try:
+        from .repo_index import build_repo_index, format_symbol_hint, query_repo_index
+    except ImportError:
+        from repo_index import build_repo_index, format_symbol_hint, query_repo_index
+
+    query = getattr(args, "query", None)
+    if query:
+        matches = query_repo_index(args.target_path, query, limit=args.limit)
+        if not matches:
+            print(f"No index matches for {query!r}. Run `sarathi index {args.target_path}` first.")
+            return
+        print(f"Top {len(matches)} match(es) for {query!r}:")
+        for entry in matches:
+            print(f"  {format_symbol_hint(entry)}")
+        return
+
+    result = build_repo_index(args.target_path, force=getattr(args, "force", False))
+    print(f"Index: {result['status']} -> {result['path']}")
+    print(
+        f"  Files indexed: {result['files_indexed']} "
+        f"(parsed {result['files_parsed']}, reused {result['files_reused']})"
+    )
+    print(f"  Symbols: {result['symbol_count']}")
 
 
 def handle_init(args: argparse.Namespace) -> None:
@@ -1027,7 +1078,7 @@ def handle_init(args: argparse.Namespace) -> None:
         todos = sum(1 for r in validation_results if r.status.value == "TODO")
         print(f"  Results: {passed} PASS, {warnings} DRIFT, {todos} TODO")
 
-        # Generate wiki if needed
+        # Generate wiki and repo index if needed
         print("\n[3/3] Bootstrap: Finalizing workspace artifacts...")
         if not getattr(args, "no_wiki", False):
             try:
@@ -1036,6 +1087,13 @@ def handle_init(args: argparse.Namespace) -> None:
                 from repo_wiki import generate_repo_wiki
             wiki_result = generate_repo_wiki(Path(args.target_path))
             print(f"  Wiki: {wiki_result.get('status')} → {wiki_result.get('path')}")
+        if not getattr(args, "no_index", False):
+            try:
+                from .repo_index import build_repo_index
+            except ImportError:
+                from repo_index import build_repo_index
+            index_result = build_repo_index(Path(args.target_path))
+            print(f"  Index: {index_result.get('status')} → {index_result.get('path')} ({index_result.get('symbol_count')} symbols)")
 
         # Write provider-native permission config files
         try:
@@ -1062,16 +1120,21 @@ def handle_init(args: argparse.Namespace) -> None:
     print(f"  Build tools: {inspection.get('build_tools', [])}")
     print(f"  Test patterns: {inspection.get('test_patterns', [])}")
 
-    # Phases 2-3: bootstrap policy pack and wiki.
+    # Phases 2-3: bootstrap policy pack, wiki, and repo index.
     print("\n[2/5] Bootstrap: Creating or reusing workspace artifacts...")
     bootstrap = bootstrap_workspace(
         args.target_path,
         engine_path=args.engine,
         with_wiki=not getattr(args, "no_wiki", False),
+        with_index=not getattr(args, "no_index", False),
     )
     policy_path = Path(bootstrap["policy_pack"]["path"])
     print(f"  Policy pack: {bootstrap['policy_pack']['status']} → {policy_path}")
     print(f"  Wiki: {bootstrap['wiki']['status']} → {bootstrap['wiki']['path']}")
+    print(
+        f"  Index: {bootstrap['index']['status']} → {bootstrap['index']['path']}"
+        + (f" ({bootstrap['index']['symbol_count']} symbols)" if "symbol_count" in bootstrap["index"] else "")
+    )
     # Write provider-native permission config files from the generated permissions.md
     try:
         from .runtime.providers.cli_bridge import ensure_provider_permissions

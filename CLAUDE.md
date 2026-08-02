@@ -70,7 +70,7 @@ Tasks can be broken into a DAG with node types: `CLASSIFY`, `FANOUT`, `SYNTHESIZ
 
 ### Provider Bridges (`src/dispatch.py`, `src/runtime/contracts.py`)
 
-Sarathi dispatches to native CLI providers: `claude`, `codex`, `gh copilot`, `opencode`. No SDK imports — all dispatch goes through subprocess bridges. Provider health tracking in `src/runtime/provider_health.py`. The MCP server (`src/mcp_server.py`) exposes Sarathi itself as an MCP tool for agent platforms.
+Sarathi dispatches to native CLI providers: `claude`, `codex`, `gh copilot`, `opencode`. No SDK imports — all dispatch goes through subprocess bridges. Provider health tracking in `src/runtime/provider_health.py`. The MCP server (`src/mcp_server.py`) exposes Sarathi itself as an MCP tool for agent platforms. `_HarnessAwareDispatcher` (`src/engine.py`) threads each provider's own session-resume id (`claude_session_id`, `codex_session_id`, `opencode_session_id` — looked up from the provider registry's `session_constraint_key`) across phases within a task, so repeated dispatches to the same provider resume its session instead of replaying the full context pack from scratch.
 
 ### Quality Signals (measured, not asserted)
 
@@ -83,6 +83,10 @@ Built with Textual. Chat-first layout with a toggleable task panel. Entry point:
 ### Service Layer (`src/service/`)
 
 HTTP service for workspace management, multi-worker scheduling, and policy proposal handling. Entry point: `sarathi-desktop`. `app.py` (~1.9K lines) is the ServiceApp router and is where most new workspace HTTP/service features land; `src/storage/__init__.py` (~2.6K lines) is actually the largest file in the repo, holding SQLite storage primitives and schema migrations.
+
+### Repo Index (`src/repo_index/`)
+
+Offline, IDE-style symbol index persisted under `.sarathi/index` (`symbols.json` + `manifest.json`), built/refreshed via `sarathi index` or automatically during `sarathi init`. Python files are parsed with `ast`; other languages use best-effort regex extraction. Incremental — only files whose (mtime, size) changed are reparsed. `ContextCompiler` (`src/runtime/context.py`) consults it through an optional `repo_index_root` argument, appending ranked `file:line symbol (kind)` hints to `relevant_files` so a dispatched agent can jump straight to likely-relevant code instead of re-discovering it with Glob/Grep every phase — a direct token-spend lever, since re-exploration is otherwise repeated per phase per graph node.
 
 ### NCP Adapter (`src/ncp_adapter/`)
 

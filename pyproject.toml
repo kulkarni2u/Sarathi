@@ -16,11 +16,13 @@ dependencies = [
 sarathi = "src.cli:main"
 sarathi-desktop = "src.service.desktop:main"
 sarathi-mcp = "src.mcp_server:main"
+sarathi-slack = "src.service.slack.socket_mode:main"
 
 [project.urls]
 Homepage = "https://github.com/kulkarni2u/Sarathi"
 
 [project.optional-dependencies]
+slack = ["slack-bolt>=1,<2"]
 tui = [
     "textual>=0.90.0",
     "rich>=13.0.0",

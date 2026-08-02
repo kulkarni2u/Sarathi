@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-import hmac
 import json
 import os
 import re
 import subprocess
 import tempfile
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Mapping
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import quote, urlparse
 
 from src.init import InitWorkflow
 from src.storage import Storage
@@ -25,7 +23,6 @@ from .preferences import (
     _optional_text,
 )
 
-_SLACK_SIGNING_SECRET_ENV = "SARATHI_SLACK_SIGNING_SECRET"
 
 # GitHub REST API base and the optional bearer-token env var. Mirrors the
 # injectable-opener, bare-urllib pattern used by ``src/notifications.py`` for
@@ -856,161 +853,6 @@ def _required_repository_bootstrap_files() -> list[str]:
         "policy-pack/skills.md",
         "policy-pack/task-tracking.md",
     ]
-
-
-def _parse_slack_body(body: str | Mapping[str, Any]) -> dict[str, Any]:
-    """Parse a Slack slash-command body — accepts a form-encoded string or dict.
-
-    Slack sends ``application/x-www-form-urlencoded``; the HTTP layer passes
-    the raw string through to ``app.handle`` as ``raw_body`` and the parsed
-    dict as ``body``. Callers that invoke ``app.handle`` directly (e.g. tests)
-    can pass a pre-built dict and skip the raw-body path.
-    """
-    if isinstance(body, str):
-        parsed = parse_qs(body)
-        return {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
-    if isinstance(body, Mapping):
-        return dict(body.items())
-    return {}
-
-
-def _verify_slack_request(
-    headers: Mapping[str, str] | None,
-    raw_body: str | None,
-) -> None:
-    """Verify a Slack slash-command request using HMAC SHA-256.
-
-    Reads ``SARATHI_SLACK_SIGNING_SECRET`` from the environment.  If unset
-    the check is skipped entirely (safe for local/test use).  When set the
-    function requires ``x-slack-request-timestamp`` (within 300 s of now)
-    and ``x-slack-signature`` (``v0=...``) headers and rejects invalid or
-    missing signatures with a ``ServiceError``.
-    """
-    secret = os.environ.get(_SLACK_SIGNING_SECRET_ENV)
-    if not secret:
-        return
-
-    if not headers or not raw_body:
-        raise ServiceError("invalid_request", "Missing headers or body for Slack signing verification.", 400)
-
-    timestamp: str | None = None
-    signature: str | None = None
-    for key, value in headers.items():
-        lk = key.lower()
-        if lk == "x-slack-request-timestamp":
-            timestamp = value
-        elif lk == "x-slack-signature":
-            signature = value
-
-    if not timestamp:
-        raise ServiceError("invalid_request", "Missing x-slack-request-timestamp header.", 400)
-    if not signature:
-        raise ServiceError("invalid_request", "Missing x-slack-signature header.", 401)
-
-    try:
-        request_time = int(timestamp)
-    except ValueError:
-        raise ServiceError("invalid_request", "Invalid x-slack-request-timestamp.", 400)
-
-    if abs(time.time() - request_time) > 300:
-        raise ServiceError("stale_request", "Slack request timestamp is too skewed (>5 minutes from now).", 401)
-
-    sig_basestring = f"v0:{timestamp}:{raw_body}"
-    expected = "v0=" + hmac.new(
-        secret.encode("utf-8"),
-        sig_basestring.encode("utf-8"),
-        "sha256",
-    ).hexdigest()
-
-    if not hmac.compare_digest(expected, signature):
-        raise ServiceError("invalid_signature", "Slack request signature does not match.", 401)
-
-
-def _create_slack_task_draft(
-    storage: Storage,
-    workspace_id: str,
-    slack_data: dict[str, Any],
-) -> dict[str, Any]:
-    """Create a PRD/AC-gated task draft from a Slack slash-command payload.
-
-    Mirrors ``_create_github_issue_task_draft``: creates a ``prd_pending``
-    task with user + sarathi messages, a PRD/AC approval gate, and lifecycle
-    events.  Slack-specific fields are preserved under ``task.metadata.slack_command``.
-    """
-    prompt = slack_data.get("text", "").strip()
-    if not prompt:
-        raise ServiceError("invalid_request", "Slash command 'text' must be non-empty.", 400)
-
-    title = _derive_task_title(prompt)
-    metadata = _task_draft_metadata(prompt)
-    metadata["source"] = "slack_command"
-
-    slack_meta: dict[str, Any] = {}
-    for key in ("team_id", "team_domain", "channel_id", "channel_name",
-                "user_id", "user_name", "command", "response_url"):
-        if key in slack_data:
-            slack_meta[key] = slack_data[key]
-    if slack_meta:
-        metadata["slack_command"] = slack_meta
-
-    task = storage.create_task(
-        workspace_id=workspace_id,
-        title=title,
-        status="prd_pending",
-        description=metadata["prd"]["problem"],
-        metadata=metadata,
-        project_id=metadata.get("project_id"),
-    )
-
-    user_message = storage.create_message(
-        workspace_id=workspace_id,
-        task_id=task["id"],
-        role="user",
-        content=prompt,
-        metadata={"target": "Sarathi", "source": "slack_command"},
-    )
-
-    sarathi_message = storage.create_message(
-        workspace_id=workspace_id,
-        task_id=task["id"],
-        role="sarathi",
-        content=(
-            "I drafted the PRD/AC shell from the Slack command and opened "
-            "the PRD/AC approval gate before graph generation."
-        ),
-        metadata={"draft_task_id": task["id"], "gate": "PRD/AC", "source": "slack_command"},
-    )
-
-    gate = storage.create_approval_gate(
-        workspace_id=workspace_id,
-        task_id=task["id"],
-        name="PRD/AC",
-        status="pending",
-        metadata={
-            "requires_human": True,
-            "source_prompt": prompt,
-            "acceptance_criteria": metadata["acceptance_criteria"],
-        },
-    )
-
-    storage.create_lifecycle_event(
-        workspace_id=workspace_id,
-        task_id=task["id"],
-        event_type="task.draft_created",
-        payload={"object_id": task["id"], "gate": gate["id"]},
-    )
-    storage.create_lifecycle_event(
-        workspace_id=workspace_id,
-        task_id=task["id"],
-        event_type="approval.requested",
-        payload={"object_id": gate["id"], "name": gate["name"]},
-    )
-
-    return {
-        "task": task,
-        "approval_gate": gate,
-        "messages": [user_message, sarathi_message],
-    }
 
 
 def _git_output(repo_path: Path, *args: str) -> str:

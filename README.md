@@ -480,40 +480,47 @@ resumable session id or streaming output shape. Both facts are documented on
 its spec (`permission_writer_unavailable_reason`) and surfaced in the
 service catalog's `degraded_reason` for the desktop UI.
 
-## Slack Notifications
+## Slack Socket Mode
 
-Sarathi can post to a Slack channel when a run needs attention: task
-completed/failed, a phase paused for human input, budget exhausted, an
-approval requested, or a review rejected. Notifications are best-effort — a
-Slack outage never blocks a run — and secrets stay in the environment.
+Sarathi's Slack integration is outbound-only Socket Mode. It does not expose
+Slack callback routes, accept request URLs, use incoming webhooks, or require a
+tunnel. The shared workspace invite URL is never parsed or persisted.
 
-Fastest path (incoming webhook):
-
-```bash
-export SARATHI_SLACK_WEBHOOK_URL="https://hooks.slack.com/services/T000/B000/XXXX"
-sarathi run "Fix the failing checkout test" --policy-pack ./policy-pack
-```
-
-Bot-token mode (one token, any channel the bot is invited to):
+Install the optional transport:
 
 ```bash
-export SARATHI_SLACK_BOT_TOKEN="xoxb-..."
-export SARATHI_SLACK_CHANNEL="#sarathi-runs"
+python3 -m pip install -e '.[slack]'
 ```
 
-Which events notify is policy: `policy-pack/notifications.md` declares the
-event list for engine runs (CLI/TUI/MCP), with fnmatch patterns such as
-`approval.*` or `phase.*`. The local service and work-queue worker fan out
-their `lifecycle_events` stream using environment-only configuration
-(`SARATHI_SLACK_EVENTS` narrows the event list, comma-separated). See
-`policy-pack/EXAMPLE/notifications.md` for the full reference.
+In your Slack app, enable Socket Mode, create an app-level token with
+`connections:write`, subscribe the bot to message events, and grant the bot
+the command, message-read, and `chat:write` scopes needed by your selected
+channels. Install the app to the workspace and invite it only to allowlisted
+channels.
 
-### Inbound Slash Commands
+Set configuration through environment variables. Do not place token values in
+source files, CLI arguments, logs, or Sarathi storage:
 
-Sarathi exposes `POST /api/workspaces/{id}/slack/commands/task` to create
-task drafts directly from Slack. HMAC signing is enforced when
-`SARATHI_SLACK_SIGNING_SECRET` is set. The endpoint returns a Slack-friendly
-JSON payload with `response_type`, `text`, `task_id`, and `approval_gate_id`.
+```bash
+export SARATHI_SLACK_APP_TOKEN
+export SARATHI_SLACK_BOT_TOKEN
+export SARATHI_SLACK_TEAM_ID
+export SARATHI_SLACK_CHANNEL_IDS
+export SARATHI_SLACK_APPROVER_IDS
+export SARATHI_SLACK_WORKSPACE_ID
+sarathi-slack --db .sarathi/sarathi.db
+```
+
+`SARATHI_SLACK_CHANNEL_IDS` and `SARATHI_SLACK_APPROVER_IDS` are comma-separated
+allowlists. Every envelope must match the configured team, channel, actor, and
+task thread before state can change. Human text is normalized, bounded, checked
+for prompt-injection and secret-extraction patterns, and carried to providers
+only as typed `untrusted_external` data behind a fixed Sarathi-owned security
+preamble.
+
+No live connection is made by the test suite; Socket Mode and Web API clients
+are injected fakes. Starting `sarathi-slack` is the only operation that opens
+the outbound Slack connection.
 
 ## Verification Commands
 

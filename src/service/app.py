@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hmac
 import json
-import shutil
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,18 +30,15 @@ from .usage_stats import build_usage_stats
 from .intake import (
     _build_github_issue_reference,
     _create_github_issue_task_draft,
-    _create_slack_task_draft,
     _derive_task_title,
     _emit_brainstorm_event,
     _get_policy_pack,
     _initialize_workspace_repository,
-    _parse_slack_body,
     _preview_repository_intake,
     _put_policy_pack_file,
     _sync_github_issues_by_label,
     _task_context_project_id,
     _task_draft_metadata,
-    _verify_slack_request,
     _write_brainstorm_spec,
 )
 from .openapi import build_openapi_spec
@@ -119,6 +115,7 @@ from .scheduling import (
     _schedule_ready_subtasks,
     _service_now,
     _transition_subtask,
+    record_gate_decision,
 )
 from .views import (
     _latest_or_none,
@@ -206,7 +203,7 @@ class ServiceApp:
         self.auth_enabled = _auth_enabled() if auth_enabled is None else auth_enabled
         self._local = threading.local()
         # Optional Slack fan-out for lifecycle events (env-configured).
-        self._event_listener = lifecycle_event_listener()
+        self._event_listener = lifecycle_event_listener(get_task=self._lookup_task)
         # Run migrations once at startup on the main thread
         with connect(self.db_path) as _conn:
             run_migrations(_conn)
@@ -218,6 +215,13 @@ class ServiceApp:
             conn = connect(self.db_path).__enter__()  # keep connection open
             self._local.conn = conn
         return conn, Storage(conn, event_listener=self._event_listener)
+
+    def _lookup_task(self, task_id: str) -> Mapping[str, Any] | None:
+        try:
+            _conn, storage = self._storage()
+            return storage.get_task(task_id)
+        except Exception:
+            return None
 
     def __call__(
         self,
@@ -274,21 +278,6 @@ class ServiceApp:
                 public_response = self._public_get_response(raw_parts, correlation_id)
                 if public_response is not None:
                     return public_response
-
-            # Slack slash-command intake — self-authenticating via HMAC
-            # signing secret, so it bypasses the bearer-token authorize.
-            if (
-                is_api_request
-                and method == "POST"
-                and len(raw_parts) == 6
-                and raw_parts[1] == "workspaces"
-                and raw_parts[3] == "slack"
-                and raw_parts[4] == "commands"
-                and raw_parts[5] == "task"
-            ):
-                return self._handle_slack_command(
-                    raw_parts[2], body or {}, headers, raw_body
-                )
 
             principal = None if skip_auth else self._authorize(headers)
             parts = raw_parts[1:] if is_api_request else raw_parts
@@ -1265,26 +1254,13 @@ class ServiceApp:
             task = storage.get_task(parts[1])
             if task is None:
                 raise ServiceError("not_found", "Task not found.", 404)
-            gate = storage.create_approval_gate(
-                workspace_id=task["workspace_id"],
-                task_id=task["id"],
+            result = record_gate_decision(
+                storage,
+                task,
                 name=_required_text(body, "name"),
                 status=_required_text(body, "status"),
                 metadata=_optional_dict(body, "metadata"),
             )
-            storage.create_lifecycle_event(
-                workspace_id=task["workspace_id"],
-                task_id=task["id"],
-                event_type="approval.recorded",
-                payload={"object_id": gate["id"], "status": gate["status"]},
-            )
-            result: dict[str, Any] = {"approval_gate": gate}
-            if gate["name"] == "Task graph" and gate["status"] == "approved":
-                result["auto_schedule"] = _maybe_auto_schedule_ready_subtasks(
-                    storage,
-                    task,
-                    reason="task_graph_approved",
-                )
             return 201, result
 
         if (
@@ -1806,45 +1782,6 @@ class ServiceApp:
             return 200, {"session": approved, "task": task}
 
         raise ServiceError("not_found", "Endpoint not found.", 404)
-
-    def _handle_slack_command(
-        self,
-        workspace_id: str,
-        body: Mapping[str, Any],
-        headers: Mapping[str, str] | None,
-        raw_body: str | None,
-    ) -> RawResponse | tuple[int, dict[str, Any]]:
-        """Handle a Slack slash-command ``/task`` request.
-
-        Verifies the Slack HMAC signature (if ``SARATHI_SLACK_SIGNING_SECRET``
-        is set), parses the form body, creates a PRD/AC-gated task draft, and
-        returns a Slack-friendly JSON response.
-        """
-        slack_data = _parse_slack_body(body)
-        _verify_slack_request(headers, raw_body)
-
-        conn, storage = self._storage()
-        if storage.get_workspace(workspace_id) is None:
-            raise ServiceError("not_found", "Workspace not found.", 404)
-
-        result = _create_slack_task_draft(storage, workspace_id, slack_data)
-
-        task = result["task"]
-        gate = result["approval_gate"]
-        slack_reply = json.dumps({
-            "response_type": "ephemeral",
-            "text": (
-                f"Task draft created (ID: {task['id']}). "
-                f"PRD/AC approval gate: {gate['id']}."
-            ),
-            "task_id": task["id"],
-            "approval_gate_id": gate["id"],
-        })
-        return RawResponse(
-            200,
-            "application/json",
-            slack_reply.encode("utf-8"),
-        )
 
     def _authorize(self, headers: Mapping[str, str] | None) -> Principal | None:
         # Opt-in multi-user mode: the bearer must be the admin token or an

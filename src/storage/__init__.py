@@ -8,13 +8,24 @@ import secrets
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 logger = logging.getLogger("sarathi.storage")
 
 
-LATEST_SCHEMA_VERSION = 11
+LATEST_SCHEMA_VERSION = 14
+
+# Canonical projection identity for human external inputs appended to subtask
+# metadata by the atomic assign+resume transaction. The workflow and context
+# compiler treat only entries carrying these identities as typed external data.
+SLACK_EXTERNAL_INPUT_SOURCE = "slack"
+SLACK_EXTERNAL_INPUT_TRUST = "untrusted_external"
+SLACK_PROVISIONAL_THREAD_PREFIX = "provisional:"
+
+
+class _AssignResumeAborted(Exception):
+    """Internal rollback signal for the atomic assign+resume transaction."""
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -124,6 +135,51 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
             (11, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 12:
+        conn.executescript(_MIGRATION_012)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (12, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 13:
+        # Migration 12 shipped two slack_outbox shapes: the original 6f9605f
+        # shape (no attempt_count) and the round-1 shape whose migration was
+        # edited in place (attempt_count present). Add the column only when
+        # missing so fresh databases and already-v12 databases converge on the
+        # same v13 schema without touching prior migrations. SQLite has no
+        # "ADD COLUMN IF NOT EXISTS", so guard on PRAGMA table_info.
+        outbox_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(slack_outbox)")
+        }
+        if "attempt_count" not in outbox_columns:
+            conn.execute(
+                "ALTER TABLE slack_outbox ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (13, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 14:
+        # Bounded inbox retry metadata: mirror the outbox's attempt_count on the
+        # inbox so a failed Slack event can be requeued a bounded number of
+        # times before terminal failure. Migration 12's inbox has no such
+        # column, so add it only when missing (SQLite has no "ADD COLUMN IF
+        # NOT EXISTS"); fresh and already-v13 databases converge on the same
+        # v14 schema without editing any prior migration.
+        inbox_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(slack_inbox)")
+        }
+        if "attempt_count" not in inbox_columns:
+            conn.execute(
+                "ALTER TABLE slack_inbox ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (14, _utc_now()),
         )
         conn.commit()
 
@@ -638,6 +694,16 @@ class Storage:
         ).fetchall()
         return [_task_from_row(row) for row in rows]
 
+    def list_tasks(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at, project_id
+            FROM tasks
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+        return [_task_from_row(row) for row in rows]
+
     def create_subtask(
         self,
         *,
@@ -910,6 +976,28 @@ class Storage:
             (gate_id,),
         ).fetchone()
         return _approval_gate_from_row(row) if row is not None else None
+
+    def update_approval_gate(
+        self, gate_id: str, *, status: str | None = None, metadata: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        existing = self.get_approval_gate(gate_id)
+        if existing is None:
+            raise KeyError(gate_id)
+        next_status = status if status is not None else existing["status"]
+        next_metadata = metadata if metadata is not None else existing["metadata"]
+        now = _utc_now()
+        self.conn.execute(
+            """
+            UPDATE approval_gates
+            SET status = ?, metadata = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (next_status, _dump_json(next_metadata), now, gate_id),
+        )
+        self.conn.commit()
+        gate = self.get_approval_gate(gate_id)
+        assert gate is not None
+        return gate
 
     def list_approval_gates_for_task(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -1912,6 +2000,1275 @@ class Storage:
         ).fetchall()
         return [_proposal_decision_from_row(row) for row in rows]
 
+    def enqueue_slack_event(
+        self,
+        *,
+        envelope_id: str,
+        event_id: str | None,
+        workspace_id: str,
+        team_id: str,
+        channel_id: str,
+        actor_id: str,
+        event_type: str,
+        content: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Insert a validated Slack event, deduplicated by ``envelope_id``.
+
+        A duplicate insert is a no-op and returns the previously recorded row so
+        Socket Mode envelopes are applied at most once. The returned row carries
+        an in-memory ``duplicate`` flag (true when the ``envelope_id`` was
+        already present, whatever its status) that is never persisted.
+        """
+        _check_no_forbidden_keys(content, kind="slack inbox content")
+        now = _utc_now()
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO slack_inbox (
+                    id, envelope_id, event_id, workspace_id, team_id, channel_id,
+                    actor_id, event_type, content, status, error_code, attempt_count,
+                    claimed_at, processed_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, 0, NULL, NULL, ?, ?)
+                """,
+                (
+                    _new_id(),
+                    envelope_id,
+                    event_id,
+                    workspace_id,
+                    team_id,
+                    channel_id,
+                    actor_id,
+                    event_type,
+                    _dump_json(content),
+                    now,
+                    now,
+                ),
+            )
+            inserted = cursor.rowcount == 1
+            row = self.conn.execute(
+                """
+                SELECT id, envelope_id, event_id, workspace_id, team_id, channel_id,
+                       actor_id, event_type, content, status, error_code, attempt_count,
+                       claimed_at, processed_at, created_at, updated_at
+                FROM slack_inbox
+                WHERE envelope_id = ?
+                """,
+                (envelope_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"No slack inbox row for envelope_id {envelope_id!r}")
+        result = _slack_inbox_from_row(row)
+        result["duplicate"] = not inserted
+        return result
+
+    def claim_slack_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Atomically transition up to ``limit`` pending inbox rows to ``processing``."""
+        if limit < 0:
+            raise ValueError(f"claim_slack_events limit must be >= 0, got {limit}")
+        now = _utc_now()
+        with self.conn:
+            claimed: list[str] = []
+            candidates = self.conn.execute(
+                """
+                SELECT id FROM slack_inbox
+                WHERE status = 'pending'
+                ORDER BY created_at, id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            for candidate in candidates:
+                cursor = self.conn.execute(
+                    """
+                    UPDATE slack_inbox
+                    SET status = 'processing', claimed_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (now, now, candidate["id"]),
+                )
+                if cursor.rowcount == 1:
+                    claimed.append(candidate["id"])
+            if not claimed:
+                return []
+            placeholders = ",".join("?" for _ in claimed)
+            rows = self.conn.execute(
+                f"""
+                SELECT id, envelope_id, event_id, workspace_id, team_id, channel_id,
+                       actor_id, event_type, content, status, error_code, attempt_count,
+                       claimed_at, processed_at, created_at, updated_at
+                FROM slack_inbox
+                WHERE id IN ({placeholders})
+                ORDER BY created_at, id
+                """,
+                claimed,
+            ).fetchall()
+        return [_slack_inbox_from_row(row) for row in rows]
+
+    def finish_slack_event(
+        self,
+        envelope_id: str,
+        *,
+        status: str,
+        error_code: str | None = None,
+    ) -> dict[str, Any]:
+        """Record a terminal inbox state: ``processed``, ``rejected``, or ``failed``.
+
+        Transitions only from ``pending`` or ``processing``; an already-terminal
+        row is returned unchanged so repeated or conflicting finishes never
+        overwrite the first terminal result (at-most-once).
+        """
+        if status not in ("processed", "rejected", "failed"):
+            raise ValueError(f"Invalid slack inbox terminal status: {status}")
+        now = _utc_now()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE slack_inbox
+                SET status = ?, error_code = ?, processed_at = ?, updated_at = ?
+                WHERE envelope_id = ? AND status IN ('pending', 'processing')
+                """,
+                (status, error_code, now, now, envelope_id),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id, envelope_id, event_id, workspace_id, team_id, channel_id,
+                       actor_id, event_type, content, status, error_code, attempt_count,
+                       claimed_at, processed_at, created_at, updated_at
+                FROM slack_inbox
+                WHERE envelope_id = ?
+                """,
+                (envelope_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"No slack inbox row for envelope_id {envelope_id!r}")
+        return _slack_inbox_from_row(row)
+
+    def fail_slack_event(
+        self,
+        envelope_id: str,
+        *,
+        error_code: str,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        """Record a failed inbox process with bounded retry metadata.
+
+        Increments ``attempt_count``. Below ``max_attempts`` the row is requeued
+        to ``pending`` so the worker can claim and retry it; at or above the
+        bound it becomes terminal ``failed``. ``error_code`` is a stable,
+        redacted code. Only applies from ``pending`` or ``processing`` — an
+        already-terminal row is returned unchanged.
+        """
+        now = _utc_now()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE slack_inbox
+                SET attempt_count = attempt_count + 1,
+                    status = CASE WHEN attempt_count + 1 >= ? THEN 'failed' ELSE 'pending' END,
+                    error_code = ?,
+                    processed_at = CASE WHEN attempt_count + 1 >= ? THEN ? ELSE NULL END,
+                    claimed_at = CASE WHEN attempt_count + 1 >= ? THEN claimed_at ELSE NULL END,
+                    updated_at = ?
+                WHERE envelope_id = ? AND status IN ('pending', 'processing')
+                """,
+                (max_attempts, error_code, max_attempts, now, max_attempts, now, envelope_id),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id, envelope_id, event_id, workspace_id, team_id, channel_id,
+                       actor_id, event_type, content, status, error_code, attempt_count,
+                       claimed_at, processed_at, created_at, updated_at
+                FROM slack_inbox
+                WHERE envelope_id = ?
+                """,
+                (envelope_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"No slack inbox row for envelope_id {envelope_id!r}")
+        return _slack_inbox_from_row(row)
+
+    def bind_slack_task(
+        self,
+        *,
+        task_id: str,
+        workspace_id: str,
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+        requester_user_id: str,
+    ) -> dict[str, Any]:
+        """Record the exact Slack thread a Sarathi task is bound to.
+
+        Re-binding an already-bound task is a no-op that returns the canonical
+        row, keeping the mapping idempotent across retries. Rebinding a thread
+        that is already owned by a *different* task raises ``ValueError``; the
+        exact thread mapping is never silently reassigned.
+        """
+        now = _utc_now()
+        with self.conn:
+            existing = self.conn.execute(
+                """
+                SELECT task_id FROM slack_task_bindings
+                WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
+                """,
+                (team_id, channel_id, thread_ts),
+            ).fetchone()
+            if existing is not None and existing["task_id"] != task_id:
+                raise ValueError(
+                    f"Slack thread {team_id}/{channel_id}/{thread_ts} is already "
+                    f"bound to task {existing['task_id']!r}; cannot rebind to task "
+                    f"{task_id!r}"
+                )
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO slack_task_bindings (
+                    id, task_id, workspace_id, team_id, channel_id, thread_ts,
+                    requester_user_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _new_id(),
+                    task_id,
+                    workspace_id,
+                    team_id,
+                    channel_id,
+                    thread_ts,
+                    requester_user_id,
+                    now,
+                    now,
+                ),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id, task_id, workspace_id, team_id, channel_id, thread_ts,
+                       requester_user_id, created_at, updated_at
+                FROM slack_task_bindings
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"No slack task binding for task_id {task_id!r}")
+        return _slack_task_binding_from_row(row)
+
+    def get_slack_task_binding(
+        self,
+        *,
+        team_id: str,
+        channel_id: str,
+        thread_ts: str,
+    ) -> dict[str, Any] | None:
+        """Resolve the exact task binding for a Slack thread, if any."""
+        row = self.conn.execute(
+            """
+            SELECT id, task_id, workspace_id, team_id, channel_id, thread_ts,
+                   requester_user_id, created_at, updated_at
+            FROM slack_task_bindings
+            WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
+            """,
+            (team_id, channel_id, thread_ts),
+        ).fetchone()
+        return _slack_task_binding_from_row(row) if row is not None else None
+
+    def enqueue_slack_outbox(
+        self,
+        *,
+        operation_key: str,
+        workspace_id: str,
+        task_id: str,
+        channel_id: str,
+        thread_ts: str | None,
+        operation: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Record outbound Slack intent, deduplicated by ``operation_key``."""
+        _check_no_forbidden_keys(payload, kind="slack outbox payload")
+        now = _utc_now()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO slack_outbox (
+                    id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                    operation, payload, status, error_code, attempt_count,
+                    slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, 0, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    _new_id(),
+                    operation_key,
+                    workspace_id,
+                    task_id,
+                    channel_id,
+                    thread_ts,
+                    operation,
+                    _dump_json(payload),
+                    now,
+                    now,
+                ),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                FROM slack_outbox
+                WHERE operation_key = ?
+                """,
+                (operation_key,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"No slack outbox row for operation_key {operation_key!r}")
+        return _slack_outbox_from_row(row)
+
+    def record_slack_reply_ambiguity(
+        self,
+        *,
+        operation_key: str,
+        workspace_id: str,
+        task_id: str,
+        channel_id: str,
+        thread_ts: str | None,
+        selections: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically preserve selection mappings and enqueue their message.
+
+        Retrying the same operation returns its original durable payload. New
+        ambiguous replies merge mappings, so earlier live buttons remain valid.
+        """
+        _check_no_forbidden_keys(selections, kind="slack reply selections")
+        now = _utc_now()
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            existing = self.conn.execute(
+                """
+                SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                FROM slack_outbox WHERE operation_key = ?
+                """,
+                (operation_key,),
+            ).fetchone()
+            if existing is not None:
+                return _slack_outbox_from_row(existing)
+
+            task_row = self.conn.execute(
+                "SELECT metadata FROM tasks WHERE id = ? AND workspace_id = ?",
+                (task_id, workspace_id),
+            ).fetchone()
+            if task_row is None:
+                raise KeyError(f"No task for Slack reply ambiguity {task_id!r}")
+            metadata = _load_json(task_row["metadata"])
+            slack_meta = metadata.get("slack")
+            slack_meta = dict(slack_meta) if isinstance(slack_meta, Mapping) else {}
+            prior = slack_meta.get("reply_selections")
+            merged = dict(prior) if isinstance(prior, Mapping) else {}
+            merged.update(dict(selections))
+            slack_meta["reply_selections"] = merged
+            metadata["slack"] = slack_meta
+            self.conn.execute(
+                "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                (_dump_json(metadata), now, task_id),
+            )
+            payload = {
+                "text": "Multiple subtasks are waiting for your input. Choose one:",
+                "selection_actions": dict(selections),
+            }
+            self.conn.execute(
+                """
+                INSERT INTO slack_outbox (
+                    id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                    operation, payload, status, error_code, attempt_count,
+                    slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'message', ?, 'pending', NULL, 0,
+                          NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    _new_id(), operation_key, workspace_id, task_id, channel_id,
+                    thread_ts, _dump_json(payload), now, now,
+                ),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                FROM slack_outbox WHERE operation_key = ?
+                """,
+                (operation_key,),
+            ).fetchone()
+        assert row is not None
+        return _slack_outbox_from_row(row)
+
+    def claim_slack_outbox(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Atomically transition up to ``limit`` pending outbox rows to ``processing``."""
+        if limit < 0:
+            raise ValueError(f"claim_slack_outbox limit must be >= 0, got {limit}")
+        now = _utc_now()
+        with self.conn:
+            claimed: list[str] = []
+            candidates = self.conn.execute(
+                """
+                SELECT id FROM slack_outbox
+                WHERE status = 'pending'
+                ORDER BY created_at, id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            for candidate in candidates:
+                cursor = self.conn.execute(
+                    """
+                    UPDATE slack_outbox
+                    SET status = 'processing', claimed_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (now, now, candidate["id"]),
+                )
+                if cursor.rowcount == 1:
+                    claimed.append(candidate["id"])
+            if not claimed:
+                return []
+            placeholders = ",".join("?" for _ in claimed)
+            rows = self.conn.execute(
+                f"""
+                SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                FROM slack_outbox
+                WHERE id IN ({placeholders})
+                ORDER BY created_at, id
+                """,
+                claimed,
+            ).fetchall()
+        return [_slack_outbox_from_row(row) for row in rows]
+
+    def finish_slack_outbox(
+        self,
+        operation_key: str,
+        *,
+        slack_message_ts: str,
+        delivered_channel_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record successful delivery of an outbox row as ``sent``.
+
+        Transitions only from ``pending`` or ``processing``; an already-terminal
+        row is returned unchanged so a repeated or conflicting finish never
+        overwrites the first terminal result (at-most-once).
+        """
+        now = _utc_now()
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            transitioned = self.conn.execute(
+                """
+                UPDATE slack_outbox
+                SET status = 'sent', slack_message_ts = ?, error_code = NULL,
+                    processed_at = ?, updated_at = ?
+                WHERE operation_key = ? AND status IN ('pending', 'processing')
+                """,
+                (slack_message_ts, now, now, operation_key),
+            )
+            if transitioned.rowcount == 1 and delivered_channel_id is not None:
+                delivery = self.conn.execute(
+                    """
+                    SELECT task_id, workspace_id, channel_id
+                    FROM slack_outbox WHERE operation_key = ?
+                    """,
+                    (operation_key,),
+                ).fetchone()
+                if delivery is None or delivery["channel_id"] != delivered_channel_id:
+                    raise ValueError("Slack delivery channel does not match durable outbox")
+                binding = self.conn.execute(
+                    """
+                    SELECT id, thread_ts FROM slack_task_bindings
+                    WHERE task_id = ? AND workspace_id = ? AND channel_id = ?
+                    """,
+                    (
+                        delivery["task_id"],
+                        delivery["workspace_id"],
+                        delivered_channel_id,
+                    ),
+                ).fetchone()
+                if (
+                    binding is not None
+                    and binding["thread_ts"].startswith(SLACK_PROVISIONAL_THREAD_PREFIX)
+                ):
+                    self.conn.execute(
+                        """
+                        UPDATE slack_task_bindings SET thread_ts = ?, updated_at = ?
+                        WHERE id = ? AND thread_ts = ?
+                        """,
+                        (slack_message_ts, now, binding["id"], binding["thread_ts"]),
+                    )
+                    task_row = self.conn.execute(
+                        "SELECT metadata FROM tasks WHERE id = ?",
+                        (delivery["task_id"],),
+                    ).fetchone()
+                    if task_row is not None:
+                        metadata = _load_json(task_row["metadata"])
+                        slack_meta = metadata.get("slack")
+                        if isinstance(slack_meta, Mapping):
+                            slack_meta = dict(slack_meta)
+                            slack_meta["thread_ts"] = slack_message_ts
+                            slack_meta["thread_ts_provisional"] = False
+                            metadata["slack"] = slack_meta
+                            self.conn.execute(
+                                "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                                (_dump_json(metadata), now, delivery["task_id"]),
+                            )
+            row = self.conn.execute(
+                """
+                SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                FROM slack_outbox
+                WHERE operation_key = ?
+                """,
+                (operation_key,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"No slack outbox row for operation_key {operation_key!r}")
+        return _slack_outbox_from_row(row)
+
+    def fail_slack_outbox(
+        self,
+        operation_key: str,
+        *,
+        error_code: str,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        """Record a failed outbox delivery with bounded retry metadata.
+
+        Increments ``attempt_count``. Below ``max_attempts`` the row is requeued
+        to ``pending`` so the worker can claim and retry it; at or above the
+        bound it becomes terminal ``failed``. Only applies from ``pending`` or
+        ``processing`` — an already-terminal row is returned unchanged.
+        """
+        now = _utc_now()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE slack_outbox
+                SET attempt_count = attempt_count + 1,
+                    status = CASE WHEN attempt_count + 1 >= ? THEN 'failed' ELSE 'pending' END,
+                    error_code = ?,
+                    processed_at = CASE WHEN attempt_count + 1 >= ? THEN ? ELSE NULL END,
+                    claimed_at = CASE WHEN attempt_count + 1 >= ? THEN claimed_at ELSE NULL END,
+                    updated_at = ?
+                WHERE operation_key = ? AND status IN ('pending', 'processing')
+                """,
+                (max_attempts, error_code, max_attempts, now, max_attempts, now, operation_key),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                       operation, payload, status, error_code, attempt_count,
+                       slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                FROM slack_outbox
+                WHERE operation_key = ?
+                """,
+                (operation_key,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"No slack outbox row for operation_key {operation_key!r}")
+        return _slack_outbox_from_row(row)
+
+    def create_slack_command_task(
+        self,
+        *,
+        envelope_id: str,
+        workspace_id: str,
+        team_id: str,
+        channel_id: str,
+        actor_id: str,
+        thread_ts: str,
+        title: str,
+        prompt: str,
+        validation_version: str,
+        digest: str,
+        approve_action: str,
+        reject_action: str,
+    ) -> dict[str, Any]:
+        """Materialize a validated Slack slash command into one draft unit.
+
+        Requires the inbox row for ``envelope_id`` to exist and be claimed
+        (``processing``): a missing row raises ``KeyError`` and a row still in
+        ``pending`` or in a terminal ``failed``/``rejected`` state raises
+        ``ValueError``. A single transaction creates the draft task
+        (``prd_pending``), the provisional Slack thread binding, the human
+        approval gate with opaque decision actions, the two opening messages,
+        the outbound message intent, and the ``task.draft_created`` /
+        ``approval.requested`` lifecycle events, then finishes the inbox event.
+        At-most-once by ``envelope_id``: a repeated call on an already
+        ``processed`` row returns the canonical ``task_id`` / ``gate_id`` with
+        ``duplicate=True`` and creates nothing new.
+        """
+        action_values = {"approve": approve_action, "reject": reject_action}
+        task_metadata = {
+            "source": "slack",
+            "slack": {
+                "team_id": team_id,
+                "channel_id": channel_id,
+                "requester_user_id": actor_id,
+                "thread_ts": thread_ts,
+                "thread_ts_provisional": True,
+                "source_prompt": prompt,
+                "validation": {
+                    "validation_version": validation_version,
+                    "digest": digest,
+                },
+            },
+        }
+        _check_no_forbidden_keys(task_metadata, kind="slack command task metadata")
+        now = _utc_now()
+        operation_key = f"task-created:{envelope_id}"
+        with self.conn:
+            existing = self.conn.execute(
+                """
+                SELECT status FROM slack_inbox
+                WHERE envelope_id = ?
+                """,
+                (envelope_id,),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(f"No slack inbox row for envelope_id {envelope_id!r}")
+            if existing["status"] == "processed":
+                binding = self.conn.execute(
+                    """
+                    SELECT task_id FROM slack_task_bindings
+                    WHERE team_id = ? AND channel_id = ? AND thread_ts = ?
+                    """,
+                    (team_id, channel_id, thread_ts),
+                ).fetchone()
+                outbox = self.conn.execute(
+                    """
+                    SELECT payload FROM slack_outbox
+                    WHERE operation_key = ?
+                    """,
+                    (operation_key,),
+                ).fetchone()
+                if binding is not None and outbox is not None:
+                    gate_id = _load_json(outbox["payload"]).get("gate_id")
+                    if gate_id:
+                        return {
+                            "task_id": binding["task_id"],
+                            "gate_id": gate_id,
+                            "duplicate": True,
+                        }
+                raise ValueError(
+                    f"Slack inbox row {envelope_id!r} is processed but its canonical "
+                    "task is unavailable"
+                )
+            if existing["status"] != "processing":
+                raise ValueError(
+                    f"Cannot create a task from slack inbox row {envelope_id!r} in "
+                    f"status {existing['status']!r}; expected 'processing'"
+                )
+
+            task_id = _new_id()
+            gate_id = _new_id()
+            self.conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, workspace_id, title, description, status, metadata,
+                    created_at, updated_at, project_id
+                )
+                VALUES (?, ?, ?, NULL, 'prd_pending', ?, ?, ?, NULL)
+                """,
+                (task_id, workspace_id, title, _dump_json(task_metadata), now, now),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO approval_gates (
+                    id, workspace_id, task_id, name, status, metadata, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 'Requires human approval', 'pending', ?, ?, ?)
+                """,
+                (
+                    gate_id,
+                    workspace_id,
+                    task_id,
+                    _dump_json(
+                        {"requires_human": True, "slack_decision_actions": action_values}
+                    ),
+                    now,
+                    now,
+                ),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO slack_task_bindings (
+                    id, task_id, workspace_id, team_id, channel_id, thread_ts,
+                    requester_user_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _new_id(),
+                    task_id,
+                    workspace_id,
+                    team_id,
+                    channel_id,
+                    thread_ts,
+                    actor_id,
+                    now,
+                    now,
+                ),
+            )
+            for role, content, message_metadata in (
+                (
+                    "system",
+                    "Draft task created from a Slack command",
+                    {"source": "slack", "slack": {"team_id": team_id, "channel_id": channel_id}},
+                ),
+                ("user", prompt, {"source": "slack"}),
+            ):
+                self.conn.execute(
+                    """
+                    INSERT INTO messages (
+                        id, workspace_id, task_id, session_id, role, content, metadata, created_at
+                    )
+                    VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        _new_id(),
+                        workspace_id,
+                        task_id,
+                        role,
+                        content,
+                        _dump_json(message_metadata),
+                        now,
+                    ),
+                )
+            outbox_payload = {
+                "text": "Draft task created — waiting on human approval.",
+                "task_id": task_id,
+                "gate_id": gate_id,
+                "actions": action_values,
+            }
+            _check_no_forbidden_keys(outbox_payload, kind="slack command outbox payload")
+            self.conn.execute(
+                """
+                INSERT INTO slack_outbox (
+                    id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                    operation, payload, status, error_code, attempt_count,
+                    slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'message', ?, 'pending', NULL, 0, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    _new_id(),
+                    operation_key,
+                    workspace_id,
+                    task_id,
+                    channel_id,
+                    thread_ts,
+                    _dump_json(outbox_payload),
+                    now,
+                    now,
+                ),
+            )
+            for event_type, payload in (
+                (
+                    "task.draft_created",
+                    {"object_id": task_id, "source": "slack", "envelope_id": envelope_id},
+                ),
+                (
+                    "approval.requested",
+                    {"object_id": gate_id, "task_id": task_id, "envelope_id": envelope_id},
+                ),
+            ):
+                self.conn.execute(
+                    """
+                    INSERT INTO lifecycle_events (
+                        id, workspace_id, task_id, event_type, payload, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _new_id(),
+                        workspace_id,
+                        task_id,
+                        event_type,
+                        _dump_json(payload),
+                        now,
+                    ),
+                )
+            self.conn.execute(
+                """
+                UPDATE slack_inbox
+                SET status = 'processed', error_code = NULL, processed_at = ?, updated_at = ?
+                WHERE envelope_id = ? AND status IN ('pending', 'processing')
+                """,
+                (now, now, envelope_id),
+            )
+        return {"task_id": task_id, "gate_id": gate_id, "duplicate": False}
+
+    def find_slack_gate_by_action_value(
+        self, value: str, *, workspace_id: str
+    ) -> dict[str, Any] | None:
+        """Return the approval gate in ``workspace_id`` bound to an opaque action.
+
+        Decision actions are stored under ``metadata["slack_decision_actions"]``;
+        the value is never persisted anywhere else, so a matching value is
+        proof the caller saw the gate's own message. The lookup is scoped to a
+        single workspace so an action value can never resolve a gate that
+        belongs to a different Sarathi workspace.
+        """
+        if not value:
+            return None
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, task_id, name, status, metadata, created_at, updated_at
+            FROM approval_gates
+            WHERE workspace_id = ?
+            """,
+            (workspace_id,),
+        ).fetchall()
+        for row in rows:
+            gate = _approval_gate_from_row(row)
+            actions = gate["metadata"].get("slack_decision_actions")
+            if not isinstance(actions, dict):
+                continue
+            if actions.get("approve") == value or actions.get("reject") == value:
+                return gate
+        return None
+
+    def apply_slack_gate_decision(
+        self,
+        *,
+        envelope_id: str,
+        gate_id: str,
+        task_id: str,
+        requested_status: str,
+        actor_id: str,
+        operation_key: str,
+        workspace_id: str,
+        channel_id: str,
+        thread_ts: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Apply a human gate decision atomically and at most once.
+
+        A single transaction CAS-transitions the gate from ``pending`` to the
+        requested terminal status; only on a successful transition does it
+        enqueue the decision outbox message and the
+        ``approval.decision_recorded`` lifecycle event. The inbox event is
+        always finished. A repeated or stale decision leaves the gate at its
+        first terminal status and returns ``applied=False``.
+
+        The canonical ``workspace_id`` and ``task_id`` are derived from the
+        gate row itself; caller-supplied values that disagree with the gate
+        raise ``ValueError`` before any CAS or outbox write, so a decision can
+        never mutate a gate that does not belong to the caller's workspace or
+        task.
+        """
+        if requested_status not in ("approved", "rejected"):
+            raise ValueError(f"Invalid gate decision status: {requested_status}")
+        _check_no_forbidden_keys(payload, kind="slack decision outbox payload")
+        now = _utc_now()
+        with self.conn:
+            gate_row = self.conn.execute(
+                """
+                SELECT id, workspace_id, task_id, name, status, metadata, created_at, updated_at
+                FROM approval_gates
+                WHERE id = ?
+                """,
+                (gate_id,),
+            ).fetchone()
+            if gate_row is not None:
+                if gate_row["workspace_id"] != workspace_id:
+                    raise ValueError(
+                        f"Gate {gate_id!r} belongs to workspace "
+                        f"{gate_row['workspace_id']!r}, not {workspace_id!r}"
+                    )
+                if gate_row["task_id"] != task_id:
+                    raise ValueError(
+                        f"Gate {gate_id!r} is bound to task {gate_row['task_id']!r}, "
+                        f"not {task_id!r}"
+                    )
+                workspace_id = gate_row["workspace_id"]
+                task_id = gate_row["task_id"]
+                cursor = self.conn.execute(
+                    """
+                    UPDATE approval_gates
+                    SET status = ?, updated_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (requested_status, now, gate_id),
+                )
+                applied = cursor.rowcount == 1
+            else:
+                applied = False
+            row = self.conn.execute(
+                """
+                SELECT id, workspace_id, task_id, name, status, metadata, created_at, updated_at
+                FROM approval_gates
+                WHERE id = ?
+                """,
+                (gate_id,),
+            ).fetchone()
+            gate_status = _approval_gate_from_row(row)["status"] if row is not None else None
+            if applied:
+                self.conn.execute(
+                    """
+                    INSERT INTO slack_outbox (
+                        id, operation_key, workspace_id, task_id, channel_id, thread_ts,
+                        operation, payload, status, error_code, attempt_count,
+                        slack_message_ts, claimed_at, processed_at, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, 'message', ?, 'pending', NULL, 0, NULL, NULL, NULL, ?, ?)
+                    """,
+                    (
+                        _new_id(),
+                        operation_key,
+                        workspace_id,
+                        task_id,
+                        channel_id,
+                        thread_ts,
+                        _dump_json(payload),
+                        now,
+                        now,
+                    ),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO lifecycle_events (
+                        id, workspace_id, task_id, event_type, payload, created_at
+                    )
+                    VALUES (?, ?, ?, 'approval.decision_recorded', ?, ?)
+                    """,
+                    (
+                        _new_id(),
+                        workspace_id,
+                        task_id,
+                        _dump_json(
+                            {
+                                "object_id": gate_id,
+                                "task_id": task_id,
+                                "status": requested_status,
+                                "actor_id": actor_id,
+                                "envelope_id": envelope_id,
+                            }
+                        ),
+                        now,
+                    ),
+                )
+            self.conn.execute(
+                """
+                UPDATE slack_inbox
+                SET status = 'processed', error_code = NULL, processed_at = ?, updated_at = ?
+                WHERE envelope_id = ? AND status IN ('pending', 'processing')
+                """,
+                (now, now, envelope_id),
+            )
+        return {"gate_status": gate_status, "applied": applied}
+
+    def create_slack_external_input(
+        self,
+        *,
+        envelope_id: str,
+        workspace_id: str,
+        task_id: str,
+        actor_id: str,
+        channel_id: str,
+        text: str,
+        validation_version: str,
+        digest: str,
+        subtask_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Store a validated human reply, deduplicated by ``envelope_id``."""
+        status = "assigned" if subtask_id is not None else "unassigned"
+        now = _utc_now()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO slack_external_inputs (
+                    id, envelope_id, workspace_id, task_id, actor_id, channel_id,
+                    text, validation_version, digest, subtask_id, status,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _new_id(),
+                    envelope_id,
+                    workspace_id,
+                    task_id,
+                    actor_id,
+                    channel_id,
+                    text,
+                    validation_version,
+                    digest,
+                    subtask_id,
+                    status,
+                    now,
+                    now,
+                ),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id, envelope_id, workspace_id, task_id, actor_id, channel_id,
+                       text, validation_version, digest, subtask_id, status,
+                       created_at, updated_at
+                FROM slack_external_inputs
+                WHERE envelope_id = ?
+                """,
+                (envelope_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"No slack external input row for envelope_id {envelope_id!r}")
+        return _slack_external_input_from_row(row)
+
+    def assign_slack_external_input(self, input_id: str, subtask_id: str) -> dict[str, Any] | None:
+        """Compare-and-set bind an unassigned external input to ``subtask_id``.
+
+        Only the first assignment wins; a later or repeated assignment returns
+        None so a stale selection is a no-op.
+        """
+        now = _utc_now()
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                UPDATE slack_external_inputs
+                SET subtask_id = ?, status = 'assigned', updated_at = ?
+                WHERE id = ? AND subtask_id IS NULL AND status = 'unassigned'
+                """,
+                (subtask_id, now, input_id),
+            )
+            row = self.conn.execute(
+                """
+                SELECT id, envelope_id, workspace_id, task_id, actor_id, channel_id,
+                       text, validation_version, digest, subtask_id, status,
+                       created_at, updated_at
+                FROM slack_external_inputs
+                WHERE id = ?
+                """,
+                (input_id,),
+            ).fetchone()
+        if row is None or cursor.rowcount == 0:
+            return None
+        return _slack_external_input_from_row(row)
+
+    def list_assigned_slack_external_inputs(self, subtask_id: str) -> list[dict[str, Any]]:
+        """Return only canonical assigned input rows for one subtask."""
+        rows = self.conn.execute(
+            """
+            SELECT id, envelope_id, workspace_id, task_id, actor_id, channel_id,
+                   text, validation_version, digest, subtask_id, status,
+                   created_at, updated_at
+            FROM slack_external_inputs
+            WHERE subtask_id = ? AND status = 'assigned'
+            ORDER BY created_at, id
+            """,
+            (subtask_id,),
+        ).fetchall()
+        return [_slack_external_input_from_row(row) for row in rows]
+
+    def record_slack_external_input_as_task_message(
+        self, input_id: str
+    ) -> dict[str, Any]:
+        """Idempotently project one canonical Slack reply into task messages."""
+        input_row = self.conn.execute(
+            """
+            SELECT id, envelope_id, workspace_id, task_id, actor_id, channel_id,
+                   text, validation_version, digest, subtask_id, status,
+                   created_at, updated_at
+            FROM slack_external_inputs WHERE id = ?
+            """,
+            (input_id,),
+        ).fetchone()
+        if input_row is None:
+            raise KeyError(f"No slack external input row for id {input_id!r}")
+        message_id = f"slack-reply-{input_id}"
+        metadata = {
+            "source": SLACK_EXTERNAL_INPUT_SOURCE,
+            "trust": SLACK_EXTERNAL_INPUT_TRUST,
+            "envelope_id": input_row["envelope_id"],
+            "actor_id": input_row["actor_id"],
+            "channel_id": input_row["channel_id"],
+            "validation_version": input_row["validation_version"],
+            "digest": input_row["digest"],
+        }
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT OR IGNORE INTO messages (
+                    id, workspace_id, task_id, session_id, role, content, metadata, created_at
+                ) VALUES (?, ?, ?, NULL, 'user', ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    input_row["workspace_id"],
+                    input_row["task_id"],
+                    input_row["text"],
+                    _dump_json(metadata),
+                    input_row["created_at"],
+                ),
+            )
+        message = self.get_message(message_id)
+        assert message is not None
+        return message
+
+    def assign_slack_external_input_and_resume_subtask(
+        self, input_id: str, subtask_id: str, *, selection_value: str | None = None
+    ) -> dict[str, Any] | None:
+        """Atomically assign an unassigned input and resume exactly one waiter.
+
+        In one transaction this verifies the canonical persisted input is still
+        ``unassigned``, verifies the input's ``workspace_id``/``task_id``
+        identity matches the target subtask, verifies that subtask belongs to
+        that task/workspace and is still ``waiting_human``, assigns the input,
+        appends the canonical typed external-input projection to the subtask
+        metadata, and transitions only that subtask to ``in_progress``.
+
+        If any condition fails, nothing is written: the input stays
+        ``unassigned`` and no subtask status or metadata changes. Returns the
+        canonical assigned input and resumed subtask on success, or ``None``
+        when the input is already assigned, the subtask is no longer waiting,
+        or the identities do not match (stale selection / lost race).
+        """
+        now = _utc_now()
+        try:
+            with self.conn:
+                # Acquire the write lock before reading either compare-and-set
+                # target so two SQLite connections cannot both observe a
+                # waiting subtask and later diverge during promotion.
+                self.conn.execute("BEGIN IMMEDIATE")
+                input_row = self.conn.execute(
+                    """
+                    SELECT id, envelope_id, workspace_id, task_id, actor_id, channel_id,
+                           text, validation_version, digest, subtask_id, status,
+                           created_at, updated_at
+                    FROM slack_external_inputs
+                    WHERE id = ?
+                    """,
+                    (input_id,),
+                ).fetchone()
+                if (
+                    input_row is None
+                    or input_row["status"] != "unassigned"
+                    or input_row["subtask_id"] is not None
+                ):
+                    raise _AssignResumeAborted()
+
+                subtask_row = self.conn.execute(
+                    """
+                    SELECT id, workspace_id, task_id, title, status, metadata,
+                           created_at, updated_at, claimed_by, claimed_at, heartbeat_at
+                    FROM subtasks
+                    WHERE id = ?
+                    """,
+                    (subtask_id,),
+                ).fetchone()
+                if subtask_row is None or subtask_row["status"] != "waiting_human":
+                    raise _AssignResumeAborted()
+                if (
+                    subtask_row["workspace_id"] != input_row["workspace_id"]
+                    or subtask_row["task_id"] != input_row["task_id"]
+                ):
+                    raise _AssignResumeAborted()
+
+                assigned = self.conn.execute(
+                    """
+                    UPDATE slack_external_inputs
+                    SET subtask_id = ?, status = 'assigned', updated_at = ?
+                    WHERE id = ? AND subtask_id IS NULL AND status = 'unassigned'
+                    """,
+                    (subtask_id, now, input_id),
+                )
+                if assigned.rowcount != 1:
+                    raise _AssignResumeAborted()
+
+                metadata = _load_json(subtask_row["metadata"])
+                inputs = list(metadata.get("external_inputs") or [])
+                if not any(
+                    isinstance(item, dict)
+                    and item.get("envelope_id") == input_row["envelope_id"]
+                    for item in inputs
+                ):
+                    inputs.append(
+                        {
+                            "source": SLACK_EXTERNAL_INPUT_SOURCE,
+                            "trust": SLACK_EXTERNAL_INPUT_TRUST,
+                            "text": input_row["text"],
+                            "validation_version": input_row["validation_version"],
+                            "digest": input_row["digest"],
+                            "envelope_id": input_row["envelope_id"],
+                            "actor_id": input_row["actor_id"],
+                            "channel_id": input_row["channel_id"],
+                        }
+                    )
+                    metadata["external_inputs"] = inputs
+
+                resumed = self.conn.execute(
+                    """
+                    UPDATE subtasks
+                    SET status = 'in_progress', metadata = ?, updated_at = ?
+                    WHERE id = ? AND status = 'waiting_human'
+                    """,
+                    (_dump_json(metadata), now, subtask_id),
+                )
+                if resumed.rowcount != 1:
+                    raise _AssignResumeAborted()
+
+                if selection_value is not None:
+                    task_row = self.conn.execute(
+                        "SELECT metadata FROM tasks WHERE id = ?",
+                        (input_row["task_id"],),
+                    ).fetchone()
+                    if task_row is not None:
+                        task_metadata = _load_json(task_row["metadata"])
+                        slack_meta = task_metadata.get("slack")
+                        if isinstance(slack_meta, Mapping):
+                            slack_meta = dict(slack_meta)
+                            raw_selections = slack_meta.get("reply_selections")
+                            if isinstance(raw_selections, Mapping):
+                                consumed = {}
+                                for key, value in raw_selections.items():
+                                    if (
+                                        isinstance(value, Mapping)
+                                        and value.get("input_id") == input_id
+                                    ):
+                                        consumed[key] = {**dict(value), "consumed": True}
+                                    else:
+                                        consumed[key] = value
+                                slack_meta["reply_selections"] = consumed
+                                task_metadata["slack"] = slack_meta
+                                self.conn.execute(
+                                    "UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ?",
+                                    (_dump_json(task_metadata), now, input_row["task_id"]),
+                                )
+
+                assigned_row = self.conn.execute(
+                    """
+                    SELECT id, envelope_id, workspace_id, task_id, actor_id, channel_id,
+                           text, validation_version, digest, subtask_id, status,
+                           created_at, updated_at
+                    FROM slack_external_inputs
+                    WHERE id = ?
+                    """,
+                    (input_id,),
+                ).fetchone()
+                resumed_row = self.conn.execute(
+                    """
+                    SELECT id, workspace_id, task_id, title, status, metadata,
+                           created_at, updated_at, claimed_by, claimed_at, heartbeat_at
+                    FROM subtasks
+                    WHERE id = ?
+                    """,
+                    (subtask_id,),
+                ).fetchone()
+            return {
+                "input": _slack_external_input_from_row(assigned_row),
+                "subtask": _subtask_from_row(resumed_row),
+            }
+        except _AssignResumeAborted:
+            return None
+
+
 
 def _workspace_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
@@ -2320,8 +3677,104 @@ def _proposal_decision_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _slack_inbox_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "envelope_id": row["envelope_id"],
+        "event_id": row["event_id"],
+        "workspace_id": row["workspace_id"],
+        "team_id": row["team_id"],
+        "channel_id": row["channel_id"],
+        "actor_id": row["actor_id"],
+        "event_type": row["event_type"],
+        "content": _load_json(row["content"]),
+        "status": row["status"],
+        "error_code": row["error_code"],
+        "attempt_count": row["attempt_count"],
+        "claimed_at": row["claimed_at"],
+        "processed_at": row["processed_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _slack_outbox_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "operation_key": row["operation_key"],
+        "workspace_id": row["workspace_id"],
+        "task_id": row["task_id"],
+        "channel_id": row["channel_id"],
+        "thread_ts": row["thread_ts"],
+        "operation": row["operation"],
+        "payload": _load_json(row["payload"]),
+        "status": row["status"],
+        "error_code": row["error_code"],
+        "attempt_count": row["attempt_count"],
+        "slack_message_ts": row["slack_message_ts"],
+        "claimed_at": row["claimed_at"],
+        "processed_at": row["processed_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _slack_task_binding_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "task_id": row["task_id"],
+        "workspace_id": row["workspace_id"],
+        "team_id": row["team_id"],
+        "channel_id": row["channel_id"],
+        "thread_ts": row["thread_ts"],
+        "requester_user_id": row["requester_user_id"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _slack_external_input_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "envelope_id": row["envelope_id"],
+        "workspace_id": row["workspace_id"],
+        "task_id": row["task_id"],
+        "actor_id": row["actor_id"],
+        "channel_id": row["channel_id"],
+        "text": row["text"],
+        "validation_version": row["validation_version"],
+        "digest": row["digest"],
+        "subtask_id": row["subtask_id"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 def _dump_json(value: Any | None) -> str:
     return json.dumps({} if value is None else value, sort_keys=True)
+
+
+_FORBIDDEN_CONTENT_KEYS = frozenset(
+    {"response_url", "raw_envelope", "app_token", "bot_token", "token"}
+)
+
+
+def _check_no_forbidden_keys(value: Any, *, kind: str) -> None:
+    """Reject Slack secrets that must never be persisted inside stored JSON.
+
+    ``response_url``, the raw Socket Mode envelope, and app/bot tokens are
+    runtime-only credentials; persisting any of them (at any nesting depth)
+    would defeat the redaction boundary.
+    """
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in _FORBIDDEN_CONTENT_KEYS:
+                raise ValueError(f"{kind} must not contain forbidden key {key!r}")
+            _check_no_forbidden_keys(child, kind=kind)
+    elif isinstance(value, list):
+        for item in value:
+            _check_no_forbidden_keys(item, kind=kind)
 
 
 def _load_json_list(value: str | None) -> list[Any]:
@@ -2763,4 +4216,95 @@ CREATE TABLE IF NOT EXISTS proposal_decisions (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_decisions_workspace_proposal
     ON proposal_decisions(workspace_id, proposal_id);
+"""
+
+
+_MIGRATION_012 = """
+CREATE TABLE IF NOT EXISTS slack_inbox (
+    id TEXT PRIMARY KEY,
+    envelope_id TEXT NOT NULL,
+    event_id TEXT,
+    workspace_id TEXT NOT NULL,
+    team_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    error_code TEXT,
+    claimed_at TEXT,
+    processed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (envelope_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_slack_inbox_pending
+    ON slack_inbox(status);
+
+CREATE TABLE IF NOT EXISTS slack_outbox (
+    id TEXT PRIMARY KEY,
+    operation_key TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    thread_ts TEXT,
+    operation TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    error_code TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    slack_message_ts TEXT,
+    claimed_at TEXT,
+    processed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (operation_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_slack_outbox_pending
+    ON slack_outbox(status);
+
+CREATE INDEX IF NOT EXISTS idx_slack_outbox_task
+    ON slack_outbox(task_id);
+
+CREATE TABLE IF NOT EXISTS slack_task_bindings (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    team_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    thread_ts TEXT NOT NULL,
+    requester_user_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (task_id),
+    UNIQUE (team_id, channel_id, thread_ts)
+);
+
+CREATE INDEX IF NOT EXISTS idx_slack_task_bindings_task
+    ON slack_task_bindings(task_id);
+
+CREATE TABLE IF NOT EXISTS slack_external_inputs (
+    id TEXT PRIMARY KEY,
+    envelope_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    validation_version TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    subtask_id TEXT,
+    status TEXT NOT NULL DEFAULT 'unassigned',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (envelope_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_slack_external_inputs_unassigned
+    ON slack_external_inputs(status);
+
+CREATE INDEX IF NOT EXISTS idx_slack_external_inputs_task
+    ON slack_external_inputs(task_id);
 """

@@ -179,7 +179,10 @@ class SlackNotifier:
     ):
         self.config = config
         self._env = os.environ if env is None else env
-        self._opener = opener or urllib.request.urlopen
+        # Legacy HTTP delivery is test/embedding-only. Production Slack
+        # delivery is owned by the durable Socket Mode outbox worker; never
+        # create a network-capable urllib transport implicitly.
+        self._opener = opener
 
     @property
     def webhook_url(self) -> str | None:
@@ -190,6 +193,8 @@ class SlackNotifier:
         return self._env.get(self.config.bot_token_env) or None
 
     def is_configured(self) -> bool:
+        if self._opener is None:
+            return False
         if not self.config.enabled:
             return False
         if self.webhook_url:
@@ -199,11 +204,13 @@ class SlackNotifier:
     def matches(self, event_type: str) -> bool:
         return any(fnmatch(event_type, pattern) for pattern in self.config.events)
 
-    def notify(self, event: NotificationEvent) -> bool:
+    def notify(self, event: NotificationEvent, *, thread_ts: str | None = None) -> bool:
         """Post the event to Slack. Returns True only on confirmed delivery."""
         if not self.is_configured() or not self.matches(event.event_type):
             return False
         message = build_slack_message(event)
+        if thread_ts:
+            message["thread_ts"] = thread_ts
         try:
             if self.webhook_url:
                 return self._post_json(self.webhook_url, message, headers={})
@@ -220,9 +227,10 @@ class SlackNotifier:
             )
             return False
 
-    def _post_json(
+    def _post_raw(
         self, url: str, payload: dict[str, Any], *, headers: dict[str, str]
-    ) -> bool:
+    ) -> tuple[int, bytes]:
+        """Post a JSON payload and return (status, raw_bytes)."""
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -230,9 +238,16 @@ class SlackNotifier:
             headers={"Content-Type": "application/json", **headers},
             method="POST",
         )
+        assert self._opener is not None
         with self._opener(request, timeout=self.config.timeout_seconds) as response:
             status = getattr(response, "status", 200)
             raw = response.read()
+        return status, raw
+
+    def _post_json(
+        self, url: str, payload: dict[str, Any], *, headers: dict[str, str]
+    ) -> bool:
+        status, raw = self._post_raw(url, payload, headers=headers)
         if status >= 300:
             logger.warning("Slack returned HTTP %s", status)
             return False
@@ -246,6 +261,36 @@ class SlackNotifier:
                 logger.warning("Slack API error: %s", parsed.get("error", "unknown"))
                 return False
         return True
+
+    def post_message(self, channel: str, message: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Post via chat.postMessage (bot-token mode only). Returns {"channel","ts"} from
+        the parsed Slack response on success, or None (webhook-only mode, missing bot
+        token/channel, HTTP error, or Slack ok:false). Never raises — same best-effort
+        contract as notify()."""
+        if not self.bot_token:
+            return None
+
+        payload = dict(message)
+        payload["channel"] = channel
+
+        try:
+            status, raw = self._post_raw(
+                SLACK_POST_MESSAGE_URL,
+                payload,
+                headers={"Authorization": f"Bearer {self.bot_token}"},
+            )
+
+            if status >= 300:
+                return None
+
+            parsed = json.loads(raw.decode("utf-8"))
+            if not parsed.get("ok"):
+                return None
+
+            return {"channel": parsed.get("channel"), "ts": parsed.get("ts")}
+        except Exception as exc:
+            logger.warning("post_message failed: %s", exc)
+            return None
 
 
 def build_slack_message(event: NotificationEvent) -> dict[str, Any]:
@@ -280,6 +325,54 @@ def build_slack_message(event: NotificationEvent) -> dict[str, Any]:
     return {"text": headline, "blocks": blocks}
 
 
+def build_gate_approval_message(
+    *, task_id: str, gate_id: str, title: str,
+    acceptance_criteria: list[str] | None = None,
+) -> dict[str, Any]:
+    """Block Kit payload with an approve/reject action block for a pending gate."""
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{title}*"},
+        },
+    ]
+    if acceptance_criteria:
+        criteria_text = "\n".join(f"• {item}" for item in acceptance_criteria[:10])
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": criteria_text},
+        })
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Approve"},
+                "style": "primary",
+                "action_id": "approve_gate",
+                "value": f"{task_id}:{gate_id}",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Reject"},
+                "style": "danger",
+                "action_id": "reject_gate",
+                "value": f"{task_id}:{gate_id}",
+            },
+        ],
+    })
+    return {"text": title, "blocks": blocks}
+
+
+def build_gate_decision_text(*, status: str, gate_id: str, user: str | None) -> str:
+    """Plain text summarizing a resolved decision, e.g. for replace_original updates."""
+    user_name = user or "someone"
+    if status == "approved":
+        return f"✅ Approved by {user_name}"
+    else:
+        return f"❌ Rejected by {user_name}"
+
+
 def build_slack_notifier(
     policy_section: Mapping[str, Any] | None = None,
     env: Mapping[str, str] | None = None,
@@ -289,8 +382,9 @@ def build_slack_notifier(
 
     When a ``notifications`` policy section is present its ``enabled`` flag
     governs. When the policy pack has no notifications section at all, the
-    environment auto-enables (exporting ``SARATHI_SLACK_WEBHOOK_URL`` is
-    enough for CLI users without a policy edit).
+    Legacy delivery is available only to callers that explicitly inject an
+    opener. Runtime code never creates this HTTP transport; Slack delivery is
+    owned by the durable Socket Mode outbox.
     """
     has_policy = isinstance(policy_section, Mapping) and bool(policy_section)
     config = (
@@ -378,6 +472,7 @@ def lifecycle_notification(event: Mapping[str, Any]) -> NotificationEvent | None
 def lifecycle_event_listener(
     env: Mapping[str, str] | None = None,
     opener: Callable[..., Any] | None = None,
+    get_task: Callable[[str], Mapping[str, Any] | None] | None = None,
 ) -> Callable[[Mapping[str, Any]], None] | None:
     """Storage listener that forwards lifecycle events to Slack, or None.
 
@@ -391,8 +486,20 @@ def lifecycle_event_listener(
 
     def _listen(event: Mapping[str, Any]) -> None:
         notification = lifecycle_notification(event)
-        if notification is not None:
-            notifier.notify(notification)
+        if notification is None:
+            return
+        thread_ts = None
+        if get_task is not None and notification.task_id and notifier.matches(notification.event_type):
+            try:
+                task = get_task(notification.task_id)
+                meta = (task or {}).get("metadata")
+                slack = meta.get("slack") if isinstance(meta, Mapping) else None
+                if isinstance(slack, Mapping):
+                    ts = slack.get("thread_ts")
+                    thread_ts = str(ts) if ts else None
+            except Exception:
+                thread_ts = None
+        notifier.notify(notification, thread_ts=thread_ts)
 
     return _listen
 

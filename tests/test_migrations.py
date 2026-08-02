@@ -570,6 +570,27 @@ def test_migration_8_applies_on_top_of_v7_db(tmp_path):
         assert versions == list(range(1, LATEST_SCHEMA_VERSION + 1))
 
 
+def test_migration_12_creates_slack_tables_on_fresh_db(tmp_path):
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert {
+            "slack_inbox",
+            "slack_outbox",
+            "slack_task_bindings",
+            "slack_external_inputs",
+        } <= tables
+
+        outbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_outbox)")}
+        assert "attempt_count" in outbox_columns
+
+
 def test_migration_10_creates_users_table_on_fresh_db(tmp_path):
     with connect(tmp_path / "sarathi.db") as conn:
         run_migrations(conn)
@@ -591,7 +612,7 @@ def test_migration_11_creates_proposal_decisions_table_on_fresh_db(tmp_path):
         run_migrations(conn)
 
         assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
-        assert LATEST_SCHEMA_VERSION == 11
+        assert LATEST_SCHEMA_VERSION == 14
 
         tables = {
             row["name"]
@@ -735,6 +756,190 @@ def test_migration_9_creates_session_tables_on_fresh_db(tmp_path):
 
         message_columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
         assert "session_id" in message_columns
+
+
+def test_migration_13_adds_attempt_count_on_fresh_db(tmp_path):
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        assert LATEST_SCHEMA_VERSION == 14
+
+        outbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_outbox)")}
+        assert "attempt_count" in outbox_columns
+
+
+def test_migration_14_adds_inbox_attempt_count_on_fresh_db(tmp_path):
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        assert LATEST_SCHEMA_VERSION == 14
+
+        inbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_inbox)")}
+        assert "attempt_count" in inbox_columns
+
+
+def test_migration_14_applies_on_top_of_v13_db(tmp_path):
+    # A v13 database (migration 12's inbox without attempt_count plus the v13
+    # outbox retry column) must be repaired by migration 14 — without re-running
+    # or changing any prior migration — and must converge on the same schema as
+    # a fresh database.
+    from src.storage import (
+        _MIGRATION_001,
+        _MIGRATION_002,
+        _MIGRATION_003,
+        _MIGRATION_004,
+        _MIGRATION_005,
+        _MIGRATION_006,
+        _MIGRATION_007,
+        _MIGRATION_008,
+        _MIGRATION_009,
+        _MIGRATION_010,
+        _MIGRATION_011,
+        _MIGRATION_012,
+        _utc_now,
+    )
+
+    db_path = tmp_path / "sarathi.db"
+    with connect(db_path) as conn:
+        for version, script in (
+            (1, _MIGRATION_001),
+            (2, _MIGRATION_002),
+            (3, _MIGRATION_003),
+            (4, _MIGRATION_004),
+            (5, _MIGRATION_005),
+            (6, _MIGRATION_006),
+            (7, _MIGRATION_007),
+            (8, _MIGRATION_008),
+            (9, _MIGRATION_009),
+            (10, _MIGRATION_010),
+            (11, _MIGRATION_011),
+            (12, _MIGRATION_012),
+        ):
+            conn.executescript(script)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, _utc_now()),
+            )
+            conn.commit()
+
+        # Apply the migration 13 inline step (outbox attempt_count) so the DB
+        # sits at exactly version 13.
+        outbox_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(slack_outbox)")
+        }
+        if "attempt_count" not in outbox_columns:
+            conn.execute(
+                "ALTER TABLE slack_outbox ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (13, _utc_now()),
+        )
+        conn.commit()
+
+        assert current_schema_version(conn) == 13
+        inbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_inbox)")}
+        assert "attempt_count" not in inbox_columns
+
+    with connect(db_path) as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        inbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_inbox)")}
+        assert "attempt_count" in inbox_columns
+
+        run_migrations(conn)
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        versions = [
+            row["version"]
+            for row in conn.execute("SELECT version FROM schema_version ORDER BY version")
+        ]
+        assert versions == list(range(1, LATEST_SCHEMA_VERSION + 1))
+
+
+def test_migration_13_upgrades_intermediate_v12_slack_outbox(tmp_path):
+    # Commit 6f9605f shipped a v12 slack_outbox WITHOUT attempt_count; the
+    # round-1 commit then edited migration 12 in place. A database already
+    # migrated to v12 (pre-fix shape) must be repaired by migration 13 —
+    # without re-running or changing any prior migration — and must converge
+    # on the same schema as a fresh database.
+    from src.storage import (
+        _MIGRATION_001,
+        _MIGRATION_002,
+        _MIGRATION_003,
+        _MIGRATION_004,
+        _MIGRATION_005,
+        _MIGRATION_006,
+        _MIGRATION_007,
+        _MIGRATION_008,
+        _MIGRATION_009,
+        _MIGRATION_010,
+        _MIGRATION_011,
+        _MIGRATION_012,
+        Storage,
+        _utc_now,
+    )
+
+    legacy_012 = _MIGRATION_012.replace(
+        "    attempt_count INTEGER NOT NULL DEFAULT 0,\n", ""
+    )
+    assert "attempt_count" not in legacy_012
+
+    db_path = tmp_path / "sarathi.db"
+    with connect(db_path) as conn:
+        for version, script in (
+            (1, _MIGRATION_001),
+            (2, _MIGRATION_002),
+            (3, _MIGRATION_003),
+            (4, _MIGRATION_004),
+            (5, _MIGRATION_005),
+            (6, _MIGRATION_006),
+            (7, _MIGRATION_007),
+            (8, _MIGRATION_008),
+            (9, _MIGRATION_009),
+            (10, _MIGRATION_010),
+            (11, _MIGRATION_011),
+            (12, legacy_012),
+        ):
+            conn.executescript(script)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, _utc_now()),
+            )
+            conn.commit()
+
+        assert current_schema_version(conn) == 12
+        outbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_outbox)")}
+        assert "attempt_count" not in outbox_columns
+
+    with connect(db_path) as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        outbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_outbox)")}
+        assert "attempt_count" in outbox_columns
+
+        # The repaired schema accepts outbox writes that need attempt_count.
+        row = Storage(conn).enqueue_slack_outbox(
+            operation_key="task-created:1",
+            workspace_id="ws-0123456789abcdef",
+            task_id="task-1",
+            channel_id="C11111111",
+            thread_ts="1700000000.000000",
+            operation="message",
+            payload={"text": "Draft created"},
+        )
+        assert row["attempt_count"] == 0
+
+        run_migrations(conn)
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        versions = [
+            row["version"]
+            for row in conn.execute("SELECT version FROM schema_version ORDER BY version")
+        ]
+        assert versions == list(range(1, LATEST_SCHEMA_VERSION + 1))
 
 
 def test_migration_9_applies_on_top_of_v8_db(tmp_path):

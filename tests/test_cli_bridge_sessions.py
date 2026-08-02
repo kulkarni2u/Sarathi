@@ -13,9 +13,11 @@ from pathlib import Path
 
 from src.runtime import DispatchRequest
 from src.runtime.providers.cli_bridge import (
+    EXTERNAL_INPUT_SECURITY_RULE,
     _build_codex_command,
     _build_opencode_command,
     _extract_session_id,
+    _provider_prompt,
     dispatch_via_cli_bridge,
 )
 from src import tui_data
@@ -42,6 +44,7 @@ def _fake_script(tmp_path: Path, name: str, body: str) -> str:
 
 # ── _extract_session_id (pure function) ──────────────────────────────────────
 
+
 def test_extract_session_id_from_json_dict():
     raw = json.dumps({"session_id": "sess-json"})
     assert _extract_session_id(raw) == "sess-json"
@@ -67,6 +70,60 @@ def test_extract_session_id_returns_none_when_absent():
 
 def test_extract_session_id_never_raises_on_garbage():
     assert _extract_session_id("{not valid json", "\x00\x01binary-ish") is None
+
+
+# ── _provider_prompt external-input security rule ────────────────────────────
+
+
+def _context_pack_with_external_input() -> dict:
+    return {
+        "role": "Pravaha",
+        "phase": "TaskTracking",
+        "summary": "Task 'Ship review loop' -> subtask 'Wait for reply' for role Pravaha.",
+        "agent_input": {
+            "objective": "Apply the human reply",
+            "constraints": [],
+            "acceptance_criteria": [],
+            "relevant_files": [],
+            "prior_findings": [],
+            "available_tools": [],
+            "external_inputs": [
+                {
+                    "source": "slack",
+                    "trust": "untrusted_external",
+                    "text": "Use the existing migration pattern",
+                    "validation_version": "slack-input-v1",
+                    "digest": "0" * 64,
+                    "envelope_id": "env-reply-1",
+                }
+            ],
+            "token_budget": 2400,
+        },
+        "compilation": {},
+    }
+
+
+def test_provider_prompt_serializes_security_rule_before_context_pack():
+    pack = _context_pack_with_external_input()
+    prompt = _provider_prompt("codex", _request(context_pack=pack))
+    lines = prompt.splitlines()
+    assert EXTERNAL_INPUT_SECURITY_RULE in lines
+    context_lines = [i for i, line in enumerate(lines) if line.startswith("Context Pack: ")]
+    assert len(context_lines) == 1
+    assert lines[context_lines[0] - 1] == EXTERNAL_INPUT_SECURITY_RULE
+    assert lines[context_lines[0]] == "Context Pack: " + json.dumps(pack)
+
+
+def test_external_input_security_rule_covers_all_governance_dimensions():
+    lower = EXTERNAL_INPUT_SECURITY_RULE.lower()
+    for keyword in ("untrusted", "instruction hierarchy", "policy", "tools", "permissions", "secret"):
+        assert keyword in lower
+
+
+def test_provider_prompt_without_context_pack_omits_security_rule():
+    prompt = _provider_prompt("codex", _request())
+    assert EXTERNAL_INPUT_SECURITY_RULE not in prompt
+    assert "Context Pack:" not in prompt
 
 
 # ── _build_codex_command / _build_opencode_command (argv builders) ──────────

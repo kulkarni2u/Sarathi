@@ -16,7 +16,7 @@ except ImportError:
     from runtime.contracts import DispatchRequest, DispatchResponse, build_usage_record
 
 from .base import ProviderAdapter, ProviderCapabilities, ProviderSession
-from .cli_bridge import dispatch_via_cli_bridge
+from .cli_bridge import _provider_prompt, dispatch_via_cli_bridge
 from ..workspace_evidence import attach_workspace_evidence, snapshot_workspace
 
 
@@ -85,7 +85,7 @@ class OpenAISdkProviderAdapter(ProviderAdapter):
             "task_id": request.task_id,
             "phase": request.phase,
             "mode": request.mode,
-            "prompt": request.prompt,
+            "prompt": _provider_prompt("codex", request, self.workspace_root),
             "title": f"Sarathi {request.phase} {request.task_id}",
             "timeout_seconds": request.timeout_seconds,
             "session_id": session.session_id,

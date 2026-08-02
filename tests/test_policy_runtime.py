@@ -218,7 +218,10 @@ providers:
     task = TaskContext(
         task_id="task-provider",
         description="Add auth flow",
-        complexity=Complexity.LOW,
+        # MEDIUM, not LOW: LOW-complexity BRAINSTORM/PLAN skip the model
+        # dispatch entirely (src/phases/brainstorm.py, src/phases/plan.py),
+        # so there'd be no dispatch here to route.
+        complexity=Complexity.MEDIUM,
     )
     engine = Engine(policy_pack_path=str(policy_dir))
     result = engine.run_task(task)
@@ -253,7 +256,8 @@ providers:
     task = TaskContext(
         task_id="task-routing-feedback",
         description="Explore auth flow",
-        complexity=Complexity.LOW,
+        # MEDIUM, not LOW: see comment in the test above.
+        complexity=Complexity.MEDIUM,
     )
     engine = Engine(policy_pack_path=str(policy_dir))
     result = engine.run_task(task)

@@ -56,8 +56,13 @@ class BrainstormHandler:
             )
 
         # Offline path — dispatcher-based approach (works without desktop service)
+        # LOW complexity tasks skip the model call: the deterministic fallback
+        # below (_generate_approaches/_assess_risks/_define_success_criteria)
+        # is a fixed template regardless of dispatch outcome, so a genuinely
+        # low-stakes task gets nothing from spending a dispatch to reach it.
+        low_complexity = getattr(task.complexity, "value", None) == "low"
         response = None
-        if self.dispatcher is not None:
+        if self.dispatcher is not None and not low_complexity:
             hint = getattr(task, "gate_retry_hint", None)
             extra_constraints: dict = {}
             if isinstance(hint, dict) and hint.get("phase") == phase.value:
@@ -86,6 +91,7 @@ class BrainstormHandler:
                 "risks_identified": response.evidence.get("risks_identified", False),
                 "success_criteria_defined": response.evidence.get("success_criteria_defined", False),
                 "reversibility_assessed": response.evidence.get("reversibility_assessed", False),
+                "dispatch_skipped_reason": None,
             }
             artifacts: dict[str, Any] = {
                 "approaches": approaches,
@@ -104,6 +110,7 @@ class BrainstormHandler:
                 "risks_identified": len(risks) > 0,
                 "success_criteria_defined": len(success_criteria) > 0,
                 "reversibility_assessed": any("rollback" in str(risk) for risk in risks),
+                "dispatch_skipped_reason": "low_complexity" if low_complexity else None,
             }
             artifacts = {
                 "approaches": approaches,

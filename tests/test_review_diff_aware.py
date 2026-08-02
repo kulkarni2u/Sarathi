@@ -371,3 +371,78 @@ def test_review_handler_no_measured_evidence_records_absence(monkeypatch, tmp_pa
         f["check"] in {"workspace_claim_divergence", "workspace_unchanged_on_success"}
         for f in result.artifacts["review_verdict"]["findings"]
     )
+
+
+# ── zero-diff fast path: skip the model dispatch, not the verdict ──────────
+
+def test_review_handler_skips_dispatch_when_no_changes_to_review(monkeypatch, tmp_path):
+    """A provably empty workspace diff shouldn't burn a model call -- the
+    same local ReviewRunner fallback already used on dispatch failure can
+    render the (correctly failing) verdict deterministically."""
+    _init_git_repo(tmp_path)  # clean checkout, no modifications made after init
+    monkeypatch.setenv("SARATHI_WORKDIR", str(tmp_path))
+
+    task = _task_with_build_result({})
+    dispatcher = _CapturingDispatcher()
+    handler = ReviewHandler(policy_pack=PolicyPack(), dispatcher=dispatcher)
+
+    result = handler.execute(task=task, phase=Phase.REVIEW)
+
+    assert dispatcher.last_request is None
+    assert result.evidence["review_dispatch_skipped_reason"] == "no_changes_to_review"
+    assert result.evidence["provider_review"] is False
+    findings = result.artifacts["review_verdict"]["findings"]
+    assert any(f["check"] == "diff_evidence" and not f["passed"] for f in findings)
+
+
+def test_review_handler_dispatches_when_untracked_files_present(monkeypatch, tmp_path):
+    """An untracked new file is a real (if unstaged) change -- must not be
+    treated as 'nothing to review' even though `git diff` alone is empty."""
+    _init_git_repo(tmp_path)
+    (tmp_path / "new_file.py").write_text("print('hello')\n", encoding="utf-8")
+    monkeypatch.setenv("SARATHI_WORKDIR", str(tmp_path))
+
+    task = _task_with_build_result({})
+    dispatcher = _CapturingDispatcher()
+    handler = ReviewHandler(policy_pack=PolicyPack(), dispatcher=dispatcher)
+
+    result = handler.execute(task=task, phase=Phase.REVIEW)
+
+    assert dispatcher.last_request is not None
+    assert result.evidence["review_dispatch_skipped_reason"] is None
+
+
+def test_review_handler_dispatches_when_diff_measurement_unavailable(monkeypatch, tmp_path):
+    """Not a git repo -> workspace_diff['measured'] is False -> never skip;
+    ambiguity always falls through to the real dispatch."""
+    monkeypatch.setenv("SARATHI_WORKDIR", str(tmp_path))  # tmp_path is not a git repo
+
+    task = _task_with_build_result({})
+    dispatcher = _CapturingDispatcher()
+    handler = ReviewHandler(policy_pack=PolicyPack(), dispatcher=dispatcher)
+
+    result = handler.execute(task=task, phase=Phase.REVIEW)
+
+    assert dispatcher.last_request is not None
+    assert result.evidence["review_dispatch_skipped_reason"] is None
+
+
+def test_no_changes_to_review_helper_directly():
+    from src.phases.review import ReviewHandler
+
+    assert ReviewHandler._no_changes_to_review(
+        workspace_diff={"measured": True, "diff": "", "untracked_files": []},
+        diff_summary={"changed_files": 0},
+    ) is True
+    assert ReviewHandler._no_changes_to_review(
+        workspace_diff={"measured": True, "diff": "diff --git a/x b/x\n", "untracked_files": []},
+        diff_summary={"changed_files": 1},
+    ) is False
+    assert ReviewHandler._no_changes_to_review(
+        workspace_diff={"measured": False, "reason": "not_a_git_repo"},
+        diff_summary=None,
+    ) is False
+    assert ReviewHandler._no_changes_to_review(
+        workspace_diff={"measured": True, "diff": "", "untracked_files": ["new.py"]},
+        diff_summary=None,
+    ) is False

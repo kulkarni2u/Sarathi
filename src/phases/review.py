@@ -31,11 +31,11 @@ class ReviewHandler:
     def execute(self, task: "TaskContext", phase: "Phase") -> "PhaseResult":
         from src.engine import DispatchRequest, PhaseResult
 
-        review_inputs = self._review_inputs(task)
+        workspace_root = os.environ.get("SARATHI_WORKDIR", os.getcwd())
+        review_inputs = self._review_inputs(task, workspace_root=workspace_root)
         diff_summary = review_inputs.get("diff_summary")
 
         measured_changes = self._collect_build_workspace_evidence(task)
-        workspace_root = os.environ.get("SARATHI_WORKDIR", os.getcwd())
         workspace_diff = collect_review_context(workspace_root)
         if measured_changes:
             review_inputs["measured_changes"] = measured_changes
@@ -53,8 +53,11 @@ class ReviewHandler:
         }
 
         # Attempt a provider-backed review dispatch if dispatcher is available
+        no_changes_to_review = self._no_changes_to_review(
+            workspace_diff=workspace_diff, diff_summary=diff_summary
+        )
         dispatch_response = None
-        if self.dispatcher is not None:
+        if self.dispatcher is not None and not no_changes_to_review:
             build_artifact = self._build_artifact(task)
             rejection_note = (
                 "\n\nA human reviewer already rejected these files in an earlier "
@@ -133,6 +136,7 @@ class ReviewHandler:
             "retry_recommended": retry_recommended,
             "auto_fix_allowed": auto_fix_allowed,
             "diff_review_rejected_files": rejected_diff_paths,
+            "review_dispatch_skipped_reason": "no_changes_to_review" if no_changes_to_review else None,
         }
 
         artifacts: dict[str, Any] = {
@@ -155,6 +159,30 @@ class ReviewHandler:
             evidence=evidence,
             artifacts=artifacts,
         )
+
+    @staticmethod
+    def _no_changes_to_review(*, workspace_diff: dict[str, Any], diff_summary: dict[str, Any] | None) -> bool:
+        """True only when every measured signal agrees the workspace has zero diff.
+
+        Skipping the review dispatch here doesn't skip the review verdict --
+        it routes straight to the same local ReviewRunner fallback already
+        used when a dispatch fails, whose `diff_evidence` check already
+        treats zero changed files as a failing finding (not an automatic
+        pass). So this only saves a model call on an outcome a git command
+        already answers; it never changes what the review concludes.
+        Conservative by construction: any measurement failure or ambiguity
+        (git unavailable, untracked files present, disagreement between diff
+        text and changed-file count) falls through to the real dispatch.
+        """
+        if not workspace_diff.get("measured"):
+            return False
+        if (workspace_diff.get("diff") or "").strip():
+            return False
+        if workspace_diff.get("untracked_files"):
+            return False
+        if diff_summary and int(diff_summary.get("changed_files", 0) or 0) > 0:
+            return False
+        return True
 
     def _build_artifact(self, task: "TaskContext") -> dict[str, Any]:
         """Extract the build result from the most recent Build phase result."""
@@ -254,7 +282,7 @@ class ReviewHandler:
             "totals": {"total": len(findings), "passed": len(findings) - failed, "failed": failed},
         }
 
-    def _review_inputs(self, task: "TaskContext") -> dict:
+    def _review_inputs(self, task: "TaskContext", *, workspace_root: str) -> dict:
         inputs = {}
         if task is None:
             return inputs
@@ -279,7 +307,7 @@ class ReviewHandler:
                 inputs["escalation_bundle"] = artifacts["escalation_bundle"]
             if "task_graph_execution" not in inputs and isinstance(artifacts.get("task_graph_execution"), dict):
                 inputs["task_graph_execution"] = artifacts["task_graph_execution"]
-        diff_summary = self._diff_summary()
+        diff_summary = self._diff_summary(workspace_root)
         if diff_summary:
             inputs["diff_summary"] = diff_summary
         diff_review = find_diff_review(task)
@@ -287,17 +315,24 @@ class ReviewHandler:
             inputs["diff_review"] = diff_review
         return inputs
 
-    def _diff_summary(self) -> dict:
-        """Collect a small real git diff summary when the task runs in a git worktree."""
+    def _diff_summary(self, workspace_root: str) -> dict:
+        """Collect a small real git diff summary when the task runs in a git worktree.
+
+        Scoped to ``workspace_root`` via ``-C`` (like ``collect_review_context``)
+        rather than the process's own cwd -- those can diverge (e.g. a
+        long-lived service process handling requests for several workspaces),
+        and reading the wrong directory here would silently report someone
+        else's diff as this task's.
+        """
         try:
             names = subprocess.run(
-                ["git", "diff", "--name-only"],
+                ["git", "-C", workspace_root, "diff", "--name-only"],
                 check=False,
                 capture_output=True,
                 text=True,
             )
             shortstat = subprocess.run(
-                ["git", "diff", "--shortstat"],
+                ["git", "-C", workspace_root, "diff", "--shortstat"],
                 check=False,
                 capture_output=True,
                 text=True,

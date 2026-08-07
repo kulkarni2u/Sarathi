@@ -8,6 +8,7 @@ import re
 from typing import Any, Iterable, Mapping
 
 from src.repo_index import format_symbol_hint, query_repo_index
+from src.runtime.run_cache import NodeOutputCache, RepoIndexCache
 from src.storage import SLACK_EXTERNAL_INPUT_SOURCE, SLACK_EXTERNAL_INPUT_TRUST
 
 MAX_EXTERNAL_INPUTS = 5
@@ -182,6 +183,8 @@ class ContextCompiler:
         available_tools: Iterable[str] = (),
         token_budget: int | None = None,
         repo_index_root: str | None = None,
+        repo_index_cache: RepoIndexCache | None = None,
+        node_output_cache: NodeOutputCache | None = None,
     ) -> ContextPack:
         role = str(node.get("role") or "Pravaha")
         resolved_budget = int(token_budget or self.DEFAULT_TOKEN_BUDGETS.get(role, 2600))
@@ -212,7 +215,10 @@ class ContextCompiler:
             relevant_files = [str(item) for item in raw_files if str(item).strip()]
         objective_text = str(packet.get("goal") or node.get("title") or node.get("id") or "")
         relevant_files = self._with_repo_index_hints(
-            objective=objective_text, relevant_files=relevant_files, repo_index_root=repo_index_root
+            objective=objective_text,
+            relevant_files=relevant_files,
+            repo_index_root=repo_index_root,
+            repo_index_cache=repo_index_cache,
         )
 
         prior_findings: list[str] = []
@@ -222,6 +228,9 @@ class ContextCompiler:
                     continue
                 if graph_node.get("status") == "failed" and isinstance(graph_node.get("last_error"), str):
                     prior_findings.append(str(graph_node["last_error"]))
+        prior_findings.extend(
+            self._pattern_context_findings(node=node, graph=graph, node_output_cache=node_output_cache)
+        )
 
         contract = AgentInputContract(
             objective=str(packet.get("goal") or node.get("title") or node.get("id") or "Complete graph node").strip(),
@@ -257,6 +266,7 @@ class ContextCompiler:
         objective: str,
         relevant_files: list[str],
         repo_index_root: str | None,
+        repo_index_cache: RepoIndexCache | None = None,
         limit: int = 5,
     ) -> list[str]:
         """Append ranked "file:line symbol (kind)" hints from the repo index.
@@ -266,11 +276,18 @@ class ContextCompiler:
         unindexed workspace or a query with no matches leaves relevant_files
         untouched, and any lookup failure is swallowed since this is an
         enrichment, not a required input.
+
+        When ``repo_index_cache`` is given, the symbol list is read from disk
+        at most once per run (per distinct root) instead of once per call --
+        see ``src/runtime/run_cache.py``.
         """
         if not repo_index_root or not objective.strip():
             return relevant_files
         try:
-            matches = query_repo_index(repo_index_root, objective, limit=limit)
+            if repo_index_cache is not None:
+                matches = repo_index_cache.query(repo_index_root, objective, limit=limit)
+            else:
+                matches = query_repo_index(repo_index_root, objective, limit=limit)
         except Exception:
             return relevant_files
         hints = [format_symbol_hint(entry) for entry in matches]
@@ -279,6 +296,57 @@ class ContextCompiler:
             if hint not in merged:
                 merged.append(hint)
         return merged
+
+    def _pattern_context_findings(
+        self,
+        *,
+        node: Mapping[str, Any],
+        graph: Mapping[str, Any] | None,
+        node_output_cache: NodeOutputCache | None,
+    ) -> list[str]:
+        """SYNTHESIZE/JUDGE findings from sibling node outputs, without NCP.
+
+        Mirrors what ``NCPContextAdapter._fetch_branch_outputs``/
+        ``_fetch_competitor_outputs`` do for the NCP-backed path (see
+        ``src/ncp_adapter/context_adapter.py``), but reads already-annotated
+        node output straight out of the in-memory graph/cache instead of an
+        external NCP fetch call -- so SYNTHESIZE/JUDGE nodes get their
+        siblings' results even when NCP isn't configured for the workspace.
+        """
+        node_type = str(node.get("node_type", "execute")).lower()
+        pattern_config = node.get("pattern_config")
+        pattern_config = pattern_config if isinstance(pattern_config, Mapping) else {}
+
+        if node_type == "synthesize":
+            ids = pattern_config.get("source_ids", [])
+            label = "Branch"
+        elif node_type == "judge":
+            ids = pattern_config.get("competitor_ids", [])
+            label = "Competitor"
+        else:
+            return []
+        ids = [str(item) for item in ids] if isinstance(ids, list) else []
+        if not ids:
+            return []
+
+        findings: list[str] = []
+        if node_output_cache is not None:
+            for node_id, cached_output in node_output_cache.outputs_for(ids):
+                text = str(cached_output.get("summary") or "").strip()
+                if text:
+                    findings.append(f"{label} {node_id}: {text[:400]}")
+        elif isinstance(graph, Mapping):
+            by_id = {
+                str(item.get("id")): item for item in graph.get("nodes", []) if isinstance(item, Mapping)
+            }
+            for node_id in ids:
+                sibling = by_id.get(node_id)
+                sibling_output = sibling.get("agent_output") if isinstance(sibling, Mapping) else None
+                if isinstance(sibling_output, Mapping):
+                    text = str(sibling_output.get("summary") or "").strip()
+                    if text:
+                        findings.append(f"{label} {node_id}: {text[:400]}")
+        return findings[:6]
 
     def _constraints_for(self, *, task: Mapping[str, Any], subtask: Mapping[str, Any]) -> list[str]:
         metadata = subtask.get("metadata") if isinstance(subtask.get("metadata"), Mapping) else {}

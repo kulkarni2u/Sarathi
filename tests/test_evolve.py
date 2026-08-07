@@ -259,6 +259,66 @@ def test_proposal_review_store_rejects_without_policy_mutation(tmp_path):
     assert (policy_dir / "review.md").read_text() == "# Review\n"
 
 
+def test_proposal_review_store_rollback_restores_pre_accept_text(tmp_path):
+    policy_dir = tmp_path / "policy-pack"
+    policy_dir.mkdir()
+    original_text = "# Commands\n"
+    (policy_dir / "commands.md").write_text(original_text)
+    proposal = PolicyProposal(
+        title="Add Verify failure recovery guidance",
+        policy_file="commands.md",
+        rationale="Verify failed repeatedly.",
+        suggested_change="Add root-cause capture before retry.",
+    )
+
+    store = ProposalReviewStore(policy_dir)
+    accept_decision = store.accept(proposal)
+    assert accept_decision["before_text"] == original_text
+    assert (policy_dir / "commands.md").read_text() != original_text
+
+    rollback_decision = store.rollback(proposal.proposal_id)
+
+    assert rollback_decision["status"] == "rolled_back"
+    assert (policy_dir / "commands.md").read_text() == original_text
+    # the original acceptance record is untouched; rollback is a new history entry
+    original_record = (policy_dir / ".sarathi-proposals" / f"{proposal.proposal_id}.json").read_text()
+    assert '"status": "accepted"' in original_record
+    rollback_files = list((policy_dir / ".sarathi-proposals").glob(f"{proposal.proposal_id}.rollback-*.json"))
+    assert len(rollback_files) == 1
+
+
+def test_proposal_review_store_rollback_refuses_on_drift_without_force(tmp_path):
+    policy_dir = tmp_path / "policy-pack"
+    policy_dir.mkdir()
+    (policy_dir / "commands.md").write_text("# Commands\n")
+    proposal = PolicyProposal(
+        title="Add Verify failure recovery guidance",
+        policy_file="commands.md",
+        rationale="Verify failed repeatedly.",
+        suggested_change="Add root-cause capture before retry.",
+    )
+
+    store = ProposalReviewStore(policy_dir)
+    store.accept(proposal)
+    (policy_dir / "commands.md").write_text("# Commands\n\nSomeone edited this since.\n")
+
+    with pytest.raises(ValueError):
+        store.rollback(proposal.proposal_id)
+
+    # force overrides the drift check
+    decision = store.rollback(proposal.proposal_id, force=True)
+    assert decision["status"] == "rolled_back"
+    assert (policy_dir / "commands.md").read_text() == "# Commands\n"
+
+
+def test_proposal_review_store_rollback_unknown_proposal_raises(tmp_path):
+    policy_dir = tmp_path / "policy-pack"
+    policy_dir.mkdir()
+
+    with pytest.raises(ValueError):
+        ProposalReviewStore(policy_dir).rollback("does-not-exist")
+
+
 def test_evolution_policy_defaults_match_hardcoded_behavior():
     policy = EvolutionPolicy.from_escalation(None)
 

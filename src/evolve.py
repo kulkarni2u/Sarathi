@@ -733,9 +733,12 @@ class ProposalReviewStore:
         policy_file.parent.mkdir(parents=True, exist_ok=True)
         marker = f"proposal-id: {proposal.proposal_id}"
         current = policy_file.read_text() if policy_file.exists() else ""
+        after_text = self._apply_to_policy_text(current, proposal)
         if marker not in current:
-            policy_file.write_text(self._apply_to_policy_text(current, proposal))
-        decision = self._decision("accepted", proposal)
+            policy_file.write_text(after_text)
+        decision = self._decision(
+            "accepted", proposal, before_text=current, after_text=after_text
+        )
         self._write_decision(decision)
         if self._sync is not None:
             self._sync.record_decision(decision)
@@ -747,6 +750,59 @@ class ProposalReviewStore:
         if self._sync is not None:
             self._sync.record_decision(decision)
         return decision
+
+    def rollback(self, proposal_id: str, force: bool = False) -> dict[str, Any]:
+        """Undo a previously accepted proposal by restoring its pre-accept text.
+
+        Reads the original acceptance decision from ``.sarathi-proposals/<id>.json``,
+        verifies the target file still matches what the acceptance wrote (unless
+        ``force``), restores ``before_text``, and records a new ``rolled_back``
+        decision so the rollback itself is snapshotted and reversible the same way.
+        """
+        decision_path = self.review_dir / f"{proposal_id}.json"
+        if not decision_path.exists():
+            raise ValueError(f"No recorded decision for proposal '{proposal_id}'")
+        decision = self._read_decision(decision_path)
+        if decision.get("status") != "accepted":
+            raise ValueError(
+                f"Proposal '{proposal_id}' is not in an 'accepted' state "
+                f"(status={decision.get('status')!r}); nothing to roll back"
+            )
+        before_text = decision.get("before_text")
+        after_text = decision.get("after_text")
+        if before_text is None:
+            raise ValueError(
+                f"Decision for proposal '{proposal_id}' has no recorded snapshot "
+                "(it predates rollback support); rollback is not available"
+            )
+        # Resolve using the same rule accept() used, without needing the original
+        # PolicyProposal object -- decision.policy_file already holds the raw target.
+        policy_file = self._resolve_stored_path(decision["policy_file"])
+        current = policy_file.read_text() if policy_file.exists() else ""
+        if not force and after_text is not None and current != after_text:
+            raise ValueError(
+                f"'{policy_file}' has changed since proposal '{proposal_id}' was "
+                "accepted; pass force=True to overwrite anyway"
+            )
+        policy_file.write_text(before_text)
+        rollback_decision = dict(decision)
+        rollback_decision.update(
+            {
+                "status": "rolled_back",
+                "before_text": after_text,
+                "after_text": before_text,
+                "reason": None,
+                "reviewed_at": datetime.utcnow().isoformat() + "Z",
+            }
+        )
+        rollback_path = (
+            self.review_dir
+            / f"{proposal_id}.rollback-{datetime.utcnow().strftime('%Y%m%dT%H%M%S%f')}.json"
+        )
+        self._write_decision(rollback_decision, path=rollback_path)
+        if self._sync is not None:
+            self._sync.record_decision(rollback_decision)
+        return rollback_decision
 
     def preview_acceptance(self, proposal: PolicyProposal) -> dict[str, Any]:
         policy_file = self._resolve_target_path(proposal)
@@ -821,7 +877,10 @@ class ProposalReviewStore:
         return current[: yaml_match.start()] + replacement + current[yaml_match.end():]
 
     def _resolve_target_path(self, proposal: PolicyProposal) -> Path:
-        target = proposal.policy_file.strip().lstrip("/")
+        return self._resolve_stored_path(proposal.policy_file)
+
+    def _resolve_stored_path(self, policy_file: str) -> Path:
+        target = policy_file.strip().lstrip("/")
         if target.startswith("wiki/") or target in {"SARATHI.md", "learnings.md"}:
             return self.workspace_root / target
         return self.policy_pack_path / target
@@ -831,6 +890,8 @@ class ProposalReviewStore:
         status: str,
         proposal: PolicyProposal,
         reason: str | None = None,
+        before_text: str | None = None,
+        after_text: str | None = None,
     ) -> dict[str, Any]:
         return {
             "id": proposal.proposal_id,
@@ -847,10 +908,17 @@ class ProposalReviewStore:
             "routing_hint": proposal.routing_hint,
             "reason": reason,
             "reviewed_at": datetime.utcnow().isoformat() + "Z",
+            "before_text": before_text,
+            "after_text": after_text,
         }
 
-    def _write_decision(self, decision: dict[str, Any]) -> None:
+    def _write_decision(self, decision: dict[str, Any], path: Path | None = None) -> None:
         import json
 
-        path = self.review_dir / f"{decision['id']}.json"
-        path.write_text(json.dumps(decision, indent=2))
+        target = path if path is not None else self.review_dir / f"{decision['id']}.json"
+        target.write_text(json.dumps(decision, indent=2))
+
+    def _read_decision(self, path: Path) -> dict[str, Any]:
+        import json
+
+        return json.loads(path.read_text())

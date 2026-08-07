@@ -25,6 +25,7 @@ try:
         lone_verified_survivor,
     )
     from src.runtime.output_index import build_artifact_index, normalize_agent_output
+    from src.runtime.run_cache import NodeOutputCache, RepoIndexCache
     from src.runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
     from src.task_graph import (
         NodeType,
@@ -46,6 +47,7 @@ except ImportError:
         lone_verified_survivor,
     )
     from runtime.output_index import build_artifact_index, normalize_agent_output
+    from runtime.run_cache import NodeOutputCache, RepoIndexCache
     from runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
     from task_graph import (
         NodeType,
@@ -156,6 +158,11 @@ class TaskGraphExecutor:
         # of relying on this constructor default.
         self.harness_config = harness_config
         self.isolation_repo_root = Path(isolation_repo_root).resolve() if isolation_repo_root else Path.cwd()
+        # Scoped to this executor's lifetime (one task run): avoids re-reading
+        # the repo index from disk and re-scanning the graph for sibling node
+        # outputs on every phase/node dispatch. See src/runtime/run_cache.py.
+        self._repo_index_cache = RepoIndexCache()
+        self._node_output_cache = NodeOutputCache()
         if max_parallel is None:
             try:
                 max_parallel = int(os.environ.get("SARATHI_GRAPH_MAX_PARALLEL", "4"))
@@ -222,8 +229,7 @@ class TaskGraphExecutor:
     def _timestamp() -> str:
         return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
-    @staticmethod
-    def _annotate_node_result(graph: dict, node_id: str, provider_result: dict | None) -> dict:
+    def _annotate_node_result(self, graph: dict, node_id: str, provider_result: dict | None) -> dict:
         if provider_result is None:
             return graph
         for node in graph.get("nodes", []):
@@ -245,6 +251,7 @@ class TaskGraphExecutor:
             isolation = provider_result.get("isolation")
             if isinstance(isolation, dict):
                 node["isolation"] = dict(isolation)
+            self._node_output_cache.record(node_id, node)
             break
         return graph
 
@@ -938,6 +945,8 @@ class TaskGraphExecutor:
             phase=self.dispatch_phase,
             available_tools=["task_graph", "workspace_files", "git_diff", "test_results"],
             repo_index_root=str(self.isolation_repo_root),
+            repo_index_cache=self._repo_index_cache,
+            node_output_cache=self._node_output_cache,
         )
         return cp.to_artifact(), cp.agent_input.token_budget
 

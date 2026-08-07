@@ -1,5 +1,6 @@
 from src.repo_index import build_repo_index
 from src.runtime.context import ContextCompiler, MAX_EXTERNAL_INPUTS
+from src.runtime.run_cache import NodeOutputCache, RepoIndexCache
 
 
 def task():
@@ -368,3 +369,95 @@ def test_repo_index_hints_never_raise_when_index_missing(tmp_path):
     )
 
     assert pack.to_artifact()["agent_input"]["relevant_files"] == []
+
+
+def test_compile_graph_node_context_uses_repo_index_cache(tmp_path):
+    _indexed_workspace(tmp_path)
+    compiler = ContextCompiler()
+    cache = RepoIndexCache()
+
+    for _ in range(3):
+        pack = compiler.compile_graph_node_context(
+            node={
+                "id": "node-1",
+                "title": "authenticate user",
+                "task_packet": {"goal": "authenticate user"},
+            },
+            repo_index_root=str(tmp_path),
+            repo_index_cache=cache,
+        )
+        assert any(
+            "authenticate_user" in entry
+            for entry in pack.to_artifact()["agent_input"]["relevant_files"]
+        )
+
+    # Same root queried three times: the symbol list is loaded once and reused.
+    assert len(cache._entries) == 1
+
+
+def test_compile_graph_node_context_reloads_cache_after_reindex(tmp_path):
+    _indexed_workspace(tmp_path)
+    cache = RepoIndexCache()
+    first = cache.query(tmp_path, "authenticate user")
+    assert first
+
+    (tmp_path / "second.py").write_text(
+        'def second_helper():\n    """Another indexed function."""\n    return 1\n',
+        encoding="utf-8",
+    )
+    build_repo_index(tmp_path)
+
+    second = cache.query(tmp_path, "second helper")
+    assert any(entry.get("name") == "second_helper" for entry in second)
+
+
+def test_compile_graph_node_context_surfaces_synthesize_branch_outputs_without_ncp():
+    compiler = ContextCompiler()
+    cache = NodeOutputCache()
+    cache.record(
+        "fanout-1-branch-0",
+        {"id": "fanout-1-branch-0", "agent_output": {"summary": "Branch 0 found a race condition."}},
+    )
+    cache.record(
+        "fanout-1-branch-1",
+        {"id": "fanout-1-branch-1", "agent_output": {"summary": "Branch 1 found no issues."}},
+    )
+
+    pack = compiler.compile_graph_node_context(
+        node={
+            "id": "fanout-1-synthesize",
+            "title": "Synthesize results",
+            "node_type": "synthesize",
+            "pattern_config": {"source_ids": ["fanout-1-branch-0", "fanout-1-branch-1"]},
+        },
+        node_output_cache=cache,
+    )
+
+    prior_findings = pack.to_artifact()["agent_input"]["prior_findings"]
+    assert any("race condition" in finding for finding in prior_findings)
+    assert any("no issues" in finding for finding in prior_findings)
+
+
+def test_compile_graph_node_context_synthesize_falls_back_to_graph_scan_without_cache():
+    compiler = ContextCompiler()
+    graph = {
+        "nodes": [
+            {
+                "id": "fanout-1-branch-0",
+                "agent_output": {"summary": "Branch 0 found a race condition."},
+            },
+        ]
+    }
+
+    pack = compiler.compile_graph_node_context(
+        node={
+            "id": "fanout-1-synthesize",
+            "title": "Synthesize results",
+            "node_type": "synthesize",
+            "pattern_config": {"source_ids": ["fanout-1-branch-0"]},
+        },
+        graph=graph,
+    )
+
+    prior_findings = pack.to_artifact()["agent_input"]["prior_findings"]
+    assert any("race condition" in finding for finding in prior_findings)

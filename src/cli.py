@@ -908,6 +908,16 @@ def main() -> None:
         default=None,
         help="Optional rejection reason",
     )
+    proposals_parser.add_argument(
+        "--rollback",
+        default=None,
+        help="Roll back a previously accepted proposal ID/prefix, restoring its pre-accept text",
+    )
+    proposals_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="With --rollback, overwrite even if the policy file changed since acceptance",
+    )
     reuse_parser = subparsers.add_parser("reuse", help="Show reusable workflow templates, saved views, and learned playbooks")
     reuse_parser.add_argument(
         "--workspace",
@@ -2192,6 +2202,29 @@ def handle_fork(args: argparse.Namespace) -> None:
 
 def handle_proposals(args: argparse.Namespace | None = None) -> None:
     """Show policy proposals generated from persisted Learn artifacts."""
+    rollback_id = getattr(args, "rollback", None) if args is not None else None
+    if rollback_id:
+        policy_pack = (
+            getattr(args, "policy_pack", None)
+            if args is not None and getattr(args, "policy_pack", None)
+            else discover_policy_pack()
+        )
+        if not policy_pack:
+            print("No policy pack found. Pass --policy-pack to roll back a proposal.")
+            return
+        store = ProposalReviewStore(policy_pack)
+        proposal_id = _find_decision(store.review_dir, rollback_id)
+        if proposal_id is None:
+            print(f"Accepted decision not found for: {rollback_id}")
+            return
+        try:
+            decision = store.rollback(proposal_id, force=bool(getattr(args, "force", False)))
+        except ValueError as exc:
+            print(f"Rollback failed: {exc}")
+            return
+        print(f"Rolled back proposal {decision['id']} -> {decision['policy_file']}")
+        return
+
     persistence_cls = globals().get("PersistenceManager")
     if persistence_cls is None:
         try:
@@ -2254,6 +2287,24 @@ def _find_proposal(proposals, proposal_id: str):
     matches = [
         proposal for proposal in proposals
         if proposal.proposal_id == proposal_id or proposal.proposal_id.startswith(proposal_id)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _find_decision(review_dir: Path, id_prefix: str) -> str | None:
+    """Resolve an ID/prefix to a recorded decision's full proposal id.
+
+    Only matches original decision files (``<id>.json``), never the
+    ``<id>.rollback-<timestamp>.json`` history entries a rollback writes.
+    """
+    if not review_dir.exists():
+        return None
+    matches = [
+        path.stem
+        for path in review_dir.glob(f"{id_prefix}*.json")
+        if ".rollback-" not in path.stem
     ]
     if len(matches) == 1:
         return matches[0]

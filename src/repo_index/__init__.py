@@ -133,14 +133,8 @@ def build_repo_index(target_path: str | Path, *, force: bool = False) -> dict[st
     }
 
 
-def query_repo_index(target_path: str | Path, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
-    """Rank indexed symbols against a free-text query.
-
-    Scores by token overlap against the symbol name (highest weight), its
-    docstring first line, and its file path. Returns the compact symbol
-    entries only -- callers format them (see ``format_symbol_hint``).
-    """
-    root = Path(target_path).expanduser().resolve()
+def _load_symbols(root: Path) -> list[dict[str, Any]]:
+    """Read ``.sarathi/index/symbols.json`` under ``root``, or ``[]`` if unavailable."""
     symbols_path = root / ".sarathi" / "index" / "symbols.json"
     if not symbols_path.exists():
         return []
@@ -150,7 +144,16 @@ def query_repo_index(target_path: str | Path, query: str, *, limit: int = 10) ->
         return []
     if not isinstance(symbols, list):
         return []
+    return symbols
 
+
+def _score_symbols(symbols: list[dict[str, Any]], query: str, *, limit: int = 10) -> list[dict[str, Any]]:
+    """Rank already-loaded symbol entries against a free-text query.
+
+    Scores by token overlap against the symbol name (highest weight), its
+    docstring first line, and its file path. Returns the compact symbol
+    entries only -- callers format them (see ``format_symbol_hint``).
+    """
     query_tokens = set(_tokenize(query))
     if not query_tokens:
         return []
@@ -175,6 +178,19 @@ def query_repo_index(target_path: str | Path, query: str, *, limit: int = 10) ->
 
     scored.sort(key=lambda item: item[0], reverse=True)
     return [entry for _score, entry in scored[:limit]]
+
+
+def query_repo_index(target_path: str | Path, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
+    """Rank indexed symbols against a free-text query.
+
+    Reads and scores ``.sarathi/index/symbols.json`` fresh on every call. For
+    repeated queries against the same root within one run (e.g. one query per
+    phase/graph node), prefer ``runtime.run_cache.RepoIndexCache`` instead,
+    which caches the loaded symbol list and only re-reads it when the index
+    file's mtime changes.
+    """
+    root = Path(target_path).expanduser().resolve()
+    return _score_symbols(_load_symbols(root), query, limit=limit)
 
 
 def check_repo_index(target_path: str | Path) -> dict[str, Any]:

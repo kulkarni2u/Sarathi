@@ -14,6 +14,7 @@ except ImportError:
     UTC = timezone.utc
 
 try:
+    from src.graph_node_mirror import GraphNodeRecorder
     from src.runtime.context import ContextCompiler
     from src.runtime.contracts import DispatchRequest
     from src.runtime.isolation import GitWorktreeIsolation
@@ -25,6 +26,7 @@ try:
         lone_verified_survivor,
     )
     from src.runtime.output_index import build_artifact_index, normalize_agent_output
+    from src.runtime.run_cache import NodeOutputCache, RepoIndexCache
     from src.runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
     from src.task_graph import (
         NodeType,
@@ -35,6 +37,7 @@ try:
         retry_graph_node,
     )
 except ImportError:
+    from graph_node_mirror import GraphNodeRecorder
     from runtime.context import ContextCompiler
     from runtime.contracts import DispatchRequest
     from runtime.isolation import GitWorktreeIsolation
@@ -46,6 +49,7 @@ except ImportError:
         lone_verified_survivor,
     )
     from runtime.output_index import build_artifact_index, normalize_agent_output
+    from runtime.run_cache import NodeOutputCache, RepoIndexCache
     from runtime.workflow_patterns import WorkflowPattern, WorkflowPatternsPolicy
     from task_graph import (
         NodeType,
@@ -156,6 +160,15 @@ class TaskGraphExecutor:
         # of relying on this constructor default.
         self.harness_config = harness_config
         self.isolation_repo_root = Path(isolation_repo_root).resolve() if isolation_repo_root else Path.cwd()
+        # Scoped to this executor's lifetime (one task run): avoids re-reading
+        # the repo index from disk and re-scanning the graph for sibling node
+        # outputs on every phase/node dispatch. See src/runtime/run_cache.py.
+        self._repo_index_cache = RepoIndexCache()
+        self._node_output_cache = NodeOutputCache()
+        # Best-effort mirror into .sarathi/sarathi.db so nodes stay addressable
+        # (sarathi graph status / message) after this call frame returns. See
+        # src/graph_node_mirror.py -- inactive unless the DB already exists.
+        self._graph_node_recorder = GraphNodeRecorder.try_create()
         if max_parallel is None:
             try:
                 max_parallel = int(os.environ.get("SARATHI_GRAPH_MAX_PARALLEL", "4"))
@@ -222,8 +235,7 @@ class TaskGraphExecutor:
     def _timestamp() -> str:
         return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
-    @staticmethod
-    def _annotate_node_result(graph: dict, node_id: str, provider_result: dict | None) -> dict:
+    def _annotate_node_result(self, graph: dict, node_id: str, provider_result: dict | None) -> dict:
         if provider_result is None:
             return graph
         for node in graph.get("nodes", []):
@@ -245,8 +257,66 @@ class TaskGraphExecutor:
             isolation = provider_result.get("isolation")
             if isinstance(isolation, dict):
                 node["isolation"] = dict(isolation)
+            self._node_output_cache.record(node_id, node)
             break
         return graph
+
+    @staticmethod
+    def _extract_session_artifact(provider_result: dict | None) -> tuple[str | None, str | None]:
+        """Pull whichever ``<provider>_session_id`` artifact a dispatch returned, if any.
+
+        Provider-agnostic by naming convention rather than a provider-registry
+        lookup, matching how this module already treats ``provider_result`` as
+        a generic dict elsewhere -- see ``_HarnessAwareDispatcher._track_session``
+        (``src/engine.py``) for the producing side of the same convention.
+        """
+        if not isinstance(provider_result, dict):
+            return None, None
+        artifacts = provider_result.get("artifacts")
+        if not isinstance(artifacts, dict):
+            return None, None
+        for key, value in artifacts.items():
+            if isinstance(key, str) and key.endswith("_session_id") and isinstance(value, str) and value:
+                return key, value
+        return None, None
+
+    def _mirror_node_started(self, task_id: str, node: dict) -> None:
+        if self._graph_node_recorder is None:
+            return
+        self._graph_node_recorder.record(
+            task_id=task_id,
+            node_id=str(node.get("id")),
+            node_type=str(node.get("node_type", "execute")),
+            status="running",
+            started_at=self._timestamp(),
+        )
+
+    def _mirror_node_finished(
+        self,
+        task_id: str,
+        *,
+        node_id: str,
+        node_type: str,
+        status: str,
+        provider_result: dict | None,
+        error: str | None,
+        finished_at: str | None,
+    ) -> None:
+        if self._graph_node_recorder is None:
+            return
+        session_key, session_value = self._extract_session_artifact(provider_result)
+        provider = session_key[: -len("_session_id")] if session_key else None
+        self._graph_node_recorder.record(
+            task_id=task_id,
+            node_id=node_id,
+            node_type=node_type,
+            status=status,
+            provider=provider,
+            session_artifact_key=session_key,
+            session_artifact_value=session_value,
+            completed_at=finished_at or self._timestamp(),
+            last_error=error,
+        )
 
     def execute_next(
         self,
@@ -262,8 +332,15 @@ class TaskGraphExecutor:
             return GraphExecutionResult(graph_state=current, events=[])
 
         effective_harness = self._resolve_harness(harness_config)
+        # Resolved once from the caller's graph, before any node-transition
+        # helper (progress_graph/fail_graph_node/inject_nodes) rebuilds the
+        # graph dict from just {"nodes": ...} and drops top-level keys like
+        # task_id -- see _mirror_node_started/_mirror_node_finished.
+        task_id = self._isolation_task_id(effective_harness, graph)
         try:
-            [(ready, provider_result)] = self._dispatch_batch([ready], current, harness_config=effective_harness)
+            [(ready, provider_result)] = self._dispatch_batch(
+                [ready], current, harness_config=effective_harness, task_id=task_id
+            )
             updated, event, _failed = self._apply_node_result(
                 current,
                 ready,
@@ -271,6 +348,7 @@ class TaskGraphExecutor:
                 fail_node_id=fail_node_id,
                 fail_error=fail_error,
                 harness_config=effective_harness,
+                task_id=task_id,
             )
         finally:
             self._cleanup_isolated_task(effective_harness, current)
@@ -339,6 +417,10 @@ class TaskGraphExecutor:
         stop = False
 
         effective_harness = self._resolve_harness(harness_config)
+        # Resolved once, before the loop's node-transition helpers rebuild
+        # `current` from just {"nodes": ...} and drop top-level keys like
+        # task_id -- see _mirror_node_started/_mirror_node_finished.
+        task_id = self._isolation_task_id(effective_harness, graph)
         try:
             while not stop:
                 remaining = None if max_nodes is None else max_nodes - executed
@@ -347,7 +429,9 @@ class TaskGraphExecutor:
                 batch = self._ready_batch(current, limit=remaining)
                 if not batch:
                     break
-                for ready, provider_result in self._dispatch_batch(batch, current, harness_config=effective_harness):
+                for ready, provider_result in self._dispatch_batch(
+                    batch, current, harness_config=effective_harness, task_id=task_id
+                ):
                     current, event, failed = self._apply_node_result(
                         current,
                         ready,
@@ -355,6 +439,7 @@ class TaskGraphExecutor:
                         fail_node_id=fail_node_id,
                         fail_error=fail_error,
                         harness_config=effective_harness,
+                        task_id=task_id,
                     )
                     events.append(event)
                     executed += 1
@@ -380,7 +465,7 @@ class TaskGraphExecutor:
         return batch
 
     def _dispatch_batch(
-        self, batch: list[dict], graph: dict, *, harness_config: Any = None
+        self, batch: list[dict], graph: dict, *, harness_config: Any = None, task_id: str | None = None
     ) -> list[tuple[dict, dict | None]]:
         """Dispatch a batch of independent ready nodes, concurrently when possible.
 
@@ -391,6 +476,13 @@ class TaskGraphExecutor:
         effective_harness = self._resolve_harness(harness_config)
         if self._uses_worktree_isolation(effective_harness):
             batch = self._prepare_isolated_batch(batch, graph, effective_harness)
+        # Prefer the caller's resolved task_id (stable across a whole
+        # execute_all/execute_some run) over re-deriving it from `graph`,
+        # which loses top-level keys once a node-transition helper rebuilds
+        # it from just {"nodes": ...} -- see callers of this method.
+        resolved_task_id = task_id or self._isolation_task_id(effective_harness, graph)
+        for node in batch:
+            self._mirror_node_started(resolved_task_id, node)
         if len(batch) == 1 or self.max_parallel <= 1 or self.dispatcher is None:
             return [
                 (node, self._dispatch_node(node, graph=graph, harness_config=effective_harness))
@@ -412,6 +504,7 @@ class TaskGraphExecutor:
         fail_node_id: str | None,
         fail_error: str | None,
         harness_config: Any = None,
+        task_id: str | None = None,
     ) -> tuple[dict, GraphExecutionEvent, bool]:
         """Apply one node's execution result to the graph. Returns (graph, event, failed)."""
         node_id = ready["id"]
@@ -443,6 +536,20 @@ class TaskGraphExecutor:
             {},
         )
         updated = self._annotate_node_result(updated, node_id, provider_result)
+        self._mirror_node_finished(
+            # Prefer the caller's resolved task_id over re-deriving it from
+            # `current`/`updated`: progress_graph/fail_graph_node rebuild the
+            # graph from just {"nodes": ...} on every transition, so by the
+            # second node in a multi-node run neither carries the original
+            # top-level task_id any more.
+            task_id or self._isolation_task_id(harness_config, current),
+            node_id=node_id,
+            node_type=ready.get("node_type", "execute"),
+            status=action,
+            provider_result=provider_result,
+            error=error if (provider_failed or injected_failure) else None,
+            finished_at=updated_node.get(finished_key),
+        )
         event = GraphExecutionEvent(
             node_id=node_id,
             title=ready.get("title", node_id),
@@ -938,6 +1045,8 @@ class TaskGraphExecutor:
             phase=self.dispatch_phase,
             available_tools=["task_graph", "workspace_files", "git_diff", "test_results"],
             repo_index_root=str(self.isolation_repo_root),
+            repo_index_cache=self._repo_index_cache,
+            node_output_cache=self._node_output_cache,
         )
         return cp.to_artifact(), cp.agent_input.token_budget
 

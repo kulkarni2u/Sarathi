@@ -284,7 +284,14 @@ def test_run_worker_once_with_empty_queue_returns_immediately(tmp_path):
 
     summary = run_worker(db_path, once=True, worker_id="worker-empty")
 
-    assert summary == {"claimed": 0, "succeeded": 0, "failed": 0, "requeued": []}
+    assert summary == {
+        "claimed": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "requeued": [],
+        "full_engine_claimed": 0,
+        "full_engine_failed": 0,
+    }
 
 
 # ---------------------------------------------------------------------------

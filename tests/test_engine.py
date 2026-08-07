@@ -659,3 +659,77 @@ def test_engine_gate_retry_phases_can_be_overridden_to_disable_gating(tmp_path: 
     engine._attach_gate_result(result)
     # Brainstorm is no longer a gated phase, so no gate_result is attached at all.
     assert "gate_result" not in result.artifacts
+
+
+# --------------------------------------------- provider_session_ids persistence
+
+
+def test_task_context_provider_session_ids_round_trip_through_persistence(tmp_path: Path):
+    persistence = PersistenceManager(str(tmp_path / "tasks"))
+    task = TaskContext(
+        task_id="session-round-trip",
+        description="Test task",
+        provider_session_ids={"claude": "sess-abc", "codex": "sess-def"},
+    )
+
+    persistence.save_task(task)
+    loaded = persistence.load_task("session-round-trip")
+
+    assert loaded is not None
+    assert loaded.provider_session_ids == {"claude": "sess-abc", "codex": "sess-def"}
+
+
+def test_engine_log_phase_mirrors_dispatcher_session_ids_onto_task(tmp_path: Path):
+    task = TaskContext(task_id="mirror-session", description="Test task")
+    engine = Engine()
+    engine.persistence = PersistenceManager(str(tmp_path / "tasks"))
+    engine.dispatcher.session_ids["claude"] = "sess-live"
+
+    engine._log_phase(task, Phase.ROUTE, "completed")
+
+    assert task.provider_session_ids == {"claude": "sess-live"}
+
+
+def test_engine_resume_task_rehydrates_dispatcher_session_ids_after_restart(tmp_path: Path, monkeypatch):
+    # Simulates a process restart: the Engine that ran the first phases is
+    # gone, and a brand-new Engine (with an empty dispatcher.session_ids)
+    # resumes the task purely from persisted state.
+    policy_dir = tmp_path / "policy-pack"
+    policy_dir.mkdir()
+    for filename, content in {
+        "complexity.md": "classification_thresholds: present\nskip_rules: present\n",
+        "conventions.md": "conventions: present\nbrainstorming_protocol: present\n",
+        "commands.md": "```yaml\ntest:\n  command: \"echo test\"\n```\n",
+        "review.md": "max_rounds: 5\nmin_coverage: 80\n",
+        "escalation.md": "auto_fix: configured\nreview: configured\n",
+        "skills.md": "pattern_detection: enabled\nevolution_threshold: 0.8\n",
+        "task-tracking.md": "task: configured\noptions: configured\n",
+    }.items():
+        (policy_dir / filename).write_text(content)
+
+    monkeypatch.setenv("SARATHI_GRAPH_STEP_LIMIT", "1")
+    tasks_dir = str(tmp_path / "tasks")
+    task = TaskContext(task_id="restart-resume", description="Fix bug", complexity=Complexity.LOW)
+
+    first_engine = Engine(policy_pack_path=str(policy_dir))
+    first_engine.persistence = PersistenceManager(tasks_dir)
+    first_pass = first_engine.run_task(task)
+    assert first_pass.current_phase == Phase.BUILD
+
+    # A real claude/codex dispatch would have set this; the test default
+    # LocalProviderAdapter doesn't call a real CLI, so set it directly to
+    # simulate what a live run would have captured.
+    first_engine.dispatcher.session_ids["claude"] = "sess-before-restart"
+    first_engine._log_phase(first_pass, Phase.BUILD, "paused")
+    first_engine.persistence.save_task(first_pass)
+
+    second_engine = Engine(policy_pack_path=str(policy_dir))
+    second_engine.persistence = PersistenceManager(tasks_dir)
+    reloaded = second_engine.persistence.load_task("restart-resume")
+    assert reloaded is not None
+    assert reloaded.provider_session_ids == {"claude": "sess-before-restart"}
+    assert second_engine.dispatcher.session_ids == {}
+
+    second_engine.resume_task(reloaded)
+
+    assert second_engine.dispatcher.session_ids.get("claude") == "sess-before-restart"

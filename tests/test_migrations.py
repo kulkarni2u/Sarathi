@@ -612,7 +612,7 @@ def test_migration_11_creates_proposal_decisions_table_on_fresh_db(tmp_path):
         run_migrations(conn)
 
         assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
-        assert LATEST_SCHEMA_VERSION == 14
+        assert LATEST_SCHEMA_VERSION == 15
 
         tables = {
             row["name"]
@@ -763,7 +763,7 @@ def test_migration_13_adds_attempt_count_on_fresh_db(tmp_path):
         run_migrations(conn)
 
         assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
-        assert LATEST_SCHEMA_VERSION == 14
+        assert LATEST_SCHEMA_VERSION == 15
 
         outbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_outbox)")}
         assert "attempt_count" in outbox_columns
@@ -774,7 +774,7 @@ def test_migration_14_adds_inbox_attempt_count_on_fresh_db(tmp_path):
         run_migrations(conn)
 
         assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
-        assert LATEST_SCHEMA_VERSION == 14
+        assert LATEST_SCHEMA_VERSION == 15
 
         inbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_inbox)")}
         assert "attempt_count" in inbox_columns
@@ -849,6 +849,126 @@ def test_migration_14_applies_on_top_of_v13_db(tmp_path):
         assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
         inbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_inbox)")}
         assert "attempt_count" in inbox_columns
+
+        run_migrations(conn)
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        versions = [
+            row["version"]
+            for row in conn.execute("SELECT version FROM schema_version ORDER BY version")
+        ]
+        assert versions == list(range(1, LATEST_SCHEMA_VERSION + 1))
+
+
+def test_migration_15_creates_graph_nodes_table_on_fresh_db(tmp_path):
+    with connect(tmp_path / "sarathi.db") as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        assert LATEST_SCHEMA_VERSION == 15
+
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "graph_nodes" in tables
+
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(graph_nodes)")}
+        assert {
+            "workspace_id",
+            "task_id",
+            "node_id",
+            "node_type",
+            "status",
+            "provider",
+            "session_artifact_key",
+            "session_artifact_value",
+            "started_at",
+            "completed_at",
+            "last_error",
+        } <= columns
+
+
+def test_migration_15_applies_on_top_of_v14_db(tmp_path):
+    # A v14 database (no graph_nodes table at all) must gain graph_nodes when
+    # migrated — without re-running or changing any prior migration — and
+    # must converge on the same schema as a fresh database.
+    from src.storage import (
+        _MIGRATION_001,
+        _MIGRATION_002,
+        _MIGRATION_003,
+        _MIGRATION_004,
+        _MIGRATION_005,
+        _MIGRATION_006,
+        _MIGRATION_007,
+        _MIGRATION_008,
+        _MIGRATION_009,
+        _MIGRATION_010,
+        _MIGRATION_011,
+        _MIGRATION_012,
+        _utc_now,
+    )
+
+    db_path = tmp_path / "sarathi.db"
+    with connect(db_path) as conn:
+        for version, script in (
+            (1, _MIGRATION_001),
+            (2, _MIGRATION_002),
+            (3, _MIGRATION_003),
+            (4, _MIGRATION_004),
+            (5, _MIGRATION_005),
+            (6, _MIGRATION_006),
+            (7, _MIGRATION_007),
+            (8, _MIGRATION_008),
+            (9, _MIGRATION_009),
+            (10, _MIGRATION_010),
+            (11, _MIGRATION_011),
+            (12, _MIGRATION_012),
+        ):
+            conn.executescript(script)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, _utc_now()),
+            )
+            conn.commit()
+
+        # Apply migrations 13 and 14's inline steps so the DB sits at exactly
+        # version 14, with no graph_nodes table.
+        outbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_outbox)")}
+        if "attempt_count" not in outbox_columns:
+            conn.execute(
+                "ALTER TABLE slack_outbox ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (13, _utc_now()),
+        )
+        inbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(slack_inbox)")}
+        if "attempt_count" not in inbox_columns:
+            conn.execute(
+                "ALTER TABLE slack_inbox ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (14, _utc_now()),
+        )
+        conn.commit()
+
+        assert current_schema_version(conn) == 14
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "graph_nodes" not in tables
+
+    with connect(db_path) as conn:
+        run_migrations(conn)
+
+        assert current_schema_version(conn) == LATEST_SCHEMA_VERSION
+        tables = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "graph_nodes" in tables
 
         run_migrations(conn)
         assert current_schema_version(conn) == LATEST_SCHEMA_VERSION

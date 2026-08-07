@@ -230,6 +230,22 @@ def _resolve_workspace_ncp(args, cwd: str) -> bool | None:
     return None  # no workspace found → auto-detect
 
 
+def _find_sarathi_db(start_path: str = ".") -> Path | None:
+    """Walk up from ``start_path`` looking for an existing ``.sarathi/sarathi.db``.
+
+    Same search used by ``_resolve_workspace_ncp`` above -- graph node status
+    (``sarathi graph status``/``message``) is only tracked once the
+    service/web stack has been bootstrapped for a workspace, never created on
+    behalf of a CLI-only user (see ``src/graph_node_mirror.py``).
+    """
+    search = Path(start_path).resolve()
+    for parent in [search] + list(search.parents):
+        db = parent / ".sarathi" / "sarathi.db"
+        if db.exists():
+            return db
+    return None
+
+
 # ============================================================================
 # Auto-discovery functions
 # ============================================================================
@@ -792,6 +808,15 @@ def main() -> None:
         default=None,
         help="Path to a recipe dir/file to execute as a FANOUT/JUDGE workflow graph (instead of the standard lifecycle)",
     )
+    run_parser.add_argument(
+        "--background",
+        action="store_true",
+        help=(
+            "Submit the task to the resident worker (see `sarathi worker start`) and "
+            "return immediately instead of blocking in the foreground. Reattach with "
+            "`sarathi watch --follow <task-id>`."
+        ),
+    )
 
     # NCP Integration
     run_parser.add_argument(
@@ -908,6 +933,16 @@ def main() -> None:
         default=None,
         help="Optional rejection reason",
     )
+    proposals_parser.add_argument(
+        "--rollback",
+        default=None,
+        help="Roll back a previously accepted proposal ID/prefix, restoring its pre-accept text",
+    )
+    proposals_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="With --rollback, overwrite even if the policy file changed since acceptance",
+    )
     reuse_parser = subparsers.add_parser("reuse", help="Show reusable workflow templates, saved views, and learned playbooks")
     reuse_parser.add_argument(
         "--workspace",
@@ -973,6 +1008,36 @@ def main() -> None:
         default="policy-pack/RECIPES",
         help="Directory containing recipe sub-packs (default: policy-pack/RECIPES)",
     )
+
+    graph_parser = subparsers.add_parser(
+        "graph", help="Inspect or follow up on durable graph nodes (FANOUT/JUDGE/SYNTHESIZE branches)"
+    )
+    graph_parser.add_argument(
+        "--policy-pack", default=None, help="Policy pack to dispatch through (only needed for 'message')"
+    )
+    graph_subparsers = graph_parser.add_subparsers(dest="action", required=True)
+    graph_status_parser = graph_subparsers.add_parser(
+        "status", help="List graph nodes and their status for a task"
+    )
+    graph_status_parser.add_argument("task_id")
+    graph_message_parser = graph_subparsers.add_parser(
+        "message",
+        help="Send a follow-up message to a completed, session-resumable graph node",
+    )
+    graph_message_parser.add_argument("task_id")
+    graph_message_parser.add_argument("node_id")
+    graph_message_parser.add_argument("text")
+
+    worker_parser = subparsers.add_parser(
+        "worker", help="Manage the resident worker process (drives `sarathi run --background` tasks)"
+    )
+    worker_parser.add_argument(
+        "--db", default=None, help="Path to sarathi.db (default: .sarathi/sarathi.db)"
+    )
+    worker_subparsers = worker_parser.add_subparsers(dest="worker_action", required=True)
+    worker_subparsers.add_parser("start", help="Start a detached resident worker")
+    worker_subparsers.add_parser("stop", help="Stop the resident worker")
+    worker_subparsers.add_parser("status", help="Check whether the resident worker is running")
 
     # Index command (build/query the offline repo symbol index)
     index_parser = subparsers.add_parser(
@@ -1066,6 +1131,10 @@ def main() -> None:
         handle_fork(args)
     elif args.command == "agents":
         handle_agents()
+    elif args.command == "graph":
+        handle_graph(args)
+    elif args.command == "worker":
+        handle_worker(args)
     elif args.command == "recipes":
         handle_recipes(args)
     elif args.command == "index":
@@ -1479,6 +1548,69 @@ def _run_via_service(args: argparse.Namespace) -> bool:
     return True
 
 
+def _run_background(args: argparse.Namespace, policy_pack: str) -> None:
+    """Submit a full-Engine task to the resident worker and return immediately.
+
+    Inserts a `tasks` row directly against `.sarathi/sarathi.db` (creating it
+    if needed, same as `sarathi worker start` would) with
+    `metadata.execution_mode = "full_engine"` -- `run_worker` claims and runs
+    it via `src/service/full_engine.py` on its next poll. This is independent
+    of the HTTP service/`_run_via_service` path above: no service process
+    needs to be running, only a worker polling the same database.
+    """
+    try:
+        from .storage import Storage, connect, run_migrations
+    except ImportError:
+        from storage import Storage, connect, run_migrations
+    import uuid
+
+    if args.complexity == "auto":
+        complexity = calculate_complexity(args.task_description)
+    else:
+        complexity = {"low": Complexity.LOW, "medium": Complexity.MEDIUM, "high": Complexity.HIGH}[args.complexity]
+
+    engine_task_id = f"bg-{uuid.uuid4().hex[:12]}"
+    db_path = _find_sarathi_db() or (Path(".sarathi") / "sarathi.db")
+    conn = connect(db_path)
+    try:
+        run_migrations(conn)
+        storage = Storage(conn)
+        root_path = os.getcwd()
+        workspace = next(
+            (ws for ws in storage.list_workspaces() if ws.get("root_path") == root_path), None
+        )
+        if workspace is None:
+            workspace = storage.create_workspace(name=Path(root_path).name or root_path, root_path=root_path)
+        task = storage.create_task(
+            workspace_id=workspace["id"],
+            title=args.task_description[:200],
+            description=args.task_description,
+            status="queued",
+            metadata={
+                "execution_mode": "full_engine",
+                "engine_task_id": engine_task_id,
+                "policy_pack": policy_pack,
+                "complexity": complexity.value,
+            },
+        )
+    finally:
+        conn.close()
+
+    print(f"Submitted task {task['id']} (engine task id: {engine_task_id})")
+    print(f"  Policy pack: {policy_pack}")
+    print(f"  Complexity: {complexity.value}")
+    pidfile = _worker_pidfile_path()
+    worker_running = False
+    if pidfile.exists():
+        try:
+            worker_running = _pid_alive(int(pidfile.read_text().strip()))
+        except ValueError:
+            worker_running = False
+    if not worker_running:
+        print("  No resident worker detected -- start one with `sarathi worker start` to process this task.")
+    print(f"  Reattach with: sarathi watch --follow {task['id']}")
+
+
 def handle_run(args: argparse.Namespace) -> None:
     """Handle the run command."""
     # Service route: when the service is reachable, no --recipe, no --dry-run,
@@ -1502,6 +1634,10 @@ def handle_run(args: argparse.Namespace) -> None:
 
     if getattr(args, "recipe", None):
         _run_recipe(args, policy_pack)
+        return
+
+    if getattr(args, "background", False):
+        _run_background(args, policy_pack)
         return
 
     # Resolve declarative user agent (--agent), if requested
@@ -1788,6 +1924,220 @@ def handle_agents() -> None:
     print("\nLifecycle Phase Mapping:")
     for mapping in list_phase_agent_roles():
         print(f"- {mapping['phase']}: {mapping['name']} ({mapping['purpose']})")
+
+
+def handle_graph(args: argparse.Namespace) -> None:
+    """Inspect or follow up on durable graph nodes (sarathi graph status/message).
+
+    Reads from the same ``.sarathi/sarathi.db`` mirror ``TaskGraphExecutor``
+    writes to (see ``src/graph_node_mirror.py``) -- a node only shows up here
+    once that mirror has been active for the run, and only workspaces already
+    bootstrapped for the service/web stack have that database at all.
+    """
+    try:
+        from .storage import Storage, connect
+    except ImportError:
+        from storage import Storage, connect
+
+    db_path = _find_sarathi_db()
+    if db_path is None:
+        print(
+            "No .sarathi/sarathi.db found. Graph node status is only tracked "
+            "once this workspace has a service database (see `sarathi init` "
+            "or `sarathi desktop`)."
+        )
+        sys.exit(1)
+
+    conn = connect(db_path)
+    try:
+        storage = Storage(conn)
+        if args.action == "status":
+            _handle_graph_status(storage, args.task_id)
+        elif args.action == "message":
+            _handle_graph_message(storage, args)
+    finally:
+        conn.close()
+
+
+def _handle_graph_status(storage: Any, task_id: str) -> None:
+    nodes = storage.list_graph_nodes(task_id)
+    if not nodes:
+        print(f"No graph nodes recorded for task '{task_id}'.")
+        return
+    print(f"Graph nodes for task '{task_id}': {len(nodes)}")
+    for node in nodes:
+        provider = f" provider={node['provider']}" if node.get("provider") else ""
+        print(f"- {node['node_id']} [{node['node_type']}] status={node['status']}{provider}")
+        if node.get("started_at"):
+            print(f"    started_at={node['started_at']}")
+        if node.get("completed_at"):
+            print(f"    completed_at={node['completed_at']}")
+        if node.get("last_error"):
+            print(f"    last_error={node['last_error']}")
+
+
+def _handle_graph_message(storage: Any, args: argparse.Namespace) -> None:
+    node = storage.get_graph_node(args.task_id, args.node_id)
+    if node is None:
+        print(f"No recorded node '{args.node_id}' for task '{args.task_id}'. Run `sarathi graph status {args.task_id}` to list nodes.")
+        sys.exit(1)
+    if node.get("status") != "completed":
+        print(f"Node '{args.node_id}' is '{node.get('status')}', not 'completed' -- only a finished node can receive a follow-up message.")
+        sys.exit(1)
+    session_key = node.get("session_artifact_key")
+    session_value = node.get("session_artifact_value")
+    if not session_key or not session_value:
+        print(
+            f"Node '{args.node_id}' has no resumable provider session recorded "
+            "(its provider doesn't support session resume, or it predates this feature)."
+        )
+        sys.exit(1)
+
+    policy_pack = args.policy_pack or discover_policy_pack()
+    if not policy_pack:
+        print("No policy pack found. Pass --policy-pack to send a follow-up message.")
+        sys.exit(1)
+
+    try:
+        from .dispatch import LocalDispatcher
+        from .policy import compile_policy_pack
+        from .runtime import DispatchRequest, apply_learning_feedback_to_provider_routing
+    except ImportError:
+        from dispatch import LocalDispatcher
+        from policy import compile_policy_pack
+        from runtime import DispatchRequest, apply_learning_feedback_to_provider_routing
+
+    compiled_policy = compile_policy_pack(policy_pack)
+    provider_config = apply_learning_feedback_to_provider_routing(
+        compiled_policy.get("model_routing"), compiled_policy.get("learning_feedback")
+    )
+    dispatcher = LocalDispatcher(provider_config=provider_config)
+
+    request = DispatchRequest(
+        mode="execute",
+        task_id=args.node_id,
+        phase="Build",
+        prompt=args.text,
+        constraints={session_key: session_value, "purpose": "graph_node_followup"},
+    )
+    response = dispatcher.dispatch(request)
+    if not response.success:
+        print(f"Follow-up dispatch failed: {response.error}")
+        sys.exit(1)
+
+    # Not persisted: graph_nodes.task_id is the Engine's own task id, which
+    # has no guaranteed row in this DB's `tasks` table (a bare CLI-only
+    # workspace only ever bootstraps the graph_nodes mirror, not a full
+    # service task) -- see src/graph_node_mirror.py and evidence_artifacts'
+    # FK on tasks(id). The reply is shown directly instead.
+    print(f"Reply from '{args.node_id}':")
+    summary = response.outputs.get("summary") if isinstance(response.outputs, dict) else None
+    print(summary or response.outputs)
+
+
+def _worker_pidfile_path() -> Path:
+    return Path(".sarathi") / "worker.pid"
+
+
+def _worker_log_path() -> Path:
+    return Path(".sarathi") / "worker.log"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by someone else -- still alive.
+        return True
+    return True
+
+
+def handle_worker(args: argparse.Namespace) -> None:
+    """Start/stop/check the resident worker (`sarathi worker start/stop/status`).
+
+    The worker is a plain `python -m src.service.worker` process, launched
+    detached (`start_new_session=True`) and tracked by a pidfile at
+    `.sarathi/worker.pid` -- deliberately no lease/heartbeat reclaim beyond
+    what `run_worker` already does for subtasks; see
+    `src/service/full_engine.py` for the accepted gap on full-Engine tasks.
+    """
+    if args.worker_action == "start":
+        _handle_worker_start(args)
+    elif args.worker_action == "stop":
+        _handle_worker_stop(args)
+    elif args.worker_action == "status":
+        _handle_worker_status(args)
+
+
+def _handle_worker_start(args: argparse.Namespace) -> None:
+    import subprocess
+
+    pidfile = _worker_pidfile_path()
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    if pidfile.exists():
+        try:
+            existing_pid = int(pidfile.read_text().strip())
+        except ValueError:
+            existing_pid = None
+        if existing_pid is not None and _pid_alive(existing_pid):
+            print(f"Worker already running (pid {existing_pid}).")
+            return
+        pidfile.unlink()
+
+    db_path = args.db or str(Path(".sarathi") / "sarathi.db")
+    log_path = _worker_log_path()
+    log_file = open(log_path, "a")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "src.service.worker", "--db", db_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    pidfile.write_text(str(process.pid))
+    print(f"Worker started (pid {process.pid})")
+    print(f"  db:  {db_path}")
+    print(f"  log: {log_path}")
+    print("  Stop with: sarathi worker stop")
+
+
+def _handle_worker_stop(args: argparse.Namespace) -> None:
+    pidfile = _worker_pidfile_path()
+    if not pidfile.exists():
+        print("No worker pidfile found -- nothing to stop.")
+        return
+    try:
+        pid = int(pidfile.read_text().strip())
+    except ValueError:
+        print(f"Pidfile {pidfile} is corrupt; removing it.")
+        pidfile.unlink()
+        return
+    if not _pid_alive(pid):
+        print(f"Worker (pid {pid}) is not running; removing stale pidfile.")
+        pidfile.unlink()
+        return
+    import signal as signal_module
+
+    os.kill(pid, signal_module.SIGINT)
+    print(f"Sent stop signal to worker (pid {pid}). It will finish its current item then exit.")
+    pidfile.unlink()
+
+
+def _handle_worker_status(args: argparse.Namespace) -> None:
+    pidfile = _worker_pidfile_path()
+    if not pidfile.exists():
+        print("Worker: not running (no pidfile)")
+        return
+    try:
+        pid = int(pidfile.read_text().strip())
+    except ValueError:
+        print(f"Worker: pidfile {pidfile} is corrupt")
+        return
+    if _pid_alive(pid):
+        print(f"Worker: running (pid {pid})")
+    else:
+        print(f"Worker: not running (stale pidfile for pid {pid})")
 
 
 def _service_discovery_path() -> Path:
@@ -2192,6 +2542,29 @@ def handle_fork(args: argparse.Namespace) -> None:
 
 def handle_proposals(args: argparse.Namespace | None = None) -> None:
     """Show policy proposals generated from persisted Learn artifacts."""
+    rollback_id = getattr(args, "rollback", None) if args is not None else None
+    if rollback_id:
+        policy_pack = (
+            getattr(args, "policy_pack", None)
+            if args is not None and getattr(args, "policy_pack", None)
+            else discover_policy_pack()
+        )
+        if not policy_pack:
+            print("No policy pack found. Pass --policy-pack to roll back a proposal.")
+            return
+        store = ProposalReviewStore(policy_pack)
+        proposal_id = _find_decision(store.review_dir, rollback_id)
+        if proposal_id is None:
+            print(f"Accepted decision not found for: {rollback_id}")
+            return
+        try:
+            decision = store.rollback(proposal_id, force=bool(getattr(args, "force", False)))
+        except ValueError as exc:
+            print(f"Rollback failed: {exc}")
+            return
+        print(f"Rolled back proposal {decision['id']} -> {decision['policy_file']}")
+        return
+
     persistence_cls = globals().get("PersistenceManager")
     if persistence_cls is None:
         try:
@@ -2254,6 +2627,24 @@ def _find_proposal(proposals, proposal_id: str):
     matches = [
         proposal for proposal in proposals
         if proposal.proposal_id == proposal_id or proposal.proposal_id.startswith(proposal_id)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _find_decision(review_dir: Path, id_prefix: str) -> str | None:
+    """Resolve an ID/prefix to a recorded decision's full proposal id.
+
+    Only matches original decision files (``<id>.json``), never the
+    ``<id>.rollback-<timestamp>.json`` history entries a rollback writes.
+    """
+    if not review_dir.exists():
+        return None
+    matches = [
+        path.stem
+        for path in review_dir.glob(f"{id_prefix}*.json")
+        if ".rollback-" not in path.stem
     ]
     if len(matches) == 1:
         return matches[0]

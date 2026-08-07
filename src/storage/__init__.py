@@ -14,7 +14,7 @@ from uuid import uuid4
 logger = logging.getLogger("sarathi.storage")
 
 
-LATEST_SCHEMA_VERSION = 14
+LATEST_SCHEMA_VERSION = 15
 
 # Canonical projection identity for human external inputs appended to subtask
 # metadata by the atomic assign+resume transaction. The workflow and context
@@ -180,6 +180,13 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
             (14, _utc_now()),
+        )
+        conn.commit()
+    if current_schema_version(conn) < 15:
+        conn.executescript(_MIGRATION_015)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (15, _utc_now()),
         )
         conn.commit()
 
@@ -703,6 +710,57 @@ class Storage:
             """
         ).fetchall()
         return [_task_from_row(row) for row in rows]
+
+    def list_claimable_full_engine_tasks(self) -> list[dict[str, Any]]:
+        """List queued tasks flagged for full-Engine execution, oldest first.
+
+        Unlike subtasks (a high-throughput queue with its own claimed_by/
+        heartbeat_at columns), a full-Engine task is a single long-running
+        job -- ``tasks`` has no dedicated claim columns, so
+        ``metadata.execution_mode == "full_engine"`` plus a plain
+        ``status == "queued"`` guard is enough; see
+        ``claim_full_engine_task`` for the atomic claim itself.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at, project_id
+            FROM tasks
+            WHERE status = 'queued'
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+        return [
+            task
+            for task in (_task_from_row(row) for row in rows)
+            if task["metadata"].get("execution_mode") == "full_engine"
+        ]
+
+    def claim_full_engine_task(self, task_id: str, *, worker_id: str) -> dict[str, Any] | None:
+        """Atomically claim a queued full-Engine task for ``worker_id``.
+
+        Returns the claimed task (with ``metadata.claimed_by``/``claimed_at``
+        set) if this call won the claim, or ``None`` if it was already moved
+        out of ``queued`` (lost the race to another worker).
+        """
+        existing = self.get_task(task_id)
+        if existing is None or existing["status"] != "queued":
+            return None
+        now = _utc_now()
+        next_metadata = dict(existing["metadata"])
+        next_metadata["claimed_by"] = worker_id
+        next_metadata["claimed_at"] = now
+        cursor = self.conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'running', metadata = ?, updated_at = ?
+            WHERE id = ? AND status = 'queued'
+            """,
+            (_dump_json(next_metadata), now, task_id),
+        )
+        self.conn.commit()
+        if cursor.rowcount != 1:
+            return None
+        return self.get_task(task_id)
 
     def create_subtask(
         self,
@@ -1999,6 +2057,99 @@ class Storage:
             (workspace_id,),
         ).fetchall()
         return [_proposal_decision_from_row(row) for row in rows]
+
+    def upsert_graph_node(
+        self,
+        *,
+        workspace_id: str,
+        task_id: str,
+        node_id: str,
+        node_type: str = "execute",
+        status: str = "pending",
+        provider: str | None = None,
+        session_artifact_key: str | None = None,
+        session_artifact_value: str | None = None,
+        started_at: str | None = None,
+        completed_at: str | None = None,
+        last_error: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or update a graph node's durable status row.
+
+        Keyed by ``(task_id, node_id)``, mirroring one FANOUT/JUDGE/SYNTHESIZE
+        branch's execution -- see ``TaskGraphExecutor`` in
+        ``src/runtime/graph_executor.py``. A later call for the same node
+        (e.g. running -> completed) updates the existing row rather than
+        inserting a new one, so a node stays addressable by a single id
+        across its whole lifecycle.
+        """
+        now = _utc_now()
+        self.conn.execute(
+            """
+            INSERT INTO graph_nodes (
+                id, workspace_id, task_id, node_id, node_type, status, provider,
+                session_artifact_key, session_artifact_value, started_at,
+                completed_at, last_error, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, node_id) DO UPDATE SET
+                node_type = excluded.node_type,
+                status = excluded.status,
+                provider = COALESCE(excluded.provider, graph_nodes.provider),
+                session_artifact_key = COALESCE(excluded.session_artifact_key, graph_nodes.session_artifact_key),
+                session_artifact_value = COALESCE(excluded.session_artifact_value, graph_nodes.session_artifact_value),
+                started_at = COALESCE(graph_nodes.started_at, excluded.started_at),
+                completed_at = COALESCE(excluded.completed_at, graph_nodes.completed_at),
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+            """,
+            (
+                _new_id(),
+                workspace_id,
+                task_id,
+                node_id,
+                node_type,
+                status,
+                provider,
+                session_artifact_key,
+                session_artifact_value,
+                started_at,
+                completed_at,
+                last_error,
+                now,
+                now,
+            ),
+        )
+        self.conn.commit()
+        node = self.get_graph_node(task_id, node_id)
+        assert node is not None
+        return node
+
+    def get_graph_node(self, task_id: str, node_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT id, workspace_id, task_id, node_id, node_type, status, provider,
+                   session_artifact_key, session_artifact_value, started_at,
+                   completed_at, last_error, created_at, updated_at
+            FROM graph_nodes
+            WHERE task_id = ? AND node_id = ?
+            """,
+            (task_id, node_id),
+        ).fetchone()
+        return _graph_node_from_row(row) if row is not None else None
+
+    def list_graph_nodes(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, task_id, node_id, node_type, status, provider,
+                   session_artifact_key, session_artifact_value, started_at,
+                   completed_at, last_error, created_at, updated_at
+            FROM graph_nodes
+            WHERE task_id = ?
+            ORDER BY created_at, id
+            """,
+            (task_id,),
+        ).fetchall()
+        return [_graph_node_from_row(row) for row in rows]
 
     def enqueue_slack_event(
         self,
@@ -3677,6 +3828,25 @@ def _proposal_decision_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _graph_node_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "workspace_id": row["workspace_id"],
+        "task_id": row["task_id"],
+        "node_id": row["node_id"],
+        "node_type": row["node_type"],
+        "status": row["status"],
+        "provider": row["provider"],
+        "session_artifact_key": row["session_artifact_key"],
+        "session_artifact_value": row["session_artifact_value"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+        "last_error": row["last_error"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 def _slack_inbox_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -4307,4 +4477,28 @@ CREATE INDEX IF NOT EXISTS idx_slack_external_inputs_unassigned
 
 CREATE INDEX IF NOT EXISTS idx_slack_external_inputs_task
     ON slack_external_inputs(task_id);
+"""
+
+
+_MIGRATION_015 = """
+CREATE TABLE IF NOT EXISTS graph_nodes (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    node_type TEXT NOT NULL DEFAULT 'execute',
+    status TEXT NOT NULL DEFAULT 'pending',
+    provider TEXT,
+    session_artifact_key TEXT,
+    session_artifact_value TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (task_id, node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_task
+    ON graph_nodes(task_id);
 """

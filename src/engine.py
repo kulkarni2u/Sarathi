@@ -394,6 +394,7 @@ class PersistenceManager:
             "current_phase": task.current_phase.value if task.current_phase else None,
             "task_class": getattr(task, "task_class", TaskClass.ANALYSIS).value,
             "harness_config": harness_dict,
+            "provider_session_ids": task.provider_session_ids,
             "phase_results": [
                 {
                     "phase": pr.phase.value,
@@ -441,6 +442,7 @@ class PersistenceManager:
                 task_class=restored_task_class,
                 budget_snapshot=task_data.get("budget_snapshot"),
                 crash_reconciliation=task_data.get("crash_reconciliation"),
+                provider_session_ids=task_data.get("provider_session_ids", {}),
             )
 
             task.current_phase = Phase(task_data["current_phase"]) if task_data.get("current_phase") else None
@@ -516,6 +518,17 @@ class TaskContext:
     gate_retry_hint: dict | None = field(default=None)
     budget_snapshot: dict[str, Any] | None = None
     crash_reconciliation: list[dict[str, Any]] | None = None
+    # Provider CLI session-resume ids (e.g. {"claude": "sess-abc"}), mirrored
+    # from _HarnessAwareDispatcher.session_ids after every phase and
+    # rehydrated by resume_task -- without this, a killed-and-resumed task
+    # silently loses claude/codex conversation continuity even though every
+    # other part of the task's state survives the restart.
+    provider_session_ids: dict[str, str] = field(default_factory=dict)
+    # Why run_task/resume_task returned early this call: "cancelled",
+    # "timeout", "rejected", or "approval_required". None means either the
+    # run hasn't stopped early, or it completed/paused for an ordinary
+    # in-lifecycle reason (see PhaseResult.outcome / current_phase instead).
+    stop_reason: str | None = None
     # Declarative user agent (set by the CLI for `--agent <name>` runs).
     # Transient: not persisted by PersistenceManager.save_task/load_task.
     agent_spec: AgentSpec | None = None
@@ -1171,6 +1184,14 @@ class Engine:
         if not task.phase_results:
             return self.run_task(task, cancel_check=cancel_check, task_timeout=task_timeout)
 
+        # Rehydrate provider CLI session-resume ids onto a freshly constructed
+        # Engine's dispatcher (this Engine, and its dispatcher, did not exist
+        # when earlier phases ran) so later phases keep resuming the same
+        # claude/codex conversation instead of silently starting fresh -- see
+        # TaskContext.provider_session_ids / _log_phase.
+        if task.provider_session_ids and hasattr(self.dispatcher, "session_ids"):
+            self.dispatcher.session_ids.update(task.provider_session_ids)
+
         self._reconcile_inflight_dispatches(task)
 
         if Phase.LEARN in task.get_completed_phases():
@@ -1548,6 +1569,12 @@ class Engine:
 
     def _log_phase(self, task: TaskContext, phase: Phase, status: str) -> None:
         """Log phase transition and persist task state."""
+        # Mirror the dispatcher's in-memory provider session ids onto the task
+        # before it's next saved, so a killed-and-resumed run doesn't lose
+        # claude/codex conversation continuity (see TaskContext.provider_session_ids).
+        session_ids = getattr(self.dispatcher, "session_ids", None)
+        if session_ids:
+            task.provider_session_ids = dict(session_ids)
         # Save phase log entry
         self.persistence.save_phase_log(task, phase, status)
         self._notify_phase(task, phase, status)

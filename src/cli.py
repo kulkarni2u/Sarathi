@@ -230,6 +230,22 @@ def _resolve_workspace_ncp(args, cwd: str) -> bool | None:
     return None  # no workspace found → auto-detect
 
 
+def _find_sarathi_db(start_path: str = ".") -> Path | None:
+    """Walk up from ``start_path`` looking for an existing ``.sarathi/sarathi.db``.
+
+    Same search used by ``_resolve_workspace_ncp`` above -- graph node status
+    (``sarathi graph status``/``message``) is only tracked once the
+    service/web stack has been bootstrapped for a workspace, never created on
+    behalf of a CLI-only user (see ``src/graph_node_mirror.py``).
+    """
+    search = Path(start_path).resolve()
+    for parent in [search] + list(search.parents):
+        db = parent / ".sarathi" / "sarathi.db"
+        if db.exists():
+            return db
+    return None
+
+
 # ============================================================================
 # Auto-discovery functions
 # ============================================================================
@@ -984,6 +1000,25 @@ def main() -> None:
         help="Directory containing recipe sub-packs (default: policy-pack/RECIPES)",
     )
 
+    graph_parser = subparsers.add_parser(
+        "graph", help="Inspect or follow up on durable graph nodes (FANOUT/JUDGE/SYNTHESIZE branches)"
+    )
+    graph_parser.add_argument(
+        "--policy-pack", default=None, help="Policy pack to dispatch through (only needed for 'message')"
+    )
+    graph_subparsers = graph_parser.add_subparsers(dest="action", required=True)
+    graph_status_parser = graph_subparsers.add_parser(
+        "status", help="List graph nodes and their status for a task"
+    )
+    graph_status_parser.add_argument("task_id")
+    graph_message_parser = graph_subparsers.add_parser(
+        "message",
+        help="Send a follow-up message to a completed, session-resumable graph node",
+    )
+    graph_message_parser.add_argument("task_id")
+    graph_message_parser.add_argument("node_id")
+    graph_message_parser.add_argument("text")
+
     # Index command (build/query the offline repo symbol index)
     index_parser = subparsers.add_parser(
         "index", help="Build or query the offline repo symbol index (.sarathi/index)"
@@ -1076,6 +1111,8 @@ def main() -> None:
         handle_fork(args)
     elif args.command == "agents":
         handle_agents()
+    elif args.command == "graph":
+        handle_graph(args)
     elif args.command == "recipes":
         handle_recipes(args)
     elif args.command == "index":
@@ -1798,6 +1835,115 @@ def handle_agents() -> None:
     print("\nLifecycle Phase Mapping:")
     for mapping in list_phase_agent_roles():
         print(f"- {mapping['phase']}: {mapping['name']} ({mapping['purpose']})")
+
+
+def handle_graph(args: argparse.Namespace) -> None:
+    """Inspect or follow up on durable graph nodes (sarathi graph status/message).
+
+    Reads from the same ``.sarathi/sarathi.db`` mirror ``TaskGraphExecutor``
+    writes to (see ``src/graph_node_mirror.py``) -- a node only shows up here
+    once that mirror has been active for the run, and only workspaces already
+    bootstrapped for the service/web stack have that database at all.
+    """
+    try:
+        from .storage import Storage, connect
+    except ImportError:
+        from storage import Storage, connect
+
+    db_path = _find_sarathi_db()
+    if db_path is None:
+        print(
+            "No .sarathi/sarathi.db found. Graph node status is only tracked "
+            "once this workspace has a service database (see `sarathi init` "
+            "or `sarathi desktop`)."
+        )
+        sys.exit(1)
+
+    conn = connect(db_path)
+    try:
+        storage = Storage(conn)
+        if args.action == "status":
+            _handle_graph_status(storage, args.task_id)
+        elif args.action == "message":
+            _handle_graph_message(storage, args)
+    finally:
+        conn.close()
+
+
+def _handle_graph_status(storage: Any, task_id: str) -> None:
+    nodes = storage.list_graph_nodes(task_id)
+    if not nodes:
+        print(f"No graph nodes recorded for task '{task_id}'.")
+        return
+    print(f"Graph nodes for task '{task_id}': {len(nodes)}")
+    for node in nodes:
+        provider = f" provider={node['provider']}" if node.get("provider") else ""
+        print(f"- {node['node_id']} [{node['node_type']}] status={node['status']}{provider}")
+        if node.get("started_at"):
+            print(f"    started_at={node['started_at']}")
+        if node.get("completed_at"):
+            print(f"    completed_at={node['completed_at']}")
+        if node.get("last_error"):
+            print(f"    last_error={node['last_error']}")
+
+
+def _handle_graph_message(storage: Any, args: argparse.Namespace) -> None:
+    node = storage.get_graph_node(args.task_id, args.node_id)
+    if node is None:
+        print(f"No recorded node '{args.node_id}' for task '{args.task_id}'. Run `sarathi graph status {args.task_id}` to list nodes.")
+        sys.exit(1)
+    if node.get("status") != "completed":
+        print(f"Node '{args.node_id}' is '{node.get('status')}', not 'completed' -- only a finished node can receive a follow-up message.")
+        sys.exit(1)
+    session_key = node.get("session_artifact_key")
+    session_value = node.get("session_artifact_value")
+    if not session_key or not session_value:
+        print(
+            f"Node '{args.node_id}' has no resumable provider session recorded "
+            "(its provider doesn't support session resume, or it predates this feature)."
+        )
+        sys.exit(1)
+
+    policy_pack = args.policy_pack or discover_policy_pack()
+    if not policy_pack:
+        print("No policy pack found. Pass --policy-pack to send a follow-up message.")
+        sys.exit(1)
+
+    try:
+        from .dispatch import LocalDispatcher
+        from .policy import compile_policy_pack
+        from .runtime import DispatchRequest, apply_learning_feedback_to_provider_routing
+    except ImportError:
+        from dispatch import LocalDispatcher
+        from policy import compile_policy_pack
+        from runtime import DispatchRequest, apply_learning_feedback_to_provider_routing
+
+    compiled_policy = compile_policy_pack(policy_pack)
+    provider_config = apply_learning_feedback_to_provider_routing(
+        compiled_policy.get("model_routing"), compiled_policy.get("learning_feedback")
+    )
+    dispatcher = LocalDispatcher(provider_config=provider_config)
+
+    request = DispatchRequest(
+        mode="execute",
+        task_id=args.node_id,
+        phase="Build",
+        prompt=args.text,
+        constraints={session_key: session_value, "purpose": "graph_node_followup"},
+    )
+    response = dispatcher.dispatch(request)
+    if not response.success:
+        print(f"Follow-up dispatch failed: {response.error}")
+        sys.exit(1)
+
+    # Not persisted: graph_nodes.task_id is the Engine's own task id, which
+    # has no guaranteed row in this DB's `tasks` table (a bare CLI-only
+    # workspace only ever bootstraps the graph_nodes mirror, not a full
+    # service task) -- see src/graph_node_mirror.py and evidence_artifacts'
+    # FK on tasks(id). The reply is shown directly instead.
+    print(f"Reply from '{args.node_id}':")
+    summary = response.outputs.get("summary") if isinstance(response.outputs, dict) else None
+    print(summary or response.outputs)
 
 
 def _service_discovery_path() -> Path:

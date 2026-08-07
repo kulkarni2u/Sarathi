@@ -711,6 +711,57 @@ class Storage:
         ).fetchall()
         return [_task_from_row(row) for row in rows]
 
+    def list_claimable_full_engine_tasks(self) -> list[dict[str, Any]]:
+        """List queued tasks flagged for full-Engine execution, oldest first.
+
+        Unlike subtasks (a high-throughput queue with its own claimed_by/
+        heartbeat_at columns), a full-Engine task is a single long-running
+        job -- ``tasks`` has no dedicated claim columns, so
+        ``metadata.execution_mode == "full_engine"`` plus a plain
+        ``status == "queued"`` guard is enough; see
+        ``claim_full_engine_task`` for the atomic claim itself.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT id, workspace_id, title, description, status, metadata, created_at, updated_at, project_id
+            FROM tasks
+            WHERE status = 'queued'
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+        return [
+            task
+            for task in (_task_from_row(row) for row in rows)
+            if task["metadata"].get("execution_mode") == "full_engine"
+        ]
+
+    def claim_full_engine_task(self, task_id: str, *, worker_id: str) -> dict[str, Any] | None:
+        """Atomically claim a queued full-Engine task for ``worker_id``.
+
+        Returns the claimed task (with ``metadata.claimed_by``/``claimed_at``
+        set) if this call won the claim, or ``None`` if it was already moved
+        out of ``queued`` (lost the race to another worker).
+        """
+        existing = self.get_task(task_id)
+        if existing is None or existing["status"] != "queued":
+            return None
+        now = _utc_now()
+        next_metadata = dict(existing["metadata"])
+        next_metadata["claimed_by"] = worker_id
+        next_metadata["claimed_at"] = now
+        cursor = self.conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'running', metadata = ?, updated_at = ?
+            WHERE id = ? AND status = 'queued'
+            """,
+            (_dump_json(next_metadata), now, task_id),
+        )
+        self.conn.commit()
+        if cursor.rowcount != 1:
+            return None
+        return self.get_task(task_id)
+
     def create_subtask(
         self,
         *,

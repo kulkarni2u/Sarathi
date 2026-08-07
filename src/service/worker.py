@@ -41,6 +41,7 @@ from src.storage import Storage, connect, run_migrations
 
 from .providers import DEFAULT_CLAIM_LEASE_SECONDS, _dispatch_subtask
 from .scheduling import _transition_subtask
+from .full_engine import run_claimed_full_engine_task
 
 logger = logging.getLogger("sarathi.worker")
 
@@ -135,6 +136,22 @@ def default_worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}"
 
 
+def _try_claim_full_engine_task(storage: Storage, worker_id: str) -> dict[str, Any] | None:
+    """Claim the oldest queued full-Engine task, or None if there's nothing claimable.
+
+    No lease/heartbeat reclaim for full-Engine tasks (unlike subtasks): a
+    worker crash mid-run leaves the row at status='running' until manually
+    requeued. That's an accepted, documented gap for this first cut -- see
+    ``src/service/full_engine.py``.
+    """
+    for candidate in storage.list_claimable_full_engine_tasks():
+        claimed = storage.claim_full_engine_task(candidate["id"], worker_id=worker_id)
+        if claimed is not None:
+            return claimed
+        # Lost the race (another worker claimed it first) -- try the next one.
+    return None
+
+
 def run_worker(
     db_path: str | Path,
     *,
@@ -144,12 +161,16 @@ def run_worker(
     lease_seconds: int = DEFAULT_CLAIM_LEASE_SECONDS,
     max_items: int | None = None,
     should_stop: Any = None,
+    tasks_dir: str | None = None,
 ) -> dict[str, Any]:
     """Run the work-queue worker loop.
 
     Args:
         db_path: Path to the shared SQLite database.
         worker_id: Identity recorded on claims. Defaults to ``hostname-pid``.
+        tasks_dir: Override for where full-Engine tasks read/write their
+            TaskContext JSON (default: ``.sarathi/tasks`` relative to cwd).
+            See ``src/service/full_engine.py``.
         poll_interval: Seconds to sleep between polls when the queue is empty.
         once: If True, process at most one item then return.
         lease_seconds: Claim lease window used by ``requeue_stale_claims``.
@@ -159,10 +180,22 @@ def run_worker(
             SIGINT handling in the CLI).
 
     Returns:
-        Summary dict: ``{"claimed": N, "succeeded": N, "failed": N, "requeued": [...]}``.
+        Summary dict: ``{"claimed": N, "succeeded": N, "failed": N, "requeued": [...],
+        "full_engine_claimed": N, "full_engine_failed": N}``. The subtask
+        queue is tried first every poll; a full-Engine task (``sarathi run
+        --background``, see ``src/service/full_engine.py``) is only claimed
+        when no subtask is ready, and doesn't count toward ``claimed``/
+        ``max_items`` -- it's a separate, much lower-throughput queue.
     """
     worker_id = worker_id or default_worker_id()
-    summary: dict[str, Any] = {"claimed": 0, "succeeded": 0, "failed": 0, "requeued": []}
+    summary: dict[str, Any] = {
+        "claimed": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "requeued": [],
+        "full_engine_claimed": 0,
+        "full_engine_failed": 0,
+    }
     limit = 1 if once else max_items
 
     with connect(db_path) as conn:
@@ -180,6 +213,18 @@ def run_worker(
 
             subtask = claim_next_subtask(storage, worker_id)
             if subtask is None:
+                full_engine_task = _try_claim_full_engine_task(storage, worker_id)
+                if full_engine_task is not None:
+                    summary["full_engine_claimed"] += 1
+                    try:
+                        run_claimed_full_engine_task(
+                            storage, full_engine_task, worker_id=worker_id, tasks_dir=tasks_dir
+                        )
+                    except Exception:
+                        summary["full_engine_failed"] += 1
+                    if once:
+                        break
+                    continue
                 if once:
                     break
                 if should_stop is not None and should_stop():

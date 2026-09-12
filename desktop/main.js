@@ -130,6 +130,13 @@ function choosePort() {
   });
 }
 
+// Replace the value that follows any "--token" flag with a placeholder so
+// startup logs never contain the bearer credential in plaintext. The real
+// `args` array (unredacted) is still what gets passed to `spawn`.
+function redactArgsForLog(args) {
+  return args.map((value, index) => (args[index - 1] === "--token" ? "***REDACTED***" : value));
+}
+
 function spawnService({ port, token, repoRoot, dbPath }) {
   const pythonBin = resolvePythonBin();
   const args = [
@@ -145,7 +152,7 @@ function spawnService({ port, token, repoRoot, dbPath }) {
     String(port),
   ];
 
-  console.log(`[sarathi] spawning: ${pythonBin} ${args.join(" ")} (cwd=${repoRoot})`);
+  console.log(`[sarathi] spawning: ${pythonBin} ${redactArgsForLog(args).join(" ")} (cwd=${repoRoot})`);
   const child = spawn(pythonBin, args, { cwd: repoRoot });
 
   child.stdout.on("data", (data) => process.stdout.write(`[service] ${data}`));

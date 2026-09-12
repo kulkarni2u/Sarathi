@@ -28,7 +28,9 @@ def _minimal_policy_pack(tmp_path: Path) -> Path:
 def _seed_full_engine_task(
     storage: Storage, *, policy_pack: str, complexity: str = "low"
 ) -> dict:
-    workspace = storage.create_workspace(name="ws", root_path="/tmp/ws")
+    workspace_root = Path(policy_pack).parent / "workspace"
+    workspace_root.mkdir(exist_ok=True)
+    workspace = storage.create_workspace(name="ws", root_path=str(workspace_root))
     return storage.create_task(
         workspace_id=workspace["id"],
         title="Fix bug",

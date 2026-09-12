@@ -78,6 +78,24 @@ def test_specific_method_coverage():
     assert "post" in paths["/workspaces/{id}/tasks"]
 
 
+def test_provider_connection_and_chat_requests_are_documented():
+    paths = build_openapi_spec()["paths"]
+    connect_schema = paths["/workspaces/{id}/providers/{provider}/test"]["post"][
+        "requestBody"
+    ]["content"]["application/json"]["schema"]
+    chat_schema = paths["/chat"]["post"]["requestBody"]["content"][
+        "application/json"
+    ]["schema"]
+
+    assert {"type", "base_url", "model", "api_key_env"} <= set(
+        connect_schema["properties"]
+    )
+    assert {"message", "workspace_id", "provider", "history"} <= set(
+        chat_schema["properties"]
+    )
+    assert chat_schema["required"] == ["message"]
+
+
 def test_openapi_spec_validator_if_available():
     try:
         from openapi_spec_validator import validate

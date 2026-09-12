@@ -98,7 +98,8 @@ def test_provider_settings_can_be_saved_and_health_checked(tmp_path):
     assert "OpenAI SDK is the primary path" in codex["degraded_reason"]
 
 
-def test_codex_provider_can_be_configured_for_sdk_only_mode(tmp_path):
+def test_codex_provider_can_be_configured_for_sdk_only_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("SARATHI_CODEX_TEST_KEY", "sk-test")
     app = create_app(tmp_path / "sarathi.db")
     workspace = create_workspace(app, tmp_path)
 
@@ -110,7 +111,7 @@ def test_codex_provider_can_be_configured_for_sdk_only_mode(tmp_path):
             {
                 "path": "",
                 "auth": "connected",
-                "api_key": "sk-test",
+                "api_key_env": "SARATHI_CODEX_TEST_KEY",
                 "base_url": "https://example.invalid/v1",
                 "model": "gpt-4.1-mini",
             },
@@ -136,7 +137,8 @@ def test_codex_provider_can_be_configured_for_sdk_only_mode(tmp_path):
     assert codex["model"] == "gpt-4.1-mini"
 
 
-def test_claude_provider_can_be_configured_for_sdk_only_mode(tmp_path):
+def test_claude_provider_can_be_configured_for_sdk_only_mode(tmp_path, monkeypatch):
+    monkeypatch.setenv("SARATHI_CLAUDE_TEST_KEY", "anthropic-test")
     app = create_app(tmp_path / "sarathi.db")
     workspace = create_workspace(app, tmp_path)
 
@@ -148,7 +150,7 @@ def test_claude_provider_can_be_configured_for_sdk_only_mode(tmp_path):
             {
                 "path": "",
                 "auth": "connected",
-                "api_key": "anthropic-test",
+                "api_key_env": "SARATHI_CLAUDE_TEST_KEY",
                 "base_url": "https://example.invalid/anthropic",
                 "model": "claude-sonnet-4-0",
             },
@@ -246,6 +248,72 @@ def test_provider_settings_reject_unknown_provider(tmp_path):
         status=404,
         code="not_found",
     )
+
+
+def test_custom_gateway_provider_uses_env_reference_without_storing_secret(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TEAM_GATEWAY_KEY", "super-secret-value")
+    app = create_app(tmp_path / "sarathi.db")
+    workspace = create_workspace(app, tmp_path)
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace['id']}/providers/team-gateway/test",
+            {
+                "type": "gateway",
+                "base_url": "https://models.example/v1",
+                "model": "small",
+                "api_key_env": "TEAM_GATEWAY_KEY",
+            },
+        )
+    )
+
+    assert status == 200
+    provider = data["provider"]
+    assert provider["id"] == "team-gateway"
+    assert provider["health"] == "online"
+    assert provider["transport_kind"] == "api"
+    assert provider["api_key_env"] == "TEAM_GATEWAY_KEY"
+    assert "super-secret-value" not in repr(provider)
+
+    _, providers_data = assert_ok(
+        request(app, "GET", f"/api/providers?workspace_id={workspace['id']}")
+    )
+    saved = next(
+        item for item in providers_data["providers"] if item["id"] == "team-gateway"
+    )
+    assert saved["model"] == "small"
+    assert "super-secret-value" not in repr(saved)
+
+
+def test_custom_gateway_provider_reports_missing_credential_environment(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("MISSING_GATEWAY_KEY", raising=False)
+    app = create_app(tmp_path / "sarathi.db")
+    workspace = create_workspace(app, tmp_path)
+
+    _, data = assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace['id']}/providers/team-gateway/test",
+            {
+                "type": "gateway",
+                "base_url": "https://models.example/v1",
+                "model": "small",
+                "api_key_env": "MISSING_GATEWAY_KEY",
+            },
+        )
+    )
+
+    provider = data["provider"]
+    assert provider["health"] == "offline"
+    assert provider["auth"] == "needs_auth"
+    assert "MISSING_GATEWAY_KEY" in provider["last_error"]
 
 
 def test_dispatch_requires_in_progress_subtask(tmp_path):
@@ -1117,6 +1185,7 @@ def test_native_claude_dispatch_prefers_sdk_and_records_invocation_metadata(tmp_
 def test_codex_dispatch_can_run_in_sdk_only_mode_without_cli_path(tmp_path, monkeypatch):
     from src.runtime.providers.openai_sdk import OpenAISdkProviderAdapter
 
+    monkeypatch.setenv("SARATHI_CODEX_TEST_KEY", "sk-test")
     app = create_app(tmp_path / "sarathi.db")
     task = create_task_with_ready_graph(app, tmp_path)
 
@@ -1149,7 +1218,7 @@ def test_codex_dispatch_can_run_in_sdk_only_mode_without_cli_path(tmp_path, monk
             {
                 "path": "",
                 "auth": "connected",
-                "api_key": "sk-test",
+                    "api_key_env": "SARATHI_CODEX_TEST_KEY",
                 "model": "gpt-4.1-mini",
             },
         )
@@ -1182,6 +1251,7 @@ def test_codex_dispatch_can_run_in_sdk_only_mode_without_cli_path(tmp_path, monk
 def test_claude_dispatch_can_run_in_sdk_only_mode_without_cli_path(tmp_path, monkeypatch):
     from src.runtime.providers.anthropic_sdk import AnthropicSdkProviderAdapter
 
+    monkeypatch.setenv("SARATHI_CLAUDE_TEST_KEY", "anthropic-test")
     app = create_app(tmp_path / "sarathi.db")
     task = create_task_with_ready_graph(app, tmp_path)
 
@@ -1214,7 +1284,7 @@ def test_claude_dispatch_can_run_in_sdk_only_mode_without_cli_path(tmp_path, mon
             {
                 "path": "",
                 "auth": "connected",
-                "api_key": "anthropic-test",
+                    "api_key_env": "SARATHI_CLAUDE_TEST_KEY",
                 "model": "claude-sonnet-4-0",
             },
         )

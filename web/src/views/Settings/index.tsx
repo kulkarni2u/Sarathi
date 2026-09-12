@@ -78,7 +78,7 @@ function isConfigurable(provider: ProviderHealth): boolean {
 }
 
 /** Build the edit-form fields for a provider, keyed by its capabilities.
- * SDK-backed providers (claude/codex) take an API key, base URL, and model;
+ * SDK-backed providers (claude/codex) take an API key environment variable, base URL, and model;
  * CLI providers just take an executable path. */
 function providerFields(provider: ProviderHealth): FormField[] {
   const id = asString(provider.id) ?? "";
@@ -95,15 +95,13 @@ function providerFields(provider: ProviderHealth): FormField[] {
     const keyConfigured = provider.api_key_configured === true;
     fields.push(
       {
-        name: "api_key",
-        label: "API key",
-        type: "password",
-        placeholder: keyConfigured ? "•••••• (leave blank to keep current)" : "Paste API key",
+        name: "api_key_env",
+        label: "API key environment variable",
+        defaultValue: asString(provider.api_key_env) ?? "",
+        placeholder: id === "claude" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY",
         hint: keyConfigured
-          ? "A key is already stored. Leave blank to keep it."
-          : id === "claude"
-            ? "Falls back to the ANTHROPIC_API_KEY env var if blank."
-            : "Falls back to the OPENAI_API_KEY env var if blank.",
+          ? "A credential is available through this environment variable."
+          : "Enter the environment variable name containing the credential.",
       },
       {
         name: "base_url",
@@ -411,11 +409,10 @@ export default function Settings() {
           onSubmit={async (values) => {
             const id = asString(configuring.id);
             if (!id) return;
-            // Only send non-empty fields so a blank API key keeps the stored
-            // secret and blank optionals don't clobber existing config.
-            const input: { path?: string; api_key?: string; base_url?: string; model?: string } = {};
+            // Only send non-empty fields so blank optionals don't clobber existing config.
+            const input: { path?: string; api_key_env?: string; base_url?: string; model?: string } = {};
             if (values.path) input.path = values.path;
-            if (values.api_key) input.api_key = values.api_key;
+            if (values.api_key_env) input.api_key_env = values.api_key_env;
             if (values.base_url) input.base_url = values.base_url;
             if (values.model) input.model = values.model;
             const { provider: updated } = await api.testProvider(currentWorkspaceId, id, input);

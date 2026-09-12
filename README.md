@@ -222,11 +222,15 @@ sarathi tui --task <task_id>
 What it supports:
 
 - centered chat prompt that docks into an ongoing conversation
-- provider chat via `claude`, `opencode`, or `codex` when those CLIs are on PATH
+- provider chat through service-connected SDK/API providers, OpenAI-compatible
+  gateways, or `claude`/`opencode`/`codex` CLIs on PATH
 - `/run <task>` to launch a governed task with recent chat context
 - `/cd [path]` to switch active workspace/repo
 - `/init [path]` to create a policy pack from inside the TUI
-- `/model [name]` to show or switch the agent CLI used for chat
+- `/providers` to inspect service-managed provider health and local CLI fallbacks
+- `/connect <provider> [key=value ...]` to test, save, and select a provider;
+  gateways use `type=gateway base_url=... model=... api_key_env=ENV_NAME`
+- `/model [name]` to show or switch the provider used for chat
 - `/context <task_id>` to attach task status to the conversation
 - `/tasks`, `/clear`, `/cancel`, `/help`, and `/quit`
 - `Ctrl+T` to switch between chat and task dashboard
@@ -234,6 +238,11 @@ What it supports:
 The task panel monitors `.sarathi/tasks`, phase transitions, graph state,
 escalations, and proposal review. Cancellation is cooperative: tasks stop at the
 next phase boundary and can be resumed later.
+
+Provider credentials are referenced by environment-variable name and are not
+accepted as raw TUI arguments. Export the variable before starting the Sarathi
+service so the service process inherits it. If the service is offline, native
+CLI providers remain available directly from `PATH` for the current TUI session.
 
 ## Web Cockpit
 

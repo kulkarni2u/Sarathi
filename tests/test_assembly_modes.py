@@ -173,5 +173,6 @@ def test_engine_populates_cache_after_route():
         description="fix null pointer bug",
         complexity=Complexity.LOW,
     )
-    engine.run_task(task)
+    # This assertion concerns Route only; later phases can dispatch real providers.
+    engine.phase_handlers[Phase.ROUTE].execute(task, Phase.ROUTE)
     assert TaskClass.CODEGEN_PATCH.value in engine._harness_cache

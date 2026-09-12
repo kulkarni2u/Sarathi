@@ -139,10 +139,7 @@ def default_worker_id() -> str:
 def _try_claim_full_engine_task(storage: Storage, worker_id: str) -> dict[str, Any] | None:
     """Claim the oldest queued full-Engine task, or None if there's nothing claimable.
 
-    No lease/heartbeat reclaim for full-Engine tasks (unlike subtasks): a
-    worker crash mid-run leaves the row at status='running' until manually
-    requeued. That's an accepted, documented gap for this first cut -- see
-    ``src/service/full_engine.py``.
+    Full-Engine claims use the task metadata heartbeat maintained by Storage.
     """
     for candidate in storage.list_claimable_full_engine_tasks():
         claimed = storage.claim_full_engine_task(candidate["id"], worker_id=worker_id)
@@ -206,7 +203,8 @@ def run_worker(
         while True:
             if should_stop is not None and should_stop():
                 break
-            if limit is not None and summary["claimed"] >= limit:
+            processed = summary["claimed"] + summary["full_engine_claimed"]
+            if limit is not None and processed >= limit:
                 break
 
             summary["requeued"].extend(requeue_stale_claims(storage, lease_seconds))
@@ -217,6 +215,7 @@ def run_worker(
                 if full_engine_task is not None:
                     summary["full_engine_claimed"] += 1
                     try:
+                        storage.heartbeat_full_engine_task(full_engine_task["id"], worker_id=worker_id, claim_generation=full_engine_task["metadata"]["claim_generation"])
                         run_claimed_full_engine_task(
                             storage, full_engine_task, worker_id=worker_id, tasks_dir=tasks_dir
                         )

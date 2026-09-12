@@ -749,6 +749,7 @@ class Storage:
         next_metadata = dict(existing["metadata"])
         next_metadata["claimed_by"] = worker_id
         next_metadata["claimed_at"] = now
+        next_metadata["claim_generation"] = secrets.token_hex(16)
         cursor = self.conn.execute(
             """
             UPDATE tasks
@@ -761,6 +762,99 @@ class Storage:
         if cursor.rowcount != 1:
             return None
         return self.get_task(task_id)
+
+    def heartbeat_full_engine_task(self, task_id: str, *, worker_id: str, claim_generation: str) -> bool:
+        """Refresh a full-Engine claim while its isolated runner is active."""
+        cursor = self.conn.execute(
+            """UPDATE tasks SET metadata = json_set(metadata, '$.heartbeat_at', ?), updated_at = ?
+               WHERE id = ? AND status = 'running'
+               AND json_extract(metadata, '$.claimed_by') = ?
+               AND json_extract(metadata, '$.claim_generation') = ?""",
+            (_utc_now(), _utc_now(), task_id, worker_id, claim_generation),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def update_full_engine_claimed_task(
+        self, task_id: str, *, worker_id: str, claim_generation: str, status: str, metadata: dict[str, Any]
+    ) -> bool:
+        """Conditionally finish a full-Engine task owned by this worker."""
+        cursor = self.conn.execute(
+            """UPDATE tasks SET status = ?, metadata = ?, updated_at = ?
+               WHERE id = ? AND status = 'running'
+               AND json_extract(metadata, '$.claimed_by') = ?
+               AND json_extract(metadata, '$.claim_generation') = ?""",
+            (status, _dump_json(metadata), _utc_now(), task_id, worker_id, claim_generation),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def reserve_full_engine_approval(self, task_id: str) -> dict[str, Any] | None:
+        """Atomically reserve the right to resolve a pending full-Engine approval.
+
+        Stamps a fresh ``metadata.approval_reservation`` token conditioned on
+        the row still being ``waiting_human`` with no existing reservation, so
+        two concurrent/duplicate approval calls for the same task can't both
+        proceed to mutate the persisted ``TaskContext`` and worker claim
+        fields -- only the caller that wins this CAS may go on to record the
+        approval decision (see ``resolve_full_engine_approval``). Returns the
+        reserved task row, or ``None`` if another caller already holds the
+        reservation or the task isn't awaiting approval.
+        """
+        existing = self.get_task(task_id)
+        if existing is None or existing["status"] != "waiting_human":
+            return None
+        if existing["metadata"].get("approval_reservation"):
+            return None
+        now = _utc_now()
+        next_metadata = dict(existing["metadata"])
+        next_metadata["approval_reservation"] = secrets.token_hex(16)
+        cursor = self.conn.execute(
+            """UPDATE tasks SET metadata = ?, updated_at = ?
+               WHERE id = ? AND status = 'waiting_human'
+               AND json_extract(metadata, '$.approval_reservation') IS NULL""",
+            (_dump_json(next_metadata), now, task_id),
+        )
+        self.conn.commit()
+        if cursor.rowcount != 1:
+            return None
+        return self.get_task(task_id)
+
+    def resolve_full_engine_approval(
+        self, task_id: str, *, reservation: str, status: str, metadata: dict[str, Any]
+    ) -> bool:
+        """Conditionally finish a reserved full-Engine approval.
+
+        Only applies while the row still carries this exact reservation
+        token -- a lost race, a timed-out/killed child, or any other
+        interleaving means this is a no-op rather than a stale overwrite.
+        """
+        cursor = self.conn.execute(
+            """UPDATE tasks SET status = ?, metadata = ?, updated_at = ?
+               WHERE id = ? AND json_extract(metadata, '$.approval_reservation') = ?""",
+            (status, _dump_json(metadata), _utc_now(), task_id, reservation),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
+
+    def release_full_engine_approval_reservation(self, task_id: str, *, reservation: str) -> bool:
+        """Release a reservation without changing status (e.g. after a failed/timed-out attempt).
+
+        Lets a subsequent approval call retry cleanly instead of leaving the
+        task permanently stuck reporting "approval already in progress".
+        """
+        existing = self.get_task(task_id)
+        if existing is None or existing["metadata"].get("approval_reservation") != reservation:
+            return False
+        next_metadata = dict(existing["metadata"])
+        next_metadata.pop("approval_reservation", None)
+        cursor = self.conn.execute(
+            """UPDATE tasks SET metadata = ?, updated_at = ?
+               WHERE id = ? AND json_extract(metadata, '$.approval_reservation') = ?""",
+            (_dump_json(next_metadata), _utc_now(), task_id, reservation),
+        )
+        self.conn.commit()
+        return cursor.rowcount == 1
 
     def create_subtask(
         self,

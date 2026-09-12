@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
 import json
 import shlex
@@ -339,7 +340,7 @@ class ConfiguredProviderAdapter(ProviderAdapter):
             return AnthropicSdkProviderAdapter(
                 workspace_root=workspace_root,
                 provider_path=str(provider_path) if isinstance(provider_path, str) and provider_path else None,
-                api_key=str(provider_cfg["api_key"]) if isinstance(provider_cfg.get("api_key"), str) and provider_cfg.get("api_key") else None,
+                api_key=(os.environ.get(str(provider_cfg["api_key_env"])) if provider_cfg.get("api_key_env") else None),
                 base_url=str(provider_cfg["base_url"]) if isinstance(provider_cfg.get("base_url"), str) and provider_cfg.get("base_url") else None,
                 model=str(provider_cfg["model"]) if isinstance(provider_cfg.get("model"), str) and provider_cfg.get("model") else None,
                 node_command=str(provider_cfg.get("node_command", "node") or "node"),
@@ -353,7 +354,7 @@ class ConfiguredProviderAdapter(ProviderAdapter):
             return OpenAISdkProviderAdapter(
                 workspace_root=workspace_root,
                 provider_path=str(provider_path) if isinstance(provider_path, str) and provider_path else None,
-                api_key=str(provider_cfg["api_key"]) if isinstance(provider_cfg.get("api_key"), str) and provider_cfg.get("api_key") else None,
+                api_key=(os.environ.get(str(provider_cfg["api_key_env"])) if provider_cfg.get("api_key_env") else None),
                 base_url=str(provider_cfg["base_url"]) if isinstance(provider_cfg.get("base_url"), str) and provider_cfg.get("base_url") else None,
                 model=str(provider_cfg["model"]) if isinstance(provider_cfg.get("model"), str) and provider_cfg.get("model") else None,
                 node_command=str(provider_cfg.get("node_command", "node") or "node"),

@@ -1249,11 +1249,47 @@ class ServiceApp:
             method == "POST"
             and len(parts) == 3
             and parts[0] == "tasks"
+            and parts[2] == "resume"
+        ):
+            task = storage.get_task(parts[1])
+            if task is None:
+                raise ServiceError("not_found", "Task not found.", 404)
+            if (task.get("metadata") or {}).get("execution_mode") == "full_engine":
+                from .full_engine import resume_full_engine_task
+                try:
+                    return 200, {"task": resume_full_engine_task(storage, task)}
+                except RuntimeError as exc:
+                    raise ServiceError("approval_required", str(exc), 409) from exc
+            if not _has_approved_gate(storage, task["id"], "Task graph"):
+                raise ServiceError(
+                    "approval_required", "Approve Task graph before resuming ready units.", 409,
+                )
+            return 200, _schedule_ready_subtasks(storage, task)
+
+        if (
+            method == "POST"
+            and len(parts) == 3
+            and parts[0] == "tasks"
             and parts[2] == "approve"
         ):
             task = storage.get_task(parts[1])
             if task is None:
                 raise ServiceError("not_found", "Task not found.", 404)
+            if (task.get("metadata") or {}).get("execution_mode") == "full_engine":
+                from .full_engine import resume_full_engine_task
+                decision = _required_text(body, "status")
+                if decision not in {"approved", "rejected"}:
+                    raise ServiceError("invalid_request", "Status must be approved or rejected.", 400)
+                approval_metadata = _optional_dict(body, "metadata") or {}
+                try:
+                    updated = resume_full_engine_task(storage, task, approval={
+                        "approved": decision == "approved",
+                        "approved_by": approval_metadata.get("approved_by", "service"),
+                        "note": approval_metadata.get("note"),
+                    })
+                except RuntimeError as exc:
+                    raise ServiceError("approval_required", str(exc), 409) from exc
+                return 201, {"task": updated}
             result = record_gate_decision(
                 storage,
                 task,

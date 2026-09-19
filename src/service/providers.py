@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 from datetime import datetime, timedelta, timezone
@@ -302,6 +303,8 @@ def _invoke_task_chat_provider(
     user_message: Mapping[str, Any],
     *,
     target: str = "Current task agents",
+    preferred_provider: str | None = None,
+    provider_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Invoke the same free-form provider chat path used by the TUI.
 
@@ -310,12 +313,39 @@ def _invoke_task_chat_provider(
     governed subtask dispatch contract.
     """
     workspace = storage.get_workspace(str(task["workspace_id"]))
-    workspace_root = workspace["root_path"] if workspace is not None else None
-    session = ChatSession(workspace_root=workspace_root)
-    preferred_provider = _prefer_chat_session_provider(storage, str(task["workspace_id"]), session)
-    reply_text = session.send(str(user_message["content"]))
-    provider = (session.provider[0] if session.provider else preferred_provider) or "unavailable"
-    error = is_error_reply(reply_text) or provider == "unavailable"
+    if preferred_provider:
+        provider = preferred_provider
+        provider_config = _provider_dispatch_adapter_config(
+            storage,
+            workspace_id=str(task["workspace_id"]),
+            provider_id=provider,
+        )
+        response = LocalDispatcher(provider_config=provider_config).dispatch(
+            DispatchRequest(
+                mode="explore",
+                task_id=str(task["id"]),
+                phase="Chat",
+                prompt=provider_prompt or str(user_message["content"]),
+                expected_outputs=["messages"],
+                constraints={"purpose": "provider_chat", "provider": provider},
+            )
+        )
+        messages = response.outputs.get("messages") if response.success else None
+        reply_text = (
+            str(messages[0])
+            if isinstance(messages, list) and messages
+            else str(response.error or f"{provider} returned an empty response.")
+        )
+        error = not response.success
+    else:
+        workspace_root = workspace["root_path"] if workspace is not None else None
+        session = ChatSession(workspace_root=workspace_root)
+        selected_provider = _prefer_chat_session_provider(
+            storage, str(task["workspace_id"]), session
+        )
+        reply_text = session.send(str(user_message["content"]))
+        provider = (session.provider[0] if session.provider else selected_provider) or "unavailable"
+        error = is_error_reply(reply_text) or provider == "unavailable"
     reply = storage.create_message(
         workspace_id=str(task["workspace_id"]),
         task_id=str(task["id"]),
@@ -446,6 +476,25 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _migrate_legacy_provider(storage: Storage, provider: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove pre-env raw credentials and fail closed until reconfigured."""
+    config = dict(provider.get("config") or {})
+    if "api_key" not in config:
+        return dict(provider)
+    config.pop("api_key", None)
+    config["auth"] = "needs_auth"
+    config["health"] = "offline"
+    config["last_error"] = "Legacy raw API key removed; configure api_key_env."
+    migrated = storage.upsert_provider(
+        workspace_id=str(provider["workspace_id"]),
+        provider_id=str(provider["id"]),
+        name=str(provider.get("name") or provider["id"]),
+        provider_type=str(provider.get("provider_type") or "sdk"),
+        config=config,
+    )
+    return migrated
+
+
 def _provider_dispatch_adapter_config(
     storage: Storage,
     *,
@@ -456,9 +505,34 @@ def _provider_dispatch_adapter_config(
         return None
     specs = _provider_specs()
     spec = specs.get(provider_id)
-    if spec is None:
-        raise ServiceError("not_found", "Provider not found.", 404)
     provider_record = storage.get_provider(workspace_id, provider_id)
+    if provider_record is not None:
+        provider_record = _migrate_legacy_provider(storage, provider_record)
+    if spec is None:
+        custom_config = (
+            dict(provider_record["config"]) if provider_record is not None else {}
+        )
+        if custom_config.get("type") != "gateway":
+            raise ServiceError("not_found", "Provider not found.", 404)
+        if custom_config.get("health") != "online":
+            detail = custom_config.get("last_error") or f"Provider '{provider_id}' is offline."
+            raise ServiceError("provider_unavailable", detail, 409)
+        return {
+            "provider": provider_id,
+            "providers": {
+                provider_id: {
+                    "type": "gateway",
+                    "base_url": custom_config["base_url"],
+                    "model": custom_config["model"],
+                    **(
+                        {"api_key_env": custom_config["api_key_env"]}
+                        if custom_config.get("api_key_env")
+                        else {}
+                    ),
+                    "timeout_seconds": 300,
+                }
+            },
+        }
     config = (
         dict(provider_record["config"])
         if provider_record is not None
@@ -515,7 +589,11 @@ def _provider_dispatch_adapter_config(
             "type": sdk.transport_type,
             "workspace_root": str(workspace["root_path"]),
             "provider_path": resolved_path,
-            **({"api_key": config.get("api_key")} if isinstance(config.get("api_key"), str) and config.get("api_key") else {}),
+            **(
+                {"api_key_env": str(config["api_key_env"])}
+                if config.get("api_key_env")
+                else {}
+            ),
             **({"base_url": config.get("base_url")} if isinstance(config.get("base_url"), str) and config.get("base_url") else {}),
             **({"model": config.get("model")} if isinstance(config.get("model"), str) and config.get("model") else {}),
             "timeout_seconds": 300,
@@ -609,13 +687,38 @@ def _provider_specs() -> dict[str, dict[str, Any]]:
     return {spec["id"]: spec for spec in specs}
 
 
+def _gateway_provider_spec(provider_id: str) -> dict[str, Any]:
+    return {
+        "id": provider_id,
+        "name": provider_id,
+        "provider_type": "api",
+        "transport_kind": "api",
+        "transport_posture": "configured",
+        "health": "offline",
+        "auth": "needs_auth",
+        "path": "",
+        "capabilities": ["child_task_execution", "planning", "review", "chat"],
+        "degraded_reason": None,
+    }
+
+
 def _provider_health(storage: Storage, workspace_id: str | None = None) -> list[dict[str, Any]]:
     specs = _provider_specs()
-    overrides = {
-        provider["id"]: provider["config"]
-        for provider in (storage.list_providers_for_workspace(workspace_id) if workspace_id else [])
-    }
-    return [_provider_view(provider_id, specs[provider_id], overrides.get(provider_id)) for provider_id in specs]
+    records = storage.list_providers_for_workspace(workspace_id) if workspace_id else []
+    records = [_migrate_legacy_provider(storage, record) for record in records]
+    overrides = {provider["id"]: provider["config"] for provider in records}
+    views = [
+        _provider_view(provider_id, specs[provider_id], overrides.get(provider_id))
+        for provider_id in specs
+    ]
+    for record in records:
+        provider_id = record["id"]
+        config = record.get("config") or {}
+        if provider_id not in specs and config.get("type") == "gateway":
+            views.append(
+                _provider_view(provider_id, _gateway_provider_spec(provider_id), config)
+            )
+    return views
 
 
 def _handle_chat(storage: Storage, body: Mapping[str, Any]) -> dict[str, Any]:
@@ -632,10 +735,12 @@ def _handle_chat(storage: Storage, body: Mapping[str, Any]) -> dict[str, Any]:
         workspace_id = workspaces[0]["id"]
     if storage.get_workspace(workspace_id) is None:
         raise ServiceError("not_found", "Workspace not found.", 404)
+    requested_provider = _optional_text(body, "provider")
     priority = _get_provider_priority(storage, workspace_id)
-    provider = _select_available_provider(storage, workspace_id, priority)
+    provider = requested_provider or _select_available_provider(storage, workspace_id, priority)
     if provider is None:
         provider = priority[0] if priority else "local"
+    provider_prompt = _bounded_chat_prompt(message, body.get("history"))
     metadata = _task_draft_metadata(
         message,
         project_id=_task_context_project_id(context),
@@ -661,7 +766,13 @@ def _handle_chat(storage: Storage, body: Mapping[str, Any]) -> dict[str, Any]:
         event_type="task.chat_created",
         payload={"object_id": task["id"], "agent": provider},
     )
-    provider_reply = _invoke_task_chat_provider(storage, task, user_message)
+    provider_reply = _invoke_task_chat_provider(
+        storage,
+        task,
+        user_message,
+        preferred_provider=requested_provider,
+        provider_prompt=provider_prompt,
+    )
     return {
         "taskId": task["id"],
         "agent": provider_reply["agent"],
@@ -669,6 +780,29 @@ def _handle_chat(storage: Storage, body: Mapping[str, Any]) -> dict[str, Any]:
         "message": user_message,
         "reply": provider_reply["message"],
     }
+
+
+def _bounded_chat_prompt(message: str, history: Any) -> str:
+    """Fold at most six recent turns into a compact provider prompt."""
+    if not isinstance(history, list):
+        return message
+    entries: list[tuple[str, str]] = []
+    for item in history[-12:]:
+        if not isinstance(item, Mapping):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        entries.append((str(role), content[:2000]))
+    if not entries:
+        return message
+    lines = ["Continue this conversation. Reply to the final user message only."]
+    for role, content in entries:
+        label = "User" if role == "user" else "Assistant"
+        lines.append(f"{label}: {content}")
+    lines.append(f"User: {message}")
+    return "\n".join(lines)
 
 
 def _get_provider_priority(storage: Storage, workspace_id: str) -> list[str]:
@@ -704,21 +838,24 @@ def _test_and_store_provider(
     body: Mapping[str, Any],
 ) -> dict[str, Any]:
     specs = _provider_specs()
-    if provider_id not in specs:
-        raise ServiceError("not_found", "Provider not found.", 404)
-    spec = specs[provider_id]
     existing = storage.get_provider(workspace_id, provider_id)
     existing_config = dict(existing["config"]) if existing is not None else {}
+    requested_type = _optional_text(body, "type") or existing_config.get("type")
+    if provider_id not in specs and requested_type != "gateway":
+        raise ServiceError("not_found", "Provider not found.", 404)
+    spec = specs.get(provider_id) or _gateway_provider_spec(provider_id)
     path = spec["path"]
     if "path" in body and isinstance(body.get("path"), str):
         path = str(body.get("path") or "").strip()
     elif isinstance(existing_config.get("path"), str):
         path = str(existing_config.get("path") or "")
     auth = _optional_text(body, "auth") or spec["auth"]
-    api_key = existing_config.get("api_key") if isinstance(existing_config.get("api_key"), str) else None
     if "api_key" in body:
-        value = body.get("api_key")
-        api_key = str(value).strip() if isinstance(value, str) and str(value).strip() else None
+        raise ServiceError(
+            "invalid_request",
+            "Raw API keys are not accepted; set api_key_env to an environment variable name.",
+            400,
+        )
     base_url = existing_config.get("base_url") if isinstance(existing_config.get("base_url"), str) else None
     if "base_url" in body:
         value = body.get("base_url")
@@ -727,7 +864,45 @@ def _test_and_store_provider(
     if "model" in body:
         value = body.get("model")
         model = str(value).strip() if isinstance(value, str) and str(value).strip() else None
-    config = _provider_check_config(spec, path=path, auth=auth, api_key=api_key, base_url=base_url, model=model)
+    api_key_env = (
+        existing_config.get("api_key_env")
+        if isinstance(existing_config.get("api_key_env"), str)
+        else None
+    )
+    if "api_key_env" in body:
+        value = body.get("api_key_env")
+        api_key_env = (
+            str(value).strip() if isinstance(value, str) and str(value).strip() else None
+        )
+    if api_key_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
+        raise ServiceError(
+            "invalid_request",
+            "api_key_env must be a valid environment variable name.",
+            400,
+        )
+    if requested_type == "gateway":
+        if not base_url or not model:
+            raise ServiceError(
+                "invalid_request",
+                "Gateway providers require base_url and model.",
+                400,
+            )
+        config = _gateway_check_config(
+            base_url=base_url,
+            model=model,
+            api_key_env=api_key_env,
+        )
+    else:
+        config = _provider_check_config(
+            spec,
+            path=path,
+            auth=auth,
+            api_key_env=api_key_env,
+            base_url=base_url,
+            model=model,
+        )
+        if api_key_env:
+            config["api_key_env"] = api_key_env
     storage.upsert_provider(
         workspace_id=workspace_id,
         provider_id=provider_id,
@@ -741,6 +916,40 @@ def _test_and_store_provider(
         payload={"object_id": provider_id, "health": config["health"], "auth": config["auth"]},
     )
     return _provider_view(provider_id, spec, config)
+
+
+def _gateway_check_config(
+    *,
+    base_url: str,
+    model: str,
+    api_key_env: str | None,
+) -> dict[str, Any]:
+    key_available = bool(api_key_env and os.getenv(api_key_env))
+    if api_key_env and not key_available:
+        return {
+            "type": "gateway",
+            "path": "",
+            "auth": "needs_auth",
+            "health": "offline",
+            "last_checked_at": _service_now(),
+            "last_error": f"Credential environment variable is not set: {api_key_env}",
+            "api_key_env": api_key_env,
+            "api_key_configured": False,
+            "base_url": base_url,
+            "model": model,
+        }
+    return {
+        "type": "gateway",
+        "path": "",
+        "auth": "connected" if api_key_env else "not_required",
+        "health": "online",
+        "last_checked_at": _service_now(),
+        "last_error": None,
+        **({"api_key_env": api_key_env} if api_key_env else {}),
+        "api_key_configured": key_available,
+        "base_url": base_url,
+        "model": model,
+    }
 
 
 def _check_provider_auth(provider_id: str, resolved_path: str) -> tuple[str, str | None]:
@@ -767,6 +976,7 @@ def _provider_check_config(
     path: str,
     auth: str,
     api_key: str | None = None,
+    api_key_env: str | None = None,
     base_url: str | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
@@ -784,7 +994,8 @@ def _provider_check_config(
     # "sdk-configured" this way; opencode's sdk_transport has none (it has
     # no credential-only mode) so this is always False for it, and None/local
     # specs fall out naturally too.
-    sdk_key_available = bool(sdk is not None and sdk.api_key_env and (api_key or os.getenv(sdk.api_key_env)))
+    credential_env = api_key_env or (sdk.api_key_env if sdk is not None else None)
+    sdk_key_available = bool(sdk is not None and credential_env and os.getenv(credential_env))
     resolved_path = shutil.which(path) if not Path(path).is_absolute() else (path if Path(path).exists() else None)
     if sdk_key_available:
         if auth == "missing":
@@ -794,7 +1005,6 @@ def _provider_check_config(
                 "health": "offline",
                 "last_checked_at": _service_now(),
                 "last_error": "Auth is missing.",
-                **({"api_key": api_key} if api_key else {}),
                 "api_key_configured": True,
                 "base_url": base_url,
                 "model": model,
@@ -805,7 +1015,6 @@ def _provider_check_config(
             "health": "online",
             "last_checked_at": _service_now(),
             "last_error": None,
-            **({"api_key": api_key} if api_key else {}),
             "api_key_configured": True,
             "base_url": base_url,
             "model": model,
@@ -817,7 +1026,6 @@ def _provider_check_config(
             "health": "offline",
             "last_checked_at": _service_now(),
             "last_error": f"CLI path not found: {path}",
-            **({"api_key": api_key} if api_key else {}),
             "api_key_configured": sdk_key_available,
             "base_url": base_url,
             "model": model,
@@ -829,7 +1037,6 @@ def _provider_check_config(
             "health": "offline",
             "last_checked_at": _service_now(),
             "last_error": "Auth is missing.",
-            **({"api_key": api_key} if api_key else {}),
             "api_key_configured": sdk_key_available,
             "base_url": base_url,
             "model": model,
@@ -847,7 +1054,6 @@ def _provider_check_config(
                 "health": "rate_limited",
                 "last_checked_at": _service_now(),
                 "last_error": "Provider rate limited",
-                **({"api_key": api_key} if api_key else {}),
                 "api_key_configured": sdk_key_available,
                 "base_url": base_url,
                 "model": model,
@@ -864,7 +1070,6 @@ def _provider_check_config(
             "last_checked_at": _service_now(),
             "last_error": degraded_reason,
             "degraded_reason": degraded_reason,
-            **({"api_key": api_key} if api_key else {}),
             "api_key_configured": sdk_key_available,
             "base_url": base_url,
             "model": model,
@@ -876,7 +1081,6 @@ def _provider_check_config(
         "health": "online",
         "last_checked_at": _service_now(),
         "last_error": None,
-        **({"api_key": api_key} if api_key else {}),
         "api_key_configured": sdk_key_available,
         "base_url": base_url,
         "model": model,
@@ -900,6 +1104,7 @@ def _provider_view(
         "path": str(override.get("path", spec["path"])),
         "capabilities": spec["capabilities"],
         "api_key_configured": bool(override.get("api_key_configured", False)),
+        "api_key_env": override.get("api_key_env"),
         "base_url": override.get("base_url"),
         "model": override.get("model"),
         "degraded_reason": override.get("degraded_reason", spec.get("degraded_reason")),

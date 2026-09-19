@@ -3,6 +3,7 @@ import json
 import stat
 import uuid
 import threading
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import pytest
@@ -667,6 +668,81 @@ def test_service_chat_invokes_provider_and_persists_reply(tmp_path, monkeypatch)
     assert data["reply"]["content"] == "provider reply: Talk to the model from the service."
     _, messages = assert_ok(request(app, "GET", f"/api/tasks/{data['taskId']}/messages"))
     assert [message["role"] for message in messages["messages"]] == ["user", "claude"]
+
+
+def test_service_chat_uses_explicit_connected_provider_with_bounded_history(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TEAM_GATEWAY_KEY", "secret-not-persisted")
+    captured = {}
+
+    class FakeDispatcher:
+        def __init__(self, provider_config=None):
+            captured["config"] = provider_config
+
+        def dispatch(self, dispatch_request):
+            captured["prompt"] = dispatch_request.prompt
+            return SimpleNamespace(
+                success=True,
+                outputs={"messages": ["gateway reply"]},
+                error=None,
+            )
+
+    monkeypatch.setattr(service_providers, "LocalDispatcher", FakeDispatcher)
+    app = create_app(tmp_path / "sarathi.db")
+    _, workspace_data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/workspaces",
+            {"name": "Sutra", "root_path": str(tmp_path)},
+        )
+    )
+    workspace_id = workspace_data["workspace"]["id"]
+    assert_ok(
+        request(
+            app,
+            "POST",
+            f"/api/workspaces/{workspace_id}/providers/team-gateway/test",
+            {
+                "type": "gateway",
+                "base_url": "https://models.example/v1",
+                "model": "small",
+                "api_key_env": "TEAM_GATEWAY_KEY",
+            },
+        )
+    )
+
+    status, data = assert_ok(
+        request(
+            app,
+            "POST",
+            "/api/chat",
+            {
+                "message": "What next?",
+                "workspace_id": workspace_id,
+                "provider": "team-gateway",
+                "history": [
+                    {"role": "user", "content": "Earlier question"},
+                    {"role": "assistant", "content": "Earlier reply"},
+                ],
+            },
+        )
+    )
+
+    assert status == 201
+    assert data["agent"] == "team-gateway"
+    assert data["reply"]["content"] == "gateway reply"
+    assert captured["config"]["providers"]["team-gateway"] == {
+        "type": "gateway",
+        "base_url": "https://models.example/v1",
+        "model": "small",
+        "api_key_env": "TEAM_GATEWAY_KEY",
+        "timeout_seconds": 300,
+    }
+    assert "Earlier question" in captured["prompt"]
+    assert captured["prompt"].endswith("User: What next?")
+    assert "secret-not-persisted" not in repr(captured)
 
 
 def test_task_message_can_invoke_provider_and_return_reply(tmp_path, monkeypatch):

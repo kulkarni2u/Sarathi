@@ -275,7 +275,7 @@ def retry_graph_node(graph: dict[str, Any], node_id: str) -> dict[str, Any]:
             updated["failed_at"] = None
             updated["last_error"] = None
         nodes.append(updated)
-    return _recompute_graph_state({"nodes": nodes})
+    return _recompute_graph_state({**graph, "nodes": nodes})
 
 
 def require_human_for_graph_node(graph: dict[str, Any], node_id: str) -> dict[str, Any]:
@@ -286,7 +286,7 @@ def require_human_for_graph_node(graph: dict[str, Any], node_id: str) -> dict[st
         if updated.get("id") == node_id and updated.get("status") == "failed":
             updated["status"] = "waiting_human"
         nodes.append(updated)
-    return _recompute_graph_state({"nodes": nodes})
+    return _recompute_graph_state({**graph, "nodes": nodes})
 
 
 def start_graph_node(graph: dict[str, Any], node_id: str) -> dict[str, Any]:
@@ -304,7 +304,7 @@ def start_graph_node(graph: dict[str, Any], node_id: str) -> dict[str, Any]:
             updated["blocked_at"] = None
             updated["last_error"] = None
         nodes.append(updated)
-    return _recompute_graph_state({"nodes": nodes})
+    return _recompute_graph_state({**graph, "nodes": nodes})
 
 
 def block_graph_node(graph: dict[str, Any], node_id: str, reason: str | None = None) -> dict[str, Any]:
@@ -321,7 +321,7 @@ def block_graph_node(graph: dict[str, Any], node_id: str, reason: str | None = N
             updated["blocked_at"] = transition_time
             updated["last_error"] = reason
         nodes.append(updated)
-    return _recompute_graph_state({"nodes": nodes})
+    return _recompute_graph_state({**graph, "nodes": nodes})
 
 
 def fail_graph_node(graph: dict[str, Any], node_id: str, error: str) -> dict[str, Any]:
@@ -339,7 +339,7 @@ def fail_graph_node(graph: dict[str, Any], node_id: str, error: str) -> dict[str
             updated["blocked_at"] = None
             updated["last_error"] = error
         nodes.append(updated)
-    return _recompute_graph_state({"nodes": nodes})
+    return _recompute_graph_state({**graph, "nodes": nodes})
 
 
 def progress_graph(graph: dict[str, Any], completed_node_id: str | None = None) -> dict[str, Any]:
@@ -357,7 +357,7 @@ def progress_graph(graph: dict[str, Any], completed_node_id: str | None = None) 
             updated["blocked_at"] = None
             updated["last_error"] = None
         nodes.append(updated)
-    return _recompute_graph_state({"nodes": nodes})
+    return _recompute_graph_state({**graph, "nodes": nodes})
 
 
 def _ready_nodes(graph: dict[str, Any]) -> list[dict[str, Any]]:

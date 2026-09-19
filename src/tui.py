@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import threading
 import time
 
@@ -46,7 +47,9 @@ CHAT_HELP = (
     "/cd [path]          show or switch the active folder/repo (workspace);\n"
     "                    starts a fresh agent session in the new workspace\n"
     "/init [path]        create a policy pack for the workspace (default: cwd)\n"
-    "/model [name]       show or switch the agent CLI used for chat\n"
+    "/providers          show service-connected and local CLI providers\n"
+    "/connect <id> ...   connect a CLI, SDK, or OpenAI-compatible gateway\n"
+    "/model [name]       show or switch the provider used for chat\n"
     "/context [task_id]  attach a task's status to the conversation\n"
     "/clear              forget the conversation and start fresh\n"
     "/tasks              switch to the task panel (Ctrl+T also toggles)\n"
@@ -643,6 +646,10 @@ class ChatScreen(Screen):
             self._handle_init_command(argument)
         elif command == "/model":
             self._handle_model_command(argument)
+        elif command == "/providers":
+            self._handle_providers_command()
+        elif command == "/connect":
+            self._handle_connect_command(argument)
         elif command == "/context":
             self._handle_context_command(argument)
         elif command in ("/clear", "/reset"):
@@ -720,17 +727,30 @@ class ChatScreen(Screen):
         self.app.launch_init(path)
 
     def _handle_model_command(self, argument: str) -> None:
-        providers = self.session.available_providers()
+        cli_providers = self.session.available_providers()
+        managed_providers = self.session.connected_providers()
+        provider_names = []
+        for provider in managed_providers:
+            name = provider.get("id")
+            if (
+                isinstance(name, str)
+                and provider.get("health") == "online"
+                and name not in provider_names
+            ):
+                provider_names.append(name)
+        for name, _path in cli_providers:
+            if name not in provider_names:
+                provider_names.append(name)
         if not argument:
-            if not providers:
+            if not provider_names:
                 self._system(
-                    "No agent CLI found on PATH (looked for: claude, opencode, codex)."
+                    "No connected provider or agent CLI found. Use /connect or install a CLI."
                 )
                 return
             current = self.session.resolve_provider()
-            current_name = current[0] if current else None
+            current_name = self.session.service_provider or (current[0] if current else None)
             parts = []
-            for name, _path in providers:
+            for name in provider_names:
                 if name == current_name:
                     parts.append(f"{name} (current)")
                 else:
@@ -743,8 +763,84 @@ class ChatScreen(Screen):
         if self.session.set_provider(name):
             self._system(f"Switched model to {name}.")
         else:
-            choices = ", ".join(n for n, _ in providers) or "none detected"
+            choices = ", ".join(provider_names) or "none detected"
             self._system(f"Unknown or unavailable provider {name!r}. Available: {choices}.")
+
+    def _handle_providers_command(self) -> None:
+        managed = self.session.connected_providers()
+        if managed:
+            parts = []
+            for provider in managed:
+                name = str(provider.get("id", "unknown"))
+                health = str(provider.get("health", "unknown"))
+                transport = str(provider.get("transport_kind", "unknown"))
+                suffix = " (current)" if name == self.session.service_provider else ""
+                parts.append(f"{name} [{health}/{transport}]{suffix}")
+            self._system("Providers: " + ", ".join(parts) + ".")
+            return
+        local = self.session.available_providers()
+        if local:
+            self._system(
+                "Service unavailable; local CLIs: "
+                + ", ".join(f"{name} ({path})" for name, path in local)
+                + "."
+            )
+            return
+        self._system("No service-connected provider or local agent CLI found.")
+
+    def _handle_connect_command(self, argument: str) -> None:
+        usage = (
+            "Usage: /connect <provider> [path=...] [model=...] [base_url=...] "
+            "[api_key_env=...]. For gateways add type=gateway."
+        )
+        if not argument:
+            self._system(usage)
+            return
+        try:
+            tokens = shlex.split(argument)
+        except ValueError as exc:
+            self._system(f"Invalid /connect syntax: {exc}")
+            return
+        if not tokens:
+            self._system(usage)
+            return
+        name = tokens[0].strip().lower()
+        if not name or any(ch not in "abcdefghijklmnopqrstuvwxyz0123456789._-" for ch in name):
+            self._system("Provider ids may contain lowercase letters, numbers, '.', '_', and '-'.")
+            return
+        allowed = {"type", "path", "auth", "base_url", "model", "api_key_env"}
+        raw_secret_fields = {"api_key", "token", "secret", "password"}
+        config: dict[str, str] = {}
+        for token in tokens[1:]:
+            key, separator, value = token.partition("=")
+            key = key.strip().lower()
+            if not separator or not key or not value.strip():
+                self._system(f"Invalid provider option {token!r}. Expected key=value. {usage}")
+                return
+            if key in raw_secret_fields or key.endswith("_secret"):
+                self._system(
+                    "Raw secrets are not accepted in the TUI. Export the credential "
+                    "and pass its variable name with api_key_env=ENV_NAME."
+                )
+                return
+            if key not in allowed:
+                self._system(
+                    f"Unsupported provider option {key!r}. Allowed: {', '.join(sorted(allowed))}."
+                )
+                return
+            config[key] = value.strip()
+        try:
+            provider = self.session.connect_provider(name, config)
+        except RuntimeError as exc:
+            self._system(f"Could not connect {name}: {exc}")
+            return
+        health = str(provider.get("health", "unknown"))
+        transport = str(provider.get("transport_kind", "unknown"))
+        if health == "online":
+            self._system(f"Connected {name} [{transport}] and selected it for chat.")
+            return
+        detail = provider.get("last_error") or provider.get("degraded_reason") or "health check failed"
+        self._system(f"Saved {name}, but it is {health}: {detail}")
 
 
 class TasksScreen(Screen):
@@ -876,8 +972,13 @@ class TasksScreen(Screen):
         if task_id is None:
             self.notify("No task selected.", severity="warning")
             return
-        policy_pack = _discover_policy_pack(self.app.workspace)
-        if not policy_pack:
+        try:
+            service_task = tui_data.is_service_task(task_id, self.app.persistence)
+        except RuntimeError as exc:
+            self.notify(f"Service task lookup failed: {exc}", severity="error")
+            return
+        policy_pack = None if service_task else _discover_policy_pack(self.app.workspace)
+        if not policy_pack and not service_task:
             self.notify(
                 "No policy pack found — run /init (or `sarathi init`) first.",
                 severity="error",
@@ -891,7 +992,7 @@ class TasksScreen(Screen):
             group="resume",
         )
 
-    def _resume(self, task_id: str, policy_pack: str) -> None:
+    def _resume(self, task_id: str, policy_pack: str | None) -> None:
         # Resumes are bounded by the same wall-clock cap as launches; the
         # interactive cancel affordance (`c` / `/cancel`) targets the
         # active `/run`/launch_task run, not a resume.
@@ -923,8 +1024,13 @@ class TasksScreen(Screen):
         if task_id is None:
             self.notify("No task selected.", severity="warning")
             return
-        policy_pack = _discover_policy_pack(self.app.workspace)
-        if not policy_pack:
+        try:
+            service_task = tui_data.is_service_task(task_id, self.app.persistence)
+        except RuntimeError as exc:
+            self.notify(f"Service task lookup failed: {exc}", severity="error")
+            return
+        policy_pack = None if service_task else _discover_policy_pack(self.app.workspace)
+        if not policy_pack and not service_task:
             self.notify(
                 "No policy pack found — run /init (or `sarathi init`) first.",
                 severity="error",
@@ -938,7 +1044,39 @@ class TasksScreen(Screen):
             group="resume",
         )
 
-    def _approve(self, task_id: str, policy_pack: str) -> None:
+    def _approve(self, task_id: str, policy_pack: str | None) -> None:
+        try:
+            service_task = tui_data.is_service_task(task_id, self.app.persistence)
+        except RuntimeError as exc:
+            message = f"Approve failed: service task lookup failed: {exc}"
+            self.app.call_from_thread(self.notify, message, severity="error")
+            return
+        if service_task:
+            try:
+                result = tui_data.approve_task(
+                    self.app.persistence,
+                    task_id,
+                    "",
+                    approved_by=_current_username(),
+                    task_timeout=DEFAULT_TASK_TIMEOUT,
+                )
+            except Exception as exc:
+                message = f"Approve failed: {exc}"
+                self.app.call_from_thread(self.notify, message, severity="error")
+                return
+            phase = result.current_phase.value if result.current_phase else "Completed"
+            if not getattr(result, "execution_scheduled", True):
+                message = f"Approved {task_id}: approval recorded (status: {phase})."
+            elif getattr(result, "stop_reason", None) == "approval_required":
+                message = f"Approved {task_id}: paused at {phase} pending further approval."
+            else:
+                message = f"Approved {task_id}: resumed, now at {phase}"
+            self.app.call_from_thread(self.notify, message)
+            self.app.call_from_thread(self.app.post_chat_event, message)
+            self.app.call_from_thread(self.refresh_data)
+            return
+
+        assert policy_pack is not None
         persistence = self.app.persistence
         task = persistence.load_task(task_id)
         if task is None:
@@ -1131,6 +1269,9 @@ class SarathiApp(App):
             # Drop the resumable claude session so the next agent call
             # starts fresh in the new workspace.
             self.chat_screen.session.reset_session()
+            # Service provider settings are workspace-scoped; require an
+            # explicit selection/connection after changing folders.
+            self.chat_screen.session.service_provider = None
         screen = self.screen
         if isinstance(screen, TasksScreen):
             screen.selected_task_id = None

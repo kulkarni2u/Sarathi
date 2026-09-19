@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+
 try:
     from .engine import Engine, PersistenceManager, TaskContext
     from .evolve import Evolver, PolicyProposal, ProposalReviewStore
@@ -96,6 +97,51 @@ class _ServiceTaskResult:
         self.stop_reason = "approval_required/service_draft"
 
 
+class _ServiceActionResult:
+    """Adapter exposing a service resume/approve response through the same
+    ``current_phase``/``stop_reason`` surface engine-driven ``TaskContext``
+    results use.
+
+    ``execution_scheduled`` distinguishes a response that reflects real
+    task/subtask progress from a bare approval-gate record: an ordinary
+    (non full-Engine) gate approval returns just ``{"approval_gate": ...}``
+    with no task status at all unless it also triggered auto-schedule, so
+    guessing "running" from that shape used to make the TUI falsely announce
+    a resume that never happened.
+    """
+
+    def __init__(self, task_id: str, current_phase: str, stop_reason: str | None, *, execution_scheduled: bool):
+        self.task_id = task_id
+        self.current_phase = _ServiceTaskPhase(current_phase)
+        self.stop_reason = stop_reason
+        self.execution_scheduled = execution_scheduled
+
+
+def _service_action_result(client: Any, task_id: str, payload: dict[str, Any]) -> _ServiceActionResult:
+    """Build a ``_ServiceActionResult`` from a service resume/approve response.
+
+    Prefers an authoritative task status wherever the response carries one
+    (full-Engine resume/approve, or ordinary ``/resume``'s refreshed task);
+    for an ordinary gate ``/approve`` that didn't auto-schedule anything,
+    there is no task info in the response at all, so the actual status is
+    refetched rather than assumed.
+    """
+    task = payload.get("task") if isinstance(payload.get("task"), dict) else None
+    auto_schedule = payload.get("auto_schedule") if isinstance(payload.get("auto_schedule"), dict) else None
+    scheduled_items = auto_schedule.get("scheduled") if auto_schedule else None
+    execution_scheduled = bool(scheduled_items) or task is not None
+    if task is None and auto_schedule is not None and isinstance(auto_schedule.get("task"), dict):
+        task = auto_schedule["task"]
+    if task is None:
+        fetched = client.get_task(task_id)
+        task = fetched if isinstance(fetched, dict) else None
+    status = str((task or {}).get("status") or "")
+    stop_reason = "approval_required" if status == "waiting_human" else None
+    return _ServiceActionResult(
+        task_id, status or "approval_recorded", stop_reason, execution_scheduled=execution_scheduled
+    )
+
+
 def default_persistence(storage_path: str | None = None) -> PersistenceManager:
     return PersistenceManager(storage_path)
 
@@ -133,6 +179,11 @@ def task_summaries(persistence: PersistenceManager) -> list[dict[str, Any]]:
             except RuntimeError:
                 pass
             else:
+                service_task_ids = getattr(persistence, "_service_task_ids", set())
+                service_task_ids.update(
+                    str(task.get("id")) for task in tasks if task.get("id")
+                )
+                persistence._service_task_ids = service_task_ids
                 summaries = [_service_task_summary(t) for t in tasks]
                 summaries.sort(key=lambda item: item["last_updated"], reverse=True)
                 return summaries
@@ -478,6 +529,10 @@ class ChatSession:
         self.workspace_root = workspace_root or os.getcwd()
         self.timeout = timeout
         self.provider: tuple[str, str] | None = None
+        # Service-backed providers may be SDK/API-only and therefore have no
+        # executable path. Keep that selection separate from the direct CLI
+        # fallback so a stopped service does not strand the chat session.
+        self.service_provider: str | None = None
         # Per-provider resumable session ids (e.g. {"claude": "sess-1"}).
         # `claude_session_id` below is a compatibility view onto this dict —
         # other code and tests still read/write it as a plain attribute.
@@ -549,6 +604,74 @@ class ChatSession:
                     break
         return self.provider
 
+    def _service_workspace(self):
+        client = _try_service_client()
+        if client is None:
+            return None, None
+        try:
+            workspace = client.select_workspace(cwd=self.workspace_root)
+        except RuntimeError:
+            return None, None
+        return client, workspace
+
+    def connected_providers(self) -> list[dict[str, Any]]:
+        """Return service-managed providers for this workspace.
+
+        An empty list means the local service is unavailable or the current
+        folder does not map to a service workspace. Direct CLI discovery is
+        intentionally kept separate in :meth:`available_providers`.
+        """
+        client, workspace = self._service_workspace()
+        if client is None or not isinstance(workspace, dict):
+            return []
+        workspace_id = workspace.get("id")
+        if not isinstance(workspace_id, str) or not workspace_id:
+            return []
+        try:
+            return client.list_providers(workspace_id)
+        except RuntimeError:
+            return []
+
+    def connect_provider(
+        self, name: str, config: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Test and persist a provider through the local service.
+
+        Only references/configuration reach this method; the TUI rejects raw
+        credential fields before calling it. The provider becomes the active
+        service chat model when its health check succeeds. If the service is
+        offline, a native CLI can still be selected for this TUI session.
+        """
+        config = config or {}
+        client, workspace = self._service_workspace()
+        if client is None or not isinstance(workspace, dict):
+            if config.get("type") != "gateway":
+                candidate = str(config.get("path") or name)
+                path = shutil.which(candidate)
+                if path:
+                    self.provider = (name, path)
+                    self.service_provider = None
+                    self.session_ids = {}
+                    return {
+                        "id": name,
+                        "health": "online",
+                        "transport_kind": "cli",
+                        "path": path,
+                        "persisted": False,
+                    }
+            raise RuntimeError(
+                "Sarathi service is unavailable or this folder is not a service workspace."
+            )
+        workspace_id = workspace.get("id")
+        if not isinstance(workspace_id, str) or not workspace_id:
+            raise RuntimeError("Current service workspace has no id.")
+        provider = client.test_provider(workspace_id, name, config)
+        if provider.get("health") == "online":
+            self.service_provider = name
+            self.provider = None
+            self.session_ids = {}
+        return provider
+
     def available_providers(self) -> list[tuple[str, str]]:
         """All agent CLIs found on PATH, as (name, path) pairs."""
         found = []
@@ -565,14 +688,63 @@ class ChatSession:
         (leaving the current provider unchanged).
         """
         path = shutil.which(name)
-        if not path:
-            return False
-        self.provider = (name, path)
-        self.session_ids = {}
-        return True
+        if path:
+            self.provider = (name, path)
+            self.service_provider = None
+            self.session_ids = {}
+            return True
+        for provider in self.connected_providers():
+            if provider.get("id") == name and provider.get("health") == "online":
+                self.service_provider = name
+                self.provider = None
+                self.session_ids = {}
+                return True
+        return False
+
+    def _send_service(self, message: str) -> str | None:
+        """Send through the selected service provider, or return None to fall back."""
+        if not self.service_provider:
+            return None
+        selected = self.service_provider
+
+        def use_cli_fallback() -> None:
+            fallback_path = shutil.which(selected)
+            self.provider = (selected, fallback_path) if fallback_path else None
+            self.service_provider = None
+
+        client, workspace = self._service_workspace()
+        if client is None or not isinstance(workspace, dict):
+            use_cli_fallback()
+            return None
+        workspace_id = workspace.get("id")
+        if not isinstance(workspace_id, str) or not workspace_id:
+            use_cli_fallback()
+            return None
+        pending_context = list(self.pending_context)
+        resolved = self._consume_context(message)
+        try:
+            result = client.chat(
+                workspace_id,
+                resolved,
+                provider=self.service_provider,
+                history=self.history[-self.HISTORY_TURNS :],
+            )
+        except (RuntimeError, OSError):
+            self.pending_context = pending_context + self.pending_context
+            use_cli_fallback()
+            return None
+        reply_record = result.get("reply") if isinstance(result, dict) else None
+        reply = reply_record.get("content") if isinstance(reply_record, dict) else None
+        if not isinstance(reply, str) or not reply:
+            reply = f"{self.service_provider} service returned an empty response."
+        self.history.append((message, reply))
+        return reply
 
     def send(self, message: str) -> str:
         self.cancelled = False
+        service_reply = self._send_service(message)
+        if service_reply is not None:
+            return service_reply
         provider = self.resolve_provider()
         if provider is None:
             return NO_PROVIDER_HELP
@@ -603,6 +775,11 @@ class ChatSession:
         once with the full reply.
         """
         self.cancelled = False
+        service_reply = self._send_service(message)
+        if service_reply is not None:
+            if on_text is not None and service_reply:
+                on_text(service_reply)
+            return service_reply
         provider = self.resolve_provider()
         if provider is None:
             reply = self.send(message)
@@ -1150,6 +1327,21 @@ def resume_task(
     `cancel_check` and `task_timeout` are forwarded to `Engine.resume_task`
     (see `start_task`).
     """
+    client = _try_service_client()
+    remembered = _is_remembered_service_task(persistence, task_id)
+    if client is None:
+        if remembered:
+            raise RuntimeError(f"Service is unavailable for service task {task_id}")
+    else:
+        service_task = _strict_service_task(client, task_id)
+        if service_task is not None:
+            return _service_action_result(client, task_id, client.resume_task(task_id))
+        if remembered:
+            # A known service-origin id must never resume against a same-ID
+            # local context, even on a genuine 404 -- report the service
+            # miss instead of silently mutating an unrelated local file.
+            raise RuntimeError(f"Service task {task_id} was not found on the service.")
+
     task = persistence.load_task(task_id)
     if task is None:
         raise ValueError(f"Task {task_id} not found")
@@ -1157,3 +1349,67 @@ def resume_task(
     engine.persistence = persistence
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         return engine.resume_task(task, cancel_check=cancel_check, task_timeout=task_timeout)
+
+
+def approve_task(
+    persistence: PersistenceManager,
+    task_id: str,
+    policy_pack: str | Path,
+    *,
+    approved_by: str | None = None,
+    note: str | None = None,
+    task_timeout: float | None = None,
+) -> TaskContext:
+    """Approve and continue either a service task or a local task."""
+    client = _try_service_client()
+    remembered = _is_remembered_service_task(persistence, task_id)
+    if client is None:
+        if remembered:
+            raise RuntimeError(f"Service is unavailable for service task {task_id}")
+    else:
+        service_task = _strict_service_task(client, task_id)
+        if service_task is not None:
+            payload = client.approve_task(task_id, approved_by=approved_by, note=note)
+            return _service_action_result(client, task_id, payload)
+        if remembered:
+            # Same rationale as resume_task: a known service-origin id must
+            # never fall through to a same-ID local context.
+            raise RuntimeError(f"Service task {task_id} was not found on the service.")
+
+    task = persistence.load_task(task_id)
+    if task is None:
+        raise ValueError(f"Task {task_id} not found")
+    engine = Engine(policy_pack_path=str(policy_pack), enforce_preflight=True)
+    engine.persistence = persistence
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        task = engine.record_approval(task, approved_by=approved_by or "local", note=note)
+        return engine.resume_task(task, task_timeout=task_timeout)
+
+
+def is_service_task(task_id: str, persistence: PersistenceManager | None = None) -> bool:
+    """Return whether a task exists in the service workspace store."""
+    client = _try_service_client()
+    if client is not None and _strict_service_task(client, task_id) is not None:
+        if persistence is not None:
+            service_task_ids = getattr(persistence, "_service_task_ids", set())
+            service_task_ids.add(task_id)
+            persistence._service_task_ids = service_task_ids
+        return True
+    return persistence is not None and task_id in getattr(persistence, "_service_task_ids", set())
+
+
+def _strict_service_task(client: Any, task_id: str) -> dict[str, Any] | None:
+    """Use strict lookup for actions while supporting lightweight test clients."""
+    method = getattr(client, "get_task_strict", None)
+    return method(task_id) if method is not None else client.get_task(task_id)
+
+
+def _is_remembered_service_task(persistence: PersistenceManager | None, task_id: str) -> bool:
+    """Whether ``task_id`` was previously observed as service-origin.
+
+    Once remembered, resume/approve must never fall back to a same-ID local
+    context -- not even on a genuine 404 -- since a legitimate local-only
+    task never gets added to this set in the first place (see
+    ``task_summaries``/``is_service_task``).
+    """
+    return persistence is not None and task_id in getattr(persistence, "_service_task_ids", set())

@@ -1809,6 +1809,31 @@
             "application/json": {
               "schema": {
                 "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "gateway"
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "auth": {
+                    "type": "string"
+                  },
+                  "base_url": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "api_key_env": {
+                    "type": "string",
+                    "description": "Environment variable name; secret values are not stored."
+                  }
+                },
                 "additionalProperties": true
               }
             }
@@ -8502,10 +8527,23 @@
                         "auto_schedule": {
                           "type": "object",
                           "additionalProperties": true
+                        },
+                        "task": {
+                          "type": "object",
+                          "additionalProperties": true
                         }
                       },
-                      "required": [
-                        "approval_gate"
+                      "anyOf": [
+                        {
+                          "required": [
+                            "approval_gate"
+                          ]
+                        },
+                        {
+                          "required": [
+                            "task"
+                          ]
+                        }
                       ]
                     },
                     "correlation_id": {
@@ -8680,6 +8718,159 @@
                         "approved",
                         "auto_schedule"
                       ]
+                    },
+                    "correlation_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "data",
+                    "correlation_id"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "enum": [
+                        false
+                      ]
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "status"
+                      ]
+                    },
+                    "correlation_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "error",
+                    "correlation_id"
+                  ]
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Unexpected error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "enum": [
+                        false
+                      ]
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        },
+                        "status": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "status"
+                      ]
+                    },
+                    "correlation_id": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "error",
+                    "correlation_id"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tasks/{id}/resume": {
+      "post": {
+        "summary": "Resume a service task without bypassing approval gates.",
+        "tags": [
+          "tasks"
+        ],
+        "operationId": "post_tasks_id_resume",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Task identifier."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Task queued or ready subtasks scheduled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "enum": [
+                        true
+                      ]
+                    },
+                    "data": {
+                      "type": "object",
+                      "additionalProperties": true
                     },
                     "correlation_id": {
                       "type": "string"
@@ -9735,7 +9926,48 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "additionalProperties": true
+                "properties": {
+                  "message": {
+                    "type": "string"
+                  },
+                  "workspace_id": {
+                    "type": "string"
+                  },
+                  "provider": {
+                    "type": "string"
+                  },
+                  "context": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "history": {
+                    "type": "array",
+                    "maxItems": 12,
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "role": {
+                          "type": "string",
+                          "enum": [
+                            "user",
+                            "assistant"
+                          ]
+                        },
+                        "content": {
+                          "type": "string",
+                          "maxLength": 2000
+                        }
+                      },
+                      "required": [
+                        "role",
+                        "content"
+                      ]
+                    }
+                  }
+                },
+                "required": [
+                  "message"
+                ]
               }
             }
           }

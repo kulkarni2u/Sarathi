@@ -1,7 +1,7 @@
 // Subscription helper for task lifecycle events.
 //
 // Transports:
-// 1. EventSource (SSE) to `/workspaces/{ws}/tasks/{task}/events/stream`:
+// 1. EventSource (SSE) to `/api/events/stream?workspace_id&task_id`:
 //    Receives real-time events as SSE frames. Token is passed as a query
 //    parameter since EventSource cannot set custom headers. On error, falls
 //    back to the polling transport below.
@@ -112,14 +112,24 @@ export function subscribeToEvents(
         messageReceived = true;
         errorCount = 0;
 
-        // Each SSE message represents a single LifecycleEvent
         try {
-          const data = JSON.parse(event.data) as LifecycleEvent;
-          // Emit as a single-element array to match polling transport shape
-          options.onEvents([data]);
+          const data = JSON.parse(event.data) as { events?: LifecycleEvent[] };
+          options.onEvents(Array.isArray(data.events) ? data.events : []);
         } catch (parseErr) {
           // Silently skip unparseable events
           console.warn("Failed to parse SSE event data:", parseErr);
+        }
+      });
+      eventSource.addEventListener("snapshot", (event) => {
+        if (cancelled || fallbackInProgress) return;
+        try {
+          const data = JSON.parse(event.data) as { events?: LifecycleEvent[] };
+          if (!Array.isArray(data.events)) return;
+          messageReceived = true;
+          errorCount = 0;
+          options.onEvents(data.events);
+        } catch (parseErr) {
+          console.warn("Failed to parse SSE snapshot data:", parseErr);
         }
       });
 
@@ -167,7 +177,7 @@ export function subscribeToEvents(
 /**
  * Build the absolute URL to the SSE events stream endpoint.
  *
- * Path: `/workspaces/{workspace_id}/tasks/{task_id}/events/stream`
+ * Path: `/api/events/stream?workspace_id&task_id`
  *
  * EventSource cannot send custom Authorization headers, so the bearer token
  * (if present) is passed as a `token` query parameter. The service's
@@ -180,11 +190,11 @@ export function buildEventsUrl(params: EventsSubscriptionParams): string {
   // Default to same-origin if baseUrl is empty (single-origin deployment)
   if (!baseUrl) {
     const url = new URL(
-      `/workspaces/${encodeURIComponent(params.workspaceId || "")}/tasks/${encodeURIComponent(
-        params.taskId || "",
-      )}/events/stream`,
+      "/api/events/stream",
       "http://localhost", // dummy base for URL construction
     );
+    if (params.workspaceId) url.searchParams.set("workspace_id", params.workspaceId);
+    if (params.taskId) url.searchParams.set("task_id", params.taskId);
     if (token) url.searchParams.set("token", token);
     // Return relative path for same-origin fetch
     return url.pathname + (url.search ? url.search : "");
@@ -192,11 +202,11 @@ export function buildEventsUrl(params: EventsSubscriptionParams): string {
 
   // Cross-origin: build absolute URL
   const url = new URL(
-    `/workspaces/${encodeURIComponent(params.workspaceId || "")}/tasks/${encodeURIComponent(
-      params.taskId || "",
-    )}/events/stream`,
+    "/api/events/stream",
     baseUrl + "/",
   );
+  if (params.workspaceId) url.searchParams.set("workspace_id", params.workspaceId);
+  if (params.taskId) url.searchParams.set("task_id", params.taskId);
   if (token) url.searchParams.set("token", token);
   return url.toString();
 }

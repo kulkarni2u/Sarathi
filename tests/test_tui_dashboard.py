@@ -634,6 +634,7 @@ def test_cd_command_resets_agent_session(persistence, tmp_path):
         async with app.run_test() as pilot:
             await pilot.pause()
             app.screen.session.claude_session_id = "sid-old"
+            app.screen.session.service_provider = "codex"
 
             for ch in f"/cd {repo}":
                 await pilot.press(ch)
@@ -642,6 +643,7 @@ def test_cd_command_resets_agent_session(persistence, tmp_path):
 
             assert app.workspace == str(repo)
             assert app.screen.session.claude_session_id is None
+            assert app.screen.session.service_provider is None
 
     asyncio.run(scenario())
 
@@ -655,6 +657,8 @@ def _cancellable_pack(tmp_path):
 
 
 def test_cancel_command_stops_active_run(persistence, tmp_path, monkeypatch):
+    # Provider detection happens during app construction; isolate before startup.
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
     pack = _cancellable_pack(tmp_path)
     monkeypatch.setattr("src.tui._discover_policy_pack", lambda *a, **k: str(pack))
 
@@ -680,7 +684,6 @@ def test_cancel_command_stops_active_run(persistence, tmp_path, monkeypatch):
 
             # Start the chat thread so the chat screen is "-started" and
             # picks up the post-run system message.
-            monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
             await pilot.press(*"hi")
             await pilot.press("enter")
             await app.workers.wait_for_complete()
@@ -941,6 +944,8 @@ def test_diff_review_screen_approve_then_reject_updates_decision(persistence, tm
 
 
 def test_timeout_reports_timed_out_message(persistence, tmp_path, monkeypatch):
+    # Provider detection happens during app construction; isolate before startup.
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
     pack = _cancellable_pack(tmp_path)
     monkeypatch.setattr("src.tui._discover_policy_pack", lambda *a, **k: str(pack))
 
@@ -961,7 +966,6 @@ def test_timeout_reports_timed_out_message(persistence, tmp_path, monkeypatch):
 
             # Start the chat thread so the chat screen is "-started" and
             # picks up the post-run system message.
-            monkeypatch.setattr(tui_data.shutil, "which", lambda name: None)
             await pilot.press(*"hi")
             await pilot.press("enter")
             await app.workers.wait_for_complete()
@@ -1009,5 +1013,113 @@ def test_model_command_lists_and_switches_provider(persistence, monkeypatch):
             contents = [str(widget.content) for widget in messages]
             assert any("codex" in content for content in contents)
             assert app.screen.session.provider[0] == "codex"
+
+    asyncio.run(scenario())
+
+
+def test_providers_command_lists_service_connections(persistence, monkeypatch):
+    monkeypatch.setattr(
+        tui_data.ChatSession,
+        "connected_providers",
+        lambda self: [
+            {"id": "codex", "health": "online", "transport_kind": "sdk"},
+            {"id": "team-gateway", "health": "offline", "transport_kind": "api"},
+        ],
+    )
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for ch in "/providers":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            contents = [str(widget.content) for widget in app.screen.query(".chat-msg.system")]
+            assert any(
+                "codex" in content
+                and "online/sdk" in content
+                and "team-gateway" in content
+                and "offline/api" in content
+                for content in contents
+            )
+
+    asyncio.run(scenario())
+
+
+def test_connect_command_passes_only_safe_provider_configuration(
+    persistence, monkeypatch
+):
+    captured = {}
+
+    def fake_connect(self, name, config):
+        captured.update({"name": name, "config": config})
+        return {
+            "id": name,
+            "health": "online",
+            "transport_kind": "api",
+            "model": config.get("model"),
+        }
+
+    monkeypatch.setattr(tui_data.ChatSession, "connect_provider", fake_connect)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            command = (
+                "/connect team-gateway type=gateway "
+                "base_url=https://models.example/v1 model=small "
+                "api_key_env=TEAM_GATEWAY_KEY"
+            )
+            for ch in command:
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert captured == {
+                "name": "team-gateway",
+                "config": {
+                    "type": "gateway",
+                    "base_url": "https://models.example/v1",
+                    "model": "small",
+                    "api_key_env": "TEAM_GATEWAY_KEY",
+                },
+            }
+            contents = [str(widget.content) for widget in app.screen.query(".chat-msg.system")]
+            assert any("Connected team-gateway" in content for content in contents)
+
+    asyncio.run(scenario())
+
+
+def test_connect_command_rejects_raw_secrets_before_service_call(
+    persistence, monkeypatch
+):
+    called = False
+
+    def fake_connect(self, name, config):
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(tui_data.ChatSession, "connect_provider", fake_connect)
+
+    async def scenario():
+        app = SarathiDashboard(persistence=persistence, refresh_interval=60.0)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for ch in "/connect codex api_key=sk-do-not-store":
+                await pilot.press(ch)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert called is False
+            contents = [str(widget.content) for widget in app.screen.query(".chat-msg.system")]
+            assert any(
+                "Raw secrets are not accepted" in content
+                and "api_key_env" in content
+                for content in contents
+            )
 
     asyncio.run(scenario())

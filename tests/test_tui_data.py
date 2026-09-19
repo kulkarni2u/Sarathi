@@ -316,6 +316,177 @@ def test_chat_session_no_provider(monkeypatch):
     assert "No agent CLI" in reply
 
 
+def test_service_client_lists_tests_and_chats_with_provider(monkeypatch):
+    monkeypatch.setattr(service_client, "_read_service_discovery", lambda: _SERVICE_DISCOVERY)
+    calls = []
+
+    def fake_get(url, path, *, token=None):
+        calls.append(("GET", path, None))
+        return {
+            "ok": True,
+            "data": {"providers": [{"id": "codex", "health": "online"}]},
+        }
+
+    def fake_post(url, path, body, *, token=None):
+        calls.append(("POST", path, body))
+        if path.endswith("/test"):
+            return {
+                "ok": True,
+                "data": {"provider": {"id": "codex", "health": "online"}},
+            }
+        return {
+            "ok": True,
+            "data": {
+                "agent": "codex",
+                "status": "completed",
+                "reply": {"content": "service reply"},
+            },
+        }
+
+    monkeypatch.setattr(service_client, "_service_get", fake_get)
+    monkeypatch.setattr(service_client, "_service_post", fake_post)
+    client = service_client.ServiceClient()
+
+    assert client.list_providers("ws one") == [{"id": "codex", "health": "online"}]
+    assert client.test_provider(
+        "ws one", "codex/sdk", {"api_key_env": "OPENAI_API_KEY"}
+    )["health"] == "online"
+    assert client.chat(
+        "ws one", "hello", provider="codex", history=[("before", "reply")]
+    )["reply"]["content"] == "service reply"
+    assert calls == [
+        ("GET", "/api/providers?workspace_id=ws%20one", None),
+        (
+            "POST",
+            "/api/workspaces/ws%20one/providers/codex%2Fsdk/test",
+            {"api_key_env": "OPENAI_API_KEY"},
+        ),
+        (
+            "POST",
+            "/api/chat",
+            {
+                "message": "hello",
+                "workspace_id": "ws one",
+                "provider": "codex",
+                "history": [
+                    {"role": "user", "content": "before"},
+                    {"role": "assistant", "content": "reply"},
+                ],
+            },
+        ),
+    ]
+
+
+def test_chat_session_connects_and_uses_service_provider(monkeypatch, tmp_path):
+    class FakeClient:
+        def select_workspace(self, *, cwd=None, **kwargs):
+            assert cwd == str(tmp_path)
+            return {"id": "ws-1"}
+
+        def list_providers(self, workspace_id):
+            assert workspace_id == "ws-1"
+            return [
+                {"id": "codex", "health": "online", "transport_kind": "sdk"},
+                {"id": "claude", "health": "offline", "transport_kind": "sdk"},
+            ]
+
+        def test_provider(self, workspace_id, provider_id, config):
+            assert (workspace_id, provider_id) == ("ws-1", "codex")
+            assert config == {"api_key_env": "OPENAI_API_KEY", "path": ""}
+            return {"id": "codex", "health": "online", "transport_kind": "sdk"}
+
+        def chat(self, workspace_id, message, *, provider=None, history=None):
+            assert workspace_id == "ws-1"
+            assert provider == "codex"
+            assert history == []
+            return {
+                "agent": "codex",
+                "status": "completed",
+                "reply": {"content": f"service: {message}"},
+            }
+
+    monkeypatch.setattr(tui_data, "_try_service_client", lambda: FakeClient())
+    session = tui_data.ChatSession(workspace_root=str(tmp_path))
+
+    assert [item["id"] for item in session.connected_providers()] == ["codex", "claude"]
+    provider = session.connect_provider(
+        "codex", {"api_key_env": "OPENAI_API_KEY", "path": ""}
+    )
+    assert provider["health"] == "online"
+    assert session.service_provider == "codex"
+
+    seen = []
+    reply = session.send_streaming("hello", on_text=seen.append)
+
+    assert reply == "service: hello"
+    assert seen == ["service: hello"]
+    assert session.history == [("hello", "service: hello")]
+
+
+def test_chat_session_service_provider_falls_back_to_cli_when_service_disappears(
+    monkeypatch,
+):
+    monkeypatch.setattr(tui_data, "_try_service_client", lambda: None)
+    monkeypatch.setattr(tui_data.shutil, "which", lambda name: f"/usr/bin/{name}")
+    session = tui_data.ChatSession()
+    session.service_provider = "codex"
+    monkeypatch.setattr(session, "_send_one_shot", lambda name, path, message: "cli reply")
+
+    assert session.send("hello") == "cli reply"
+    assert session.service_provider is None
+
+
+def test_chat_session_connect_uses_direct_cli_when_service_is_offline(monkeypatch):
+    monkeypatch.setattr(tui_data, "_try_service_client", lambda: None)
+    monkeypatch.setattr(
+        tui_data.shutil,
+        "which",
+        lambda name: "/usr/local/bin/codex" if name == "codex" else None,
+    )
+    session = tui_data.ChatSession()
+
+    provider = session.connect_provider("codex")
+
+    assert provider == {
+        "id": "codex",
+        "health": "online",
+        "transport_kind": "cli",
+        "path": "/usr/local/bin/codex",
+        "persisted": False,
+    }
+    assert session.provider == ("codex", "/usr/local/bin/codex")
+
+
+def test_chat_session_preserves_pending_context_when_service_chat_falls_back(
+    monkeypatch,
+):
+    class FailingClient:
+        def select_workspace(self, *, cwd=None, **kwargs):
+            return {"id": "ws-1"}
+
+        def chat(self, *args, **kwargs):
+            raise RuntimeError("service stopped")
+
+    monkeypatch.setattr(tui_data, "_try_service_client", lambda: FailingClient())
+    monkeypatch.setattr(
+        tui_data.shutil,
+        "which",
+        lambda name: "/usr/local/bin/codex" if name == "codex" else None,
+    )
+    sent = []
+    session = tui_data.ChatSession()
+    session.service_provider = "codex"
+    session.add_context("Task", "Build is failing")
+    monkeypatch.setattr(
+        session,
+        "_send_one_shot",
+        lambda name, path, message: sent.append(message) or "cli reply",
+    )
+
+    assert session.send("help") == "cli reply"
+    assert "Build is failing" in sent[0]
+
+
 def test_chat_session_claude_session_continuity(monkeypatch):
     def fake_which(name):
         return "/usr/bin/claude" if name == "claude" else None

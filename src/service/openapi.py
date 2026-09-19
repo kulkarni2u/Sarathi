@@ -451,7 +451,21 @@ ROUTES: list[dict[str, Any]] = [
         "summary": "Test and store credentials for a provider.",
         "tags": ["providers"],
         "params": ["id", "provider"],
-        "request": OBJECT_SCHEMA,
+        "request": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "enum": ["gateway"]},
+                "path": {"type": "string"},
+                "auth": {"type": "string"},
+                "base_url": {"type": "string", "format": "uri"},
+                "model": {"type": "string"},
+                "api_key_env": {
+                    "type": "string",
+                    "description": "Environment variable name; secret values are not stored.",
+                },
+            },
+            "additionalProperties": True,
+        },
         "success": ("200", "Provider test result."),
         "data_schema": {
             "type": "object",
@@ -992,8 +1006,9 @@ ROUTES: list[dict[str, Any]] = [
             "properties": {
                 "approval_gate": OBJECT_SCHEMA,
                 "auto_schedule": OBJECT_SCHEMA,
+                "task": OBJECT_SCHEMA,
             },
-            "required": ["approval_gate"],
+            "anyOf": [{"required": ["approval_gate"]}, {"required": ["task"]}],
         },
         "not_found": True,
     },
@@ -1016,6 +1031,17 @@ ROUTES: list[dict[str, Any]] = [
             },
             "required": ["approved", "auto_schedule"],
         },
+        "not_found": True,
+    },
+    {
+        "path": "/tasks/{id}/resume",
+        "method": "POST",
+        "summary": "Resume a service task without bypassing approval gates.",
+        "tags": ["tasks"],
+        "params": ["task_id"],
+        "request": OBJECT_SCHEMA,
+        "success": ("200", "Task queued or ready subtasks scheduled."),
+        "data_schema": OBJECT_SCHEMA,
         "not_found": True,
     },
     {
@@ -1103,7 +1129,31 @@ ROUTES: list[dict[str, Any]] = [
         "path": "/chat",
         "summary": "Handle a chat request and dispatch to the appropriate provider.",
         "tags": ["chat"],
-        "request": OBJECT_SCHEMA,
+        "request": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"},
+                "workspace_id": {"type": "string"},
+                "provider": {"type": "string"},
+                "context": OBJECT_SCHEMA,
+                "history": {
+                    "type": "array",
+                    "maxItems": 12,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {
+                                "type": "string",
+                                "enum": ["user", "assistant"],
+                            },
+                            "content": {"type": "string", "maxLength": 2000},
+                        },
+                        "required": ["role", "content"],
+                    },
+                },
+            },
+            "required": ["message"],
+        },
         "success": ("201", "Chat response."),
     },
     {

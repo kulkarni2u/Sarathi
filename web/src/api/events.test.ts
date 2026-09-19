@@ -46,7 +46,7 @@ describe("buildEventsUrl", () => {
     });
 
     const url = buildEventsUrl({ workspaceId: "ws-123", taskId: "task-456" });
-    expect(url).toBe("/workspaces/ws-123/tasks/task-456/events/stream");
+    expect(url).toBe("/api/events/stream?workspace_id=ws-123&task_id=task-456");
   });
 
   it("builds a relative path without token when token is empty", () => {
@@ -66,7 +66,7 @@ describe("buildEventsUrl", () => {
     });
 
     const url = buildEventsUrl({ workspaceId: "ws-123", taskId: "task-456" });
-    expect(url).toBe("/workspaces/ws-123/tasks/task-456/events/stream?token=test-token-123");
+    expect(url).toBe("/api/events/stream?workspace_id=ws-123&task_id=task-456&token=test-token-123");
   });
 
   it("builds an absolute URL for cross-origin baseUrl", () => {
@@ -76,7 +76,7 @@ describe("buildEventsUrl", () => {
     });
 
     const url = buildEventsUrl({ workspaceId: "ws-123", taskId: "task-456" });
-    expect(url).toBe("https://api.example.com/workspaces/ws-123/tasks/task-456/events/stream");
+    expect(url).toBe("https://api.example.com/api/events/stream?workspace_id=ws-123&task_id=task-456");
   });
 
   it("appends token as query param for cross-origin when token is present", () => {
@@ -87,7 +87,7 @@ describe("buildEventsUrl", () => {
 
     const url = buildEventsUrl({ workspaceId: "ws-123", taskId: "task-456" });
     expect(url).toContain("token=cross-origin-token");
-    expect(url).toContain("https://api.example.com/workspaces/ws-123/tasks/task-456/events/stream");
+    expect(url).toContain("https://api.example.com/api/events/stream?workspace_id=ws-123&task_id=task-456");
   });
 
   it("encodes special characters in workspace and task IDs", () => {
@@ -108,12 +108,13 @@ describe("buildEventsUrl", () => {
     });
 
     const url = buildEventsUrl({ workspaceId: undefined, taskId: undefined });
-    expect(url).toBe("/workspaces//tasks//events/stream");
+    expect(url).toBe("/api/events/stream");
   });
 });
 
 describe("subscribeToEvents - SSE transport", () => {
   let messageHandlers: Function[];
+  let snapshotHandlers: Function[];
   let errorHandlers: Function[];
   let mockEventSource: any;
 
@@ -121,6 +122,7 @@ describe("subscribeToEvents - SSE transport", () => {
     vi.clearAllMocks();
 
     messageHandlers = [];
+    snapshotHandlers = [];
     errorHandlers = [];
 
     mockEventSource = {
@@ -128,6 +130,8 @@ describe("subscribeToEvents - SSE transport", () => {
       addEventListener(eventType: string, handler: Function) {
         if (eventType === "message") {
           messageHandlers.push(handler);
+        } else if (eventType === "snapshot") {
+          snapshotHandlers.push(handler);
         } else if (eventType === "error") {
           errorHandlers.push(handler);
         }
@@ -161,7 +165,7 @@ describe("subscribeToEvents - SSE transport", () => {
     const callback = vi.fn();
     subscribeToEvents({ workspaceId: "ws-1", taskId: "task-1" }, { onEvents: callback });
 
-    expect(urlsCalled[0]).toBe("/workspaces/ws-1/tasks/task-1/events/stream?token=test-token");
+    expect(urlsCalled[0]).toBe("/api/events/stream?workspace_id=ws-1&task_id=task-1&token=test-token");
   });
 
   it("parses and delivers JSON SSE events to the callback", () => {
@@ -172,10 +176,8 @@ describe("subscribeToEvents - SSE transport", () => {
 
     const event = {
       data: JSON.stringify({
-        id: "evt-123",
-        phase: "BUILD",
-        timestamp: "2026-07-07T12:00:00Z",
-      } as LifecycleEvent),
+        events: [{ id: "evt-123", phase: "BUILD", timestamp: "2026-07-07T12:00:00Z" }],
+      }),
     };
 
     messageHandlers[0]?.(event);
@@ -193,7 +195,7 @@ describe("subscribeToEvents - SSE transport", () => {
     const callback = vi.fn();
     subscribeToEvents({ workspaceId: "ws-1", taskId: "task-1" }, { onEvents: callback });
 
-    const event = { data: JSON.stringify({ id: "evt-456", phase: "VERIFY" } as LifecycleEvent) };
+    const event = { data: JSON.stringify({ events: [{ id: "evt-456", phase: "VERIFY" }] }) };
     messageHandlers[0]?.(event);
 
     const callArg = callback.mock.calls[0]?.[0];
@@ -213,6 +215,28 @@ describe("subscribeToEvents - SSE transport", () => {
     expect(callback).not.toHaveBeenCalled();
     expect(consoleWarn).toHaveBeenCalled();
 
+    consoleWarn.mockRestore();
+  });
+
+  it("treats a valid named snapshot as a successful message before a transient error", () => {
+    const callback = vi.fn();
+    subscribeToEvents({ workspaceId: "ws-1", taskId: "task-1" }, { onEvents: callback });
+
+    snapshotHandlers[0]?.({ data: JSON.stringify({ events: [{ id: "evt-snapshot" }] }) });
+    errorHandlers[0]?.({});
+
+    expect(callback).toHaveBeenCalledWith([{ id: "evt-snapshot" }]);
+    expect(mockEventSource.close).not.toHaveBeenCalled();
+  });
+
+  it("ignores malformed named snapshots without throwing", () => {
+    const callback = vi.fn();
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    subscribeToEvents({ workspaceId: "ws-1", taskId: "task-1" }, { onEvents: callback });
+
+    expect(() => snapshotHandlers[0]?.({ data: "not valid json {" })).not.toThrow();
+    expect(callback).not.toHaveBeenCalled();
+    expect(consoleWarn).toHaveBeenCalled();
     consoleWarn.mockRestore();
   });
 

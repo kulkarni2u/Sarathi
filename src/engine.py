@@ -122,6 +122,7 @@ try:
         NCPWhisperRouter,
         NCPOutcomeLedger,
         NCPOutcomeReporter,
+        NCPImprovementTracker,
     )
 except ImportError:
     from ncp_adapter import (
@@ -133,6 +134,7 @@ except ImportError:
         NCPWhisperRouter,
         NCPOutcomeLedger,
         NCPOutcomeReporter,
+        NCPImprovementTracker,
     )
 
 
@@ -856,6 +858,22 @@ class Engine:
             for adapter in (self.context_adapter, self.persistence, self.artifact_store, self.whisper_router):
                 if adapter is not None:
                     adapter.outcome_ledger = self.ncp_outcome_ledger
+            # Proposals as NCP improvement attempts + post-accept check. State
+            # lives beside the policy pack, where ProposalReviewStore (which
+            # records accept/reject/rollback) looks for it.
+            try:
+                from .evolve import EvolutionPolicy
+            except ImportError:
+                from evolve import EvolutionPolicy  # type: ignore[no-redef]
+            learn_policy = EvolutionPolicy.from_escalation(
+                getattr(self.policy_pack, "escalation", {}) or {}
+            )
+            self.ncp_improvement_tracker: NCPImprovementTracker | None = NCPImprovementTracker(
+                **adapter_kwargs,
+                workspace_root=Path(self.policy_pack_path).resolve().parent,
+                min_outcomes=learn_policy.post_accept_min_outcomes,
+                gate_ratio=learn_policy.post_accept_gate_ratio,
+            )
         else:
             self.context_adapter = ContextCompiler()
             self.persistence = PersistenceManager()
@@ -863,6 +881,7 @@ class Engine:
             self.whisper_router = None
             self.ncp_outcome_ledger = None
             self.ncp_outcome_reporter = None
+            self.ncp_improvement_tracker = None
 
         # Provider health tracking — same base directory PersistenceManager
         # uses by default (".sarathi/tasks" -> ".sarathi"), independent of
@@ -966,6 +985,7 @@ class Engine:
                 self.dispatcher,
                 provider_health=self.provider_health,
                 ncp_outcome_reporter=getattr(self, "ncp_outcome_reporter", None),
+                ncp_improvement_tracker=getattr(self, "ncp_improvement_tracker", None),
             ),
         }
 

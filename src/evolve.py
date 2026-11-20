@@ -136,6 +136,14 @@ class EvolutionPolicy:
     # `Evolver.propose_from_bakeoff_history` proposes routing that class to it.
     bakeoff_min_wins: int = 5
     bakeoff_min_win_rate: float = 0.7
+    # Post-accept check of an accepted proposal (src/ncp_adapter/improvement.py):
+    # once `post_accept_min_outcomes` tasks of the proposal's task class have
+    # finished after acceptance (and as many before), a success rate below
+    # `post_accept_gate_ratio` x the pre-accept rate is reported as a
+    # regression with a rollback recommendation. Defaults match NCP's refine
+    # gate (min_trial_outcomes 5, gate_ratio 0.9).
+    post_accept_min_outcomes: int = 5
+    post_accept_gate_ratio: float = 0.9
 
     @classmethod
     def from_escalation(cls, escalation: dict[str, Any] | None = None) -> "EvolutionPolicy":
@@ -155,6 +163,15 @@ class EvolutionPolicy:
             ),
             bakeoff_min_win_rate=_non_negative_float(
                 config.get("bakeoff_min_win_rate"), cls.bakeoff_min_win_rate
+            ),
+            post_accept_min_outcomes=max(
+                1,
+                _non_negative_int(
+                    config.get("post_accept_min_outcomes"), cls.post_accept_min_outcomes
+                ),
+            ),
+            post_accept_gate_ratio=_non_negative_float(
+                config.get("post_accept_gate_ratio"), cls.post_accept_gate_ratio
             ),
         )
 
@@ -742,6 +759,7 @@ class ProposalReviewStore:
         self._write_decision(decision)
         if self._sync is not None:
             self._sync.record_decision(decision)
+        self._record_ncp_decision(decision)
         return decision
 
     def reject(self, proposal: PolicyProposal, reason: str | None = None) -> dict[str, Any]:
@@ -749,6 +767,7 @@ class ProposalReviewStore:
         self._write_decision(decision)
         if self._sync is not None:
             self._sync.record_decision(decision)
+        self._record_ncp_decision(decision)
         return decision
 
     def rollback(self, proposal_id: str, force: bool = False) -> dict[str, Any]:
@@ -802,7 +821,32 @@ class ProposalReviewStore:
         self._write_decision(rollback_decision, path=rollback_path)
         if self._sync is not None:
             self._sync.record_decision(rollback_decision)
+        self._record_ncp_decision(rollback_decision)
         return rollback_decision
+
+    def _record_ncp_decision(self, decision: dict[str, Any]) -> None:
+        """Mirror the decision onto the proposal's NCP improvement attempt.
+
+        Best effort: a workspace without an NCP bridge, or a proposal that
+        was never filed in NCP, is a no-op, and errors are only logged.
+        """
+        try:
+            try:
+                from src.ncp_adapter.improvement import NCPImprovementTracker
+            except ImportError:
+                from ncp_adapter.improvement import NCPImprovementTracker  # type: ignore[no-redef]
+            tracker = NCPImprovementTracker.for_workspace(self.workspace_root)
+            if tracker is None:
+                return
+            result = tracker.record_decision(decision)
+            if isinstance(result, dict) and (result.get("error") or result.get("unsupported")):
+                logger.warning(
+                    "NCP improvement record not updated for proposal %s: %s",
+                    decision.get("id"),
+                    result.get("error") or result.get("unsupported"),
+                )
+        except Exception:
+            logger.warning("NCP improvement record update failed", exc_info=True)
 
     def preview_acceptance(self, proposal: PolicyProposal) -> dict[str, Any]:
         policy_file = self._resolve_target_path(proposal)

@@ -53,6 +53,7 @@ except ImportError as e:
         f"installed. Missing dependency: {e}"
     ) from e
 
+from .improvement import NCPImprovementTracker
 from .outcome import NCPOutcomeLedger, NCPOutcomeReporter
 
 __all__ = [
@@ -64,4 +65,5 @@ __all__ = [
     "NCPWhisperRouter",
     "NCPOutcomeLedger",
     "NCPOutcomeReporter",
+    "NCPImprovementTracker",
 ]

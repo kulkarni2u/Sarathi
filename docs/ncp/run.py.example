@@ -15,6 +15,11 @@ Supported commands:
     record_outcome -- record a task outcome crediting chunk_ids, then run NCP's
                       feedback calibration (unless [calibration].auto_on_outcome
                       is false); print {"recorded", "outcome_id", "calibrated"}
+    improvement_record -- file a policy proposal as an NCP improvement attempt
+                      (kind "manual") under the problem named problem_name in
+                      scope; an open ("proposed") attempt with the same `what`
+                      is reused. Print the attempt and the problem's history.
+    improvement_update -- update an attempt's status / observed fields
 
 All errors are reported on stderr with a non-zero exit code; an unknown
 command exits 2.
@@ -34,12 +39,84 @@ from pathlib import Path
 # reads <project_root>/.ncp/config.toml (sqlite store at .ncp/store.db).
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-SARATHI_NCP_BRIDGE_VERSION = 2
+SARATHI_NCP_BRIDGE_VERSION = 3
 
 
 def _fail(message: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
     print(message, file=sys.stderr)
     sys.exit(code)
+
+
+def _attempt_view(attempt) -> dict:
+    return {
+        "attempt_id": attempt.attempt_id,
+        "problem_id": attempt.problem_id,
+        "status": attempt.status,
+        "what": attempt.what,
+        "passed": attempt.passed,
+        "total": attempt.total,
+        "anchor_rate": attempt.anchor_rate,
+        "note": attempt.note,
+        "created_at": attempt.created_at,
+        "resolved_at": attempt.resolved_at,
+    }
+
+
+def _improvement_command(command: str, args: dict, store) -> dict:
+    import time
+
+    from ncp.stores.improvement_common import (
+        make_problem_id,
+        new_attempt_id,
+        normalize_problem_name,
+    )
+    from ncp.types import ImprovementAttempt, ImprovementProblem
+
+    if command == "improvement_update":
+        fields = dict(args.get("fields") or {})
+        if fields.get("status") in ("applied", "rejected", "rolled_back"):
+            fields.setdefault("resolved_at", time.time())
+        return {"attempt": _attempt_view(store.update_improvement_attempt(str(args["attempt_id"]), **fields))}
+
+    scope = str(args["scope"])
+    name = str(args["problem_name"]).strip()[:300]
+    what = str(args["what"]).strip()[:500]
+    problem = store.upsert_improvement_problem(
+        ImprovementProblem(
+            problem_id=make_problem_id(pipeline_id=None, scope=scope, name=name),
+            scope=scope,
+            name=name,
+            opened_at=time.time(),
+        )
+    )
+    history = store.list_improvement_attempts(problem_id=problem.problem_id)
+    wanted = normalize_problem_name(what)
+    reused = next(
+        (a for a in history if a.status == "proposed" and normalize_problem_name(a.what) == wanted),
+        None,
+    )
+    if reused is not None:
+        attempt = reused
+    else:
+        attempt = store.record_improvement_attempt(
+            ImprovementAttempt(
+                attempt_id=new_attempt_id(),
+                problem_id=problem.problem_id,
+                kind="manual",
+                what=what,
+                rationale=(str(args["rationale"])[:1000] if args.get("rationale") else None),
+                files=[str(item) for item in args.get("files") or []],
+                model=args.get("model"),
+                note=args.get("note"),
+                created_at=time.time(),
+            )
+        )
+    return {
+        "problem_id": problem.problem_id,
+        "attempt": _attempt_view(attempt),
+        "reused": reused is not None,
+        "history": [_attempt_view(a) for a in history if a.attempt_id != attempt.attempt_id],
+    }
 
 
 def main(argv: list[str]) -> int:
@@ -187,6 +264,14 @@ def main(argv: list[str]) -> int:
                 "outcome_id": outcome.outcome_id,
                 "calibrated": calibrated,
             }))
+            return 0
+
+        if command in ("improvement_record", "improvement_update"):
+            try:
+                print(json.dumps(_improvement_command(command, args, store)))
+            except NotImplementedError as exc:
+                # Improvement records need the sqlite or pgvector store.
+                print(json.dumps({"unsupported": str(exc)}))
             return 0
 
         _fail(f"unknown command: {command!r}", 2)

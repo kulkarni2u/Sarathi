@@ -25,6 +25,7 @@ class LearnHandler:
         provider_health=None,
         workspace_root=None,
         ncp_outcome_reporter=None,
+        ncp_improvement_tracker=None,
     ):
         self.policy_pack = policy_pack
         self.dispatcher = dispatcher
@@ -42,6 +43,10 @@ class LearnHandler:
         # outcome is recorded in NCP so it can recalibrate the trust of the
         # memory this task read and wrote. None means NCP is off.
         self.ncp_outcome_reporter = ncp_outcome_reporter
+        # Optional NCPImprovementTracker: files proposals as NCP improvement
+        # attempts (with their history) and runs the post-accept check of
+        # accepted proposals against measured outcomes. None means NCP is off.
+        self.ncp_improvement_tracker = ncp_improvement_tracker
 
     def execute(self, task: "TaskContext", phase: "Phase") -> "PhaseResult":
         from src.engine import PhaseResult
@@ -53,12 +58,15 @@ class LearnHandler:
         )
 
         # Wire HarnessOutcome into Evolver when harness_config is available (Piece 5)
-        harness_proposals, ncp_feedback = self._ingest_harness_outcome(task)
+        harness_proposals, ncp_feedback, outcome = self._ingest_harness_outcome(task)
         proposals.extend(harness_proposals)
         if ncp_feedback is not None:
             artifacts["ncp_outcome"] = ncp_feedback
 
         artifacts["policy_proposals"] = [proposal.to_artifact() for proposal in proposals]
+        post_accept = self._track_improvements(task, outcome, artifacts["policy_proposals"])
+        if post_accept is not None:
+            artifacts["post_accept_checks"] = post_accept
         artifacts["proposal_count"] = len(proposals)
         lessons = artifacts["lessons_learned"]
         patterns_updated = artifacts["patterns_updated"]
@@ -70,6 +78,9 @@ class LearnHandler:
             "policy_proposals_generated": len(proposals),
             "harness_outcome_ingested": harness_proposals is not None,
             "ncp_outcome_recorded": bool(ncp_feedback and ncp_feedback.get("recorded")),
+            "post_accept_regressions": sum(
+                1 for check in post_accept or [] if check.get("verdict") == "regressed"
+            ),
         }
 
         return PhaseResult(
@@ -79,15 +90,15 @@ class LearnHandler:
             artifacts=artifacts,
         )
 
-    def _ingest_harness_outcome(self, task: "TaskContext") -> tuple[list, dict | None]:
+    def _ingest_harness_outcome(self, task: "TaskContext") -> tuple[list, dict | None, object]:
         """Build a measured HarnessOutcome and feed it into Evolver and NCP.
 
-        Returns the Evolver's proposals and the NCP feedback summary (None
-        when NCP is off or no outcome could be measured).
+        Returns the Evolver's proposals, the NCP feedback summary (None when
+        NCP is off) and the measured outcome (None when none could be measured).
         """
         harness_config = getattr(task, "harness_config", None)
         if harness_config is None:
-            return [], None
+            return [], None, None
         try:
             try:
                 from src.harness import measure_outcome
@@ -95,16 +106,53 @@ class LearnHandler:
                 from harness import measure_outcome
             outcome = measure_outcome(task, harness_config)
         except Exception:
-            return [], None
+            return [], None, None
         self._record_provider_health(task, outcome)
         ncp_feedback = None
         if self.ncp_outcome_reporter is not None:
             # report() never raises; feedback must not fail LEARN.
             ncp_feedback = self.ncp_outcome_reporter.report(task, outcome)
         try:
-            return self.evolver.ingest_harness_outcome(outcome), ncp_feedback
+            return self.evolver.ingest_harness_outcome(outcome), ncp_feedback, outcome
         except Exception:
-            return [], ncp_feedback
+            return [], ncp_feedback, outcome
+
+    def _track_improvements(
+        self, task: "TaskContext", outcome, proposal_artifacts: list[dict]
+    ) -> list[dict] | None:
+        """File proposals as NCP attempts; log the outcome; check accepted proposals.
+
+        Annotates each proposal artifact with ``improvement`` (its NCP attempt
+        and the problem's earlier attempts). Returns the post-accept verdicts
+        for this task's class, or None when tracking is off or no outcome was
+        measured. Never raises.
+        """
+        tracker = self.ncp_improvement_tracker
+        if tracker is None:
+            return None
+        task_class = getattr(getattr(outcome, "task_class", None), "value", None)
+        try:
+            annotations = tracker.record_proposals(proposal_artifacts, task_class=task_class)
+            for proposal in proposal_artifacts:
+                if proposal.get("id") in annotations:
+                    proposal["improvement"] = annotations[proposal["id"]]
+            if outcome is None or not task_class:
+                return None
+            try:
+                from src.ncp_adapter.outcome import derive_ncp_outcome
+            except ImportError:
+                from ncp_adapter.outcome import derive_ncp_outcome
+            derived = derive_ncp_outcome(task, outcome)
+            tracker.record_task_outcome(
+                task_id=str(getattr(task, "task_id", "")),
+                task_class=str(task_class),
+                success=derived["success"],
+                weight=derived["weight"],
+                output_tokens=derived["ctx"].get("output_tokens"),
+            )
+            return tracker.check_accepted(str(task_class))
+        except Exception as exc:  # tracking must never fail LEARN
+            return [{"verdict": "error", "error": str(exc)[:300]}]
 
     def _record_provider_health(self, task: "TaskContext", outcome) -> None:
         """Record success/failure of the agent that did the work for health tracking."""

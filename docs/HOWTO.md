@@ -493,7 +493,38 @@ upgrades a bridge it generated earlier and keeps the old copy as
 `.ncp/run.py.bak`; until then, LEARN reports `.ncp/run.py has no
 record_outcome; re-run sarathi init`.
 
-### 7.6 Dynamic workflow patterns without NCP
+### 7.6 Policy proposals as NCP improvement records
+
+With NCP active (direct mode), each policy proposal LEARN generates is also
+filed in NCP's improvement history: an attempt under the problem named by the
+proposal's title, scoped to its policy file. Accepting, rejecting or rolling
+back the proposal (`sarathi proposals --accept/--reject/--rollback`, or the
+web cockpit) sets the attempt to `applied`, `rejected` or `rolled_back`.
+`ncp improvements show` prints the history.
+
+- **History on new proposals.** Each proposal in LEARN's `policy_proposals`
+  carries `improvement`: its NCP attempt, the problem's earlier attempts, and
+  `previously` when the same change was already rejected or rolled back.
+  A proposal that recurs reuses its open attempt instead of filing a new one.
+- **Post-accept check.** LEARN logs every task's measured outcome in
+  `.sarathi/ncp_outcomes.jsonl`. For an accepted proposal, once
+  `post_accept_min_outcomes` tasks of its task class have finished both
+  before and after acceptance, LEARN compares their weighted success rates.
+  A rate below `post_accept_gate_ratio` x the pre-accept rate is a
+  regression: LEARN's `post_accept_checks` lists it with
+  `sarathi proposals --rollback <id>`, and the NCP attempt records the
+  observed `passed`/`total` against `anchor_rate`. Nothing is rolled back
+  automatically. Both thresholds live in the `learn_evolve` block of
+  `escalation.md` (defaults 5 and 0.9).
+
+This is not NCP's `ncp refine` gate: that gate judges a shorter rewrite of
+a single procedure chunk, while a Sarathi proposal is a note added to a whole
+policy file after review. Improvement records need the version-3
+`.ncp/run.py` bridge (`sarathi init` upgrades it) and are reported
+unsupported in MCP mode, where NCP exposes them only in the `full` tool
+profile.
+
+### 7.7 Dynamic workflow patterns without NCP
 
 If you enable dynamic workflow patterns (`workflow-patterns.md`) but NCP is not active:
 

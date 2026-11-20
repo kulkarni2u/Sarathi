@@ -38,12 +38,18 @@ budget:
 # (deviation_threshold), the pattern pass-rate required for promotion
 # (pass_gate), and the minimum repeated-signal count before a
 # repeated-failure/escalation/hotspot proposal is generated (proposal_gate).
+# post_accept_min_outcomes / post_accept_gate_ratio drive the post-accept
+# check of an accepted proposal (NCP active): after that many tasks of the
+# proposal's task class finish on each side of the acceptance, a success rate
+# below gate_ratio x the pre-accept rate is reported as a regression.
 # Values below reproduce Evolver's built-in defaults; override any subset to
 # tune sensitivity per policy pack.
 learn_evolve:
   deviation_threshold: 0.1
   pass_gate: 0.8
   proposal_gate: 2
+  post_accept_min_outcomes: 5
+  post_accept_gate_ratio: 0.9
 
 # Classifies phase failures into a recovery_class used to route
 # provider-backed recovery dispatch (src/runtime/recovery.py). The values

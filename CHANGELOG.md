@@ -6,6 +6,23 @@ All notable changes to Sarathi are documented here.
 
 ### Added
 
+- Added NCP improvement records for policy proposals (direct mode): each
+  proposal LEARN generates is filed as an NCP improvement attempt under a
+  problem named by its title, and accept / reject / rollback set its status.
+  New proposals carry the problem's earlier attempts (`improvement` on the
+  proposal artifact), including whether the same change was rejected or
+  rolled back before.
+- Added a post-accept check for accepted proposals: LEARN logs each task's
+  measured outcome (`.sarathi/ncp_outcomes.jsonl`) and, once enough tasks of
+  the proposal's task class have run on both sides of the acceptance,
+  compares success rates. A drop below `post_accept_gate_ratio` x the
+  pre-accept rate is reported in LEARN's `post_accept_checks` with a rollback
+  command and recorded on the NCP attempt; nothing is rolled back
+  automatically. Thresholds: `learn_evolve.post_accept_min_outcomes` (5) and
+  `post_accept_gate_ratio` (0.9) in `escalation.md`.
+- `.ncp/run.py` bridge version 3 adds `improvement_record` and
+  `improvement_update`.
+
 - Added NCP outcome feedback: LEARN records each task's measured outcome in
   NCP (`record_outcome`), crediting the NCP chunks the task read and wrote, so
   NCP raises the trust of memory behind successful work and lowers it for

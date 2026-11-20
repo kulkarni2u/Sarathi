@@ -406,7 +406,7 @@ Sarathi installs NCP as a Python dependency and can bootstrap a project-local NC
 
 ### 7.1 What is NCP?
 
-NCP (Neural Context Protocol) is a sidecar runtime that Sarathi calls for context and memory. Sarathi depends on `neural-context-protocol>=1.1.0,<2.0.0`, so installing Sarathi also installs the Python package.
+NCP (Neural Context Protocol) is a sidecar runtime that Sarathi calls for context and memory. Sarathi depends on `neural-context-protocol>=1.9.7,<2.0.0`, so installing Sarathi also installs the Python package.
 
 **PyPI:** `neural-context-protocol` — **[kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)**
 

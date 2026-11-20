@@ -12,6 +12,8 @@ All notable changes to Sarathi are documented here.
 
 ### Changed
 
+- Raised the `neural-context-protocol` floor to `>=1.9.7` (required for
+  `ncp handoff --return`).
 - Made recovery failure classification, engine gate thresholds and
   remediation text, and the learn-evolve deviation threshold
   policy-configurable via `escalation.md`/`review.md` instead of hardcoded in
@@ -22,6 +24,19 @@ All notable changes to Sarathi are documented here.
 
 ### Fixed
 
+- Fixed NCP handoff dispatch failing on every call: the `share` whisper
+  payload was a pipe-delimited string, which NCP rejects (it validates
+  `share` payloads as `HandoffPayload` JSON since 1.2.1). The payload is now
+  bounded `{"ask", "slice", "files"}` JSON.
+- Fixed NCP handoff returning truncated provider output to downstream
+  phases: NCP 1.9.6+ prints a ≤2,000-char summary by default, so Sarathi now
+  runs `ncp handoff <provider> --return full`.
+- Fixed `sarathi init`'s NCP config overrides never taking effect: they were
+  appended after the last TOML table (landing in `[embedding]`), and
+  `max_chunk_tokens` was never an NCP setting. Init now writes
+  `[pipeline] default_ttl_hours = 168` and `[tools] profile = "standard"`
+  into the correct tables, keeps values the user changed, and removes the
+  old block from existing `.ncp/config.toml` files on re-init.
 - Fixed `sarathi autoresearch` crashing on a corrupted store file; malformed
   JSONL lines are now skipped instead of crashing every future invocation,
   and `KeyError` messages no longer print with stray quotes.

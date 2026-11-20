@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -65,7 +66,7 @@ def test_e2e_ncp_init_creates_dot_ncp(tmp_path):
 
 
 def test_e2e_ncp_init_sarathi_optimized_config(tmp_path):
-    """sarathi init --ncp writes Sarathi-optimized NCP config overrides."""
+    """sarathi init writes NCP overrides into tables NCP actually reads."""
     if not _ncp_available():
         pytest.skip("ncp CLI not available")
     _ensure_policy_pack(tmp_path)
@@ -73,10 +74,14 @@ def test_e2e_ncp_init_sarathi_optimized_config(tmp_path):
     result = _run_sarathi(tmp_path, "init", ".", "--ncp")
     assert result.returncode == 0, f"init failed: {result.stderr}"
 
-    config = (tmp_path / ".ncp" / "config.toml").read_text()
-    assert "max_chunk_tokens = 400" in config
-    assert "default_ttl_hours = 168" in config
-    assert "Sarathi-optimized" in config
+    config = tomllib.loads((tmp_path / ".ncp" / "config.toml").read_text())
+    assert config["pipeline"]["default_ttl_hours"] == 168
+    assert config["tools"]["profile"] == "standard"
+
+    doctor = subprocess.run(
+        ["ncp", "doctor"], capture_output=True, text=True, cwd=str(tmp_path), timeout=60
+    )
+    assert "unknown keys" not in doctor.stdout + doctor.stderr
 
 
 def test_e2e_ncp_auto_detect_uses_ncp_when_available(tmp_path):

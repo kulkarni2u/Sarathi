@@ -15,7 +15,7 @@ This creates a `.ncp/` directory in the target project so Sarathi can auto-detec
 NCP on subsequent runs.
 
 **Requires:** Sarathi installed from a package version that includes
-`neural-context-protocol>=1.1.0`. See [HOWTO.md §7](HOWTO.md#7-ncp-integration)
+`neural-context-protocol>=1.9.7`. See [HOWTO.md §7](HOWTO.md#7-ncp-integration)
 for the full NCP setup guide.
 
 When `--ncp` is passed, `sarathi init` also generates a `workflow-patterns.md`

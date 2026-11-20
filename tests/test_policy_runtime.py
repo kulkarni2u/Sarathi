@@ -77,7 +77,7 @@ def test_python_requires_matches_core_ncp_dependency_floor():
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
     assert pyproject["project"]["requires-python"] == ">=3.11"
-    assert "neural-context-protocol>=1.1.0,<2.0.0" in pyproject["project"]["dependencies"]
+    assert "neural-context-protocol>=1.9.7,<2.0.0" in pyproject["project"]["dependencies"]
 
 
 def test_runtime_install_hints_use_sarathi_ai_distribution_name():

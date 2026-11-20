@@ -7,13 +7,18 @@ type = "sqlite"           # local, zero-infra. Use "pgvector" only with `ncp inf
 path = ".ncp/store.db"    # SQLite DB file (gitignored — regenerable per workspace)
 
 [budget]
-context_token_budget = 840
+context_token_budget = 840   # the actual context bound; NCP has no per-chunk size key
 warn_at_ratio = 0.70
 critical_at_ratio = 0.85
 
 [chunking]
-max_chunk_tokens = 200
 default_type = "auto"
+
+[pipeline]
+default_ttl_hours = 168   # Sarathi keeps pipeline working memory for a week (NCP default: 24)
+
+[tools]
+profile = "standard"      # MCP tool profile Sarathi is written against; "full" adds memo/task/overview tools
 
 [whispers]
 default_ttl_seconds = 1800

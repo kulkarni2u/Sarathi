@@ -814,27 +814,36 @@ def _ncp_handoff_counterpart(provider: str, request: DispatchRequest) -> str | N
     return None
 
 
+_NCP_HANDOFF_ASK_CHARS = 400
+_NCP_HANDOFF_MAX_FILES = 6
+
+
 def _summarize_ncp_handoff_payload(provider: str, request: DispatchRequest) -> str:
+    """Build the bounded ``share`` whisper payload for an NCP handoff.
+
+    NCP validates ``share`` payloads as ``HandoffPayload`` JSON
+    (``ask`` required, optional ``slice`` and ``files``); other keys are
+    dropped, so acceptance criteria travel inside ``ask``. Fields are cut
+    individually so the result stays bounded and still parses as JSON.
+    """
     context_pack = request.context_pack if isinstance(request.context_pack, dict) else {}
-    agent_input = context_pack.get("agent_input") if isinstance(context_pack.get("agent_input"), dict) else {}
-    relevant_files = agent_input.get("relevant_files") if isinstance(agent_input.get("relevant_files"), list) else []
-    acceptance = (
-        agent_input.get("acceptance_criteria")
-        if isinstance(agent_input.get("acceptance_criteria"), list)
-        else []
-    )
-    summary_parts = [
-        f"task={request.task_id}",
-        f"phase={request.phase}",
-        f"prompt={request.prompt}",
-    ]
-    if relevant_files:
-        summary_parts.append("files=" + ",".join(str(item) for item in relevant_files[:6]))
+    raw_agent_input = context_pack.get("agent_input")
+    agent_input: dict[str, Any] = raw_agent_input if isinstance(raw_agent_input, dict) else {}
+    raw_files = agent_input.get("relevant_files")
+    relevant_files: list[Any] = raw_files if isinstance(raw_files, list) else []
+    raw_acceptance = agent_input.get("acceptance_criteria")
+    acceptance: list[Any] = raw_acceptance if isinstance(raw_acceptance, list) else []
+    ask = str(request.prompt).strip()
     if acceptance:
-        summary_parts.append("acceptance=" + "; ".join(str(item) for item in acceptance[:3]))
-    summary_parts.append(f"provider={provider}")
-    payload = " | ".join(summary_parts)
-    return payload[:600]
+        ask += " | acceptance: " + "; ".join(str(item) for item in acceptance[:3])
+    if len(ask) > _NCP_HANDOFF_ASK_CHARS:
+        ask = ask[: _NCP_HANDOFF_ASK_CHARS - 3].rstrip() + "..."
+    payload = {
+        "ask": ask or f"Run {request.phase} for task {request.task_id}",
+        "slice": f"task={request.task_id} phase={request.phase} provider={provider}",
+        "files": [str(item)[:200] for item in relevant_files[:_NCP_HANDOFF_MAX_FILES]],
+    }
+    return json.dumps(payload, separators=(",", ":"))
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -1001,6 +1010,10 @@ def _run_ncp_handoff_dispatch(
         instruction,
         "--timeout-seconds",
         str(handoff_timeout),
+        # NCP >= 1.9.6 prints a <=2,000-char summary by default; downstream
+        # phases (VERIFY, REVIEW, JUDGE) need the provider's full output.
+        "--return",
+        "full",
     ]
     emit_to = _ncp_handoff_counterpart(provider, request)
     if emit_to:

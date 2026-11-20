@@ -33,11 +33,14 @@ class _WhisperRouter:
     def __init__(self):
         self.emitted: list[dict] = []
 
-    def emit(self, from_agent, target, whisper_type, payload, confidence=0.9):
+    def emit(self, from_agent, target, whisper_type, payload, confidence=0.9, *, pipeline_id=None):
         self.emitted.append({
             "from": from_agent, "target": target,
-            "type": whisper_type, "payload": payload,
+            "type": whisper_type, "payload": payload, "pipeline_id": pipeline_id,
         })
+
+    def ack(self, agent_id, whisper_ids):
+        return len(whisper_ids)
 
 
 class _PersistenceAdapter:
@@ -253,8 +256,12 @@ class _NcpContextAdapter:
     def __init__(self):
         self.calls: list[dict] = []
 
-    def compile_typed_node_context(self, *, node, graph=None, phase="Build", token_budget=None):
-        self.calls.append({"node_id": node.get("id"), "node_type": node.get("node_type")})
+    def compile_typed_node_context(
+        self, *, node, graph=None, phase="Build", token_budget=None, pipeline_id=None
+    ):
+        self.calls.append(
+            {"node_id": node.get("id"), "node_type": node.get("node_type"), "pipeline_id": pipeline_id}
+        )
         return {
             "agent_input": {"objective": "test", "token_budget": 1000, "constraints": [],
                             "acceptance_criteria": [], "relevant_files": [],
@@ -360,47 +367,45 @@ def test_plain_execute_node_still_skips_ncp_context():
 # Bug 2 fix — whisper fetch key uses s. prefix
 # ---------------------------------------------------------------------------
 
-def test_fetch_node_whispers_uses_s_prefix():
-    """_fetch_node_whispers must query 'whisper:s.{node_id}' to match emit targets."""
-    fetched_queries: list[str] = []
+def test_branch_node_reads_its_own_whispers_in_the_task_pipeline():
+    """A branch reads whispers queued for s.<node_id> in its task's pipeline --
+    never a memory search, which returned other tasks' signals."""
+    from src.ncp_adapter import NCPContextAdapter
 
-    class _TrackingAdapter:
-        mode = "direct"
-        endpoint = "http://127.0.0.1:4242/mcp"
-        run_path = ".ncp/run.py"
+    peeks: list[dict] = []
 
-        def _call_fetch(self, query: str, k: int = 3) -> list:
-            fetched_queries.append(query)
-            return []
+    class _TrackingAdapter(NCPContextAdapter):
+        def _call_get_context(self, args):
+            return ""
 
-        def _reconstruct_chunk_text(self, chunk: str) -> str:
-            return chunk
+        def _call_fetch(self, query, k=3):
+            raise AssertionError(f"branch context must not search memory: {query!r}")
 
-        def compile_typed_node_context(self, *, node, graph=None, phase="Build", token_budget=None):
-            # delegate only the whisper fetch
-            node_id = str(node.get("id", ""))
-            self._call_fetch(f"whisper:s.{node_id}", k=3)
-            return {
-                "agent_input": {"objective": "test", "token_budget": 1000, "constraints": [],
-                                "acceptance_criteria": [], "relevant_files": [],
-                                "prior_findings": [], "available_tools": []},
-                "compilation": {"ncp_mode": "direct", "ncp_conscious": {}},
-            }
+        def _call_peek_whispers(self, *, agent_id, pipeline_id, max_items=3):
+            peeks.append({"agent_id": agent_id, "pipeline_id": pipeline_id})
+            return [{"whisper_id": "wsp_1", "payload": '{"kind":"fanout_context","parent_id":"fan"}'}]
 
-    ncp_ctx = _TrackingAdapter()
+    ncp_ctx = _TrackingAdapter(mode="direct", run_path=".ncp/run.py")
+    router = _WhisperRouter()
+    acked: list = []
+    router.ack = lambda agent_id, ids: acked.append((agent_id, ids)) or len(ids)  # type: ignore[method-assign]
     dispatcher = _SuccessDispatcher()
     graph = graph_from_workflow({
-        "nodes": [{"id": "fan-branch-2", "title": "Branch", "node_type": "execute"}]
+        "task_id": "task-42",
+        "nodes": [{"id": "fan-branch-2", "title": "Branch", "node_type": "execute"}],
     }).to_artifact()
-    executor = TaskGraphExecutor(dispatcher=dispatcher, ncp_context_adapter=ncp_ctx)
+    executor = TaskGraphExecutor(
+        dispatcher=dispatcher, ncp_context_adapter=ncp_ctx, ncp_whisper_router=router
+    )
     executor.execute_next(graph)
 
-    assert any("whisper:s.fan-branch-2" in q for q in fetched_queries)
+    [peek] = peeks
+    assert peek["agent_id"] == "s.fan-branch-2"
+    assert peek["pipeline_id"].startswith("sarathi_")
+    prior = dispatcher.requests[0].context_pack["agent_input"]["prior_findings"]
+    assert any("fanout_context" in item for item in prior)
+    assert acked == [("s.fan-branch-2", ["wsp_1"])]  # acknowledged after success
 
-
-# ---------------------------------------------------------------------------
-# Bug 3 fix — NCP write failures surfaced as ncp_warnings
-# ---------------------------------------------------------------------------
 
 class _FailingArtifactAdapter:
     """Always raises on write_memory."""

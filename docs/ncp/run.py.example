@@ -20,6 +20,11 @@ Supported commands:
                       scope; an open ("proposed") attempt with the same `what`
                       is reused. Print the attempt and the problem's history.
     improvement_update -- update an attempt's status / observed fields
+    emit_whisper   -- queue a targeted whisper (scoped by pipeline_id); print
+                      {"whisper_id"}
+    peek_whispers  -- print queued whispers for agent_id in pipeline_id as a JSON
+                      list, without consuming them (a retried node sees them again)
+    ack_whispers   -- acknowledge (delete) whisper_ids for agent_id; print {"acknowledged"}
 
 All errors are reported on stderr with a non-zero exit code; an unknown
 command exits 2.
@@ -39,7 +44,7 @@ from pathlib import Path
 # reads <project_root>/.ncp/config.toml (sqlite store at .ncp/store.db).
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-SARATHI_NCP_BRIDGE_VERSION = 3
+SARATHI_NCP_BRIDGE_VERSION = 4
 
 
 def _fail(message: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
@@ -264,6 +269,52 @@ def main(argv: list[str]) -> int:
                 "outcome_id": outcome.outcome_id,
                 "calibrated": calibrated,
             }))
+            return 0
+
+        if command == "emit_whisper":
+            from ncp.types import Whisper
+
+            whisper = Whisper(
+                from_agent=str(args["from_agent"]),
+                target=str(args["target"]),
+                whisper_type=args.get("whisper_type", "nudge"),
+                payload=args["payload"],
+                confidence=float(args.get("confidence", 0.9)),
+                pipeline_id=args.get("pipeline_id"),
+                ttl_seconds=int(args.get("ttl_seconds", config.whisper_ttl_default)),
+            )
+            store.emit_whisper(whisper)
+            print(json.dumps({"whisper_id": whisper.whisper_id}))
+            return 0
+
+        if command == "peek_whispers":
+            whispers = store.peek_whispers(
+                agent_id=str(args["agent_id"]),
+                pipeline_id=args.get("pipeline_id"),
+                max_items=int(args.get("max_items", 3)),
+                min_confidence=float(args.get("min_confidence", 0.6)),
+            )
+            print(json.dumps([
+                {
+                    "whisper_id": w.whisper_id,
+                    "from_agent": w.from_agent,
+                    "target": w.target,
+                    "whisper_type": w.whisper_type,
+                    "payload": w.payload,
+                    "confidence": w.confidence,
+                    "pipeline_id": w.pipeline_id,
+                    "created_at": w.created_at,
+                }
+                for w in whispers
+            ]))
+            return 0
+
+        if command == "ack_whispers":
+            count = store.acknowledge_whispers(
+                [str(item) for item in args.get("whisper_ids") or []],
+                agent_id=str(args["agent_id"]),
+            )
+            print(json.dumps({"acknowledged": count}))
             return 0
 
         if command in ("improvement_record", "improvement_update"):

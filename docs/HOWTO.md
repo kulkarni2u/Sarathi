@@ -524,7 +524,17 @@ policy file after review. Improvement records need the version-3
 unsupported in MCP mode, where NCP exposes them only in the `full` tool
 profile.
 
-### 7.7 Dynamic workflow patterns without NCP
+### 7.7 Signals between graph nodes
+
+With `--ncp-router`, FANOUT, CLASSIFY and JUDGE nodes send their context to
+the nodes they create (each branch, the activated branch, the winner) as NCP
+whispers: addressed to `s.<node_id>`, scoped to the task (`sarathi_<task_id>`),
+and acknowledged once the receiving node's dispatch succeeds. A node never
+receives another task's signals, and a node nothing was sent to receives
+nothing. This needs the version-4 `.ncp/run.py` bridge; in MCP mode signals are sent but
+not read back.
+
+### 7.8 Dynamic workflow patterns without NCP
 
 If you enable dynamic workflow patterns (`workflow-patterns.md`) but NCP is not active:
 

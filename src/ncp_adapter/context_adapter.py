@@ -109,6 +109,7 @@ class NCPContextAdapter(NCPTransportMixin):
         graph: Mapping[str, Any] | None = None,
         phase: str = "Build",
         token_budget: int | None = None,
+        pipeline_id: str | None = None,
     ) -> dict[str, Any]:
         """Context pack for a typed workflow-pattern node.
 
@@ -118,7 +119,10 @@ class NCPContextAdapter(NCPTransportMixin):
         - SYNTHESIZE  → fetches each source branch's saved output
         - JUDGE       → fetches each competitor's saved output
         - LOOP_GATE   → fetches previous-iteration findings from episodic memory
-        - EXECUTE     → polls any whispers targeting this node (e.g. fanout/classify signals)
+        - EXECUTE     → reads whispers queued for this node in ``pipeline_id``
+                        (fanout/classify/judge signals); their ids are returned in
+                        ``compilation.ncp_whisper_ids`` so the caller can
+                        acknowledge them once the node succeeds
         """
         node_type = str(node.get("node_type", "execute")).lower()
         pattern_config = dict(node.get("pattern_config", {}))
@@ -143,10 +147,11 @@ class NCPContextAdapter(NCPTransportMixin):
                 parent_id = node_id.rsplit("-iter-", 1)[0] if "-iter-" in node_id else node_id
                 additional.extend(self._fetch_loop_history(parent_id, max_items=iteration - 1))
 
-        elif node_type == "execute":
-            # Only branch nodes (fanout/classify children) receive whispers from a parent
-            if "-branch-" in node_id:
-                additional.extend(self._fetch_node_whispers(node_id))
+        elif node_type == "execute" and pipeline_id:
+            signals, whisper_ids = self._fetch_node_whispers(node_id, pipeline_id)
+            additional.extend(signals)
+            if whisper_ids:
+                base.setdefault("compilation", {})["ncp_whisper_ids"] = whisper_ids
 
         if additional:
             ai = base.setdefault("agent_input", {})
@@ -193,19 +198,28 @@ class NCPContextAdapter(NCPTransportMixin):
                 findings.append(f"Previous finding: {text[:400]}")
         return findings
 
-    def _fetch_node_whispers(self, node_id: str) -> list[str]:
-        """Poll NCP for whispers addressed to this node (fanout/classify context)."""
-        chunks = self._call_fetch(f"whisper:s.{node_id}", k=3)
+    def _fetch_node_whispers(self, node_id: str, pipeline_id: str) -> tuple[list[str], list[str]]:
+        """Whispers queued for this node in this task's pipeline.
+
+        Returns (findings, whisper_ids). Only real, targeted whispers are
+        read: a memory search here would hand a node whatever chunks rank
+        highest, including other tasks' signals.
+        """
         findings: list[str] = []
-        for chunk in chunks:
-            text = self._reconstruct_chunk_text(chunk).strip()
-            if text:
-                try:
-                    obj = json.loads(text)
-                    findings.append(f"Signal: {json.dumps(obj)[:400]}")
-                except json.JSONDecodeError:
-                    findings.append(f"Signal: {text[:400]}")
-        return findings
+        whisper_ids: list[str] = []
+        for whisper in self._call_peek_whispers(
+            agent_id=f"s.{node_id}", pipeline_id=pipeline_id, max_items=3
+        ):
+            text = str(whisper.get("payload", "")).strip()
+            if not text:
+                continue
+            try:
+                findings.append(f"Signal: {json.dumps(json.loads(text))[:400]}")
+            except json.JSONDecodeError:
+                findings.append(f"Signal: {text[:400]}")
+            if whisper.get("whisper_id"):
+                whisper_ids.append(str(whisper["whisper_id"]))
+        return findings, whisper_ids
 
     # ------------------------------------------------------------------
     # Internal transport

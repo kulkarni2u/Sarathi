@@ -61,6 +61,17 @@ All notable changes to Sarathi are documented here.
 
 ### Fixed
 
+- Fixed graph-node signals reaching the wrong nodes. In direct mode,
+  FANOUT/CLASSIFY/JUDGE "whispers" were plain memory chunks and nodes found
+  them with a memory search that falls back to recent chunks, so every
+  branch (including ones nothing was sent to) received other tasks' signals
+  and unrelated memory. They are now real NCP whispers, addressed to the
+  node and scoped to the task (`sarathi_<task_id>`), read only by their
+  target and acknowledged after it succeeds; a JUDGE's winner node now reads
+  its signal too. In MCP mode, emits used `fanout_context`-style types NCP
+  rejects, and the JSON-RPC error was never checked; they now use NCP's
+  `nudge` type and report errors. Requires the version-4 `.ncp/run.py`
+  bridge (`sarathi init` upgrades it).
 - Fixed harness-outcome policy proposals never firing in normal use: the
   Evolver's per-task-class quality baselines lived only in memory, so every
   `sarathi run` started without one. Baselines are now persisted

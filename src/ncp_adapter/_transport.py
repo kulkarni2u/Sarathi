@@ -237,6 +237,109 @@ class NCPTransportMixin:
             except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException):
                 return []
 
+    # ------------------------------------------------------------------
+    # Whispers: targeted, pipeline-scoped signals between graph nodes
+    # ------------------------------------------------------------------
+
+    def _run_bridge_json(self, command: str, args: dict[str, Any]) -> Any:
+        """Run a JSON-printing bridge command; None when the bridge predates it."""
+        result = subprocess.run(
+            [str(self.run_path), command, json.dumps(args)],
+            capture_output=True, text=True, timeout=_TRANSPORT_TIMEOUT,
+        )
+        if result.returncode == _UNKNOWN_COMMAND_EXIT and "unknown command" in result.stderr:
+            return None
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"NCP {command} failed: {result.stderr.strip() or result.stdout.strip()}"
+            )
+        return json.loads(result.stdout or "null")
+
+    def _call_emit_whisper(
+        self,
+        *,
+        from_agent: str,
+        target: str,
+        payload: str,
+        pipeline_id: str | None,
+        whisper_type: str = "nudge",
+        confidence: float = 0.9,
+    ) -> str | None:
+        """Queue a whisper for ``target`` in ``pipeline_id``; return its id."""
+        if self.mode == "direct":
+            result = self._run_bridge_json(
+                "emit_whisper",
+                {
+                    "from_agent": from_agent,
+                    "target": target,
+                    "whisper_type": whisper_type,
+                    "payload": payload,
+                    "confidence": confidence,
+                    "pipeline_id": pipeline_id,
+                },
+            )
+            if result is None:
+                raise RuntimeError(".ncp/run.py has no emit_whisper; re-run `sarathi init`")
+            return result.get("whisper_id") if isinstance(result, dict) else None
+
+        import httpx
+        arguments: dict[str, Any] = {
+            "from": from_agent,
+            "target": target,
+            "type": whisper_type,
+            "payload": payload,
+            "confidence": confidence,
+        }
+        if pipeline_id is not None:
+            arguments["pipeline_id"] = pipeline_id
+        try:
+            resp = httpx.post(
+                self.endpoint,
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": "ncp_emit_whisper", "arguments": arguments},
+                    "id": 1,
+                },
+                timeout=_TRANSPORT_TIMEOUT,
+            )
+            resp.raise_for_status()
+            response = resp.json()
+        except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException) as e:
+            raise RuntimeError(f"NCP MCP whisper emit failed: {e}") from e
+        if "error" in response:
+            raise RuntimeError(f"NCP MCP whisper emit failed: {response['error']}")
+        return _mcp_tool_result(response).get("whisper_id")
+
+    def _call_peek_whispers(
+        self, *, agent_id: str, pipeline_id: str | None, max_items: int = 3
+    ) -> list[dict[str, Any]]:
+        """Whispers queued for ``agent_id`` in ``pipeline_id``, not consumed.
+
+        Only real, targeted whispers are returned -- never search results.
+        MCP mode returns none: NCP's MCP surface delivers whisper payloads
+        only inside ``ncp_get_context``'s display block.
+        """
+        if self.mode != "direct":
+            return []
+        try:
+            result = self._run_bridge_json(
+                "peek_whispers",
+                {"agent_id": agent_id, "pipeline_id": pipeline_id, "max_items": max_items},
+            )
+        except (RuntimeError, json.JSONDecodeError, subprocess.SubprocessError, OSError):
+            return []
+        return [w for w in result if isinstance(w, dict)] if isinstance(result, list) else []
+
+    def _call_ack_whispers(self, *, agent_id: str, whisper_ids: list[str]) -> int:
+        """Acknowledge (delete) delivered whispers; 0 when unsupported."""
+        if self.mode != "direct" or not whisper_ids:
+            return 0
+        result = self._run_bridge_json(
+            "ack_whispers", {"agent_id": agent_id, "whisper_ids": list(whisper_ids)}
+        )
+        return int(result.get("acknowledged", 0)) if isinstance(result, dict) else 0
+
     def _call_record_outcome(self, args: dict[str, Any]) -> dict[str, Any]:
         """Call NCP record_outcome via direct API or MCP.
 

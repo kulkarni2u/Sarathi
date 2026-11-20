@@ -96,6 +96,13 @@ def test_verified_pass_is_full_weight_success_with_token_context():
     assert "all phases passed" in derived["note"]
 
 
+def test_failure_outcomes_are_configurable():
+    task = SimpleNamespace(phase_results=[_pr(_Phase.REVIEW, "escalate")])
+    assert derive_ncp_outcome(task, _outcome())["success"] is False
+    lenient = derive_ncp_outcome(task, _outcome(), failure_outcomes=("fail",))
+    assert lenient["success"] is True
+
+
 def test_no_measured_tests_is_half_weight_self_report():
     task = SimpleNamespace(phase_results=[_pr(_Phase.BUILD)])
     derived = derive_ncp_outcome(task, _outcome(provenance={"test_pass_rate": "missing"}))
@@ -108,7 +115,9 @@ def test_no_measured_tests_is_half_weight_self_report():
 @pytest.mark.parametrize(
     ("phase_results", "outcome", "reason"),
     [
-        ([_pr(_Phase.BUILD, "fail")], _outcome(), "failed phases: Build"),
+        ([_pr(_Phase.BUILD, "fail")], _outcome(), "failed phases: Build=fail"),
+        # Escalation means the task needed a human: not a success.
+        ([_pr(_Phase.REVIEW, "escalate")], _outcome(), "failed phases: Review=escalate"),
         ([_pr(_Phase.BUILD)], _outcome(rollback=True), "rollback triggered"),
         (
             [_pr(_Phase.VERIFY)],
@@ -380,7 +389,9 @@ def test_learn_records_ncp_outcome_as_evidence():
     ):
         result = handler.execute(task, Phase.LEARN)
 
-    reporter.report.assert_called_once_with(task, fake_outcome)
+    reporter.report.assert_called_once_with(
+        task, fake_outcome, failure_outcomes=("fail", "escalate")
+    )
     assert result.evidence["ncp_outcome_recorded"] is True
     assert result.artifacts["ncp_outcome"] == {"recorded": True, "credited_chunks": 2}
 

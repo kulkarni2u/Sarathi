@@ -476,7 +476,7 @@ failures ranks lower.
 
 | Measured result | NCP outcome |
 |---|---|
-| Any phase failed, a rollback was triggered, or VERIFY's test command failed | failure |
+| Any phase ended `fail` or `escalate` (policy: `learn_evolve.failure_outcomes` in `escalation.md`), a rollback was triggered, or VERIFY's test command failed | failure |
 | Otherwise | success |
 | VERIFY ran a real test command | `eval_source: verifier`, weight 1.0 |
 | No test command (review verdicts and phase outcomes only) | `eval_source: self_report`, weight 0.5 |

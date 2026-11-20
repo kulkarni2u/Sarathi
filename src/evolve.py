@@ -1,5 +1,7 @@
 import hashlib
+import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -23,6 +25,11 @@ _PROVENANCE_WEIGHT: dict[str, float] = {
     "measured": 1.0,
     "derived": 0.5,
 }
+
+# Quality signals where a lower value is better; a rise is a degradation.
+_LOWER_IS_BETTER: frozenset[str] = frozenset(
+    {"token_cost", "latency", "latency_ms", "blast_radius", "rollback_triggered"}
+)
 
 
 @dataclass
@@ -144,6 +151,15 @@ class EvolutionPolicy:
     # gate (min_trial_outcomes 5, gate_ratio 0.9).
     post_accept_min_outcomes: int = 5
     post_accept_gate_ratio: float = 0.9
+    # Per-task-class quality baselines: the mean of the last
+    # `baseline_window` values of each signal, compared only once at least
+    # `baseline_min_samples` values exist.
+    baseline_window: int = 20
+    baseline_min_samples: int = 1
+    # Phase outcomes that make a task count as failed when its measured
+    # outcome is reported to NCP (src/ncp_adapter/outcome.py). "escalate"
+    # means the task needed a human, so it is not a success either.
+    failure_outcomes: tuple[str, ...] = ("fail", "escalate")
 
     @classmethod
     def from_escalation(cls, escalation: dict[str, Any] | None = None) -> "EvolutionPolicy":
@@ -173,6 +189,14 @@ class EvolutionPolicy:
             post_accept_gate_ratio=_non_negative_float(
                 config.get("post_accept_gate_ratio"), cls.post_accept_gate_ratio
             ),
+            baseline_window=max(
+                1, _non_negative_int(config.get("baseline_window"), cls.baseline_window)
+            ),
+            baseline_min_samples=max(
+                1,
+                _non_negative_int(config.get("baseline_min_samples"), cls.baseline_min_samples),
+            ),
+            failure_outcomes=_outcome_names(config.get("failure_outcomes"), cls.failure_outcomes),
         )
 
 
@@ -184,6 +208,13 @@ def _non_negative_float(value: Any, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= 0 else default
+
+
+def _outcome_names(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return default
+    names = tuple(str(item).strip() for item in value if str(item).strip())
+    return names or default
 
 
 def _non_negative_int(value: Any, default: int) -> int:
@@ -200,8 +231,16 @@ class Evolver:
     PASS_GATE = 0.8
     PROPOSAL_GATE = 2
 
-    def __init__(self, policy: EvolutionPolicy | None = None):
+    def __init__(
+        self,
+        policy: EvolutionPolicy | None = None,
+        baseline_path: str | Path | None = None,
+    ):
+        """``baseline_path`` persists per-task-class quality baselines across
+        runs (a JSON file); without it they live only as long as this Evolver,
+        and a new process starts with none."""
         self.policy = policy or EvolutionPolicy()
+        self.baseline_path = Path(baseline_path) if baseline_path is not None else None
         # Instance attributes shadow the class constants above so existing
         # references to self.PASS_GATE / self.PROPOSAL_GATE stay correct
         # while remaining tunable via policy without touching call sites.
@@ -227,20 +266,30 @@ class Evolver:
         (and logged at debug level) rather than triggering a proposal.
         """
         proposals: list[PolicyProposal] = []
-        baseline = self._get_or_create_baseline(outcome.task_class.value)
+        history = self._get_or_create_baseline(outcome.task_class.value)
         provenance_map = getattr(outcome, "signal_provenance", {}) or {}
 
         deviations: list[tuple[str, float, float, str]] = []
         for signal_name, measured_value in outcome.quality_signals.items():
-            expected = baseline.get(signal_name)
+            samples = history.setdefault(signal_name, [])
+            expected = (
+                sum(samples) / len(samples)
+                if len(samples) >= self.policy.baseline_min_samples
+                else None
+            )
+            samples.append(float(measured_value))
+            del samples[: -self.policy.baseline_window]
             if expected is None:
-                baseline[signal_name] = measured_value
                 continue
             delta = measured_value - expected
+            # Relative to the baseline's magnitude: rates in [0, 1] compare as
+            # absolute deltas, counts (tokens, ms) as a fraction of baseline.
+            relative = delta / max(abs(expected), 1.0)
             provenance = provenance_map.get(signal_name, "measured")
             weight = _PROVENANCE_WEIGHT.get(provenance, 1.0)
-            if abs(delta * weight) > self.policy.deviation_threshold:
+            if abs(relative * weight) > self.policy.deviation_threshold:
                 deviations.append((signal_name, delta, weight, provenance))
+        self._save_baselines()
 
         if not deviations:
             return proposals
@@ -262,10 +311,46 @@ class Evolver:
 
         return proposals
 
-    def _get_or_create_baseline(self, task_class_value: str) -> dict[str, float]:
+    def _get_or_create_baseline(self, task_class_value: str) -> dict[str, list[float]]:
+        """Recent values per signal for a task class (loaded from disk once)."""
         if not hasattr(self, "_harness_baselines"):
-            self._harness_baselines: dict[str, dict[str, float]] = {}
+            self._harness_baselines: dict[str, dict[str, list[float]]] = self._load_baselines()
         return self._harness_baselines.setdefault(task_class_value, {})
+
+    def _load_baselines(self) -> dict[str, dict[str, list[float]]]:
+        if self.baseline_path is None:
+            return {}
+        try:
+            raw = json.loads(self.baseline_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        baselines: dict[str, dict[str, list[float]]] = {}
+        if not isinstance(raw, dict):
+            return baselines
+        for task_class, signals in raw.items():
+            if not isinstance(signals, dict):
+                continue
+            kept: dict[str, list[float]] = {}
+            for name, values in signals.items():
+                if isinstance(values, list):
+                    kept[str(name)] = [
+                        float(v) for v in values
+                        if isinstance(v, (int, float)) and not isinstance(v, bool)
+                    ]
+            baselines[str(task_class)] = kept
+        return baselines
+
+    def _save_baselines(self) -> None:
+        """Persist baselines atomically; a failed write only loses this sample."""
+        if self.baseline_path is None or not hasattr(self, "_harness_baselines"):
+            return
+        try:
+            self.baseline_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.baseline_path.with_name(self.baseline_path.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(self._harness_baselines, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, self.baseline_path)
+        except OSError:
+            logger.warning("Could not persist evolve baselines to %s", self.baseline_path, exc_info=True)
 
     def _proposals_for_quality_deviation(
         self,
@@ -275,7 +360,8 @@ class Evolver:
         provenance: str = "measured",
         weight: float = 1.0,
     ) -> list[PolicyProposal]:
-        direction = "degraded" if delta < 0 else "improved"
+        worse = delta > 0 if signal_name in _LOWER_IS_BETTER else delta < 0
+        direction = "degraded" if worse else "improved"
         task_class_value = outcome.task_class.value
         return [
             PolicyProposal(
@@ -288,7 +374,7 @@ class Evolver:
                     f"Evidence provenance: {provenance} (weight {weight:.1f})."
                 ),
                 suggested_change=(
-                    f"Review {'assembly defaults' if delta < 0 else 'routing strategy'} for "
+                    f"Review {'assembly defaults' if worse else 'routing strategy'} for "
                     f"{task_class_value} tasks, focusing on {signal_name} optimization."
                 ),
                 evidence_refs=[f"{outcome.task_id}:quality:{signal_name}:{provenance}"],

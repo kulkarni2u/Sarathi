@@ -44,6 +44,11 @@ All notable changes to Sarathi are documented here.
 
 ### Changed
 
+- An escalated phase now makes a task a failure in the outcome reported to
+  NCP and in the post-accept check (it needed a human). Configurable with
+  `learn_evolve.failure_outcomes` in `escalation.md` (default
+  `[fail, escalate]`; `[fail]` restores the previous rule).
+
 - Raised the `neural-context-protocol` floor to `>=1.9.7` (required for
   `ncp handoff --return`).
 - Made recovery failure classification, engine gate thresholds and
@@ -55,6 +60,18 @@ All notable changes to Sarathi are documented here.
   matching the single-task ROUTE path.
 
 ### Fixed
+
+- Fixed harness-outcome policy proposals never firing in normal use: the
+  Evolver's per-task-class quality baselines lived only in memory, so every
+  `sarathi run` started without one. Baselines are now persisted
+  (`.sarathi/evolve_baselines.json`) as the mean of the last
+  `learn_evolve.baseline_window` values (default 20), compared once
+  `baseline_min_samples` (default 1) exist.
+- Fixed quality-signal deviation being absolute: any change in `token_cost`
+  or latency (counts in the thousands) exceeded the 0.1 threshold. Deviation
+  is now relative to the baseline's magnitude, so rates behave as before and
+  counts use the documented 10%; and a lower `token_cost`, latency,
+  `blast_radius` or rollback rate is reported as improved, not degraded.
 
 - Fixed NCP MCP mode, which was broken outside handoffs: cost logging called
   `ncp_log_cost`, a tool NCP does not have, so every call failed (it now uses

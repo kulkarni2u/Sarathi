@@ -50,6 +50,14 @@ learn_evolve:
   proposal_gate: 2
   post_accept_min_outcomes: 5
   post_accept_gate_ratio: 0.9
+  # Per-task-class quality baselines (persisted in .sarathi/evolve_baselines.json):
+  # the mean of the last baseline_window values, compared once
+  # baseline_min_samples exist. Deviation is relative to the baseline's size.
+  baseline_window: 20
+  baseline_min_samples: 1
+  # Phase outcomes that count a task as failed in the outcome reported to NCP
+  # and in the post-accept check ("escalate" = it needed a human).
+  failure_outcomes: [fail, escalate]
 
 # Classifies phase failures into a recovery_class used to route
 # provider-backed recovery dispatch (src/runtime/recovery.py). The values

@@ -26,12 +26,19 @@ class LearnHandler:
         workspace_root=None,
         ncp_outcome_reporter=None,
         ncp_improvement_tracker=None,
+        state_dir=None,
     ):
         self.policy_pack = policy_pack
         self.dispatcher = dispatcher
         self.learning_store = LearningStore()
         escalation = getattr(self.policy_pack, "escalation", {}) or {}
-        self.evolver = Evolver(EvolutionPolicy.from_escalation(escalation))
+        # state_dir (the engine's .sarathi directory) persists per-task-class
+        # quality baselines across runs; without it each process starts with
+        # no baseline and harness-outcome proposals can never fire.
+        self.evolver = Evolver(
+            EvolutionPolicy.from_escalation(escalation),
+            baseline_path=(Path(state_dir) / "evolve_baselines.json") if state_dir else None,
+        )
         self.provider_health = provider_health
         # Optional workspace root so measured JUDGE routing feedback (Piece
         # 2.3) can find `.sarathi/bakeoff_history.json` (written by
@@ -111,7 +118,9 @@ class LearnHandler:
         ncp_feedback = None
         if self.ncp_outcome_reporter is not None:
             # report() never raises; feedback must not fail LEARN.
-            ncp_feedback = self.ncp_outcome_reporter.report(task, outcome)
+            ncp_feedback = self.ncp_outcome_reporter.report(
+                task, outcome, failure_outcomes=self.evolver.policy.failure_outcomes
+            )
         try:
             return self.evolver.ingest_harness_outcome(outcome), ncp_feedback, outcome
         except Exception:
@@ -142,7 +151,9 @@ class LearnHandler:
                 from src.ncp_adapter.outcome import derive_ncp_outcome
             except ImportError:
                 from ncp_adapter.outcome import derive_ncp_outcome
-            derived = derive_ncp_outcome(task, outcome)
+            derived = derive_ncp_outcome(
+                task, outcome, failure_outcomes=self.evolver.policy.failure_outcomes
+            )
             tracker.record_task_outcome(
                 task_id=str(getattr(task, "task_id", "")),
                 task_class=str(task_class),

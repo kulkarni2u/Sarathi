@@ -89,13 +89,25 @@ def _phase_name(phase_result: Any) -> str:
     return str(getattr(phase, "value", phase or ""))
 
 
-def derive_ncp_outcome(task: Any, outcome: Any) -> dict[str, Any]:
+# Phase outcomes that make a task a failure unless policy says otherwise
+# (escalation.md learn_evolve.failure_outcomes). "escalate" means the task
+# needed a human, so it is not evidence that the memory it used works.
+DEFAULT_FAILURE_OUTCOMES: tuple[str, ...] = ("fail", "escalate")
+
+
+def derive_ncp_outcome(
+    task: Any,
+    outcome: Any,
+    *,
+    failure_outcomes: tuple[str, ...] | list[str] = DEFAULT_FAILURE_OUTCOMES,
+) -> dict[str, Any]:
     """Map a measured ``HarnessOutcome`` to ``record_outcome`` arguments.
 
     Returns ``success``, ``weight``, ``note`` and ``ctx`` (without chunk ids).
 
-    - Failure when any phase failed, a rollback was triggered, or a measured
-      test run failed. Otherwise success.
+    - Failure when any phase ended in one of ``failure_outcomes`` (default
+      ``fail`` or ``escalate``), a rollback was triggered, or a measured test
+      run failed. Otherwise success.
     - ``eval_source`` is ``verifier`` only when ``test_pass_rate`` was measured
       from a real VERIFY command; otherwise ``self_report`` at half weight.
     """
@@ -103,8 +115,11 @@ def derive_ncp_outcome(task: Any, outcome: Any) -> dict[str, Any]:
     signals: dict[str, float] = dict(getattr(outcome, "quality_signals", {}) or {})
     provenance: dict[str, str] = dict(getattr(outcome, "signal_provenance", {}) or {})
 
+    failing = set(failure_outcomes)
     failed_phases = [
-        _phase_name(pr) for pr in phase_results if getattr(pr, "outcome", "") == "fail"
+        f"{_phase_name(pr)}={getattr(pr, 'outcome', '')}"
+        for pr in phase_results
+        if getattr(pr, "outcome", "") in failing
     ]
     tests_measured = provenance.get("test_pass_rate") == "measured"
     tests_failed = tests_measured and signals.get("test_pass_rate", 1.0) < 1.0
@@ -161,13 +176,19 @@ class NCPOutcomeReporter(NCPTransportMixin):
         super().__init__(*args, **kwargs)
         self.outcome_ledger = ledger or NCPOutcomeLedger()
 
-    def report(self, task: Any, outcome: Any) -> dict[str, Any]:
+    def report(
+        self,
+        task: Any,
+        outcome: Any,
+        *,
+        failure_outcomes: tuple[str, ...] | list[str] = DEFAULT_FAILURE_OUTCOMES,
+    ) -> dict[str, Any]:
         """Record the outcome; never raises. Returns a summary for LEARN evidence."""
         collected = self.outcome_ledger.drain()
         # Read chunks first, then this task's own writes; keep the most recent.
         chunk_ids = list(dict.fromkeys(collected["consumed"] + collected["produced"]))
         chunk_ids = chunk_ids[-MAX_CREDITED_CHUNKS:]
-        derived = derive_ncp_outcome(task, outcome)
+        derived = derive_ncp_outcome(task, outcome, failure_outcomes=failure_outcomes)
         summary: dict[str, Any] = {
             "recorded": False,
             "success": derived["success"],

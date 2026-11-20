@@ -887,6 +887,7 @@ class Engine:
         # uses by default (".sarathi/tasks" -> ".sarathi"), independent of
         # whether NCP persistence is active.
         health_base_dir = getattr(self.persistence, "storage_path", Path(".sarathi/tasks")).parent
+        self.state_dir = Path(health_base_dir)
         self.provider_health = ProviderHealthStore(health_base_dir)
 
         # Crash-safe dispatch journal — same base directory as provider health.
@@ -986,6 +987,7 @@ class Engine:
                 provider_health=self.provider_health,
                 ncp_outcome_reporter=getattr(self, "ncp_outcome_reporter", None),
                 ncp_improvement_tracker=getattr(self, "ncp_improvement_tracker", None),
+                state_dir=getattr(self, "state_dir", None),
             ),
         }
 

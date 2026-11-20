@@ -3,12 +3,40 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
+import uuid
 from pathlib import Path
+from typing import Any
 
 
 _TRANSPORT_TIMEOUT = 30
+
+# `.ncp/run.py` exits 2 for an unknown command. Bridges written by older
+# `sarathi init` releases have no `record_outcome` and print no write status.
+_UNKNOWN_COMMAND_EXIT = 2
+
+
+# Chunk headers in NCP's pidgin output (`fetch` and `get_context`) start a line
+# with ``chunk:<id>``, optionally followed by space-separated attributes.
+_CHUNK_HEADER = re.compile(r"^chunk:(\S+)", re.MULTILINE)
+
+
+def parse_chunk_ids(text: str) -> list[str]:
+    """Return the chunk ids named in NCP pidgin output, in order, de-duplicated."""
+    return list(dict.fromkeys(_CHUNK_HEADER.findall(text or "")))
+
+
+def _mcp_tool_result(response: dict[str, Any]) -> dict[str, Any]:
+    """Decode an MCP ``tools/call`` result whose first content item is JSON text."""
+    content = (response.get("result") or {}).get("content") or [{}]
+    text = content[0].get("text", "") if isinstance(content[0], dict) else ""
+    try:
+        decoded = json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
 
 
 class NCPTransportMixin:
@@ -29,6 +57,17 @@ class NCPTransportMixin:
         self.mode = mode
         self.endpoint = endpoint
         self.run_path = Path(run_path)
+        # Optional NCPOutcomeLedger (see outcome.py), shared by the engine's
+        # adapters so a task's outcome credits the chunks it read and wrote.
+        self.outcome_ledger: Any = None
+
+    def _note_consumed(self, chunk_ids: list[str]) -> None:
+        if self.outcome_ledger is not None and chunk_ids:
+            self.outcome_ledger.note_consumed(chunk_ids)
+
+    def _note_produced(self, chunk_id: str) -> None:
+        if self.outcome_ledger is not None and chunk_id:
+            self.outcome_ledger.note_produced(chunk_id)
 
     # ------------------------------------------------------------------
     # Public transport
@@ -71,12 +110,33 @@ class NCPTransportMixin:
         else:
             import httpx
             try:
+                # NCP's MCP server has no ncp_log_cost; cost is recorded with
+                # ncp_post_turn. Explicit empty ack/retrieved lists keep it from
+                # acknowledging the session's pending whispers.
+                post_turn_args: dict[str, Any] = {
+                    "agent_id": agent_id,
+                    "role": "sarathi",
+                    "task": pipeline_id or "sarathi",
+                    "slot": "dispatch",
+                    "intent": "log_cost",
+                    "turn_id": args["turn_id"],
+                    "result_summary": f"sarathi dispatch cost ({model})",
+                    "model": model,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cost_usd": cost_usd,
+                    "latency_ms": latency_ms,
+                    "ack_whisper_ids": [],
+                    "retrieved_chunk_ids": [],
+                }
+                if pipeline_id is not None:
+                    post_turn_args["pipeline_id"] = pipeline_id
                 payload = {
                     "jsonrpc": "2.0",
                     "method": "tools/call",
                     "params": {
-                        "name": "ncp_log_cost",
-                        "arguments": args,
+                        "name": "ncp_post_turn",
+                        "arguments": post_turn_args,
                     },
                     "id": 1,
                 }
@@ -91,12 +151,19 @@ class NCPTransportMixin:
     def _call_write_memory(
         self, content: str, layer: str, src: str, written_by: str,
     ) -> None:
-        """Call NCP write_memory via direct API or MCP."""
+        """Call NCP write_memory via direct API or MCP.
+
+        Sarathi names the chunk itself so the task's outcome can credit it,
+        but only once NCP confirms the write (a near-duplicate is skipped and
+        creates no chunk).
+        """
+        chunk_id = f"sub_{uuid.uuid4().hex[:12]}"
         args = {
             "content": content,
             "layer": layer,
             "src": src,
             "written_by": written_by,
+            "chunk_id": chunk_id,
         }
         if self.mode == "direct":
             result = subprocess.run(
@@ -107,6 +174,10 @@ class NCPTransportMixin:
                 raise RuntimeError(
                     f"NCP write_memory failed: {result.stderr.strip() or result.stdout.strip()}"
                 )
+            # Bridge v2 prints "written:<id>"; older bridges print nothing and
+            # ignore chunk_id, so there is no id to credit.
+            if f"written:{chunk_id}" in (result.stdout or ""):
+                self._note_produced(chunk_id)
         else:
             import httpx
             try:
@@ -124,6 +195,9 @@ class NCPTransportMixin:
                 result = resp.json()
                 if "error" in result:
                     raise RuntimeError(f"NCP MCP write_memory failed: {result['error']}")
+                written = _mcp_tool_result(result)
+                if written.get("written") and written.get("chunk_id"):
+                    self._note_produced(str(written["chunk_id"]))
             except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException) as e:
                 raise RuntimeError(f"NCP MCP write_memory failed: {e}") from e
 
@@ -137,7 +211,9 @@ class NCPTransportMixin:
             )
             if result.returncode != 0:
                 return []
-            return self._parse_fetch_output(result.stdout)
+            chunks = self._parse_fetch_output(result.stdout)
+            self._note_consumed(parse_chunk_ids("\n".join(chunks)))
+            return chunks
         else:
             import httpx
             try:
@@ -153,12 +229,57 @@ class NCPTransportMixin:
                 resp = httpx.post(self.endpoint, json=payload, timeout=_TRANSPORT_TIMEOUT)
                 resp.raise_for_status()
                 result = resp.json()
-                content_items = (
-                    result.get("result", {}).get("content", [])
-                )
-                return [item.get("text", "") for item in content_items]
+                # ncp_fetch returns {"result": "<pidgin chunk blocks>"}.
+                encoded = _mcp_tool_result(result).get("result", "")
+                chunks = self._parse_fetch_output(encoded if isinstance(encoded, str) else "")
+                self._note_consumed(parse_chunk_ids("\n".join(chunks)))
+                return chunks
             except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException):
                 return []
+
+    def _call_record_outcome(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Call NCP record_outcome via direct API or MCP.
+
+        Returns ``{"recorded", "outcome_id", "calibrated"}``, or
+        ``{"recorded": False, "unsupported": <reason>}`` when the workspace's
+        bridge predates ``record_outcome``.
+        """
+        if self.mode == "direct":
+            result = subprocess.run(
+                [str(self.run_path), "record_outcome", json.dumps(args)],
+                capture_output=True, text=True, timeout=_TRANSPORT_TIMEOUT,
+            )
+            if result.returncode == _UNKNOWN_COMMAND_EXIT and "unknown command" in result.stderr:
+                return {
+                    "recorded": False,
+                    "unsupported": ".ncp/run.py has no record_outcome; re-run `sarathi init`",
+                }
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"NCP record_outcome failed: {result.stderr.strip() or result.stdout.strip()}"
+                )
+            try:
+                decoded = json.loads(result.stdout or "{}")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"NCP record_outcome returned non-JSON: {exc}") from exc
+            return decoded if isinstance(decoded, dict) else {}
+
+        import httpx
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "ncp_record_outcome", "arguments": args},
+                "id": 1,
+            }
+            resp = httpx.post(self.endpoint, json=payload, timeout=_TRANSPORT_TIMEOUT)
+            resp.raise_for_status()
+            response = resp.json()
+        except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException) as e:
+            raise RuntimeError(f"NCP MCP record_outcome failed: {e}") from e
+        if "error" in response:
+            raise RuntimeError(f"NCP MCP record_outcome failed: {response['error']}")
+        return _mcp_tool_result(response)
 
     # ------------------------------------------------------------------
     # Helpers

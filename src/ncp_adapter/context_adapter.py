@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import NCPNotAvailableError
-from ._transport import NCPTransportMixin
+from ._transport import NCPTransportMixin, _mcp_tool_result, parse_chunk_ids
 
 
 class NCPContextAdapter(NCPTransportMixin):
@@ -222,6 +222,7 @@ class NCPContextAdapter(NCPTransportMixin):
             )
             if result.returncode != 0:
                 raise NCPNotAvailableError(f"NCP get_context failed: {result.stderr}")
+            self._note_consumed(parse_chunk_ids(result.stdout))
             return result.stdout
         else:
             import httpx, json as _json
@@ -235,7 +236,15 @@ class NCPContextAdapter(NCPTransportMixin):
                 resp = httpx.post(self.endpoint, json=payload, timeout=30)
                 resp.raise_for_status()
                 result = resp.json()
-                return result.get("result", {}).get("content", [{}])[0].get("text", "")
+                # ncp_get_context returns {"context": "<pidgin>", "retrieved_chunk_ids": [...]}.
+                decoded = _mcp_tool_result(result)
+                context = decoded.get("context", "")
+                retrieved = decoded.get("retrieved_chunk_ids")
+                if isinstance(retrieved, list):
+                    self._note_consumed([str(item) for item in retrieved])
+                else:
+                    self._note_consumed(parse_chunk_ids(str(context)))
+                return context if isinstance(context, str) else ""
             except (httpx.HTTPStatusError, httpx.ConnectError, httpx.TimeoutException) as e:
                 raise NCPNotAvailableError(f"NCP MCP get_context failed: {e}") from e
 

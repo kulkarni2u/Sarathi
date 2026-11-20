@@ -65,6 +65,32 @@ def _find_ncp_template(filename: str) -> Path | None:
     return None
 
 
+_NCP_BRIDGE_HEADER = "Direct-mode bridge: Sarathi <-> NCP"
+_NCP_BRIDGE_VERSION_RE = re.compile(r"^SARATHI_NCP_BRIDGE_VERSION\s*=\s*(\d+)", re.MULTILINE)
+
+
+def _ncp_bridge_version(text: str) -> int:
+    """Version of a Sarathi ``.ncp/run.py``; bridges before versioning are 1."""
+    match = _NCP_BRIDGE_VERSION_RE.search(text)
+    return int(match.group(1)) if match else 1
+
+
+def _ncp_bridge_is_outdated(run_path: Path, template: Path) -> bool:
+    """True for a Sarathi-generated bridge older than the bundled template.
+
+    A ``run.py`` without Sarathi's header was not written by Sarathi and is
+    never replaced.
+    """
+    try:
+        current = run_path.read_text()
+        bundled = template.read_text()
+    except OSError:
+        return False
+    if _NCP_BRIDGE_HEADER not in current:
+        return False
+    return _ncp_bridge_version(current) < _ncp_bridge_version(bundled)
+
+
 def _ensure_ncp_sidecar(init_target: Path) -> dict[str, bool]:
     """Ensure Sarathi's direct-mode NCP files exist under ``init_target/.ncp``."""
     import shutil
@@ -81,11 +107,18 @@ def _ensure_ncp_sidecar(init_target: Path) -> dict[str, bool]:
             created["config"] = True
 
     run_path = ncp_dir / "run.py"
+    created["run_py_upgraded"] = False
+    run_template = _find_ncp_template("run.py.example")
     if not run_path.exists():
-        run_template = _find_ncp_template("run.py.example")
         if run_template is not None:
             shutil.copyfile(run_template, run_path)
             created["run_py"] = True
+    elif run_template is not None and _ncp_bridge_is_outdated(run_path, run_template):
+        # A Sarathi-generated bridge from an older release (e.g. without
+        # record_outcome). Keep the previous copy in case it was edited.
+        shutil.copyfile(run_path, run_path.with_name("run.py.bak"))
+        shutil.copyfile(run_template, run_path)
+        created["run_py_upgraded"] = True
 
     if run_path.exists():
         run_path.chmod(run_path.stat().st_mode | 0o111)
@@ -207,6 +240,8 @@ def _bootstrap_ncp(init_target: Path, *, step_label: str) -> None:
         print("  ✓ Wrote .ncp/config.toml from Sarathi template")
     if sidecar_created["run_py"]:
         print("  ✓ Wrote .ncp/run.py direct-mode bridge")
+    elif sidecar_created.get("run_py_upgraded"):
+        print("  ✓ Upgraded .ncp/run.py direct-mode bridge (previous copy: .ncp/run.py.bak)")
     elif (init_target / ".ncp" / "run.py").exists():
         print("  ✓ Verified .ncp/run.py direct-mode bridge")
 

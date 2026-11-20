@@ -53,6 +53,8 @@ except ImportError as e:
         f"installed. Missing dependency: {e}"
     ) from e
 
+from .outcome import NCPOutcomeLedger, NCPOutcomeReporter
+
 __all__ = [
     "NCPAdapterConfig",
     "NCPNotAvailableError",
@@ -60,4 +62,6 @@ __all__ = [
     "NCPPersistenceAdapter",
     "NCPArtifactAdapter",
     "NCPWhisperRouter",
+    "NCPOutcomeLedger",
+    "NCPOutcomeReporter",
 ]

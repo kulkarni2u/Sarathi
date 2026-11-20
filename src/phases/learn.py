@@ -18,7 +18,14 @@ if TYPE_CHECKING:
 class LearnHandler:
     """Extract lessons learned from task execution."""
 
-    def __init__(self, policy_pack, dispatcher=None, provider_health=None, workspace_root=None):
+    def __init__(
+        self,
+        policy_pack,
+        dispatcher=None,
+        provider_health=None,
+        workspace_root=None,
+        ncp_outcome_reporter=None,
+    ):
         self.policy_pack = policy_pack
         self.dispatcher = dispatcher
         self.learning_store = LearningStore()
@@ -31,6 +38,10 @@ class LearnHandler:
         # default) means "not wired up here" -- generate_policy_proposals
         # simply gets no bake-off history and behaves exactly as before.
         self.workspace_root = workspace_root
+        # Optional NCPOutcomeReporter: when NCP is active, the measured
+        # outcome is recorded in NCP so it can recalibrate the trust of the
+        # memory this task read and wrote. None means NCP is off.
+        self.ncp_outcome_reporter = ncp_outcome_reporter
 
     def execute(self, task: "TaskContext", phase: "Phase") -> "PhaseResult":
         from src.engine import PhaseResult
@@ -42,8 +53,10 @@ class LearnHandler:
         )
 
         # Wire HarnessOutcome into Evolver when harness_config is available (Piece 5)
-        harness_proposals = self._ingest_harness_outcome(task)
+        harness_proposals, ncp_feedback = self._ingest_harness_outcome(task)
         proposals.extend(harness_proposals)
+        if ncp_feedback is not None:
+            artifacts["ncp_outcome"] = ncp_feedback
 
         artifacts["policy_proposals"] = [proposal.to_artifact() for proposal in proposals]
         artifacts["proposal_count"] = len(proposals)
@@ -56,6 +69,7 @@ class LearnHandler:
             "insights_generated": len(lessons) > 0,
             "policy_proposals_generated": len(proposals),
             "harness_outcome_ingested": harness_proposals is not None,
+            "ncp_outcome_recorded": bool(ncp_feedback and ncp_feedback.get("recorded")),
         }
 
         return PhaseResult(
@@ -65,21 +79,32 @@ class LearnHandler:
             artifacts=artifacts,
         )
 
-    def _ingest_harness_outcome(self, task: "TaskContext") -> list:
-        """Build a measured HarnessOutcome from phase_results and feed it into Evolver."""
+    def _ingest_harness_outcome(self, task: "TaskContext") -> tuple[list, dict | None]:
+        """Build a measured HarnessOutcome and feed it into Evolver and NCP.
+
+        Returns the Evolver's proposals and the NCP feedback summary (None
+        when NCP is off or no outcome could be measured).
+        """
         harness_config = getattr(task, "harness_config", None)
         if harness_config is None:
-            return []
+            return [], None
         try:
             try:
                 from src.harness import measure_outcome
             except ImportError:
                 from harness import measure_outcome
             outcome = measure_outcome(task, harness_config)
-            self._record_provider_health(task, outcome)
-            return self.evolver.ingest_harness_outcome(outcome)
         except Exception:
-            return []
+            return [], None
+        self._record_provider_health(task, outcome)
+        ncp_feedback = None
+        if self.ncp_outcome_reporter is not None:
+            # report() never raises; feedback must not fail LEARN.
+            ncp_feedback = self.ncp_outcome_reporter.report(task, outcome)
+        try:
+            return self.evolver.ingest_harness_outcome(outcome), ncp_feedback
+        except Exception:
+            return [], ncp_feedback
 
     def _record_provider_health(self, task: "TaskContext", outcome) -> None:
         """Record success/failure of the agent that did the work for health tracking."""

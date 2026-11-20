@@ -120,6 +120,8 @@ try:
         NCPPersistenceAdapter,
         NCPArtifactAdapter,
         NCPWhisperRouter,
+        NCPOutcomeLedger,
+        NCPOutcomeReporter,
     )
 except ImportError:
     from ncp_adapter import (
@@ -129,6 +131,8 @@ except ImportError:
         NCPPersistenceAdapter,
         NCPArtifactAdapter,
         NCPWhisperRouter,
+        NCPOutcomeLedger,
+        NCPOutcomeReporter,
     )
 
 
@@ -843,11 +847,22 @@ class Engine:
             self.persistence = NCPPersistenceAdapter(**adapter_kwargs)
             self.artifact_store = NCPArtifactAdapter(**adapter_kwargs)
             self.whisper_router = NCPWhisperRouter(**adapter_kwargs) if ncp_router else None
+            # One ledger shared by every adapter: LEARN credits the chunks this
+            # task read and wrote when it records the measured outcome in NCP.
+            self.ncp_outcome_ledger: NCPOutcomeLedger | None = NCPOutcomeLedger()
+            self.ncp_outcome_reporter: NCPOutcomeReporter | None = NCPOutcomeReporter(
+                **adapter_kwargs, ledger=self.ncp_outcome_ledger
+            )
+            for adapter in (self.context_adapter, self.persistence, self.artifact_store, self.whisper_router):
+                if adapter is not None:
+                    adapter.outcome_ledger = self.ncp_outcome_ledger
         else:
             self.context_adapter = ContextCompiler()
             self.persistence = PersistenceManager()
             self.artifact_store = ArtifactStore()
             self.whisper_router = None
+            self.ncp_outcome_ledger = None
+            self.ncp_outcome_reporter = None
 
         # Provider health tracking — same base directory PersistenceManager
         # uses by default (".sarathi/tasks" -> ".sarathi"), independent of
@@ -946,7 +961,12 @@ class Engine:
             Phase.RISK_CHECK: RiskCheckHandler(self.policy_pack, self.dispatcher),
             Phase.ELEGANCE: EleganceHandler(self.policy_pack, self.dispatcher),
             Phase.PHASE_LOG: PhaseLogHandler(self.policy_pack, self.dispatcher),
-            Phase.LEARN: LearnHandler(self.policy_pack, self.dispatcher, provider_health=self.provider_health),
+            Phase.LEARN: LearnHandler(
+                self.policy_pack,
+                self.dispatcher,
+                provider_health=self.provider_health,
+                ncp_outcome_reporter=getattr(self, "ncp_outcome_reporter", None),
+            ),
         }
 
     def generate_task_id(self, description: str) -> str:
@@ -1040,6 +1060,9 @@ class Engine:
         `task.stop_reason`.
         """
         task.stop_reason = None
+        ledger = getattr(self, "ncp_outcome_ledger", None)
+        if ledger is not None:
+            ledger.begin(task.task_id)
         if hasattr(self.dispatcher, "reset_task_state"):
             self.dispatcher.reset_task_state()
         self._reconcile_inflight_dispatches(task)
@@ -1181,6 +1204,11 @@ class Engine:
         phase boundary, see `task.stop_reason`.
         """
         task.stop_reason = None
+        ledger = getattr(self, "ncp_outcome_ledger", None)
+        if ledger is not None:
+            # Chunks read before a pause in another process are not known
+            # here; the outcome credits what this process saw.
+            ledger.begin(task.task_id)
         if not task.phase_results:
             return self.run_task(task, cancel_check=cancel_check, task_timeout=task_timeout)
 

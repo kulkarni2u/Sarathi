@@ -465,7 +465,35 @@ sarathi run --no-ncp "task"    # force native adapters
 sarathi run --ncp --ncp-mode mcp --ncp-endpoint http://ncp.internal:4242/mcp "task"
 ```
 
-### 7.5 Dynamic workflow patterns without NCP
+### 7.5 Outcome feedback: NCP learns which memory helped
+
+When NCP is active, LEARN records each task's measured outcome in NCP
+(`record_outcome`), crediting the NCP chunks the task read (`fetch`,
+`get_context`) and wrote (`write_memory`). NCP then recalibrates those chunks'
+trust (by `[calibration].auto_outcome_step`, default 0.1 per outcome), so
+memory that preceded successful work ranks higher next time and memory behind
+failures ranks lower.
+
+| Measured result | NCP outcome |
+|---|---|
+| Any phase failed, a rollback was triggered, or VERIFY's test command failed | failure |
+| Otherwise | success |
+| VERIFY ran a real test command | `eval_source: verifier`, weight 1.0 |
+| No test command (review verdicts and phase outcomes only) | `eval_source: self_report`, weight 0.5 |
+
+The result is stored on the LEARN phase as `artifacts["ncp_outcome"]` (and
+`evidence["ncp_outcome_recorded"]`). Feedback never fails LEARN: an
+unreachable store is recorded as an `error` in that summary. Tasks that used
+no NCP chunks record nothing (`skipped: no_ncp_chunks`). Set
+`[calibration] auto_on_outcome = false` in `.ncp/config.toml` to keep the
+outcomes but recalibrate only when you run `ncp calibrate --feedback`.
+
+`record_outcome` needs the version-2 `.ncp/run.py` bridge. `sarathi init`
+upgrades a bridge it generated earlier and keeps the old copy as
+`.ncp/run.py.bak`; until then, LEARN reports `.ncp/run.py has no
+record_outcome; re-run sarathi init`.
+
+### 7.6 Dynamic workflow patterns without NCP
 
 If you enable dynamic workflow patterns (`workflow-patterns.md`) but NCP is not active:
 

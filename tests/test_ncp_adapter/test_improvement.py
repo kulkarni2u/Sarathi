@@ -1,4 +1,5 @@
 """Tests for policy proposals as NCP improvement records and the post-accept check."""
+
 from __future__ import annotations
 
 import json
@@ -18,7 +19,11 @@ BRIDGE_TEMPLATE = REPO_ROOT / "docs" / "ncp" / "run.py.example"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.evolve import EvolutionPolicy, PolicyProposal, ProposalReviewStore  # noqa: E402
+from src.evolve import (
+    EvolutionPolicy,
+    PolicyProposal,
+    ProposalReviewStore,
+)  # noqa: E402
 
 
 def _proposal(**overrides) -> PolicyProposal:
@@ -63,15 +68,25 @@ def _ncp_attempts(root: Path) -> list[dict]:
         "print(json.dumps([a.model_dump() for a in s.list_improvement_attempts()]))"
     )
     out = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, check=True, cwd=root
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=root,
     )
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-def _log(tracker: NCPImprovementTracker, results: list[bool], task_class="codegen/patch"):
+def _log(
+    tracker: NCPImprovementTracker, results: list[bool], task_class="codegen/patch"
+):
     for i, ok in enumerate(results):
         tracker.record_task_outcome(
-            task_id=f"t{i}", task_class=task_class, success=ok, weight=1.0, output_tokens=100
+            task_id=f"t{i}",
+            task_class=task_class,
+            success=ok,
+            weight=1.0,
+            output_tokens=100,
         )
 
 
@@ -83,11 +98,17 @@ def test_proposal_lifecycle_and_post_accept_regression_reach_ncp(workspace):
     assert tracker is not None
     proposal = _proposal()
 
-    first = tracker.record_proposals([proposal.to_artifact()], task_class="codegen/patch")
-    again = tracker.record_proposals([proposal.to_artifact()], task_class="codegen/patch")
+    first = tracker.record_proposals(
+        [proposal.to_artifact()], task_class="codegen/patch"
+    )
+    again = tracker.record_proposals(
+        [proposal.to_artifact()], task_class="codegen/patch"
+    )
     note = first[proposal.proposal_id]
     assert note["attempt_id"].startswith("att_") and note["reused"] is False
-    assert again[proposal.proposal_id]["reused"] is True  # recurring proposal: one attempt
+    assert (
+        again[proposal.proposal_id]["reused"] is True
+    )  # recurring proposal: one attempt
     assert again[proposal.proposal_id]["attempt_id"] == note["attempt_id"]
 
     _log(tracker, [True] * 5)  # pre-accept anchor: 5/5
@@ -100,10 +121,17 @@ def test_proposal_lifecycle_and_post_accept_regression_reach_ncp(workspace):
     [verdict] = tracker.check_accepted("codegen/patch")
     assert verdict["verdict"] == "regressed"
     assert verdict["before_rate"] == 1.0 and verdict["after_rate"] == 0.6
-    assert verdict["recommendation"] == f"sarathi proposals --rollback {proposal.proposal_id}"
+    assert (
+        verdict["recommendation"]
+        == f"sarathi proposals --rollback {proposal.proposal_id}"
+    )
 
     [attempt] = _ncp_attempts(workspace)
-    assert (attempt["passed"], attempt["total"], attempt["anchor_rate"]) == (3.0, 5.0, 1.0)
+    assert (attempt["passed"], attempt["total"], attempt["anchor_rate"]) == (
+        3.0,
+        5.0,
+        1.0,
+    )
     assert attempt["mean_output_tokens"] == 100.0
     assert "regressed, consider rollback" in attempt["note"]
 
@@ -133,7 +161,9 @@ def test_rollback_and_history_shown_on_the_next_proposal(workspace):
     store.reject(rejected, reason="lint must always run")
     statuses = sorted(a["status"] for a in _ncp_attempts(workspace))
     assert statuses == ["proposed", "rejected", "rolled_back"]
-    assert any(a["note"] == "rejected: lint must always run" for a in _ncp_attempts(workspace))
+    assert any(
+        a["note"] == "rejected: lint must always run" for a in _ncp_attempts(workspace)
+    )
 
 
 def test_post_accept_check_holds_and_writes_once(workspace):
@@ -184,7 +214,9 @@ def test_old_bridge_reports_upgrade_hint(tmp_path):
 def test_review_store_without_ncp_is_unchanged(tmp_path):
     (tmp_path / "policy-pack").mkdir()
     assert NCPImprovementTracker.for_workspace(tmp_path) is None
-    decision = ProposalReviewStore(tmp_path / "policy-pack", mirror=False).accept(_proposal())
+    decision = ProposalReviewStore(tmp_path / "policy-pack", mirror=False).accept(
+        _proposal()
+    )
     assert decision["status"] == "accepted"
 
 
@@ -199,11 +231,21 @@ def test_outcome_log_skips_torn_lines(tmp_path):
 
 def test_post_accept_thresholds_come_from_escalation_policy():
     policy = EvolutionPolicy.from_escalation(
-        {"learn_evolve": {"post_accept_min_outcomes": 8, "post_accept_gate_ratio": 0.75}}
+        {
+            "learn_evolve": {
+                "post_accept_min_outcomes": 8,
+                "post_accept_gate_ratio": 0.75,
+            }
+        }
     )
     assert (policy.post_accept_min_outcomes, policy.post_accept_gate_ratio) == (8, 0.75)
-    defaults = EvolutionPolicy.from_escalation({"learn_evolve": {"post_accept_min_outcomes": 0}})
-    assert (defaults.post_accept_min_outcomes, defaults.post_accept_gate_ratio) == (1, 0.9)
+    defaults = EvolutionPolicy.from_escalation(
+        {"learn_evolve": {"post_accept_min_outcomes": 0}}
+    )
+    assert (defaults.post_accept_min_outcomes, defaults.post_accept_gate_ratio) == (
+        1,
+        0.9,
+    )
 
 
 # ── LEARN wiring ───────────────────────────────────────────────────────────
@@ -217,25 +259,46 @@ def test_learn_annotates_proposals_and_reports_post_accept_checks():
 
     tracker = MagicMock()
     proposal = _proposal()
-    tracker.record_proposals.return_value = {proposal.proposal_id: {"attempt_id": "att_1"}}
+    tracker.record_proposals.return_value = {
+        proposal.proposal_id: {"attempt_id": "att_1"}
+    }
     tracker.check_accepted.return_value = [{"verdict": "regressed", "proposal_id": "p"}]
-    handler = LearnHandler(SimpleNamespace(escalation={}), ncp_improvement_tracker=tracker)
+    handler = LearnHandler(
+        SimpleNamespace(escalation={}), ncp_improvement_tracker=tracker
+    )
     outcome = SimpleNamespace(
-        task_id="t", task_class=SimpleNamespace(value="codegen/patch"),
-        quality_signals={}, signal_provenance={}, rollback_triggered=False, agent_used="claude",
+        task_id="t",
+        task_class=SimpleNamespace(value="codegen/patch"),
+        quality_signals={},
+        signal_provenance={},
+        rollback_triggered=False,
+        agent_used="claude",
     )
     task = SimpleNamespace(task_id="t", phase_results=[], harness_config=object())
-    with patch("src.harness.measure_outcome", return_value=outcome), patch.object(
-        handler.learning_store,
-        "build_artifacts",
-        return_value={"learning_record": {}, "lessons_learned": [], "patterns_updated": False},
-    ), patch.object(handler.evolver, "ingest_harness_outcome", return_value=[]), patch.object(
-        handler.evolver, "generate_policy_proposals", return_value=[proposal]
+    with (
+        patch("src.harness.measure_outcome", return_value=outcome),
+        patch.object(
+            handler.learning_store,
+            "build_artifacts",
+            return_value={
+                "learning_record": {},
+                "lessons_learned": [],
+                "patterns_updated": False,
+            },
+        ),
+        patch.object(handler.evolver, "ingest_harness_outcome", return_value=[]),
+        patch.object(
+            handler.evolver, "generate_policy_proposals", return_value=[proposal]
+        ),
     ):
         result = handler.execute(task, Phase.LEARN)
 
-    assert result.artifacts["policy_proposals"][0]["improvement"] == {"attempt_id": "att_1"}
+    assert result.artifacts["policy_proposals"][0]["improvement"] == {
+        "attempt_id": "att_1"
+    }
     tracker.record_task_outcome.assert_called_once()
     assert tracker.record_task_outcome.call_args.kwargs["task_class"] == "codegen/patch"
-    assert result.artifacts["post_accept_checks"] == [{"verdict": "regressed", "proposal_id": "p"}]
+    assert result.artifacts["post_accept_checks"] == [
+        {"verdict": "regressed", "proposal_id": "p"}
+    ]
     assert result.evidence["post_accept_regressions"] == 1

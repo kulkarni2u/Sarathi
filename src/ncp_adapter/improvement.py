@@ -31,6 +31,7 @@ Improvement records need the direct bridge (``.ncp/run.py`` version 3) and
 NCP's sqlite or pgvector store. In MCP mode they are reported unsupported:
 NCP exposes them over MCP only in the ``full`` tool profile.
 """
+
 from __future__ import annotations
 
 import json
@@ -151,12 +152,19 @@ class NCPImprovementTracker(NCPTransportMixin):
 
     def _call_bridge(self, command: str, args: dict[str, Any]) -> dict[str, Any]:
         if self.mode != "direct":
-            return {"unsupported": "NCP improvement records need direct mode (.ncp/run.py)"}
+            return {
+                "unsupported": "NCP improvement records need direct mode (.ncp/run.py)"
+            }
         result = subprocess.run(
             [str(self.run_path), command, json.dumps(args)],
-            capture_output=True, text=True, timeout=_TRANSPORT_TIMEOUT,
+            capture_output=True,
+            text=True,
+            timeout=_TRANSPORT_TIMEOUT,
         )
-        if result.returncode == _UNKNOWN_COMMAND_EXIT and "unknown command" in result.stderr:
+        if (
+            result.returncode == _UNKNOWN_COMMAND_EXIT
+            and "unknown command" in result.stderr
+        ):
             return {"unsupported": _UPGRADE_HINT}
         if result.returncode != 0:
             raise RuntimeError(
@@ -239,9 +247,11 @@ class NCPImprovementTracker(NCPTransportMixin):
 
     def record_decision(self, decision: dict[str, Any]) -> dict[str, Any] | None:
         """Mirror an accept / reject / rollback decision onto the NCP attempt."""
-        status = {"accepted": "applied", "rejected": "rejected", "rolled_back": "rolled_back"}.get(
-            str(decision.get("status"))
-        )
+        status = {
+            "accepted": "applied",
+            "rejected": "rejected",
+            "rolled_back": "rolled_back",
+        }.get(str(decision.get("status")))
         proposal_id = str(decision.get("id", ""))
         if status is None or not proposal_id:
             return None
@@ -259,7 +269,8 @@ class NCPImprovementTracker(NCPTransportMixin):
                 fields["note"] = f"{status}: {decision['reason']}"[:500]
             try:
                 result = self._call_bridge(
-                    "improvement_update", {"attempt_id": entry["attempt_id"], "fields": fields}
+                    "improvement_update",
+                    {"attempt_id": entry["attempt_id"], "fields": fields},
                 )
             except Exception as exc:
                 return {"error": str(exc)[:300]}
@@ -303,10 +314,15 @@ class NCPImprovementTracker(NCPTransportMixin):
             entries = self.outcome_log.entries(task_class)
             changed = False
             for proposal_id, entry in registry.items():
-                if entry.get("status") != "applied" or entry.get("task_class") != task_class:
+                if (
+                    entry.get("status") != "applied"
+                    or entry.get("task_class") != task_class
+                ):
                     continue
                 accepted_at = float(entry.get("accepted_at") or 0)
-                before = [e for e in entries if float(e.get("at", 0)) < accepted_at][-ANCHOR_WINDOW:]
+                before = [e for e in entries if float(e.get("at", 0)) < accepted_at][
+                    -ANCHOR_WINDOW:
+                ]
                 after = [e for e in entries if float(e.get("at", 0)) >= accepted_at]
                 verdict: dict[str, Any] = {
                     "proposal_id": proposal_id,
@@ -333,7 +349,9 @@ class NCPImprovementTracker(NCPTransportMixin):
                     after_rate=round(after_rate, 4),
                 )
                 if regressed:
-                    verdict["recommendation"] = f"sarathi proposals --rollback {proposal_id}"
+                    verdict["recommendation"] = (
+                        f"sarathi proposals --rollback {proposal_id}"
+                    )
                 verdicts.append(verdict)
                 if entry.get("checked_total") == total:
                     continue  # nothing new since the last write
@@ -353,7 +371,8 @@ class NCPImprovementTracker(NCPTransportMixin):
                     fields["mean_output_tokens"] = sum(tokens) / len(tokens)
                 try:
                     self._call_bridge(
-                        "improvement_update", {"attempt_id": entry["attempt_id"], "fields": fields}
+                        "improvement_update",
+                        {"attempt_id": entry["attempt_id"], "fields": fields},
                     )
                 except Exception as exc:
                     verdict["error"] = str(exc)[:300]

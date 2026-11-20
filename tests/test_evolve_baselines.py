@@ -1,4 +1,5 @@
 """Persisted, rolling, relative quality baselines for Evolver.ingest_harness_outcome."""
+
 from __future__ import annotations
 
 import json
@@ -27,10 +28,17 @@ def _outcome(signals: dict[str, float], task_id: str = "t") -> HarnessOutcome:
 
 def test_baselines_survive_a_new_process(tmp_path):
     path = tmp_path / ".sarathi" / "evolve_baselines.json"
-    assert Evolver(baseline_path=path).ingest_harness_outcome(_outcome({"test_pass_rate": 0.9})) == []
+    assert (
+        Evolver(baseline_path=path).ingest_harness_outcome(
+            _outcome({"test_pass_rate": 0.9})
+        )
+        == []
+    )
 
     # A fresh Evolver (as in the next `sarathi run`) compares against it.
-    proposals = Evolver(baseline_path=path).ingest_harness_outcome(_outcome({"test_pass_rate": 0.5}))
+    proposals = Evolver(baseline_path=path).ingest_harness_outcome(
+        _outcome({"test_pass_rate": 0.5})
+    )
     assert [p.title for p in proposals] == [
         "Quality signal 'test_pass_rate' degraded for codegen/patch"
     ]
@@ -73,13 +81,18 @@ def test_rolling_window_and_min_samples_come_from_policy(tmp_path):
 def test_corrupt_baseline_file_starts_empty(tmp_path):
     path = tmp_path / "b.json"
     path.write_text("{not json")
-    assert Evolver(baseline_path=path).ingest_harness_outcome(_outcome({"accuracy": 0.9})) == []
+    assert (
+        Evolver(baseline_path=path).ingest_harness_outcome(_outcome({"accuracy": 0.9}))
+        == []
+    )
     assert json.loads(path.read_text())["codegen/patch"]["accuracy"] == [0.9]
 
 
 def test_failure_outcomes_policy():
     assert EvolutionPolicy().failure_outcomes == ("fail", "escalate")
-    custom = EvolutionPolicy.from_escalation({"learn_evolve": {"failure_outcomes": ["fail"]}})
+    custom = EvolutionPolicy.from_escalation(
+        {"learn_evolve": {"failure_outcomes": ["fail"]}}
+    )
     assert custom.failure_outcomes == ("fail",)
     assert EvolutionPolicy.from_escalation(
         {"learn_evolve": {"failure_outcomes": "fail"}}

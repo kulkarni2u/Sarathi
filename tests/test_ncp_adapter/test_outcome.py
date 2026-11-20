@@ -1,4 +1,5 @@
 """Tests for sending measured task outcomes back to NCP (outcome feedback)."""
+
 from __future__ import annotations
 
 import json
@@ -38,7 +39,13 @@ def _pr(phase: _Phase, outcome: str = "pass", **artifacts):
 
 
 def _usage(inp: int, out: int) -> dict:
-    return {"dispatch_usage": {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}}
+    return {
+        "dispatch_usage": {
+            "input_tokens": inp,
+            "output_tokens": out,
+            "total_tokens": inp + out,
+        }
+    }
 
 
 def _outcome(*, signals=None, provenance=None, rollback=False):
@@ -81,7 +88,9 @@ def test_verified_pass_is_full_weight_success_with_token_context():
     )
     derived = derive_ncp_outcome(
         task,
-        _outcome(signals={"test_pass_rate": 1.0}, provenance={"test_pass_rate": "measured"}),
+        _outcome(
+            signals={"test_pass_rate": 1.0}, provenance={"test_pass_rate": "measured"}
+        ),
     )
     assert derived["success"] is True
     assert derived["weight"] == VERIFIED_WEIGHT
@@ -105,7 +114,9 @@ def test_failure_outcomes_are_configurable():
 
 def test_no_measured_tests_is_half_weight_self_report():
     task = SimpleNamespace(phase_results=[_pr(_Phase.BUILD)])
-    derived = derive_ncp_outcome(task, _outcome(provenance={"test_pass_rate": "missing"}))
+    derived = derive_ncp_outcome(
+        task, _outcome(provenance={"test_pass_rate": "missing"})
+    )
     assert derived["success"] is True
     assert derived["weight"] == SELF_REPORTED_WEIGHT
     assert derived["ctx"]["eval_source"] == "self_report"
@@ -117,11 +128,18 @@ def test_no_measured_tests_is_half_weight_self_report():
     [
         ([_pr(_Phase.BUILD, "fail")], _outcome(), "failed phases: Build=fail"),
         # Escalation means the task needed a human: not a success.
-        ([_pr(_Phase.REVIEW, "escalate")], _outcome(), "failed phases: Review=escalate"),
+        (
+            [_pr(_Phase.REVIEW, "escalate")],
+            _outcome(),
+            "failed phases: Review=escalate",
+        ),
         ([_pr(_Phase.BUILD)], _outcome(rollback=True), "rollback triggered"),
         (
             [_pr(_Phase.VERIFY)],
-            _outcome(signals={"test_pass_rate": 0.0}, provenance={"test_pass_rate": "measured"}),
+            _outcome(
+                signals={"test_pass_rate": 0.0},
+                provenance={"test_pass_rate": "measured"},
+            ),
             "tests failed",
         ),
     ],
@@ -172,7 +190,9 @@ def test_ledger_is_safe_under_parallel_fanout():
 
 
 def _reporter(ledger: NCPOutcomeLedger) -> NCPOutcomeReporter:
-    return NCPOutcomeReporter(mode="direct", run_path="/nonexistent/run.py", ledger=ledger)
+    return NCPOutcomeReporter(
+        mode="direct", run_path="/nonexistent/run.py", ledger=ledger
+    )
 
 
 def test_reporter_skips_when_no_ncp_chunks_shaped_the_task():
@@ -196,7 +216,9 @@ def test_reporter_credits_consumed_and_produced_chunks_once():
         "_call_record_outcome",
         return_value={"recorded": True, "outcome_id": "out_1", "calibrated": True},
     ) as call:
-        summary = reporter.report(SimpleNamespace(phase_results=[_pr(_Phase.BUILD)]), _outcome())
+        summary = reporter.report(
+            SimpleNamespace(phase_results=[_pr(_Phase.BUILD)]), _outcome()
+        )
 
     args = call.call_args.args[0]
     assert args["chunk_ids"] == ["sub_r1", "sub_r2", "sub_w1"]
@@ -219,7 +241,9 @@ def test_reporter_never_raises():
     ledger = NCPOutcomeLedger()
     ledger.note_consumed(["sub_r1"])
     reporter = _reporter(ledger)
-    with patch.object(reporter, "_call_record_outcome", side_effect=RuntimeError("store down")):
+    with patch.object(
+        reporter, "_call_record_outcome", side_effect=RuntimeError("store down")
+    ):
         summary = reporter.report(SimpleNamespace(phase_results=[]), _outcome())
     assert summary["recorded"] is False
     assert "store down" in summary["error"]
@@ -234,9 +258,9 @@ def test_old_bridge_without_record_outcome_reports_unsupported(tmp_path):
     old_bridge.chmod(0o755)
     ledger = NCPOutcomeLedger()
     ledger.note_consumed(["sub_r1"])
-    summary = NCPOutcomeReporter(mode="direct", run_path=old_bridge, ledger=ledger).report(
-        SimpleNamespace(phase_results=[]), _outcome()
-    )
+    summary = NCPOutcomeReporter(
+        mode="direct", run_path=old_bridge, ledger=ledger
+    ).report(SimpleNamespace(phase_results=[]), _outcome())
     assert summary["recorded"] is False
     assert "sarathi init" in summary["error"]
 
@@ -245,7 +269,9 @@ def test_old_bridge_without_record_outcome_reports_unsupported(tmp_path):
 
 
 def _completed(stdout: str = "", returncode: int = 0, stderr: str = ""):
-    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+    )
 
 
 @pytest.mark.parametrize(
@@ -285,7 +311,9 @@ def test_direct_fetch_and_get_context_credit_consumed_chunks():
         persistence._call_fetch("q", k=2)
     with patch(
         "subprocess.run",
-        return_value=_completed("[NCP:SUBCONSCIOUS]\nchunk:sub_g1 layer:episodic trust:0.7\n  x\n"),
+        return_value=_completed(
+            "[NCP:SUBCONSCIOUS]\nchunk:sub_g1 layer:episodic trust:0.7\n  x\n"
+        ),
     ):
         context._call_get_context({"task": "t"})
     assert ledger.snapshot()["consumed"] == ["sub_f1", "sub_f2", "sub_g1"]
@@ -293,16 +321,24 @@ def test_direct_fetch_and_get_context_credit_consumed_chunks():
 
 def _mcp_response(result: dict) -> MagicMock:
     response = MagicMock()
-    response.json.return_value = {"result": {"content": [{"type": "text", "text": json.dumps(result)}]}}
+    response.json.return_value = {
+        "result": {"content": [{"type": "text", "text": json.dumps(result)}]}
+    }
     return response
 
 
 def test_mcp_write_credits_written_chunk():
     adapter = NCPPersistenceAdapter(mode="mcp", endpoint="http://127.0.0.1:1/mcp")
     adapter.outcome_ledger = NCPOutcomeLedger()
-    with patch("httpx.post", return_value=_mcp_response({"written": True, "chunk_id": "sub_m1"})):
+    with patch(
+        "httpx.post",
+        return_value=_mcp_response({"written": True, "chunk_id": "sub_m1"}),
+    ):
         adapter._call_write_memory("c", "episodic", "tool_result", "sarathi")
-    with patch("httpx.post", return_value=_mcp_response({"written": False, "chunk_id": "sub_m2"})):
+    with patch(
+        "httpx.post",
+        return_value=_mcp_response({"written": False, "chunk_id": "sub_m2"}),
+    ):
         adapter._call_write_memory("c", "episodic", "tool_result", "sarathi")
     assert adapter.outcome_ledger.snapshot()["produced"] == ["sub_m1"]
 
@@ -325,7 +361,9 @@ def test_mcp_get_context_returns_context_text_and_credits_retrieved_ids():
 def test_mcp_log_cost_uses_post_turn_without_acknowledging_whispers():
     adapter = NCPPersistenceAdapter(mode="mcp", endpoint="http://127.0.0.1:1/mcp")
     with patch("httpx.post", return_value=_mcp_response({"recorded": True})) as post:
-        adapter._call_log_cost(agent_id="claude", model="m", input_tokens=5, output_tokens=2)
+        adapter._call_log_cost(
+            agent_id="claude", model="m", input_tokens=5, output_tokens=2
+        )
     params = post.call_args.kwargs["json"]["params"]
     assert params["name"] == "ncp_post_turn"
     assert params["arguments"]["ack_whisper_ids"] == []
@@ -363,9 +401,13 @@ def test_init_leaves_current_and_foreign_bridges_alone(tmp_path):
 
     foreign_dir = tmp_path / "foreign"
     foreign_dir.mkdir()
-    ncp_dir, created = _sidecar(foreign_dir, "#!/usr/bin/env python3\n# my own bridge\n")
+    ncp_dir, created = _sidecar(
+        foreign_dir, "#!/usr/bin/env python3\n# my own bridge\n"
+    )
     assert created["run_py_upgraded"] is False
-    assert (ncp_dir / "run.py").read_text() == "#!/usr/bin/env python3\n# my own bridge\n"
+    assert (
+        ncp_dir / "run.py"
+    ).read_text() == "#!/usr/bin/env python3\n# my own bridge\n"
 
 
 # ── LEARN wiring ───────────────────────────────────────────────────────────
@@ -377,15 +419,24 @@ def test_learn_records_ncp_outcome_as_evidence():
 
     reporter = MagicMock()
     reporter.report.return_value = {"recorded": True, "credited_chunks": 2}
-    handler = LearnHandler(SimpleNamespace(escalation={}), ncp_outcome_reporter=reporter)
+    handler = LearnHandler(
+        SimpleNamespace(escalation={}), ncp_outcome_reporter=reporter
+    )
     fake_outcome = _outcome()
     task = SimpleNamespace(task_id="task-1", phase_results=[], harness_config=object())
-    with patch("src.harness.measure_outcome", return_value=fake_outcome), patch.object(
-        handler.learning_store,
-        "build_artifacts",
-        return_value={"learning_record": {}, "lessons_learned": [], "patterns_updated": False},
-    ), patch.object(handler.evolver, "ingest_harness_outcome", return_value=[]), patch.object(
-        handler.evolver, "generate_policy_proposals", return_value=[]
+    with (
+        patch("src.harness.measure_outcome", return_value=fake_outcome),
+        patch.object(
+            handler.learning_store,
+            "build_artifacts",
+            return_value={
+                "learning_record": {},
+                "lessons_learned": [],
+                "patterns_updated": False,
+            },
+        ),
+        patch.object(handler.evolver, "ingest_harness_outcome", return_value=[]),
+        patch.object(handler.evolver, "generate_policy_proposals", return_value=[]),
     ):
         result = handler.execute(task, Phase.LEARN)
 
@@ -434,13 +485,18 @@ def test_real_ncp_outcome_moves_trust_of_credited_chunk(tmp_path, monkeypatch):
             "print(s.get_chunks_by_ids([sys.argv[1]])[0].base_trust)"
         )
         out = subprocess.run(
-            [sys.executable, "-c", probe, written], capture_output=True, text=True, check=True
+            [sys.executable, "-c", probe, written],
+            capture_output=True,
+            text=True,
+            check=True,
         )
         return float(out.stdout.strip().splitlines()[-1])
 
     before = base_trust()
     reporter = NCPOutcomeReporter(mode="direct", run_path=run_py, ledger=ledger)
-    verified = _outcome(signals={"test_pass_rate": 1.0}, provenance={"test_pass_rate": "measured"})
+    verified = _outcome(
+        signals={"test_pass_rate": 1.0}, provenance={"test_pass_rate": "measured"}
+    )
     summary = reporter.report(SimpleNamespace(phase_results=[]), verified)
     assert summary["recorded"] is True and summary["calibrated"] is True
     raised = base_trust()
@@ -448,7 +504,9 @@ def test_real_ncp_outcome_moves_trust_of_credited_chunk(tmp_path, monkeypatch):
 
     ledger.begin("task-2")
     ledger.note_consumed([written])
-    failed = _outcome(signals={"test_pass_rate": 0.0}, provenance={"test_pass_rate": "measured"})
+    failed = _outcome(
+        signals={"test_pass_rate": 0.0}, provenance={"test_pass_rate": "measured"}
+    )
     summary = reporter.report(SimpleNamespace(phase_results=[]), failed)
     assert summary["recorded"] is True and summary["success"] is False
     assert base_trust() < raised

@@ -9,6 +9,7 @@ read (``fetch``/``get_context``) and wrote (``write_memory``).
 Nothing here asserts quality: success and the evidence weight are derived
 only from the measured ``HarnessOutcome`` and the recorded phase results.
 """
+
 from __future__ import annotations
 
 import threading
@@ -77,7 +78,10 @@ class NCPOutcomeLedger:
     def drain(self) -> dict[str, list[str]]:
         """Return and clear the collected ids."""
         with self._lock:
-            result = {"consumed": list(self._consumed), "produced": list(self._produced)}
+            result = {
+                "consumed": list(self._consumed),
+                "produced": list(self._produced),
+            }
             self._consumed.clear()
             self._produced.clear()
             self._task_id = None
@@ -172,7 +176,9 @@ def derive_ncp_outcome(
 class NCPOutcomeReporter(NCPTransportMixin):
     """Records one NCP outcome per task from its measured ``HarnessOutcome``."""
 
-    def __init__(self, *args: Any, ledger: NCPOutcomeLedger | None = None, **kwargs: Any):
+    def __init__(
+        self, *args: Any, ledger: NCPOutcomeLedger | None = None, **kwargs: Any
+    ):
         super().__init__(*args, **kwargs)
         self.outcome_ledger = ledger or NCPOutcomeLedger()
 

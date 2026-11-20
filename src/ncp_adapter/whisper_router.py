@@ -90,7 +90,11 @@ class NCPWhisperRouter(NCPTransportMixin):
             if not isinstance(body, dict):
                 body = {"text": body}
             signals.append(
-                {**body, "whisper_id": whisper.get("whisper_id"), "from_agent": whisper.get("from_agent")}
+                {
+                    **body,
+                    "whisper_id": whisper.get("whisper_id"),
+                    "from_agent": whisper.get("from_agent"),
+                }
             )
         return signals
 

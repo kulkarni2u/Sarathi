@@ -38,12 +38,26 @@ budget:
 # (deviation_threshold), the pattern pass-rate required for promotion
 # (pass_gate), and the minimum repeated-signal count before a
 # repeated-failure/escalation/hotspot proposal is generated (proposal_gate).
+# post_accept_min_outcomes / post_accept_gate_ratio drive the post-accept
+# check of an accepted proposal (NCP active): after that many tasks of the
+# proposal's task class finish on each side of the acceptance, a success rate
+# below gate_ratio x the pre-accept rate is reported as a regression.
 # Values below reproduce Evolver's built-in defaults; override any subset to
 # tune sensitivity per policy pack.
 learn_evolve:
   deviation_threshold: 0.1
   pass_gate: 0.8
   proposal_gate: 2
+  post_accept_min_outcomes: 5
+  post_accept_gate_ratio: 0.9
+  # Per-task-class quality baselines (persisted in .sarathi/evolve_baselines.json):
+  # the mean of the last baseline_window values, compared once
+  # baseline_min_samples exist. Deviation is relative to the baseline's size.
+  baseline_window: 20
+  baseline_min_samples: 1
+  # Phase outcomes that count a task as failed in the outcome reported to NCP
+  # and in the post-accept check ("escalate" = it needed a human).
+  failure_outcomes: [fail, escalate]
 
 # Classifies phase failures into a recovery_class used to route
 # provider-backed recovery dispatch (src/runtime/recovery.py). The values

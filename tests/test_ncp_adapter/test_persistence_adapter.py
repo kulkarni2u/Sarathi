@@ -134,10 +134,16 @@ class TestNCPPersistenceAdapter:
     def test_mcp_fetch_parses_response(self):
         adapter = NCPPersistenceAdapter(mode="mcp", endpoint="http://127.0.0.1:1/mcp")
         mock_response = MagicMock()
-        mock_response.json.return_value = {"result": {"content": [{"text": '{"task_id":"t1"}'}]}}
+        # ncp_fetch returns {"result": "<pidgin>"} as the tool's JSON text.
+        pidgin = 'ncp_fetch:results k:1\nchunk:sub_t1 layer:episodic score:0.50\n  {"task_id":"t1"}'
+        mock_response.json.return_value = {
+            "result": {"content": [{"type": "text", "text": json.dumps({"result": pidgin})}]}
+        }
         with patch("httpx.post", return_value=mock_response):
             result = adapter._call_fetch("test", k=1)
-            assert "task_id" in result[0]
+        assert len(result) == 1
+        assert result[0].startswith("chunk:sub_t1")
+        assert json.loads(adapter._reconstruct_chunk_text(result[0])) == {"task_id": "t1"}
 
     def test_mcp_save_learning(self):
         import httpx

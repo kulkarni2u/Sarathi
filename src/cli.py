@@ -65,6 +65,32 @@ def _find_ncp_template(filename: str) -> Path | None:
     return None
 
 
+_NCP_BRIDGE_HEADER = "Direct-mode bridge: Sarathi <-> NCP"
+_NCP_BRIDGE_VERSION_RE = re.compile(r"^SARATHI_NCP_BRIDGE_VERSION\s*=\s*(\d+)", re.MULTILINE)
+
+
+def _ncp_bridge_version(text: str) -> int:
+    """Version of a Sarathi ``.ncp/run.py``; bridges before versioning are 1."""
+    match = _NCP_BRIDGE_VERSION_RE.search(text)
+    return int(match.group(1)) if match else 1
+
+
+def _ncp_bridge_is_outdated(run_path: Path, template: Path) -> bool:
+    """True for a Sarathi-generated bridge older than the bundled template.
+
+    A ``run.py`` without Sarathi's header was not written by Sarathi and is
+    never replaced.
+    """
+    try:
+        current = run_path.read_text()
+        bundled = template.read_text()
+    except OSError:
+        return False
+    if _NCP_BRIDGE_HEADER not in current:
+        return False
+    return _ncp_bridge_version(current) < _ncp_bridge_version(bundled)
+
+
 def _ensure_ncp_sidecar(init_target: Path) -> dict[str, bool]:
     """Ensure Sarathi's direct-mode NCP files exist under ``init_target/.ncp``."""
     import shutil
@@ -81,16 +107,109 @@ def _ensure_ncp_sidecar(init_target: Path) -> dict[str, bool]:
             created["config"] = True
 
     run_path = ncp_dir / "run.py"
+    created["run_py_upgraded"] = False
+    run_template = _find_ncp_template("run.py.example")
     if not run_path.exists():
-        run_template = _find_ncp_template("run.py.example")
         if run_template is not None:
             shutil.copyfile(run_template, run_path)
             created["run_py"] = True
+    elif run_template is not None and _ncp_bridge_is_outdated(run_path, run_template):
+        # A Sarathi-generated bridge from an older release (e.g. without
+        # record_outcome). Keep the previous copy in case it was edited.
+        shutil.copyfile(run_path, run_path.with_name("run.py.bak"))
+        shutil.copyfile(run_template, run_path)
+        created["run_py_upgraded"] = True
 
     if run_path.exists():
         run_path.chmod(run_path.stat().st_mode | 0o111)
 
     return created
+
+
+# Sarathi's overrides on top of the NCP-generated config, as (table, key,
+# TOML literal, NCP default). Keys must exist in NCP's schema (`ncp doctor`
+# reports unknown ones). An existing value is replaced only while it still
+# equals NCP's default, so values the user changed survive a re-init.
+_NCP_CONFIG_OVERRIDES: tuple[tuple[str, str, str, object], ...] = (
+    # Keep pipeline working memory for a week instead of NCP's 24h default.
+    ("pipeline", "default_ttl_hours", "168", 24),
+    # Pin the MCP tool profile Sarathi is written against instead of
+    # inheriting whatever NCP's default becomes.
+    ("tools", "profile", '"standard"', "standard"),
+)
+
+# Earlier `sarathi init` releases appended this block after the last table,
+# so both keys landed in whatever table came last ([embedding] with current
+# `ncp init`) and NCP ignored them. `max_chunk_tokens` was never read by NCP.
+_LEGACY_NCP_OVERRIDE_MARKER = "# Sarathi-optimized overrides"
+_LEGACY_NCP_OVERRIDE_KEYS = ("max_chunk_tokens", "default_ttl_hours")
+
+
+def _strip_legacy_ncp_overrides(lines: list[str]) -> list[str]:
+    """Drop the legacy override block: the marker plus the key lines after it."""
+    if _LEGACY_NCP_OVERRIDE_MARKER not in (line.strip() for line in lines):
+        return lines
+    start = next(i for i, line in enumerate(lines) if line.strip() == _LEGACY_NCP_OVERRIDE_MARKER)
+    end = start + 1
+    while end < len(lines) and lines[end].split("=", 1)[0].strip() in _LEGACY_NCP_OVERRIDE_KEYS:
+        end += 1
+    return lines[:start] + lines[end:]
+
+
+def _apply_ncp_config_overrides(config_path: Path) -> list[str]:
+    """Merge Sarathi's NCP overrides into ``config_path``.
+
+    Each key is written under its own table. A key the user already set is
+    left alone. Returns ``table.key=value`` for every key written.
+    """
+    import tomllib
+
+    lines = config_path.read_text().splitlines()
+    lines = _strip_legacy_ncp_overrides(lines)
+    try:
+        parsed = tomllib.loads("\n".join(lines) + "\n")
+    except tomllib.TOMLDecodeError as exc:
+        print(f"  ⚠ Skipped Sarathi NCP overrides: {config_path} is not valid TOML ({exc})")
+        return []
+
+    header = re.compile(r"^\s*\[([^\[\]]+)\]\s*(#.*)?$")
+    applied: list[str] = []
+    for table, key, literal, ncp_default in _NCP_CONFIG_OVERRIDES:
+        section = parsed.get(table)
+        current = section.get(key) if isinstance(section, dict) else None
+        wanted = tomllib.loads(f"v = {literal}")["v"]
+        if current is not None and (current == wanted or current != ncp_default):
+            # Already Sarathi's value, or deliberately changed by the user.
+            continue
+        entry = f"{key} = {literal}  # set by sarathi init"
+        table_start = next(
+            (i for i, line in enumerate(lines) if (m := header.match(line)) and m.group(1).strip() == table),
+            None,
+        )
+        if table_start is None:
+            lines.extend(["", f"[{table}]", entry])
+        else:
+            table_end = next(
+                (i for i in range(table_start + 1, len(lines)) if header.match(lines[i])),
+                len(lines),
+            )
+            existing = next(
+                (
+                    i
+                    for i in range(table_start + 1, table_end)
+                    if lines[i].split("=", 1)[0].strip() == key and "=" in lines[i]
+                ),
+                None,
+            )
+            if existing is None:
+                lines.insert(table_start + 1, entry)
+            else:
+                lines[existing] = entry
+        value = literal.strip('"')
+        applied.append(f"{table}.{key}={value}")
+
+    config_path.write_text("\n".join(lines).rstrip("\n") + "\n")
+    return applied
 
 
 def _bootstrap_ncp(init_target: Path, *, step_label: str) -> None:
@@ -121,22 +240,18 @@ def _bootstrap_ncp(init_target: Path, *, step_label: str) -> None:
         print("  ✓ Wrote .ncp/config.toml from Sarathi template")
     if sidecar_created["run_py"]:
         print("  ✓ Wrote .ncp/run.py direct-mode bridge")
+    elif sidecar_created.get("run_py_upgraded"):
+        print("  ✓ Upgraded .ncp/run.py direct-mode bridge (previous copy: .ncp/run.py.bak)")
     elif (init_target / ".ncp" / "run.py").exists():
         print("  ✓ Verified .ncp/run.py direct-mode bridge")
 
-    # Write Sarathi-optimized config overrides (bounded chunk size keeps
-    # handoff context small — see docs/ncp/config.toml.example for defaults).
+    # Write Sarathi's NCP config overrides into the right TOML tables. NCP
+    # bounds context through [budget] (its own default), not a chunk-size key.
     ncp_config_path = init_target / ".ncp" / "config.toml"
     if ncp_config_path.exists():
-        config_text = ncp_config_path.read_text()
-        overrides = """
-# Sarathi-optimized overrides
-max_chunk_tokens = 400
-default_ttl_hours = 168
-"""
-        if "Sarathi-optimized" not in config_text:
-            ncp_config_path.write_text(config_text.strip() + "\n" + overrides.strip() + "\n")
-            print("  ✓ Wrote Sarathi-optimized NCP config (max_chunk_tokens=400, ttl=168h)")
+        applied = _apply_ncp_config_overrides(ncp_config_path)
+        if applied:
+            print(f"  ✓ Wrote Sarathi NCP config overrides ({', '.join(applied)})")
 
     welcome_path = init_target / ".ncp" / "WELCOME.md"
     welcome_path.write_text(

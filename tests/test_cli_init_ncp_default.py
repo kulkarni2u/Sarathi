@@ -1,6 +1,6 @@
 """Tests for NCP-by-default `sarathi init` behavior.
 
-NCP bounds context (max_chunk_tokens) and routes whispers between graph
+NCP bounds context (its [budget] token budget) and routes whispers between graph
 nodes instead of every phase/node replaying full context, so it's now
 bootstrapped by default rather than requiring an explicit --ncp flag.
 """
@@ -11,7 +11,9 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from src.cli import _bootstrap_ncp, handle_init
+import tomllib
+
+from src.cli import _apply_ncp_config_overrides, _bootstrap_ncp, handle_init
 
 
 def _init_args(tmp_path: Path, **overrides) -> argparse.Namespace:
@@ -45,9 +47,79 @@ def test_init_no_ncp_flag_skips_bootstrap(tmp_path: Path):
 def test_init_sarathi_optimized_config_present_by_default(tmp_path: Path):
     handle_init(_init_args(tmp_path))
 
-    config = (tmp_path / ".ncp" / "config.toml").read_text()
-    assert "Sarathi-optimized" in config
-    assert "max_chunk_tokens = 400" in config
+    config = tomllib.loads((tmp_path / ".ncp" / "config.toml").read_text())
+    assert config["pipeline"]["default_ttl_hours"] == 168
+    assert config["tools"]["profile"] == "standard"
+    assert "max_chunk_tokens" not in str(config)
+
+
+def test_ncp_overrides_go_into_existing_tables(tmp_path: Path):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[pipeline]\nmax_working_chunks = 500\n\n[embedding]\nenabled = true\n"
+    )
+
+    applied = _apply_ncp_config_overrides(config_path)
+
+    config = tomllib.loads(config_path.read_text())
+    assert applied == ["pipeline.default_ttl_hours=168", "tools.profile=standard"]
+    assert config["pipeline"] == {"default_ttl_hours": 168, "max_working_chunks": 500}
+    assert config["tools"] == {"profile": "standard"}
+    assert config["embedding"] == {"enabled": True}
+
+
+def test_ncp_overrides_keep_user_values_and_are_idempotent(tmp_path: Path):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('[pipeline]\ndefault_ttl_hours = 72\n\n[tools]\nprofile = "full"\n')
+
+    assert _apply_ncp_config_overrides(config_path) == []
+    assert _apply_ncp_config_overrides(config_path) == []
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["pipeline"]["default_ttl_hours"] == 72
+    assert config["tools"]["profile"] == "full"
+
+
+def test_ncp_overrides_replace_ncp_generated_default_in_place(tmp_path: Path):
+    """`ncp init` writes default_ttl_hours = 24 explicitly; that is NCP's default, not a user choice."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[pipeline]\ndefault_ttl_hours = 24\nmax_working_chunks = 500\n")
+
+    assert _apply_ncp_config_overrides(config_path) == [
+        "pipeline.default_ttl_hours=168",
+        "tools.profile=standard",
+    ]
+    assert _apply_ncp_config_overrides(config_path) == []
+
+    text = config_path.read_text()
+    assert text.count("default_ttl_hours") == 1
+    assert tomllib.loads(text)["pipeline"] == {"default_ttl_hours": 168, "max_working_chunks": 500}
+
+
+def test_ncp_overrides_remove_legacy_block_that_landed_in_last_table(tmp_path: Path):
+    """Earlier releases appended the keys after [embedding], where NCP ignored them."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "[pipeline]\nmax_working_chunks = 500\n\n[embedding]\nenabled = true\n"
+        "# Sarathi-optimized overrides\nmax_chunk_tokens = 400\ndefault_ttl_hours = 168\n"
+    )
+
+    _apply_ncp_config_overrides(config_path)
+
+    text = config_path.read_text()
+    config = tomllib.loads(text)
+    assert "Sarathi-optimized" not in text
+    assert config["embedding"] == {"enabled": True}
+    assert config["pipeline"]["default_ttl_hours"] == 168
+
+
+def test_ncp_overrides_skip_invalid_toml(tmp_path: Path, capsys):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("[pipeline\n")
+
+    assert _apply_ncp_config_overrides(config_path) == []
+    assert config_path.read_text() == "[pipeline\n"
+    assert "not valid TOML" in capsys.readouterr().out
 
 
 def test_bootstrap_ncp_degrades_gracefully_when_ncp_binary_missing(tmp_path: Path, capsys):

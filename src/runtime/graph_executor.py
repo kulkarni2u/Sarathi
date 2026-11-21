@@ -143,6 +143,10 @@ class TaskGraphExecutor:
         self.ncp_context_adapter = ncp_context_adapter
         self.ncp_artifact_adapter = ncp_artifact_adapter
         self.ncp_whisper_router = ncp_whisper_router
+        # (pipeline_id, node_id) pairs this executor queued a whisper for, so
+        # their nodes read it even when they are not FANOUT/CLASSIFY branches
+        # (e.g. a JUDGE's winner node).
+        self._ncp_whisper_targets: set[tuple[str, str]] = set()
         self.ncp_persistence_adapter = ncp_persistence_adapter
         self.workflow_patterns_policy = workflow_patterns_policy
         # Measured JUDGE scoring (src/runtime/judge_scoring.py): parsed from a
@@ -678,6 +682,7 @@ class TaskGraphExecutor:
     ) -> dict:
         """After a node completes, inject follow-on nodes and emit NCP signals."""
         node_type = node.get("node_type", NodeType.EXECUTE)
+        pipeline_id = self._ncp_pipeline_id(harness_config, graph)
 
         if node_type == NodeType.FANOUT:
             if not self._pattern_allowed(WorkflowPattern.FANOUT_AND_SYNTHESIZE):
@@ -687,7 +692,9 @@ class TaskGraphExecutor:
             count = int(cfg.get("count", cfg.get("max_branches", 2)))
             branch_ids = [f"{node['id']}-branch-{i}" for i in range(1, count + 1)]
             synthesize_id = f"{node['id']}-synthesize"
-            failed = self._ncp_emit_fanout_whispers(node, branch_ids, synthesize_id)
+            failed = self._ncp_emit_fanout_whispers(
+                node, branch_ids, synthesize_id, pipeline_id=pipeline_id
+            )
             if failed:
                 updated.setdefault("_ncp_warnings", []).append(
                     {"type": "fanout_whisper_failed", "targets": failed}
@@ -702,7 +709,9 @@ class TaskGraphExecutor:
             self._record_bakeoff_outcome(node, provider_result, harness_config=harness_config)
             updated = self._inject_judge_result(node, graph, provider_result)
             winner_id = f"{node['id']}-winner"
-            err = self._ncp_emit_judge_whisper(node, winner_id, provider_result)
+            err = self._ncp_emit_judge_whisper(
+                node, winner_id, provider_result, pipeline_id=pipeline_id
+            )
             if err:
                 updated.setdefault("_ncp_warnings", []).append(
                     {"type": "judge_whisper_failed", "error": err}
@@ -728,7 +737,9 @@ class TaskGraphExecutor:
             classification = str(outputs.get("classification", outputs.get("route", "")))
             if classification:
                 branch_id = f"{node['id']}-branch-{classification}"
-                err = self._ncp_emit_classify_whisper(node, branch_id, classification)
+                err = self._ncp_emit_classify_whisper(
+                    node, branch_id, classification, pipeline_id=pipeline_id
+                )
                 if err:
                     updated.setdefault("_ncp_warnings", []).append(
                         {"type": "classify_whisper_failed", "error": err}
@@ -770,8 +781,29 @@ class TaskGraphExecutor:
             return str(exc)
         return None
 
+    def _ncp_pipeline_id(self, harness_config: Any, graph: dict | None) -> str:
+        """NCP pipeline scoping this task's whispers (node ids repeat across tasks)."""
+        try:
+            from ..ncp_adapter.whisper_router import pipeline_for_task
+        except ImportError:
+            from ncp_adapter.whisper_router import pipeline_for_task  # type: ignore[no-redef]
+        effective = self._resolve_harness(harness_config)
+        return pipeline_for_task(self._isolation_task_id(effective, graph) or "graph")
+
+    def _ncp_emit(self, *, target_node: str, kind: str, payload: str, pipeline_id: str) -> None:
+        if self.ncp_whisper_router is None:
+            raise RuntimeError("no NCP whisper router configured")
+        self.ncp_whisper_router.emit(
+            from_agent="s.sarathi",
+            target=f"s.{target_node}",
+            whisper_type=kind,
+            payload=payload,
+            pipeline_id=pipeline_id,
+        )
+        self._ncp_whisper_targets.add((pipeline_id, target_node))
+
     def _ncp_emit_fanout_whispers(
-        self, node: dict, branch_ids: list[str], synthesize_id: str
+        self, node: dict, branch_ids: list[str], synthesize_id: str, *, pipeline_id: str
     ) -> list[str]:
         """Whisper the fanout objective + sibling list to every branch agent.
 
@@ -789,18 +821,18 @@ class TaskGraphExecutor:
                     "synthesize_id": synthesize_id,
                     "objective": node.get("title", ""),
                 })[:600]
-                self.ncp_whisper_router.emit(
-                    from_agent="s.sarathi",
-                    target=f"s.{branch_id}",
-                    whisper_type="fanout_context",
+                self._ncp_emit(
+                    target_node=branch_id,
+                    kind="fanout_context",
                     payload=payload,
+                    pipeline_id=pipeline_id,
                 )
             except Exception:
                 failed.append(branch_id)
         return failed
 
     def _ncp_emit_classify_whisper(
-        self, node: dict, branch_id: str, classification: str
+        self, node: dict, branch_id: str, classification: str, *, pipeline_id: str
     ) -> "str | None":
         """Whisper why a branch was activated to the classified branch agent.
 
@@ -815,18 +847,18 @@ class TaskGraphExecutor:
                 "classification": classification,
                 "objective": node.get("title", ""),
             })[:600]
-            self.ncp_whisper_router.emit(
-                from_agent="s.sarathi",
-                target=f"s.{branch_id}",
-                whisper_type="classify_context",
+            self._ncp_emit(
+                target_node=branch_id,
+                kind="classify_context",
                 payload=payload,
+                pipeline_id=pipeline_id,
             )
         except Exception as exc:
             return str(exc)
         return None
 
     def _ncp_emit_judge_whisper(
-        self, node: dict, winner_id: str, provider_result: dict | None
+        self, node: dict, winner_id: str, provider_result: dict | None, *, pipeline_id: str
     ) -> "str | None":
         """Whisper the judgment decision to the winner node.
 
@@ -842,11 +874,11 @@ class TaskGraphExecutor:
                 "judgment": outputs,
                 "objective": node.get("title", ""),
             })[:600]
-            self.ncp_whisper_router.emit(
-                from_agent="s.sarathi",
-                target=f"s.{winner_id}",
-                whisper_type="judge_context",
+            self._ncp_emit(
+                target_node=winner_id,
+                kind="judge_context",
                 payload=payload,
+                pipeline_id=pipeline_id,
             )
         except Exception as exc:
             return str(exc)
@@ -1064,14 +1096,23 @@ class TaskGraphExecutor:
         node_type = str(node_for_context.get("node_type", NodeType.EXECUTE)).lower()
         ncp = self.ncp_context_adapter
 
-        # Typed nodes and EXECUTE branch nodes get NCP-aware context.
-        # Branch nodes have '-branch-' in their id and receive fanout/classify whispers.
+        # Typed nodes, EXECUTE branch nodes and any node this executor sent a
+        # whisper to (e.g. a JUDGE winner) get NCP-aware context; EXECUTE nodes
+        # read the whispers queued for them in this task's pipeline.
         # Fall back to local ContextCompiler on any NCP error.
-        is_branch = "-branch-" in str(node_for_context.get("id", ""))
-        if ncp is not None and (node_type not in (NodeType.EXECUTE, "execute") or is_branch):
+        node_id = str(node_for_context.get("id", ""))
+        pipeline_id = self._ncp_pipeline_id(harness_config, graph)
+        is_branch = "-branch-" in node_id
+        is_target = (pipeline_id, node_id) in self._ncp_whisper_targets
+        if ncp is not None and (
+            node_type not in (NodeType.EXECUTE, "execute") or is_branch or is_target
+        ):
             try:
                 context_pack_artifact = ncp.compile_typed_node_context(
-                    node=node_for_context, graph=graph, phase=self.dispatch_phase,
+                    node=node_for_context,
+                    graph=graph,
+                    phase=self.dispatch_phase,
+                    pipeline_id=pipeline_id,
                 )
                 token_budget = (
                     context_pack_artifact.get("agent_input", {}).get("token_budget")
@@ -1199,6 +1240,14 @@ class TaskGraphExecutor:
         }
         if judge_scorecard:
             result["artifacts"]["judge_scorecard"] = judge_scorecard
+        whisper_ids = context_pack_artifact.get("compilation", {}).get("ncp_whisper_ids") or []
+        if response.success and whisper_ids and self.ncp_whisper_router is not None:
+            # Acted on: stop re-delivering. A failed node keeps them, so a
+            # retry sees the same signals.
+            try:
+                self.ncp_whisper_router.ack(f"s.{node_id}", list(whisper_ids))
+            except Exception:
+                pass
         if response.usage:
             result["usage"] = response.usage.to_artifact()
             ncp = self.ncp_context_adapter

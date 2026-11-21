@@ -6,13 +6,31 @@ Invoked by Sarathi's NCPTransportMixin as:
     .ncp/run.py <command> <json-args>
 
 Supported commands:
-    status        -- exit 0 if the NCP store is reachable (used by check_available)
-    write_memory  -- persist a SubconsciousChunk; exit 0 on success
-    get_context   -- assemble pidgin context for a ConsciousBlock; print to stdout
-    fetch         -- query the store for relevant chunks; print pidgin "chunk:" blocks
-    log_cost      -- record a cost/turn entry; exit 0 on success
+    status         -- exit 0 if the NCP store is reachable (used by check_available)
+    write_memory   -- persist a SubconsciousChunk; print "written:<id>" or
+                      "suppressed:<id>" (near-duplicate, no chunk created)
+    get_context    -- assemble pidgin context for a ConsciousBlock; print to stdout
+    fetch          -- query the store for relevant chunks; print pidgin "chunk:" blocks
+    log_cost       -- record a cost/turn entry; exit 0 on success
+    record_outcome -- record a task outcome crediting chunk_ids, then run NCP's
+                      feedback calibration (unless [calibration].auto_on_outcome
+                      is false); print {"recorded", "outcome_id", "calibrated"}
+    improvement_record -- file a policy proposal as an NCP improvement attempt
+                      (kind "manual") under the problem named problem_name in
+                      scope; an open ("proposed") attempt with the same `what`
+                      is reused. Print the attempt and the problem's history.
+    improvement_update -- update an attempt's status / observed fields
+    emit_whisper   -- queue a targeted whisper (scoped by pipeline_id); print
+                      {"whisper_id"}
+    peek_whispers  -- print queued whispers for agent_id in pipeline_id as a JSON
+                      list, without consuming them (a retried node sees them again)
+    ack_whispers   -- acknowledge (delete) whisper_ids for agent_id; print {"acknowledged"}
 
-All errors are reported on stderr with a non-zero exit code.
+All errors are reported on stderr with a non-zero exit code; an unknown
+command exits 2.
+
+`sarathi init` replaces this file with the bundled template when its
+SARATHI_NCP_BRIDGE_VERSION is older (the previous copy is kept as run.py.bak).
 """
 
 from __future__ import annotations
@@ -26,10 +44,84 @@ from pathlib import Path
 # reads <project_root>/.ncp/config.toml (sqlite store at .ncp/store.db).
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+SARATHI_NCP_BRIDGE_VERSION = 4
+
 
 def _fail(message: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
     print(message, file=sys.stderr)
     sys.exit(code)
+
+
+def _attempt_view(attempt) -> dict:
+    return {
+        "attempt_id": attempt.attempt_id,
+        "problem_id": attempt.problem_id,
+        "status": attempt.status,
+        "what": attempt.what,
+        "passed": attempt.passed,
+        "total": attempt.total,
+        "anchor_rate": attempt.anchor_rate,
+        "note": attempt.note,
+        "created_at": attempt.created_at,
+        "resolved_at": attempt.resolved_at,
+    }
+
+
+def _improvement_command(command: str, args: dict, store) -> dict:
+    import time
+
+    from ncp.stores.improvement_common import (
+        make_problem_id,
+        new_attempt_id,
+        normalize_problem_name,
+    )
+    from ncp.types import ImprovementAttempt, ImprovementProblem
+
+    if command == "improvement_update":
+        fields = dict(args.get("fields") or {})
+        if fields.get("status") in ("applied", "rejected", "rolled_back"):
+            fields.setdefault("resolved_at", time.time())
+        return {"attempt": _attempt_view(store.update_improvement_attempt(str(args["attempt_id"]), **fields))}
+
+    scope = str(args["scope"])
+    name = str(args["problem_name"]).strip()[:300]
+    what = str(args["what"]).strip()[:500]
+    problem = store.upsert_improvement_problem(
+        ImprovementProblem(
+            problem_id=make_problem_id(pipeline_id=None, scope=scope, name=name),
+            scope=scope,
+            name=name,
+            opened_at=time.time(),
+        )
+    )
+    history = store.list_improvement_attempts(problem_id=problem.problem_id)
+    wanted = normalize_problem_name(what)
+    reused = next(
+        (a for a in history if a.status == "proposed" and normalize_problem_name(a.what) == wanted),
+        None,
+    )
+    if reused is not None:
+        attempt = reused
+    else:
+        attempt = store.record_improvement_attempt(
+            ImprovementAttempt(
+                attempt_id=new_attempt_id(),
+                problem_id=problem.problem_id,
+                kind="manual",
+                what=what,
+                rationale=(str(args["rationale"])[:1000] if args.get("rationale") else None),
+                files=[str(item) for item in args.get("files") or []],
+                model=args.get("model"),
+                note=args.get("note"),
+                created_at=time.time(),
+            )
+        )
+    return {
+        "problem_id": problem.problem_id,
+        "attempt": _attempt_view(attempt),
+        "reused": reused is not None,
+        "history": [_attempt_view(a) for a in history if a.attempt_id != attempt.attempt_id],
+    }
 
 
 def main(argv: list[str]) -> int:
@@ -46,7 +138,7 @@ def main(argv: list[str]) -> int:
 
     try:
         import ncp
-        from ncp.types import ConsciousBlock, SubconsciousChunk, BudgetContext
+        from ncp.types import BudgetContext, ConsciousBlock, OutcomeRecord, SubconsciousChunk
         from ncp import configure
         from ncp.stores import create_store
     except Exception as exc:  # pragma: no cover - import failure
@@ -65,20 +157,25 @@ def main(argv: list[str]) -> int:
             return 0
 
         if command == "write_memory":
-            chunk = SubconsciousChunk(
-                content=str(args["content"]),
-                layer=args.get("layer", "episodic"),
-                src=args.get("src", "tool_result"),
-                written_by=args.get("written_by", "sarathi"),
-            )
+            chunk_kwargs = {
+                "content": str(args["content"]),
+                "layer": args.get("layer", "episodic"),
+                "src": args.get("src", "tool_result"),
+                "written_by": args.get("written_by", "sarathi"),
+            }
+            if args.get("chunk_id"):
+                chunk_kwargs["chunk_id"] = str(args["chunk_id"])
+            chunk = SubconsciousChunk(**chunk_kwargs)
             ok = ncp.write_memory(chunk, store=store, config=config)
             if not ok:
-                # SQLiteStore.write() returns False only when the chunk is a
-                # near-duplicate (>0.92 similarity) of an existing chunk in
-                # the same zone/layer/pipeline -- a no-op dedup, not an
-                # error. Treat as success per the direct-protocol contract
-                # ("write_memory ... exit 0 on success").
+                # write() returns False when the chunk is a near-duplicate of a
+                # recent chunk in the same zone/layer/pipeline -- a no-op
+                # dedup, not an error, so still exit 0. No chunk was created,
+                # so Sarathi must not credit this id in a task outcome.
+                print(f"suppressed:{chunk.chunk_id}")
                 print("write_memory: skipped (near-duplicate of existing chunk)", file=sys.stderr)
+                return 0
+            print(f"written:{chunk.chunk_id}")
             return 0
 
         if command == "get_context":
@@ -124,6 +221,108 @@ def main(argv: list[str]) -> int:
                 pipeline_id=args.get("pipeline_id"),
                 latency_ms=int(args.get("latency_ms", 0)),
             )
+            return 0
+
+        if command == "record_outcome":
+            ctx = args.get("ctx") or {}
+            chunk_ids = [str(item) for item in args.get("chunk_ids") or []]
+            # Same pipeline rule as NCP's MCP tool: use the pipeline the
+            # credited chunks share, if there is exactly one.
+            pipelines = {c.pipeline_id for c in store.get_chunks_by_ids(chunk_ids)} if chunk_ids else set()
+            pipeline_id = next(iter(pipelines)) if len(pipelines) == 1 else None
+            outcome_kwargs = {
+                "chunk_ids": chunk_ids,
+                "success": bool(args["success"]),
+                "weight": float(args.get("weight", 1.0)),
+                "note": args.get("note"),
+                "pipeline_id": pipeline_id,
+                "task": ctx.get("task"),
+                "slot": ctx.get("slot"),
+                "model": ctx.get("model"),
+                "eval_source": ctx.get("eval_source", "self_report"),
+                "input_tokens": ctx.get("input_tokens"),
+                "output_tokens": ctx.get("output_tokens"),
+                "turns": ctx.get("turns"),
+            }
+            if args.get("outcome_id"):
+                outcome_kwargs["outcome_id"] = str(args["outcome_id"])
+            outcome = OutcomeRecord(**outcome_kwargs)
+            recorded = bool(store.record_outcome(outcome))
+            calibrated = False
+            # ncp_record_outcome calibrates after each outcome (NCP >= 1.9.7);
+            # the direct API does not, so do the same here. This process runs
+            # once per task, so NCP's per-process debounce does not apply.
+            if recorded and config.calibration_auto_on_outcome:
+                try:
+                    store.calibrate(
+                        feedback_mode=True,
+                        pipeline_id=pipeline_id,
+                        outcome_step=config.calibration_auto_outcome_step,
+                    )
+                    calibrated = True
+                except NotImplementedError:
+                    calibrated = False
+                except Exception as exc:  # recorded is what matters; report and go on
+                    print(f"record_outcome: calibration failed: {exc}", file=sys.stderr)
+            print(json.dumps({
+                "recorded": recorded,
+                "outcome_id": outcome.outcome_id,
+                "calibrated": calibrated,
+            }))
+            return 0
+
+        if command == "emit_whisper":
+            from ncp.types import Whisper
+
+            whisper = Whisper(
+                from_agent=str(args["from_agent"]),
+                target=str(args["target"]),
+                whisper_type=args.get("whisper_type", "nudge"),
+                payload=args["payload"],
+                confidence=float(args.get("confidence", 0.9)),
+                pipeline_id=args.get("pipeline_id"),
+                ttl_seconds=int(args.get("ttl_seconds", config.whisper_ttl_default)),
+            )
+            store.emit_whisper(whisper)
+            print(json.dumps({"whisper_id": whisper.whisper_id}))
+            return 0
+
+        if command == "peek_whispers":
+            whispers = store.peek_whispers(
+                agent_id=str(args["agent_id"]),
+                pipeline_id=args.get("pipeline_id"),
+                max_items=int(args.get("max_items", 3)),
+                min_confidence=float(args.get("min_confidence", 0.6)),
+            )
+            print(json.dumps([
+                {
+                    "whisper_id": w.whisper_id,
+                    "from_agent": w.from_agent,
+                    "target": w.target,
+                    "whisper_type": w.whisper_type,
+                    "payload": w.payload,
+                    "confidence": w.confidence,
+                    "pipeline_id": w.pipeline_id,
+                    "created_at": w.created_at,
+                }
+                for w in whispers
+            ]))
+            return 0
+
+        if command == "ack_whispers":
+            count = store.acknowledge_whispers(
+                [str(item) for item in args.get("whisper_ids") or []],
+                agent_id=str(args["agent_id"]),
+            )
+            print(json.dumps({"acknowledged": count}))
+            return 0
+
+        if command in ("improvement_record", "improvement_update"):
+            try:
+                print(json.dumps(_improvement_command(command, args, store)))
+            except NotImplementedError as exc:
+                # Improvement records need the sqlite or pgvector store.
+                print(json.dumps({"unsupported": str(exc)}))
             return 0
 
         _fail(f"unknown command: {command!r}", 2)

@@ -753,6 +753,8 @@ def test_cli_bridge_can_route_claude_via_ncp_handoff(tmp_path, monkeypatch):
     assert calls[1][calls[1].index("--emit-to") + 1] == "opencode"
     assert "--pipeline-id" in calls[1]
     assert calls[1][calls[1].index("--pipeline-id") + 1] == "sarathi_subtask-123"
+    # NCP >= 1.9.6 summarizes handoff output unless asked for the full text.
+    assert calls[1][calls[1].index("--return") + 1] == "full"
     assert "--instruction" in calls[1]
     handoff_instruction = calls[1][calls[1].index("--instruction") + 1]
     assert "Inputs:" not in handoff_instruction
@@ -762,6 +764,58 @@ def test_cli_bridge_can_route_claude_via_ncp_handoff(tmp_path, monkeypatch):
     assert token_profile["estimator"] == "chars_div_4"
     assert token_profile["handoff_instruction_tokens"] > 0
     assert token_profile["handoff_payload_tokens"] > 0
+
+
+def test_ncp_handoff_payload_is_a_valid_ncp_share_payload():
+    """`ncp emit --type share` validates the payload as NCP's HandoffPayload."""
+    from ncp.types import HandoffPayload
+
+    from src.runtime.providers.cli_bridge import _summarize_ncp_handoff_payload
+
+    long_prompt = "Implement the slice. " * 100
+    request = DispatchRequest(
+        mode="execute",
+        task_id="subtask-9",
+        phase="TaskTracking",
+        prompt=long_prompt,
+        inputs={},
+        constraints={},
+        context_pack={
+            "agent_input": {
+                "relevant_files": [f"src/m{i}.py" for i in range(10)],
+                "acceptance_criteria": ["tests pass", "no new lint", "docs updated", "extra"],
+            }
+        },
+    )
+
+    raw = _summarize_ncp_handoff_payload("claude", request)
+
+    payload = HandoffPayload.model_validate_json(raw)
+    assert len(payload.ask) <= 400
+    assert payload.ask.endswith("...")
+    assert payload.files == [f"src/m{i}.py" for i in range(6)]
+    assert payload.slice == "task=subtask-9 phase=TaskTracking provider=claude"
+    assert len(raw) < 1000
+
+
+def test_ncp_handoff_payload_keeps_acceptance_inside_ask():
+    from ncp.types import HandoffPayload
+
+    from src.runtime.providers.cli_bridge import _summarize_ncp_handoff_payload
+
+    request = DispatchRequest(
+        mode="execute",
+        task_id="t1",
+        phase="Build",
+        prompt="Add the flag.",
+        inputs={},
+        constraints={},
+        context_pack={"agent_input": {"acceptance_criteria": ["flag documented"]}},
+    )
+
+    payload = HandoffPayload.model_validate_json(_summarize_ncp_handoff_payload("opencode", request))
+    assert payload.ask == "Add the flag. | acceptance: flag documented"
+    assert payload.files == []
 
 
 def test_ncp_handoff_instruction_stays_compact_against_full_provider_prompt():

@@ -406,7 +406,7 @@ Sarathi installs NCP as a Python dependency and can bootstrap a project-local NC
 
 ### 7.1 What is NCP?
 
-NCP (Neural Context Protocol) is a sidecar runtime that Sarathi calls for context and memory. Sarathi depends on `neural-context-protocol>=1.1.0,<2.0.0`, so installing Sarathi also installs the Python package.
+NCP (Neural Context Protocol) is a sidecar runtime that Sarathi calls for context and memory. Sarathi depends on `neural-context-protocol>=1.9.7,<2.0.0`, so installing Sarathi also installs the Python package.
 
 **PyPI:** `neural-context-protocol` — **[kulkarni2u/neural-context-protocol](https://github.com/kulkarni2u/neural-context-protocol)**
 
@@ -465,7 +465,76 @@ sarathi run --no-ncp "task"    # force native adapters
 sarathi run --ncp --ncp-mode mcp --ncp-endpoint http://ncp.internal:4242/mcp "task"
 ```
 
-### 7.5 Dynamic workflow patterns without NCP
+### 7.5 Outcome feedback: NCP learns which memory helped
+
+When NCP is active, LEARN records each task's measured outcome in NCP
+(`record_outcome`), crediting the NCP chunks the task read (`fetch`,
+`get_context`) and wrote (`write_memory`). NCP then recalibrates those chunks'
+trust (by `[calibration].auto_outcome_step`, default 0.1 per outcome), so
+memory that preceded successful work ranks higher next time and memory behind
+failures ranks lower.
+
+| Measured result | NCP outcome |
+|---|---|
+| Any phase ended `fail` or `escalate` (policy: `learn_evolve.failure_outcomes` in `escalation.md`), a rollback was triggered, or VERIFY's test command failed | failure |
+| Otherwise | success |
+| VERIFY ran a real test command | `eval_source: verifier`, weight 1.0 |
+| No test command (review verdicts and phase outcomes only) | `eval_source: self_report`, weight 0.5 |
+
+The result is stored on the LEARN phase as `artifacts["ncp_outcome"]` (and
+`evidence["ncp_outcome_recorded"]`). Feedback never fails LEARN: an
+unreachable store is recorded as an `error` in that summary. Tasks that used
+no NCP chunks record nothing (`skipped: no_ncp_chunks`). Set
+`[calibration] auto_on_outcome = false` in `.ncp/config.toml` to keep the
+outcomes but recalibrate only when you run `ncp calibrate --feedback`.
+
+`record_outcome` needs the version-2 `.ncp/run.py` bridge. `sarathi init`
+upgrades a bridge it generated earlier and keeps the old copy as
+`.ncp/run.py.bak`; until then, LEARN reports `.ncp/run.py has no
+record_outcome; re-run sarathi init`.
+
+### 7.6 Policy proposals as NCP improvement records
+
+With NCP active (direct mode), each policy proposal LEARN generates is also
+filed in NCP's improvement history: an attempt under the problem named by the
+proposal's title, scoped to its policy file. Accepting, rejecting or rolling
+back the proposal (`sarathi proposals --accept/--reject/--rollback`, or the
+web cockpit) sets the attempt to `applied`, `rejected` or `rolled_back`.
+`ncp improvements show` prints the history.
+
+- **History on new proposals.** Each proposal in LEARN's `policy_proposals`
+  carries `improvement`: its NCP attempt, the problem's earlier attempts, and
+  `previously` when the same change was already rejected or rolled back.
+  A proposal that recurs reuses its open attempt instead of filing a new one.
+- **Post-accept check.** LEARN logs every task's measured outcome in
+  `.sarathi/ncp_outcomes.jsonl`. For an accepted proposal, once
+  `post_accept_min_outcomes` tasks of its task class have finished both
+  before and after acceptance, LEARN compares their weighted success rates.
+  A rate below `post_accept_gate_ratio` x the pre-accept rate is a
+  regression: LEARN's `post_accept_checks` lists it with
+  `sarathi proposals --rollback <id>`, and the NCP attempt records the
+  observed `passed`/`total` against `anchor_rate`. Nothing is rolled back
+  automatically. Both thresholds live in the `learn_evolve` block of
+  `escalation.md` (defaults 5 and 0.9).
+
+This is not NCP's `ncp refine` gate: that gate judges a shorter rewrite of
+a single procedure chunk, while a Sarathi proposal is a note added to a whole
+policy file after review. Improvement records need the version-3
+`.ncp/run.py` bridge (`sarathi init` upgrades it) and are reported
+unsupported in MCP mode, where NCP exposes them only in the `full` tool
+profile.
+
+### 7.7 Signals between graph nodes
+
+With `--ncp-router`, FANOUT, CLASSIFY and JUDGE nodes send their context to
+the nodes they create (each branch, the activated branch, the winner) as NCP
+whispers: addressed to `s.<node_id>`, scoped to the task (`sarathi_<task_id>`),
+and acknowledged once the receiving node's dispatch succeeds. A node never
+receives another task's signals, and a node nothing was sent to receives
+nothing. This needs the version-4 `.ncp/run.py` bridge; in MCP mode signals are sent but
+not read back.
+
+### 7.8 Dynamic workflow patterns without NCP
 
 If you enable dynamic workflow patterns (`workflow-patterns.md`) but NCP is not active:
 
